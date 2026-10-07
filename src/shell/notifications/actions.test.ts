@@ -345,7 +345,9 @@ describe('notificationActionButtons', () => {
 			['Details', 'ghost'],
 		]);
 		buttons[0]?.run();
-		await vi.waitFor(() => expect(mocks.requestWslFix).toHaveBeenCalledWith('repair_dns', 'Ubuntu'));
+		await vi.waitFor(() =>
+			expect(mocks.requestWslFix).toHaveBeenCalledWith('repair_dns', 'Ubuntu')
+		);
 		buttons[1]?.run();
 		expect(mocks.navigateFocused).toHaveBeenCalledWith('/settings/engines');
 	});
@@ -363,6 +365,22 @@ describe('notificationActionButtons', () => {
 		await vi.waitFor(() =>
 			expect(mocks.requestWslFix).toHaveBeenCalledWith('restart_networking', 'default')
 		);
+	});
+
+	it('fix.wsl_network leads with NAT once a restart failed this episode, like the banner', async () => {
+		const { useWslHealthUi } = await import('@/lib/wsl-health/store');
+		useWslHealthUi.setState({ restartTried: { Ubuntu: true } });
+		try {
+			const buttons = notificationActionButtons(
+				row({
+					kind: 'violation',
+					action: { kind: 'fix.wsl_network', distro: 'Ubuntu', state: 'no_route' },
+				})
+			);
+			expect(buttons[0]?.label).toBe('Switch to NAT…');
+		} finally {
+			useWslHealthUi.setState({ restartTried: {} });
+		}
 	});
 
 	it('a resolved fix.wsl_network row (WSL came back) offers nothing', () => {

@@ -37,7 +37,10 @@ import { iykeFetch } from '@/lib/iyke/client';
 import { asKnownNotificationAction } from '@/lib/notifications/action-kind';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { type NotificationRow, notificationsList } from '@/lib/tauri-cmd';
-import { primaryFixForState } from '@/lib/wsl-health/copy';
+import { notificationFix } from '@/lib/wsl-health/copy';
+import { cachedWslHealth } from '@/lib/wsl-health/query';
+import { useWslHealthUi } from '@/lib/wsl-health/store';
+import { normalizeWslDistro } from '@/lib/wsl-health/tabs';
 
 // Duplicated from `src/shell/status-bar.tsx`'s `NGWA_LINKS` rather than
 // imported: this module is reached from the popover, and `status-bar.tsx`
@@ -366,16 +369,22 @@ export function notificationActionButtons(
 				run: () => navigate(WSL_HEALTH_ROUTE),
 			};
 			if (row.resolvedAt != null) return [];
-			const fix = primaryFixForState(action.state);
+			// Same primary as the banner / Settings row (D-6: NAT once a
+			// restart has failed this episode).
+			const key = normalizeWslDistro(action.distro);
+			const fix = notificationFix(action.state, {
+				health: cachedWslHealth(key),
+				restartTried: useWslHealthUi.getState().restartTried[key] ?? false,
+			});
 			if (!fix) return [details];
-			const { distro } = action;
+			const distro = key;
 			return [
 				{
 					label: fix.label,
 					variant: 'primary',
 					run: () =>
 						void import('@/lib/wsl-health/fix-flow').then((m) =>
-							m.requestWslFix(fix.action, distro ?? 'default')
+							m.requestWslFix(fix.action, distro)
 						),
 				},
 				details,

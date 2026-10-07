@@ -4,6 +4,7 @@ import {
 	isWslTab,
 	normalizeWslDistro,
 	planWslRelaunch,
+	scansForNetworkErrno,
 	snapshotWslSessions,
 	wslShutdownSettled,
 	wslTabDistro,
@@ -68,6 +69,16 @@ describe('WSL tab detection', () => {
 	});
 });
 
+describe('scansForNetworkErrno', () => {
+	it('scans WSL tabs on a fresh spawn, never on a reattach (old scrollback)', () => {
+		const w = claudeWsl('w', 'Ubuntu', null);
+		expect(scansForNetworkErrno(w, { attached: false })).toBe(true);
+		expect(scansForNetworkErrno(w, { attached: true })).toBe(false);
+		const native = tab({ id: 'n', spec: { cwd: '/', cmd: ['pwsh.exe'] } });
+		expect(scansForNetworkErrno(native, { attached: false })).toBe(false);
+	});
+});
+
 describe('D-5 relaunch snapshot / restore', () => {
 	const before = [
 		claudeWsl('w1', 'Ubuntu', 'sess-1'),
@@ -78,9 +89,30 @@ describe('D-5 relaunch snapshot / restore', () => {
 
 	it('snapshots every WSL tab with its resume id, before the fix', () => {
 		expect(snapshotWslSessions(before)).toEqual([
-			{ tabId: 'w1', title: 'w1', distro: 'Ubuntu', claudeSessionId: 'sess-1', wasRunning: true },
-			{ tabId: 'w2', title: 'w2', distro: 'default', claudeSessionId: null, wasRunning: true },
-			{ tabId: 'w3', title: 'w3', distro: 'default', claudeSessionId: null, wasRunning: false },
+			{
+				tabId: 'w1',
+				title: 'w1',
+				distro: 'Ubuntu',
+				claudeSessionId: 'sess-1',
+				wasRunning: true,
+				ephemeral: false,
+			},
+			{
+				tabId: 'w2',
+				title: 'w2',
+				distro: 'default',
+				claudeSessionId: null,
+				wasRunning: true,
+				ephemeral: false,
+			},
+			{
+				tabId: 'w3',
+				title: 'w3',
+				distro: 'default',
+				claudeSessionId: null,
+				wasRunning: false,
+				ephemeral: false,
+			},
 		]);
 	});
 
@@ -94,8 +126,18 @@ describe('D-5 relaunch snapshot / restore', () => {
 		);
 		expect(wslShutdownSettled(snap, after)).toBe(true);
 		expect(planWslRelaunch(snap, after)).toEqual([
-			{ tabId: 'w1', claudeSessionId: 'sess-1' },
-			{ tabId: 'w2', claudeSessionId: null },
+			{ tabId: 'w1', claudeSessionId: 'sess-1', forceEphemeral: false },
+			{ tabId: 'w2', claudeSessionId: null, forceEphemeral: false },
+		]);
+	});
+
+	it('keeps an in-process (seat / attach-run) PTY in-process on relaunch', () => {
+		const seat = { ...claudeWsl('seat', 'Ubuntu', 'sess-s'), mode: 'ephemeral' as const };
+		const snap = snapshotWslSessions([seat]);
+		expect(snap[0]?.ephemeral).toBe(true);
+		const after = [{ ...seat, status: 'exited' as const, ptyId: null, claudeSessionId: null }];
+		expect(planWslRelaunch(snap, after)).toEqual([
+			{ tabId: 'seat', claudeSessionId: 'sess-s', forceEphemeral: true },
 		]);
 	});
 

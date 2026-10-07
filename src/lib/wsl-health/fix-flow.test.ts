@@ -1,6 +1,7 @@
 // honest-failure-states WP-2 — D-5 around the fixes that shut WSL down:
-// snapshot resume ids before the call, relaunch with them after `done`,
-// leave sessions alone on `cancelled_by_user`.
+// snapshot resume ids before the call, relaunch with them after a `done`
+// that brought WSL back, keep them (no respawn) when the shutdown ran but WSL
+// is still broken, leave sessions alone on `cancelled_by_user`.
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { create, type StoreApi, type UseBoundStore } from 'zustand';
@@ -150,5 +151,63 @@ describe('D-5 relaunch', () => {
 		expect(out.outcome).toBe('failed');
 		expect(mocks.openTabPty).not.toHaveBeenCalled();
 		expect(useWslHealthUi.getState().runs.Ubuntu?.message).toBe("Couldn't fix it: boom");
+	});
+
+	it('failed after the shutdown already ran: resume ids survive, nothing respawns', async () => {
+		// `wsl --shutdown` succeeded, then `Restart-Service hns` failed (exit 11).
+		mocks.wslHealthFix.mockImplementation(async () => {
+			killAllWsl();
+			return {
+				outcome: 'failed',
+				reason: 'restarting the Host Network Service (hns) failed',
+			} satisfies WslFixOutcome;
+		});
+		requestWslFix('restart_networking', 'Ubuntu');
+		await confirmWslFix();
+		expect(mocks.openTabPty).not.toHaveBeenCalled();
+		expect(store.ref.getState().tabs.map((t) => t.claudeSessionId)).toEqual(['sess-a', null]);
+		const run = useWslHealthUi.getState().runs.Ubuntu;
+		expect(run?.phase).toBe('failed');
+		expect(run?.message).toContain('2 WSL sessions were closed');
+	});
+
+	it('a thrown IPC error after the shutdown is handled the same way', async () => {
+		mocks.wslHealthFix.mockImplementation(async () => {
+			killAllWsl();
+			throw new Error('ipc gone');
+		});
+		requestWslFix('switch_to_nat', 'Ubuntu');
+		await confirmWslFix();
+		expect(mocks.openTabPty).not.toHaveBeenCalled();
+		expect(store.ref.getState().tabs[0]?.claudeSessionId).toBe('sess-a');
+		expect(useWslHealthUi.getState().runs.Ubuntu?.message).toMatch(/^Couldn't fix it: ipc gone/);
+	});
+
+	it('done but still broken: keeps the resume ids and does not relaunch into it', async () => {
+		mocks.wslHealthFix.mockImplementation(async () => {
+			killAllWsl();
+			return { outcome: 'done', health: { ...OK, state: 'no_route' } } satisfies WslFixOutcome;
+		});
+		requestWslFix('restart_networking', 'Ubuntu');
+		await confirmWslFix();
+		expect(mocks.openTabPty).not.toHaveBeenCalled();
+		expect(store.ref.getState().tabs[0]?.claudeSessionId).toBe('sess-a');
+		expect(useWslHealthUi.getState().runs.Ubuntu?.message).toMatch(
+			/^That didn't fix it.* 2 WSL sessions were closed/
+		);
+	});
+
+	it('relaunches an in-process seat terminal in-process', async () => {
+		store.ref.setState((s) => ({
+			tabs: s.tabs.map((t) => (t.id === 'a' ? { ...t, mode: 'ephemeral' as const } : t)),
+		}));
+		mocks.wslHealthFix.mockImplementation(async () => {
+			killAllWsl();
+			return { outcome: 'done', health: OK } satisfies WslFixOutcome;
+		});
+		requestWslFix('restart_networking', 'Ubuntu');
+		await confirmWslFix();
+		const opts = Object.fromEntries(mocks.openTabPty.mock.calls.map(([t, o]) => [t.id, o]));
+		expect(opts).toEqual({ a: { forceEphemeral: true }, b: {} });
 	});
 });

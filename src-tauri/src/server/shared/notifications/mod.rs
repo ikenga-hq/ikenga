@@ -808,6 +808,29 @@ pub async fn resolve_installed_updates(
     Ok(resolved)
 }
 
+/// The open (unresolved) rows whose dedupe key starts with `prefix`, as
+/// `(dedupe_key, action)`. For producers whose resolution spans a family of
+/// keys (`wsl:network:*`, where one VM-wide recovery ends every distro's row).
+pub async fn open_rows_with_key_prefix(
+    pool: &sqlx::SqlitePool,
+    prefix: &str,
+) -> Result<Vec<(String, Option<Value>)>, String> {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT dedupe_key, action FROM shell_notifications
+         WHERE resolved_at IS NULL AND dedupe_key IS NOT NULL
+           AND substr(dedupe_key, 1, ?) = ?",
+    )
+    .bind(prefix.chars().count() as i64)
+    .bind(prefix)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("notifications open rows by prefix: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|(key, action)| (key, action.and_then(|a| serde_json::from_str(&a).ok())))
+        .collect())
+}
+
 /// Best-effort [`resolve_by_key`] for emit sites holding a `PaDb`.
 pub async fn resolve_key_with_db(db: &crate::db::PaDb, dedupe_key: &str) {
     let result = match db.ensure_pool().await {
@@ -1120,6 +1143,20 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(next, RecordOutcome::Inserted(ref n) if n.id != id));
+    }
+
+    #[tokio::test]
+    async fn open_rows_with_key_prefix_lists_only_open_matching_rows() {
+        let (pool, _tmp) = fresh_pool().await;
+        for key in ["wsl:network:default", "wsl:network:ubuntu", "wsl:networkx", "other:wsl:network:"] {
+            record(&pool, note(NotificationKind::Violation, Some(key), Coalesce::WhileUnresolved))
+                .await
+                .unwrap();
+        }
+        resolve_by_key(&pool, "wsl:network:ubuntu").await.unwrap();
+        let open = open_rows_with_key_prefix(&pool, "wsl:network:").await.unwrap();
+        let keys: Vec<_> = open.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["wsl:network:default"]);
     }
 
     #[tokio::test]

@@ -7,11 +7,14 @@
 // (`src/lib/ngwa/install-errors.ts`): a terminal prints "timed out" and
 // ECONNREFUSED for plenty of reasons that say nothing about WSL's network, so
 // only the errnos that mean "this machine can't resolve / route" count.
+// Not ENOTFOUND either: Node reports it for an ordinary NXDOMAIN (a typo'd or
+// dead host) on a perfectly healthy network; a broken resolver shows up as
+// EAI_AGAIN.
 
 import { stripAnsi } from '@/terminal/pty-output-buffer';
 
 export const NETWORK_ERRNO_RE =
-	/\b(EAI_AGAIN|ENOTFOUND|ENETUNREACH)\b|Temporary failure in name resolution|Network is unreachable/i;
+	/\b(EAI_AGAIN|ENETUNREACH)\b|Temporary failure in name resolution|Network is unreachable/i;
 
 /** Characters kept from the previous chunk so a match split across two PTY
  *  reads is still seen. Longer than the longest pattern. */

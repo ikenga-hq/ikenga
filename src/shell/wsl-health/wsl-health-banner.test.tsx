@@ -115,9 +115,30 @@ describe('WslHealthBannerView', () => {
 
 describe('WslFixConfirmBody', () => {
 	const sessions = [
-		{ tabId: 'a', title: 'claude', distro: 'Ubuntu', claudeSessionId: 's1', wasRunning: true },
-		{ tabId: 'b', title: 'bash', distro: 'default', claudeSessionId: null, wasRunning: true },
-		{ tabId: 'c', title: 'old', distro: 'default', claudeSessionId: null, wasRunning: false },
+		{
+			tabId: 'a',
+			title: 'claude',
+			distro: 'Ubuntu',
+			claudeSessionId: 's1',
+			wasRunning: true,
+			ephemeral: false,
+		},
+		{
+			tabId: 'b',
+			title: 'bash',
+			distro: 'default',
+			claudeSessionId: null,
+			wasRunning: true,
+			ephemeral: false,
+		},
+		{
+			tabId: 'c',
+			title: 'old',
+			distro: 'default',
+			claudeSessionId: null,
+			wasRunning: false,
+			ephemeral: false,
+		},
 	];
 
 	it('restart lists the running WSL sessions it will close (D-5)', () => {

@@ -150,10 +150,14 @@ pub enum WslFixAction {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum WslFixOutcome {
     /// The fix ran; `health` is a fresh (forced) re-probe.
-    Done { health: WslHealth },
+    Done {
+        health: WslHealth,
+    },
     /// The user declined the UAC prompt.
     CancelledByUser,
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
 }
 
 /// `true` for a name WSL could register and that is safe as a lone argv
@@ -175,7 +179,11 @@ fn now_ms() -> i64 {
 
 /// The fixed in-distro probe. POSIX `sh`, no iproute2 needed (reads
 /// `/proc/net/route` and `/sys/class/net`), one `key=value` per line.
-/// `getent` is bounded with `timeout` when the distro has it.
+/// The lookup uses `getent hosts`, else `nslookup` (busybox / Alpine), and
+/// reports `dns=unknown` when the distro has neither — a missing tool is not
+/// a DNS failure. It is bounded with `timeout` when the distro has it, and a
+/// lookup cut off by that cap reports `dns=timeout` (exit 124) apart from
+/// one that failed outright.
 pub const DISTRO_PROBE_SCRIPT: &str = concat!(
     "echo ikenga_probe=1\n",
     "r=0\n",
@@ -187,7 +195,10 @@ pub const DISTRO_PROBE_SCRIPT: &str = concat!(
     "elif [ ! -r /etc/resolv.conf ]; then echo resolv=unreadable\n",
     "else echo \"resolv=ok $(grep -c '^[[:space:]]*nameserver' /etc/resolv.conf)\"; fi\n",
     "t=; command -v timeout >/dev/null 2>&1 && t='timeout 8'\n",
-    "if $t getent hosts www.msftconnecttest.com >/dev/null 2>&1; then echo dns=1; else echo dns=0; fi\n",
+    "q=; if command -v getent >/dev/null 2>&1; then q='getent hosts'; elif command -v nslookup >/dev/null 2>&1; then q=nslookup; fi\n",
+    "if [ -z \"$q\" ]; then echo dns=unknown\n",
+    "else $t $q www.msftconnecttest.com >/dev/null 2>&1; c=$?\n",
+    "if [ $c -eq 0 ]; then echo dns=1; elif [ -n \"$t\" ] && [ $c -eq 124 ]; then echo dns=timeout; else echo dns=0; fi; fi\n",
     "tun=0; grep -q '10\\.255\\.255\\.254' /proc/net/fib_trie 2>/dev/null && tun=1; echo dnstunnel=$tun\n",
     "echo \"uptime=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)\"\n",
 );
@@ -203,14 +214,28 @@ pub enum ResolvState {
     Unreadable,
 }
 
+/// How the in-distro lookup of [`HEALTH_HOST`] went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DnsCheck {
+    Resolved,
+    /// The lookup failed (no answer, NXDOMAIN, no nameserver …).
+    Failed,
+    /// The lookup ran past the script's 8 s cap. glibc's own default (5 s ×
+    /// 2 attempts) gives up later than that, so a nameserver that never
+    /// answers lands here — it is a failure, named apart in the detail.
+    TimedOut,
+    /// The distro has no `getent` or `nslookup`: resolution wasn't tested.
+    Unknown,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DistroProbe {
     pub has_default_route: bool,
     /// Interfaces other than `lo`.
     pub interfaces: Vec<String>,
     pub resolv: ResolvState,
-    /// `getent hosts HEALTH_HOST` succeeded.
-    pub dns_ok: bool,
+    /// The lookup of [`HEALTH_HOST`].
+    pub dns: DnsCheck,
     /// The DNS tunnelling address is configured (mirrored / dnsTunneling).
     pub dns_tunnel: bool,
     pub uptime_secs: Option<f64>,
@@ -224,7 +249,7 @@ pub fn parse_distro_probe(stdout: &str) -> Option<DistroProbe> {
         has_default_route: false,
         interfaces: Vec::new(),
         resolv: ResolvState::Unreadable,
-        dns_ok: false,
+        dns: DnsCheck::Failed,
         dns_tunnel: false,
         uptime_secs: None,
     };
@@ -251,7 +276,14 @@ pub fn parse_distro_probe(stdout: &str) -> Option<DistroProbe> {
                     },
                 }
             }
-            "dns" => probe.dns_ok = value == "1",
+            "dns" => {
+                probe.dns = match value {
+                    "1" => DnsCheck::Resolved,
+                    "timeout" => DnsCheck::TimedOut,
+                    "unknown" => DnsCheck::Unknown,
+                    _ => DnsCheck::Failed,
+                }
+            }
             "dnstunnel" => probe.dns_tunnel = value == "1",
             "uptime" => probe.uptime_secs = value.parse().ok(),
             _ => {}
@@ -265,8 +297,14 @@ pub fn parse_distro_probe(stdout: &str) -> Option<DistroProbe> {
 pub enum ProbeFailure {
     /// No `wsl.exe`, or WSL says it has no distribution.
     NotInstalled(String),
-    /// `wsl.exe` failed, hung or answered with something else.
+    /// `wsl.exe` failed or answered with something else.
     Down(String),
+    /// `wsl.exe` didn't answer within the budget. Kept apart from [`Down`]
+    /// so the probe can retry once: a first launch after a Windows boot can
+    /// be that slow without anything being wrong.
+    ///
+    /// [`Down`]: ProbeFailure::Down
+    TimedOut(String),
 }
 
 /// Read a finished `wsl.exe … sh -c <probe>`: the parsed probe, or why not.
@@ -284,9 +322,17 @@ pub fn read_distro_probe(
         super::wsl::decode_wsl_output(stderr),
         out
     ));
-    if err.to_ascii_lowercase().contains("no installed distributions") {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("no installed distributions") {
         return Err(ProbeFailure::NotInstalled(
             "WSL has no installed distribution".into(),
+        ));
+    }
+    if lower.contains("no distribution with the supplied name")
+        || lower.contains("wsl_e_distro_not_found")
+    {
+        return Err(ProbeFailure::NotInstalled(
+            "That WSL distribution isn't installed".into(),
         ));
     }
     Err(ProbeFailure::Down(if err.is_empty() {
@@ -381,7 +427,9 @@ pub fn newest_mirrored_failure(events: &[WslEvent], since_ms: i64) -> Option<Mir
         events
             .iter()
             .filter(|e| (e.at - fallback.at).abs() <= PAIRING_WINDOW_MS)
-            .filter_map(|e| configure_networking_code(&e.text).map(|c| ((e.at - fallback.at).abs(), c)))
+            .filter_map(|e| {
+                configure_networking_code(&e.text).map(|c| ((e.at - fallback.at).abs(), c))
+            })
             .min_by_key(|(distance, _)| *distance)
             .map(|(_, c)| c)
     });
@@ -429,6 +477,8 @@ fn networking_mode_value(line: &str) -> Option<&str> {
 pub fn networking_mode(wslconfig: &str) -> Option<String> {
     let mut section = None::<String>;
     let mut mode = None;
+    // `trim()` keeps U+FEFF, so a BOM would hide a first-line `[wsl2]`.
+    let wslconfig = wslconfig.strip_prefix('\u{feff}').unwrap_or(wslconfig);
     for line in wslconfig.lines() {
         if let Some(name) = section_name(line) {
             section = Some(name);
@@ -496,14 +546,113 @@ pub fn set_networking_mode_nat(wslconfig: &str) -> String {
     out
 }
 
+/// How a `.wslconfig` is stored on disk, so an edit is written back the
+/// same way. Notepad and PowerShell 5's `Out-File` both write UTF-16.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WslConfigEncoding {
+    Utf8 { bom: bool },
+    Utf16Le { bom: bool },
+    Utf16Be { bom: bool },
+}
+
+/// Decode a `.wslconfig`: UTF-8 (BOM optional), or UTF-16 LE / BE with or
+/// without a BOM. The returned text never starts with a BOM. `Err` for
+/// anything else — notably a NUL byte that isn't UTF-16 framing: UTF-16
+/// ASCII text is otherwise *valid UTF-8* (NULs in between), and an edit
+/// would append UTF-8 lines to a UTF-16 file.
+pub fn decode_wslconfig(bytes: &[u8]) -> Result<(String, WslConfigEncoding), String> {
+    fn utf16(bytes: &[u8], le: bool) -> Result<String, String> {
+        if bytes.len() % 2 != 0 {
+            return Err("odd-length UTF-16".into());
+        }
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| {
+                if le {
+                    u16::from_le_bytes([c[0], c[1]])
+                } else {
+                    u16::from_be_bytes([c[0], c[1]])
+                }
+            })
+            .collect();
+        String::from_utf16(&units).map_err(|_| "invalid UTF-16".to_string())
+    }
+    let unsupported =
+        |why: &str| format!(".wslconfig isn't in a text encoding Ikenga can edit safely ({why})");
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return std::str::from_utf8(rest)
+            .map(|t| (t.to_string(), WslConfigEncoding::Utf8 { bom: true }))
+            .map_err(|_| unsupported("invalid UTF-8"));
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return utf16(rest, true)
+            .map(|t| (t, WslConfigEncoding::Utf16Le { bom: true }))
+            .map_err(|e| unsupported(&e));
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return utf16(rest, false)
+            .map(|t| (t, WslConfigEncoding::Utf16Be { bom: true }))
+            .map_err(|e| unsupported(&e));
+    }
+    if bytes.contains(&0) {
+        // BOM-less UTF-16: an ASCII config has its NULs all on one side.
+        let even_nuls = bytes.iter().step_by(2).filter(|b| **b == 0).count();
+        let odd_nuls = bytes.iter().skip(1).step_by(2).filter(|b| **b == 0).count();
+        let le = odd_nuls > 0 && even_nuls == 0;
+        let be = even_nuls > 0 && odd_nuls == 0;
+        if bytes.len() % 2 == 0 && (le || be) {
+            if let Ok(t) = utf16(bytes, le) {
+                if !t.contains('\0') {
+                    let encoding = if le {
+                        WslConfigEncoding::Utf16Le { bom: false }
+                    } else {
+                        WslConfigEncoding::Utf16Be { bom: false }
+                    };
+                    return Ok((t, encoding));
+                }
+            }
+        }
+        return Err(unsupported("it contains NUL bytes"));
+    }
+    std::str::from_utf8(bytes)
+        .map(|t| (t.to_string(), WslConfigEncoding::Utf8 { bom: false }))
+        .map_err(|_| unsupported("invalid UTF-8"))
+}
+
+/// `text` written back as [`decode_wslconfig`] found it (BOM included).
+pub fn encode_wslconfig(text: &str, encoding: WslConfigEncoding) -> Vec<u8> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let (bom, mut out): (bool, Vec<u8>) = match encoding {
+        WslConfigEncoding::Utf8 { bom } => (bom, text.as_bytes().to_vec()),
+        WslConfigEncoding::Utf16Le { bom } => (
+            bom,
+            text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        ),
+        WslConfigEncoding::Utf16Be { bom } => (
+            bom,
+            text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+        ),
+    };
+    if bom {
+        let mark: &[u8] = match encoding {
+            WslConfigEncoding::Utf8 { .. } => &[0xEF, 0xBB, 0xBF],
+            WslConfigEncoding::Utf16Le { .. } => &[0xFF, 0xFE],
+            WslConfigEncoding::Utf16Be { .. } => &[0xFE, 0xFF],
+        };
+        out.splice(0..0, mark.iter().copied());
+    }
+    out
+}
+
 /// `%USERPROFILE%\.wslconfig`.
 pub fn wslconfig_path() -> Option<std::path::PathBuf> {
     crate::platform::home_dir().map(|h| h.join(".wslconfig"))
 }
 
+#[cfg(windows)]
 fn read_networking_mode() -> Option<String> {
-    let text = std::fs::read_to_string(wslconfig_path()?).ok()?;
-    networking_mode(&text)
+    let bytes = std::fs::read(wslconfig_path()?).ok()?;
+    networking_mode(&decode_wslconfig(&bytes).ok()?.0)
 }
 
 // ─── Classification ─────────────────────────────────────────────────────────
@@ -530,15 +679,12 @@ pub fn classify(
     };
     let p = match probe {
         Err(ProbeFailure::NotInstalled(why)) => return (WslHealthState::NotInstalled, why.clone()),
-        Err(ProbeFailure::Down(why)) => {
-            return (
-                WslHealthState::WslDown,
-                format!("WSL didn't answer: {why}"),
-            )
+        Err(ProbeFailure::Down(why) | ProbeFailure::TimedOut(why)) => {
+            return (WslHealthState::WslDown, format!("WSL didn't answer: {why}"))
         }
         Ok(p) => p,
     };
-    if p.dns_ok {
+    if p.dns == DnsCheck::Resolved {
         return (WslHealthState::Ok, "WSL can reach the network.".into());
     }
     if !p.has_default_route {
@@ -561,6 +707,13 @@ pub fn classify(
             "Windows can't resolve names either, so this isn't a WSL problem.".into(),
         );
     }
+    // No lookup tool: only a broken resolv.conf is evidence of a DNS fault.
+    if p.dns == DnsCheck::Unknown && matches!(p.resolv, ResolvState::Ok(n) if n > 0) {
+        return (
+            WslHealthState::Ok,
+            "WSL has a network route (this distro has no getent or nslookup, so name lookups weren't tested).".into(),
+        );
+    }
     let why = match p.resolv {
         ResolvState::Dangling => {
             "WSL can't resolve names: /etc/resolv.conf points at a file WSL never wrote."
@@ -568,6 +721,9 @@ pub fn classify(
         ResolvState::Missing => "WSL can't resolve names: /etc/resolv.conf is missing.",
         ResolvState::Unreadable => "WSL can't resolve names: /etc/resolv.conf is unreadable.",
         ResolvState::Ok(0) => "WSL can't resolve names: /etc/resolv.conf lists no nameserver.",
+        ResolvState::Ok(_) if p.dns == DnsCheck::TimedOut => {
+            "WSL has a route but its DNS servers didn't answer within 8 seconds."
+        }
         ResolvState::Ok(_) => "WSL has a route but its DNS servers don't answer.",
     };
     (WslHealthState::DnsOnly, why.into())
@@ -624,7 +780,9 @@ pub fn read_elevated_exit(code: Option<i32>, stderr: &str) -> Result<(), WslFixO
         Some(0) => Ok(()),
         Some(1223) => Err(WslFixOutcome::CancelledByUser),
         _ if stderr.to_ascii_lowercase().contains("canceled by the user")
-            || stderr.to_ascii_lowercase().contains("cancelled by the user") =>
+            || stderr
+                .to_ascii_lowercase()
+                .contains("cancelled by the user") =>
         {
             Err(WslFixOutcome::CancelledByUser)
         }
@@ -689,7 +847,8 @@ pub fn elevated_restart_script() -> String {
 }
 
 /// Host IPv4 DNS servers, one per line.
-pub const HOST_DNS_SCRIPT: &str = "Get-DnsClientServerAddress -AddressFamily IPv4 | ForEach-Object { $_.ServerAddresses }";
+pub const HOST_DNS_SCRIPT: &str =
+    "Get-DnsClientServerAddress -AddressFamily IPv4 | ForEach-Object { $_.ServerAddresses }";
 
 // ─── Probe + fixes (Windows) ────────────────────────────────────────────────
 
@@ -727,22 +886,47 @@ mod imp {
     type Slot = Arc<tokio::sync::Mutex<Option<(Instant, WslHealth)>>>;
     static CACHE: LazyLock<Mutex<HashMap<String, Slot>>> = LazyLock::new(Default::default);
 
+    /// One fix at a time, machine-wide: two surfaces (banner + notification)
+    /// clicked together must not raise two UAC prompts or race two
+    /// `wsl --shutdown`s, and a DNS rewrite mid-restart is meaningless.
+    static FIX_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    enum RunError {
+        Failed(String),
+        TimedOut(String),
+    }
+
+    impl RunError {
+        fn message(self) -> String {
+            match self {
+                RunError::Failed(m) | RunError::TimedOut(m) => m,
+            }
+        }
+    }
+
     fn slot(distro: Option<&str>) -> Slot {
         let key = distro.unwrap_or("").to_ascii_lowercase();
         let mut map = CACHE.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(key).or_default().clone()
     }
 
-    async fn run(spec: SpawnSpec, budget: Duration) -> Result<Output, String> {
+    async fn run_checked(spec: SpawnSpec, budget: Duration) -> Result<Output, RunError> {
         let program = spec.program.to_string_lossy().into_owned();
         let child = crate::executor::current()
             .spawn_piped(spec, OPTS)
-            .map_err(|e| format!("couldn't start {program}: {e}"))?;
+            .map_err(|e| RunError::Failed(format!("couldn't start {program}: {e}")))?;
         match timeout(budget, child.wait_with_output()).await {
-            Err(_) => Err(format!("{program} did not answer within {}s", budget.as_secs())),
-            Ok(Err(e)) => Err(format!("{program} failed: {e}")),
+            Err(_) => Err(RunError::TimedOut(format!(
+                "{program} did not answer within {}s",
+                budget.as_secs()
+            ))),
+            Ok(Err(e)) => Err(RunError::Failed(format!("{program} failed: {e}"))),
             Ok(Ok(out)) => Ok(out),
         }
+    }
+
+    async fn run(spec: SpawnSpec, budget: Duration) -> Result<Output, String> {
+        run_checked(spec, budget).await.map_err(RunError::message)
     }
 
     /// `powershell.exe` running `script` as `-EncodedCommand`, so nothing in
@@ -771,18 +955,34 @@ mod imp {
         spec
     }
 
-    async fn distro_probe(distro: Option<&str>) -> Result<DistroProbe, ProbeFailure> {
-        if !wsl::wsl_exe_present() {
-            return Err(ProbeFailure::NotInstalled("wsl.exe is not installed".into()));
-        }
-        match run(
+    async fn distro_probe_once(distro: Option<&str>) -> Result<DistroProbe, ProbeFailure> {
+        match run_checked(
             wsl_sh(distro, false, DISTRO_PROBE_SCRIPT, &[]),
             PROBE_BUDGET + wsl::COLD_START,
         )
         .await
         {
-            Err(e) => Err(ProbeFailure::Down(e)),
+            Err(RunError::TimedOut(e)) => Err(ProbeFailure::TimedOut(e)),
+            Err(RunError::Failed(e)) => Err(ProbeFailure::Down(e)),
             Ok(out) => read_distro_probe(out.status.code(), &out.stdout, &out.stderr),
+        }
+    }
+
+    /// The distro probe, retried once after a timeout: the first WSL start
+    /// after a Windows boot can outlast one budget, and the second attempt
+    /// finds the VM up. Two timeouts in a row is a wedged WSL.
+    async fn distro_probe(distro: Option<&str>) -> Result<DistroProbe, ProbeFailure> {
+        if !wsl::wsl_exe_present() {
+            return Err(ProbeFailure::NotInstalled(
+                "wsl.exe is not installed".into(),
+            ));
+        }
+        match distro_probe_once(distro).await {
+            Err(ProbeFailure::TimedOut(first)) => {
+                tracing::info!(target: "ikenga::wsl", "WSL probe timed out ({first}); retrying once");
+                distro_probe_once(distro).await
+            }
+            other => other,
         }
     }
 
@@ -874,6 +1074,11 @@ mod imp {
     }
 
     pub async fn fix(action: WslFixAction, distro: Option<&str>) -> WslFixOutcome {
+        let Ok(_one_at_a_time) = FIX_LOCK.try_lock() else {
+            return WslFixOutcome::Failed {
+                reason: "another WSL fix is already running".into(),
+            };
+        };
         if let Err(reason) = check_installed(distro).await {
             return WslFixOutcome::Failed { reason };
         }
@@ -885,7 +1090,10 @@ mod imp {
     }
 
     async fn repair_dns(distro: Option<&str>) -> WslFixOutcome {
-        let tunnel = distro_probe(distro).await.map(|p| p.dns_tunnel).unwrap_or(false);
+        let tunnel = distro_probe(distro)
+            .await
+            .map(|p| p.dns_tunnel)
+            .unwrap_or(false);
         let host = match run(powershell(HOST_DNS_SCRIPT), POWERSHELL_BUDGET).await {
             Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
             Err(e) => {
@@ -915,9 +1123,20 @@ mod imp {
     }
 
     async fn restart_networking(distro: Option<&str>) -> WslFixOutcome {
-        let out = match run(powershell(&elevated_restart_script()), ELEVATED_BUDGET).await {
+        let out = match run_checked(powershell(&elevated_restart_script()), ELEVATED_BUDGET).await {
             Ok(out) => out,
-            Err(reason) => return WslFixOutcome::Failed { reason },
+            // The prompt belongs to consent.exe, not the wrapper we just
+            // killed: it can still be approved, and the restart then runs.
+            Err(RunError::TimedOut(_)) => {
+                return WslFixOutcome::Failed {
+                    reason: format!(
+                        "the administrator prompt wasn't answered within {} minutes. If it is \
+                         still open and you approve it, WSL restarts then; check again afterwards",
+                        ELEVATED_BUDGET.as_secs() / 60
+                    ),
+                }
+            }
+            Err(RunError::Failed(reason)) => return WslFixOutcome::Failed { reason },
         };
         if let Err(outcome) =
             read_elevated_exit(out.status.code(), &String::from_utf8_lossy(&out.stderr))
@@ -934,11 +1153,11 @@ mod imp {
             };
         };
         let current = match std::fs::read(&path) {
-            Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(s) => Some(s),
-                Err(_) => {
+            Ok(bytes) => match decode_wslconfig(&bytes) {
+                Ok(decoded) => Some(decoded),
+                Err(why) => {
                     return WslFixOutcome::Failed {
-                        reason: ".wslconfig is not UTF-8 text; edit it by hand".into(),
+                        reason: format!("{why}; set networkingMode=nat under [wsl2] by hand"),
                     }
                 }
             },
@@ -949,9 +1168,11 @@ mod imp {
                 }
             }
         };
-        let text = current.clone().unwrap_or_default();
+        let (text, encoding) = current
+            .clone()
+            .unwrap_or((String::new(), WslConfigEncoding::Utf8 { bom: false }));
         let next = set_networking_mode_nat(&text);
-        if current.as_deref() != Some(next.as_str()) {
+        if current.as_ref().map(|(t, _)| t.as_str()) != Some(next.as_str()) {
             if current.is_some() {
                 let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
                 let backup = path.with_file_name(format!(".wslconfig.bak-{stamp}"));
@@ -962,7 +1183,8 @@ mod imp {
                 }
             }
             let tmp = path.with_file_name(".wslconfig.ikenga-tmp");
-            if let Err(e) = std::fs::write(&tmp, &next).and_then(|_| std::fs::rename(&tmp, &path)) {
+            let bytes = encode_wslconfig(&next, encoding);
+            if let Err(e) = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, &path)) {
                 let _ = std::fs::remove_file(&tmp);
                 return WslFixOutcome::Failed {
                     reason: format!("writing .wslconfig: {e}"),
@@ -1038,7 +1260,11 @@ mod tests {
             has_default_route: route,
             interfaces: ifaces.iter().map(|s| s.to_string()).collect(),
             resolv,
-            dns_ok: dns,
+            dns: if dns {
+                DnsCheck::Resolved
+            } else {
+                DnsCheck::Failed
+            },
             dns_tunnel: false,
             uptime_secs: Some(60.0),
         }
@@ -1062,7 +1288,11 @@ mod tests {
         assert_eq!(m.error_code.as_deref(), Some("0x8007054f"));
 
         // An unpaired fallback carries no code.
-        let only_old: Vec<_> = events.iter().filter(|e| e.at < 1791354800000).cloned().collect();
+        let only_old: Vec<_> = events
+            .iter()
+            .filter(|e| e.at < 1791354800000)
+            .cloned()
+            .collect();
         let m = newest_mirrored_failure(&only_old, 0).unwrap();
         assert_eq!(m.at, 1791354120080);
         assert_eq!(m.error_code, None);
@@ -1075,7 +1305,10 @@ mod tests {
     #[test]
     fn event_window_is_this_boot_capped_at_a_day() {
         let now = 10_000_000_000;
-        assert_eq!(event_window_start(now, Some(60.0)), now - 60_000 - BOOT_SLACK_MS);
+        assert_eq!(
+            event_window_start(now, Some(60.0)),
+            now - 60_000 - BOOT_SLACK_MS
+        );
         let day = EVENT_LOOKBACK.as_millis() as i64;
         assert_eq!(event_window_start(now, None), now - day);
         assert_eq!(event_window_start(now, Some(1e9)), now - day);
@@ -1083,23 +1316,41 @@ mod tests {
 
     #[test]
     fn probe_script_resolves_the_health_host() {
-        assert!(DISTRO_PROBE_SCRIPT.contains(&format!("getent hosts {HEALTH_HOST} ")));
+        assert!(DISTRO_PROBE_SCRIPT.contains(&format!("$q {HEALTH_HOST} ")));
+        assert!(DISTRO_PROBE_SCRIPT.contains("q='getent hosts'"));
+        assert!(DISTRO_PROBE_SCRIPT.contains("q=nslookup"));
+        assert!(DISTRO_PROBE_SCRIPT.contains("echo dns=unknown"));
+        assert!(DISTRO_PROBE_SCRIPT.contains("$c -eq 124 ]; then echo dns=timeout"));
     }
 
     #[test]
     fn distro_probe_output_parses() {
-        let out = "ikenga_probe=1\nroute=0\nifaces=\nresolv=dangling\ndns=0\ndnstunnel=1\nuptime=4.21\n";
+        let out =
+            "ikenga_probe=1\nroute=0\nifaces=\nresolv=dangling\ndns=0\ndnstunnel=1\nuptime=4.21\n";
         let p = parse_distro_probe(out).unwrap();
         assert!(!p.has_default_route);
         assert!(p.interfaces.is_empty());
         assert_eq!(p.resolv, ResolvState::Dangling);
-        assert!(!p.dns_ok && p.dns_tunnel);
+        assert_eq!(p.dns, DnsCheck::Failed);
+        assert!(p.dns_tunnel);
         assert_eq!(p.uptime_secs, Some(4.21));
 
-        let p = parse_distro_probe("ikenga_probe=1\r\nroute=1\r\nifaces=eth0 loopback0 \r\nresolv=ok 2\r\ndns=1\r\n").unwrap();
-        assert!(p.has_default_route && p.dns_ok);
+        let p = parse_distro_probe(
+            "ikenga_probe=1\r\nroute=1\r\nifaces=eth0 loopback0 \r\nresolv=ok 2\r\ndns=1\r\n",
+        )
+        .unwrap();
+        assert!(p.has_default_route);
+        assert_eq!(p.dns, DnsCheck::Resolved);
         assert_eq!(p.interfaces, ["eth0", "loopback0"]);
         assert_eq!(p.resolv, ResolvState::Ok(2));
+
+        let dns = |v: &str| {
+            parse_distro_probe(&format!("ikenga_probe=1\ndns={v}\n"))
+                .unwrap()
+                .dns
+        };
+        assert_eq!(dns("timeout"), DnsCheck::TimedOut);
+        assert_eq!(dns("unknown"), DnsCheck::Unknown);
 
         assert_eq!(parse_distro_probe("route=1\ndns=1\n"), None);
     }
@@ -1113,17 +1364,66 @@ mod tests {
                 &utf16("Windows Subsystem for Linux has no installed distributions.\r\n"),
                 b""
             ),
-            Err(ProbeFailure::NotInstalled("WSL has no installed distribution".into()))
+            Err(ProbeFailure::NotInstalled(
+                "WSL has no installed distribution".into()
+            ))
         );
         match read_distro_probe(
             Some(-1),
-            &utf16("An internal error occurred.\r\nError code: Wsl/Service/CreateInstance/E_FAIL\r\n"),
+            &utf16(
+                "An internal error occurred.\r\nError code: Wsl/Service/CreateInstance/E_FAIL\r\n",
+            ),
             b"",
         ) {
-            Err(ProbeFailure::Down(why)) => assert!(why.contains("Wsl/Service/CreateInstance/E_FAIL"), "{why}"),
+            Err(ProbeFailure::Down(why)) => {
+                assert!(why.contains("Wsl/Service/CreateInstance/E_FAIL"), "{why}")
+            }
             other => panic!("{other:?}"),
         }
-        assert!(matches!(read_distro_probe(None, b"", b""), Err(ProbeFailure::Down(_))));
+        assert!(matches!(
+            read_distro_probe(None, b"", b""),
+            Err(ProbeFailure::Down(_))
+        ));
+        // A named distro that doesn't exist is not "WSL isn't starting".
+        assert!(matches!(
+            read_distro_probe(
+                Some(-1),
+                &utf16("There is no distribution with the supplied name.\r\nError code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND\r\n"),
+                b""
+            ),
+            Err(ProbeFailure::NotInstalled(_))
+        ));
+    }
+
+    #[test]
+    fn missing_lookup_tool_or_a_timeout_is_told_apart() {
+        let with = |resolv: ResolvState, dns: DnsCheck| {
+            let mut p = probe(true, &["eth0"], resolv, false);
+            p.dns = dns;
+            Ok(p)
+        };
+        // No getent / nslookup on a healthy distro: not a DNS fault.
+        let (state, detail) = classify(&with(ResolvState::Ok(1), DnsCheck::Unknown), true, None);
+        assert_eq!(state, WslHealthState::Ok);
+        assert!(detail.contains("weren't tested"), "{detail}");
+        // …but a dangling resolv.conf is evidence on its own.
+        assert_eq!(
+            classify(&with(ResolvState::Dangling, DnsCheck::Unknown), true, None).0,
+            WslHealthState::DnsOnly
+        );
+        // No route stays no_route whatever the lookup tool.
+        let mut lo = probe(false, &[], ResolvState::Ok(1), false);
+        lo.dns = DnsCheck::Unknown;
+        assert_eq!(classify(&Ok(lo), true, None).0, WslHealthState::NoRoute);
+        // A lookup cut off at 8 s is a DNS failure, named as such.
+        let (state, detail) = classify(&with(ResolvState::Ok(1), DnsCheck::TimedOut), true, None);
+        assert_eq!(state, WslHealthState::DnsOnly);
+        assert!(detail.contains("8 seconds"), "{detail}");
+        // A wsl.exe timeout (after the retry) is wsl_down.
+        let slow = Err(ProbeFailure::TimedOut(
+            "wsl.exe did not answer within 27s".into(),
+        ));
+        assert_eq!(classify(&slow, true, None).0, WslHealthState::WslDown);
     }
 
     #[test]
@@ -1136,11 +1436,20 @@ mod tests {
         let lo_only = Ok(probe(false, &[], ResolvState::Dangling, false));
         let (state, detail) = classify(&lo_only, true, Some(&mirrored));
         assert_eq!(state, WslHealthState::NoRoute);
-        assert!(detail.contains("0x8007054f") && detail.contains("loopback"), "{detail}");
+        assert!(
+            detail.contains("0x8007054f") && detail.contains("loopback"),
+            "{detail}"
+        );
         // …even when Windows is offline too: the log names WSL as the cause.
-        assert_eq!(classify(&lo_only, false, Some(&mirrored)).0, WslHealthState::NoRoute);
+        assert_eq!(
+            classify(&lo_only, false, Some(&mirrored)).0,
+            WslHealthState::NoRoute
+        );
         // lo-only with no logged failure and Windows offline → host_offline.
-        assert_eq!(classify(&lo_only, false, None).0, WslHealthState::HostOffline);
+        assert_eq!(
+            classify(&lo_only, false, None).0,
+            WslHealthState::HostOffline
+        );
         assert_eq!(classify(&lo_only, true, None).0, WslHealthState::NoRoute);
 
         // route ok + DNS fail → dns_only (host fine), host_offline (host not).
@@ -1151,11 +1460,15 @@ mod tests {
         assert_eq!(classify(&dns, false, None).0, WslHealthState::HostOffline);
 
         // wsl.exe failure → wsl_down; missing → not_installed.
-        let down = Err(ProbeFailure::Down("wsl.exe did not answer within 27s".into()));
+        let down = Err(ProbeFailure::Down(
+            "wsl.exe did not answer within 27s".into(),
+        ));
         let (state, detail) = classify(&down, true, None);
         assert_eq!(state, WslHealthState::WslDown);
         assert!(detail.contains("27s"));
-        let none = Err(ProbeFailure::NotInstalled("wsl.exe is not installed".into()));
+        let none = Err(ProbeFailure::NotInstalled(
+            "wsl.exe is not installed".into(),
+        ));
         assert_eq!(classify(&none, true, None).0, WslHealthState::NotInstalled);
 
         // resolves → ok, whatever else.
@@ -1165,7 +1478,10 @@ mod tests {
 
     #[test]
     fn state_wire_names_and_fault_set() {
-        assert_eq!(serde_json::to_value(WslHealthState::DnsOnly).unwrap(), "dns_only");
+        assert_eq!(
+            serde_json::to_value(WslHealthState::DnsOnly).unwrap(),
+            "dns_only"
+        );
         assert_eq!(WslHealthState::HostOffline.as_str(), "host_offline");
         assert!(WslHealthState::NoRoute.is_wsl_fault());
         assert!(!WslHealthState::HostOffline.is_wsl_fault());
@@ -1200,6 +1516,55 @@ mod tests {
         assert_eq!(networking_mode(text).as_deref(), Some("mirrored"));
         assert_eq!(networking_mode("[wsl2]\nmemory=1GB\n"), None);
         assert_eq!(networking_mode(""), None);
+        // A UTF-8 BOM before the first-line header (Notepad) still reads.
+        assert_eq!(
+            networking_mode("\u{feff}[wsl2]\r\nnetworkingMode=mirrored\r\n").as_deref(),
+            Some("mirrored")
+        );
+    }
+
+    #[test]
+    fn wslconfig_encodings_round_trip_and_unknown_ones_are_refused() {
+        let text = "[wsl2]\r\nnetworkingMode=mirrored\r\n";
+        let le: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let be: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        let cases: Vec<(Vec<u8>, WslConfigEncoding)> = vec![
+            (
+                text.as_bytes().to_vec(),
+                WslConfigEncoding::Utf8 { bom: false },
+            ),
+            (
+                [&[0xEF, 0xBB, 0xBF][..], text.as_bytes()].concat(),
+                WslConfigEncoding::Utf8 { bom: true },
+            ),
+            (
+                [&[0xFF, 0xFE][..], &le].concat(),
+                WslConfigEncoding::Utf16Le { bom: true },
+            ),
+            // BOM-less UTF-16LE is *valid UTF-8* byte-wise — the old trap.
+            (le.clone(), WslConfigEncoding::Utf16Le { bom: false }),
+            (
+                [&[0xFE, 0xFF][..], &be].concat(),
+                WslConfigEncoding::Utf16Be { bom: true },
+            ),
+            (be.clone(), WslConfigEncoding::Utf16Be { bom: false }),
+        ];
+        for (bytes, want) in cases {
+            let (decoded, enc) = decode_wslconfig(&bytes).unwrap();
+            assert_eq!(enc, want);
+            assert_eq!(decoded, text, "{want:?}");
+            assert_eq!(networking_mode(&decoded).as_deref(), Some("mirrored"));
+            // Unchanged text writes back byte-for-byte; the edit keeps the
+            // encoding.
+            assert_eq!(encode_wslconfig(&decoded, enc), bytes, "{want:?}");
+            let edited = encode_wslconfig(&set_networking_mode_nat(&decoded), enc);
+            let (again, enc2) = decode_wslconfig(&edited).unwrap();
+            assert_eq!(enc2, want);
+            assert_eq!(again, "[wsl2]\r\nnetworkingMode=nat\r\n");
+        }
+        // Stray NULs / invalid UTF-8: refuse, never guess.
+        assert!(decode_wslconfig(b"[wsl2]\0\0\nx=1\n").is_err());
+        assert!(decode_wslconfig(&[b'[', 0xFF, b']']).is_err());
     }
 
     #[test]
@@ -1250,17 +1615,26 @@ mod tests {
     #[test]
     fn repair_nameservers_prefers_tunnel_then_host_then_fallback() {
         assert_eq!(
-            repair_nameservers(true, "192.168.1.1\r\n192.168.1.1\r\nfe80::1\r\n127.0.0.1\r\n8.8.4.4\r\n9.9.9.9\r\n"),
+            repair_nameservers(
+                true,
+                "192.168.1.1\r\n192.168.1.1\r\nfe80::1\r\n127.0.0.1\r\n8.8.4.4\r\n9.9.9.9\r\n"
+            ),
             ["10.255.255.254", "192.168.1.1", "8.8.4.4"]
         );
         assert_eq!(repair_nameservers(false, ""), ["1.1.1.1"]);
-        assert_eq!(repair_nameservers(false, "10.0.0.1\n; rm -rf /\n"), ["10.0.0.1", "1.1.1.1"]);
+        assert_eq!(
+            repair_nameservers(false, "10.0.0.1\n; rm -rf /\n"),
+            ["10.0.0.1", "1.1.1.1"]
+        );
     }
 
     #[test]
     fn elevated_exit_codes_map_to_outcomes() {
         assert_eq!(read_elevated_exit(Some(0), ""), Ok(()));
-        assert_eq!(read_elevated_exit(Some(1223), ""), Err(WslFixOutcome::CancelledByUser));
+        assert_eq!(
+            read_elevated_exit(Some(1223), ""),
+            Err(WslFixOutcome::CancelledByUser)
+        );
         assert_eq!(
             read_elevated_exit(Some(1), "This command cannot be run due to the error: The operation was canceled by the user."),
             Err(WslFixOutcome::CancelledByUser)
@@ -1285,8 +1659,13 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split('\'').next())
             .unwrap();
-        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
-        let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
         assert_eq!(String::from_utf16(&units).unwrap(), ELEVATED_INNER_SCRIPT);
     }
 

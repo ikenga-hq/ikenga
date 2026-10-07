@@ -11,7 +11,6 @@ describe('createNetworkErrnoScanner', () => {
 	it('hits on the errnos that mean WSL has no network', () => {
 		for (const line of [
 			'OAuth error: getaddrinfo EAI_AGAIN platform.claude.com',
-			'npm ERR! getaddrinfo ENOTFOUND registry.npmjs.org',
 			'connect ENETUNREACH 1.2.3.4:443',
 			'curl: (6) Could not resolve host: x (Temporary failure in name resolution)',
 			'ping: connect: Network is unreachable',
@@ -28,6 +27,8 @@ describe('createNetworkErrnoScanner', () => {
 		scan(enc('Request timed out\r\n'));
 		scan(enc('connect ECONNREFUSED 127.0.0.1:3000\r\n'));
 		scan(enc('EAI_AGAINST nothing\r\n'));
+		// A dead / typo'd host on a healthy network — not WSL's problem.
+		scan(enc('npm ERR! getaddrinfo ENOTFOUND registry.npmjs.orgg\r\n'));
 		expect(hit).not.toHaveBeenCalled();
 	});
 
@@ -42,7 +43,7 @@ describe('createNetworkErrnoScanner', () => {
 	it('does not re-report the carried tail', () => {
 		const hit = vi.fn();
 		const scan = createNetworkErrnoScanner(hit);
-		scan(enc('ENOTFOUND'));
+		scan(enc('EAI_AGAIN'));
 		scan(enc(' more output'));
 		expect(hit).toHaveBeenCalledTimes(1);
 	});

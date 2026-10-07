@@ -61,6 +61,23 @@ export function primaryFixForState(state: WslHealthState): WslFixChoice | null {
 	}
 }
 
+/**
+ * The fix a `fix.wsl_network` notification leads with — the same one the
+ * banner and Settings row show for that episode: taken from the cached
+ * health when it reports the row's state, else from the state alone, where a
+ * restart that already failed this episode moves `no_route` to NAT (D-6).
+ */
+export function notificationFix(
+	state: WslHealthState,
+	ctx: { health?: WslHealth | null; restartTried?: boolean } = {}
+): WslFixChoice | null {
+	if (ctx.health && ctx.health.state === state) {
+		return wslHealthCopy(ctx.health, { restartTried: ctx.restartTried })?.primary ?? null;
+	}
+	if (ctx.restartTried && state === 'no_route') return FIX.switch_to_nat;
+	return primaryFixForState(state);
+}
+
 export interface WslHealthCopyContext {
 	/** A restart was already tried this episode and the mirrored setup still
 	 *  failed — lead with NAT instead (D-6). */

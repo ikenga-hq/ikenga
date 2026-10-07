@@ -33,16 +33,40 @@ fn resolve_distro(distro: Option<String>) -> Result<Option<String>, String> {
     }
 }
 
-/// Raise or resolve the `fix.wsl_network` row for a freshly measured result.
+/// Raise or resolve `fix.wsl_network` rows for a freshly measured result
+/// (see [`producers::wsl_network_keys_to_resolve`] for which rows end).
 async fn report(db: &PaDb, health: &WslHealth) {
-    if health.state == WslHealthState::Ok {
-        notifications::resolve_key_with_db(
-            db,
-            &producers::wsl_network_key(health.distro.as_deref()),
-        )
-        .await;
-    } else if let Some(n) = producers::wsl_network(health) {
+    if let Some(n) = producers::wsl_network(health) {
         notifications::record_with_db(db, n).await;
+        return;
+    }
+    if !matches!(
+        health.state,
+        WslHealthState::Ok | WslHealthState::NotInstalled
+    ) {
+        return;
+    }
+    let pool = match db.ensure_pool().await {
+        Ok(pool) => pool,
+        Err(e) => {
+            log::warn!(target: "ikenga::notifications", "no db pool: {e}");
+            return;
+        }
+    };
+    let open =
+        match notifications::open_rows_with_key_prefix(&pool, producers::WSL_NETWORK_KEY_PREFIX)
+            .await
+        {
+            Ok(open) => open,
+            Err(e) => {
+                log::warn!(target: "ikenga::notifications", "{e}");
+                return;
+            }
+        };
+    for key in producers::wsl_network_keys_to_resolve(health, &open) {
+        if let Err(e) = notifications::resolve_by_key(&pool, &key).await {
+            log::warn!(target: "ikenga::notifications", "could not resolve {key}: {e}");
+        }
     }
 }
 
@@ -86,7 +110,10 @@ mod tests {
 
     #[test]
     fn explicit_distros_are_validated_and_default_means_none() {
-        assert_eq!(resolve_distro(Some("Ubuntu".into())), Ok(Some("Ubuntu".into())));
+        assert_eq!(
+            resolve_distro(Some("Ubuntu".into())),
+            Ok(Some("Ubuntu".into()))
+        );
         assert_eq!(resolve_distro(Some("default".into())), Ok(None));
         assert_eq!(resolve_distro(Some("  ".into())), Ok(None));
         assert!(resolve_distro(Some("Ubuntu; wsl --shutdown".into())).is_err());

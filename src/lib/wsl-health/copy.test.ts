@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { WslHealth } from '@/lib/tauri-cmd';
-import { primaryFixForState, wslHealthCopy, wslHealthStateLabel } from './copy';
+import { notificationFix, primaryFixForState, wslHealthCopy, wslHealthStateLabel } from './copy';
 
 function health(over: Partial<WslHealth>): WslHealth {
 	return {
@@ -98,6 +98,29 @@ describe('primaryFixForState', () => {
 		expect(primaryFixForState('wsl_down')?.action).toBe('restart_networking');
 		expect(primaryFixForState('host_offline')).toBeNull();
 		expect(primaryFixForState('ok')).toBeNull();
+	});
+});
+
+describe('notificationFix (D-6: never disagrees with the banner)', () => {
+	it('leads with the banner primary for the cached health of the same state', () => {
+		expect(notificationFix('no_route', { health: MIRRORED_BROKEN })?.action).toBe(
+			'restart_networking'
+		);
+		expect(
+			notificationFix('no_route', { health: MIRRORED_BROKEN, restartTried: true })?.action
+		).toBe(wslHealthCopy(MIRRORED_BROKEN, { restartTried: true })?.primary?.action ?? 'missing');
+		expect(
+			notificationFix('no_route', { health: MIRRORED_BROKEN, restartTried: true })?.action
+		).toBe('switch_to_nat');
+	});
+
+	it('falls back to the state (NAT after a failed restart) without a matching cache', () => {
+		expect(notificationFix('dns_only')?.action).toBe('repair_dns');
+		expect(notificationFix('no_route')?.action).toBe('restart_networking');
+		expect(notificationFix('no_route', { restartTried: true })?.action).toBe('switch_to_nat');
+		// A cached result for another state (the row is older) is ignored.
+		expect(notificationFix('dns_only', { health: MIRRORED_BROKEN })?.action).toBe('repair_dns');
+		expect(notificationFix('host_offline')).toBeNull();
 	});
 });
 

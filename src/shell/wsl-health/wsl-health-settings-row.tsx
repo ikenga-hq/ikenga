@@ -1,7 +1,8 @@
 // honest-failure-states WP-2 (D-2) — Settings › Engines "WSL health" row:
 // state chip, the probe's detail, "Check now" and the same fixes as the pane
-// banner. Probes (through the 30 s cache) when the row mounts, i.e. when the
-// user opens the page with the WSL agent target selected.
+// banner. Shows what a launch / errno probe already measured and probes only
+// on "Check now": opening Settings is not a WSL launch (D-7), and a probe can
+// cold-start the distro.
 
 import { Loader2, RefreshCw } from 'lucide-react';
 import { useState } from 'react';
@@ -26,7 +27,7 @@ const CHIP_TONE: Record<WslHealthState, ChipTone> = {
 
 export function WslHealthSettingsRow({ distro }: { distro: string | null }) {
 	const key = normalizeWslDistro(distro);
-	const { data: health, isLoading, error } = useWslHealth(key);
+	const { data: health, error } = useWslHealth(key, { enabled: false });
 	const run = useWslHealthUi((s) => s.runs[key] ?? null);
 	const restartTried = useWslHealthUi((s) => s.restartTried[key] ?? false);
 	const [checking, setChecking] = useState(false);
@@ -50,10 +51,12 @@ export function WslHealthSettingsRow({ distro }: { distro: string | null }) {
 						<StatusChip tone={CHIP_TONE[health.state]} dot>
 							{wslHealthStateLabel(health.state)}
 						</StatusChip>
-					) : isLoading || checking ? (
+					) : checking ? (
 						<StatusChip tone="muted">Checking…</StatusChip>
-					) : (
+					) : error ? (
 						<StatusChip tone="muted">Couldn't check</StatusChip>
+					) : (
+						<StatusChip tone="muted">Not checked yet</StatusChip>
 					)}
 					<span className="min-w-0 flex-1 text-xs text-muted-foreground">
 						{busy ? (

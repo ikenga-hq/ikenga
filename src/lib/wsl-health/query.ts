@@ -62,6 +62,11 @@ export async function probeWslHealth(
 	return health;
 }
 
+/** The cached health of a distro, if any (never probes). */
+export function cachedWslHealth(distro: string | null | undefined): WslHealth | undefined {
+	return queryClient.getQueryData<WslHealth>(wslHealthQueryKey(distro));
+}
+
 /** Put a result measured elsewhere (a fix's re-probe) into the cache. */
 export function setWslHealth(distro: string | null | undefined, health: WslHealth): void {
 	const key = normalizeWslDistro(distro);

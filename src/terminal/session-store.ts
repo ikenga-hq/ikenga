@@ -20,7 +20,7 @@ import { attachCapture } from './pty-output-buffer';
 import { acquirePty, disposePty, getPty } from './pty-registry';
 import { buildSpawnOpts } from './spawn-opts';
 import { createNetworkErrnoScanner } from '@/lib/wsl-health/errno';
-import { isWslTab, wslTabDistro } from '@/lib/wsl-health/tabs';
+import { isWslTab, scansForNetworkErrno, wslTabDistro } from '@/lib/wsl-health/tabs';
 import type { HookEventPayload } from './tool-call-feed';
 
 const STORAGE_KEY = 'terminal.tabs';
@@ -350,9 +350,10 @@ export function openTabPty(tab: TerminalTab, opts: { forceEphemeral?: boolean } 
 			// forces a WSL health probe (debounced, once per episode). A
 			// passive tee like `attachCapture` below: it renders nothing, and
 			// the replay-buffer retention rule (pty-bridge.ts) is unchanged —
-			// the capture is already a non-rendering subscriber.
+			// the capture is already a non-rendering subscriber. Spawns only: a
+			// reattach replays old scrollback (see `scansForNetworkErrno`).
 			let offErrno: (() => void) | null = null;
-			if (isWslTab(tab)) {
+			if (scansForNetworkErrno(tab, { attached: Boolean(attachId) })) {
 				const distro = wslTabDistro(tab);
 				offErrno = pty.onData(
 					createNetworkErrnoScanner(() => {

@@ -36,6 +36,21 @@ export function isWslTab(tab: Pick<TerminalTab, 'spec'>): boolean {
 	return isWslExe(tab.spec.cmd[0]);
 }
 
+/**
+ * Whether a tab's PTY output should feed the network-errno scanner: WSL tabs
+ * on a fresh spawn only. A reattach (`Pty.attach`, the tab already had a
+ * `ptyId`) first replays old scrollback — synchronously to the first
+ * `onData` subscriber in-process, asynchronously over the daemon socket — so
+ * yesterday's `EAI_AGAIN` would force a probe (and cold-start WSL) at boot,
+ * which D-7 rules out. A reattached session's next spawn scans again.
+ */
+export function scansForNetworkErrno(
+	tab: Pick<TerminalTab, 'spec'>,
+	opts: { attached: boolean }
+): boolean {
+	return !opts.attached && isWslTab(tab);
+}
+
 /** The distro key a WSL tab runs in (`'default'` when unnamed). */
 export function wslTabDistro(tab: Pick<TerminalTab, 'spec'>): string {
 	if (tab.spec.wrap?.shellTarget === 'wsl') return normalizeWslDistro(tab.spec.wrap.wslDistro);
@@ -59,6 +74,10 @@ export interface WslSessionSnapshot {
 	claudeSessionId: string | null;
 	/** Whether its process was running — only those are relaunched. */
 	wasRunning: boolean;
+	/** Its PTY was in-process (`mode: 'ephemeral'`). Seat and attach-run
+	 *  terminals are spawned `forceEphemeral` so Rust can see them; the
+	 *  relaunch must keep that, or the respawn lands on the daemon. */
+	ephemeral: boolean;
 }
 
 /** Snapshot every WSL tab (all distros: `wsl --shutdown` stops every one). */
@@ -69,6 +88,7 @@ export function snapshotWslSessions(tabs: readonly TerminalTab[]): WslSessionSna
 		distro: wslTabDistro(t),
 		claudeSessionId: t.claudeSessionId ?? null,
 		wasRunning: t.status === 'running' || t.status === 'spawning' || Boolean(t.ptyId),
+		ephemeral: t.mode === 'ephemeral',
 	}));
 }
 
@@ -76,6 +96,8 @@ export function snapshotWslSessions(tabs: readonly TerminalTab[]): WslSessionSna
 export interface WslRelaunchStep {
 	tabId: string;
 	claudeSessionId: string | null;
+	/** Respawn with `openTabPty(tab, { forceEphemeral: true })`. */
+	forceEphemeral: boolean;
 }
 
 /**
@@ -97,7 +119,11 @@ export function planWslRelaunch(
 		if (!now) continue;
 		const dead = (now.status === 'exited' || now.status === 'error') && !now.ptyId;
 		if (!dead) continue;
-		steps.push({ tabId: snap.tabId, claudeSessionId: snap.claudeSessionId });
+		steps.push({
+			tabId: snap.tabId,
+			claudeSessionId: snap.claudeSessionId,
+			forceEphemeral: snap.ephemeral,
+		});
 	}
 	return steps;
 }

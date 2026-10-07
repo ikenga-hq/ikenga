@@ -8,12 +8,16 @@
 //   1. snapshot {tabId → claudeSessionId} for every WSL tab — BEFORE the
 //      call, because `openTabPty`'s exit handler clears the id on exit;
 //   2. run the fix;
-//   3. `done`: wait for the killed PTYs to report their exit, put each tab's
-//      resume id back and respawn it through `openTabPty` (`--resume`);
+//   3. `done` with WSL back `ok`: wait for the killed PTYs to report their
+//      exit, put each tab's resume id back and respawn it through
+//      `openTabPty` (`--resume`);
+//      `done` but WSL still broken, `failed`, or a thrown IPC error: the
+//      shutdown may already have killed the sessions (a restart whose HNS
+//      step failed, a NAT switch whose re-probe still fails), so put each
+//      killed tab's resume id back — its Restart then resumes the
+//      conversation — but don't respawn into a WSL that isn't working;
 //      `cancelled_by_user`: the UAC prompt was declined, nothing changed —
-//      say so quietly and leave the sessions alone;
-//      `failed`: say why, and leave the sessions alone (no respawn into a
-//      WSL that just failed to come back).
+//      say so quietly and leave the sessions alone.
 
 import { type WslFixAction, type WslFixOutcome, wslHealthFix } from '@/lib/tauri-cmd';
 import { openTabPty, useTerminalStore } from '@/terminal/session-store';
@@ -30,6 +34,10 @@ import {
 
 /** How long to wait for the shutdown's PTY exits to land before relaunching. */
 const SHUTDOWN_SETTLE_MS = 10_000;
+/** The same wait after a fix that didn't work. Shorter: when it failed before
+ *  the shutdown, the tabs never exit and this is pure delay before the
+ *  message; when the shutdown ran, its exits are already landing. */
+const RESTORE_SETTLE_MS = 3_000;
 
 function errText(e: unknown): string {
 	if (e instanceof Error) return e.message;
@@ -66,13 +74,16 @@ export async function confirmWslFix(): Promise<void> {
 	await runWslFix(pending.action, pending.distro, snapshot);
 }
 
-function waitForShutdown(snapshot: readonly WslSessionSnapshot[]): Promise<void> {
+function waitForShutdown(
+	snapshot: readonly WslSessionSnapshot[],
+	settleMs = SHUTDOWN_SETTLE_MS
+): Promise<void> {
 	return new Promise((resolve) => {
 		if (wslShutdownSettled(snapshot, useTerminalStore.getState().tabs)) {
 			resolve();
 			return;
 		}
-		const timer = setTimeout(done, SHUTDOWN_SETTLE_MS);
+		const timer = setTimeout(done, settleMs);
 		const unsub = useTerminalStore.subscribe((s) => {
 			if (wslShutdownSettled(snapshot, s.tabs)) done();
 		});
@@ -82,6 +93,26 @@ function waitForShutdown(snapshot: readonly WslSessionSnapshot[]): Promise<void>
 			resolve();
 		}
 	});
+}
+
+/**
+ * After a disruptive fix that didn't bring WSL back: put each killed tab's
+ * resume id back (the exit handler cleared it) without respawning, so the
+ * tab's own Restart resumes the conversation. Waits for the exits like the
+ * relaunch does; tabs the shutdown never reached are left as they are.
+ * Returns how many tabs were killed.
+ */
+export async function restoreWslSessionIds(
+	snapshot: readonly WslSessionSnapshot[]
+): Promise<number> {
+	if (!snapshot.some((s) => s.wasRunning)) return 0;
+	await waitForShutdown(snapshot, RESTORE_SETTLE_MS);
+	const store = useTerminalStore.getState();
+	const steps = planWslRelaunch(snapshot, store.tabs);
+	for (const step of steps) {
+		if (step.claudeSessionId) store.setClaudeSessionId(step.tabId, step.claudeSessionId);
+	}
+	return steps.length;
 }
 
 /**
@@ -105,7 +136,8 @@ export async function relaunchWslSessions(
 		const tab = useTerminalStore.getState().tabs.find((t) => t.id === step.tabId);
 		if (!tab) continue;
 		try {
-			await openTabPty(tab);
+			// Seat / attach-run terminals stay in-process, where Rust sees them.
+			await openTabPty(tab, step.forceEphemeral ? { forceEphemeral: true } : {});
 			relaunched += 1;
 		} catch (err) {
 			console.error('[wsl-health] relaunch failed for', step.tabId, err);
@@ -118,7 +150,8 @@ export async function relaunchWslSessions(
 function doneMessage(
 	action: WslFixAction,
 	outcome: Extract<WslFixOutcome, { outcome: 'done' }>,
-	relaunched: number
+	relaunched: number,
+	closed: number
 ): string {
 	const reopened =
 		relaunched > 0 ? ` Reopened ${relaunched} WSL session${relaunched === 1 ? '' : 's'}.` : '';
@@ -130,7 +163,14 @@ function doneMessage(
 		return `${what}${reopened}`;
 	}
 	const copy = wslHealthCopy(outcome.health);
-	return `That didn't fix it${copy ? `: ${copy.title.charAt(0).toLowerCase()}${copy.title.slice(1)}` : ''}.${reopened}`;
+	return `That didn't fix it${copy ? `: ${copy.title.charAt(0).toLowerCase()}${copy.title.slice(1)}` : ''}.${closedNote(closed)}`;
+}
+
+function closedNote(closed: number): string {
+	if (closed === 0) return '';
+	return closed === 1
+		? ' 1 WSL session was closed; restarting it resumes its Claude conversation.'
+		: ` ${closed} WSL sessions were closed; restarting them resumes their Claude conversations.`;
 }
 
 /** Run a fix now (no confirm). `snapshot` = the sessions to relaunch. */
@@ -157,16 +197,23 @@ export async function runWslFix(
 				useWslHealthUi.getState().markRestartTried(key);
 			}
 			let relaunched = 0;
+			let closed = 0;
 			if (isDisruptive(action) && snapshot.length > 0) {
-				useWslHealthUi
-					.getState()
-					.setRun(key, { action, phase: 'relaunching', message: null, at: Date.now() });
-				relaunched = await relaunchWslSessions(snapshot);
+				if (outcome.health.state === 'ok') {
+					useWslHealthUi
+						.getState()
+						.setRun(key, { action, phase: 'relaunching', message: null, at: Date.now() });
+					relaunched = await relaunchWslSessions(snapshot);
+				} else {
+					// D-5 relaunches after a fix that worked; into a WSL that is
+					// still broken it would only fail again. Keep the resume ids.
+					closed = await restoreWslSessionIds(snapshot);
+				}
 			}
 			useWslHealthUi.getState().setRun(key, {
 				action,
 				phase: 'done',
-				message: doneMessage(action, outcome, relaunched),
+				message: doneMessage(action, outcome, relaunched, closed),
 				at: Date.now(),
 			});
 			break;
@@ -179,14 +226,16 @@ export async function runWslFix(
 				at: Date.now(),
 			});
 			break;
-		case 'failed':
+		case 'failed': {
+			const closed = isDisruptive(action) ? await restoreWslSessionIds(snapshot) : 0;
 			useWslHealthUi.getState().setRun(key, {
 				action,
 				phase: 'failed',
-				message: `Couldn't fix it: ${outcome.reason}`,
+				message: `Couldn't fix it: ${outcome.reason}${closedNote(closed)}`,
 				at: Date.now(),
 			});
 			break;
+		}
 	}
 	return outcome;
 }

@@ -38,17 +38,18 @@ export function WslFixConfirmBody({ confirm }: { confirm: WslFixConfirm }) {
 						Windows apps on this PC can still reach them at <code>localhost</code>.
 					</p>
 					<p>
-						Ikenga backs up your current settings to{' '}
-						<code className="break-all">{WSLCONFIG_BACKUP_HINT}</code>, sets{' '}
-						<code>networkingMode=nat</code> in <code>.wslconfig</code> (other lines and comments are
-						kept), and restarts WSL.
+						Ikenga sets <code>networkingMode=nat</code> in <code>.wslconfig</code> (other lines and
+						comments are kept; if the file doesn't exist yet, it is created), and restarts WSL. If
+						you already have a <code>.wslconfig</code>, it is first backed up to{' '}
+						<code className="break-all">{WSLCONFIG_BACKUP_HINT}</code>.
 					</p>
 				</>
 			) : (
 				<p>
 					Windows will ask for administrator approval. Ikenga then shuts WSL down (every
 					distribution) and restarts Windows' Host Network Service, which is what brings{' '}
-					{wslDistroLabel(confirm.distro)}'s network back.
+					{wslDistroLabel(confirm.distro)}'s network back. Restarting that service briefly drops
+					other virtual networks on this PC too (Docker Desktop, Hyper-V and Windows Sandbox VMs).
 				</p>
 			)}
 			{sessions.length > 0 ? (
