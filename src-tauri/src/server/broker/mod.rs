@@ -242,6 +242,8 @@ pub struct BrokerBoot {
     /// The Part B flags (G-ACCESS §10.1): `--public-url`, `--max-accounts`,
     /// `--invite-ttl`, `--member-invites-create-accounts`.
     pub access: crate::access::AccessOptions,
+    /// Web Push flags (plans/pwa S2): the broker owns the hub under T1.
+    pub push: crate::server::push::PushOptions,
 }
 
 /// Refuse to exec a binary a principal could have replaced (I-9: nothing a
@@ -273,6 +275,7 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
         bootstrap,
         insecure_cookie,
         access: access_options,
+        push: push_options,
     } = boot;
 
     // Only the broker migrates (§6.1); the probe already did, so this is a
@@ -294,6 +297,15 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
     // every start"). Only the broker migrates it.
     let access_store = crate::access::AccessStore::attach_t1(pool.clone()).await?;
     let max_accounts = access_options.max_accounts;
+    // plans/pwa S2: the broker owns push under T1 — the VAPID key in the
+    // root-only `operator/push/`, subscriptions in `accounts.db`. Children
+    // never see either; they queue events the pump below drains.
+    let push_hub = crate::server::push::hub::boot(
+        access_store.clone(),
+        &crate::server::push::vapid::path_in(&root.operator_dir()),
+        &push_options,
+        access_options.public_url.as_deref(),
+    );
     let access_t1 = crate::access::t1::T1Access::new(access_store, pool.clone(), access_options);
     // G-ACCESS P-27 / §4.4: `--max-accounts` caps every creation path — the
     // root CLI and the env bootstrap included, which never see this flag —
@@ -349,6 +361,10 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
     let installed = crate::access::t1::install(&access_t1, broker_state.ws.clone());
     broker_state.hooks = BrokerHooks::access(&installed);
     let state = Arc::new(broker_state);
+    if let Some(hub) = push_hub {
+        crate::server::push::install_hub(hub);
+        crate::server::push::pump::spawn(state.children.clone());
+    }
     // G-ACCESS §4.5 / §7 (WP-76): the broker's handle on owner children
     // (share validation, the `invite` notification, member socket closes),
     // the membership expiry sweeper, and the invite-accept host (the §7.2

@@ -253,6 +253,13 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("access_audit_export", req!(access)),
     ("access_audit_record_local", req!(access)),
     ("access_audit_reseal", req!(access)),
+    // ── push (plans/pwa S2 §7) ──
+    ("access_push_config", req!(access)),
+    ("access_push_subscribe", req!(access)),
+    ("access_push_update", req!(access)),
+    ("access_push_unsubscribe", req!(access)),
+    ("access_push_list", req!(access)),
+    ("access_push_test", req!(access)),
     ("permission_decide", req!(shared[Approve])),
     ("notifications_record_access", req!(internal)),
     ("share_project_info", req!(internal)),

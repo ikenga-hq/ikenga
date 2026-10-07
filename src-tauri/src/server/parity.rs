@@ -49,7 +49,16 @@ const VALID_TAGS: &[&str] = &["WP-19", "WP-18b", "WP-20", "desktop-only-forever"
 ///   `share_project_info` are `internal` arms (broker → owner child only);
 ///   the three `permission_relay_*` arms are called only by the desktop's
 ///   own Rust relay task (WP-75), never from the front end.
+/// * plans/pwa S2: the six `access_push_*` arms are browser-only; the
+///   desktop never registers a service worker, so it has no push
+///   subscription to manage.
 const DAEMON_ONLY_VERBS: &[&str] = &[
+    "access_push_config",
+    "access_push_list",
+    "access_push_subscribe",
+    "access_push_test",
+    "access_push_unsubscribe",
+    "access_push_update",
     "fs_home",
     "notifications_record_access",
     "permission_relay_put",

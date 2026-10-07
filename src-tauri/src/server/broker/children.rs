@@ -215,6 +215,23 @@ impl Children {
         futures_util::future::join_all(stopping).await;
     }
 
+    /// The principal's child endpoint **if one is running** — never
+    /// launches one (the push pump must not keep or bring children up).
+    pub async fn running_endpoint(&self, id: PrincipalId) -> Option<ChildEndpoint> {
+        let slot = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned()?;
+        let mut live = slot.lock().await;
+        let l = live.as_mut()?;
+        if l.process.has_exited() {
+            return None;
+        }
+        Some(l.endpoint.clone())
+    }
+
     /// Principals with a live (not exited) child.
     pub async fn running(&self) -> Vec<PrincipalId> {
         let mut out = Vec::new();
