@@ -453,6 +453,19 @@ pub async fn rpc_handler(
         // The server has no install-time trust gate, so nothing is ever
         // parked for a capability review.
         "pkg_trust_list_pending" => RpcResponse::success(Vec::<serde_json::Value>::new()),
+        // No trust store, so no pkg's trust can be evaluated. An empty list
+        // would read as "nothing to trust"; the refusal names why, and the
+        // frontend renders it as "not available on this server".
+        "pkg_trust_list" => RpcResponse::error(format!(
+            "pkg_trust_list: {}",
+            rpc_claude::TRUST_NOT_SERVED
+        )),
+        // What the daemon can see: `--pkgs-dir` entries that failed to load,
+        // are api-incompatible, or a registry rejected — plus one
+        // `records_unavailable` row saying install-record health is not
+        // checked here, so the answer is never a bare `[]` that reads as
+        // healthy. Removal (`pkg_health_remove*`) stays desktop-only.
+        "pkg_health_scan" => RpcResponse::success(state.pkg_index.health_scan()),
         // Elevated trust (`host.fetch`, `host.invoke`) is granted on the
         // desktop only, and the server runs neither, so the answer here is
         // always no: the app reports the capability as unavailable instead
@@ -696,6 +709,15 @@ pub async fn rpc_handler(
         "oba_set_auto_update" => rpc_claude::oba_set_auto_update(&state, &payload.args).await,
         "oba_relink_dependents" => rpc_claude::oba_relink_dependents(&state, &payload.args).await,
         "oba_unlink_one" => rpc_claude::oba_unlink_one(&state, &payload.args).await,
+
+        // --- Ngwa snapshot (WP-19) ---
+        //
+        // The desktop's own join over the projects, `--pkgs-dir` index,
+        // config scan and Ọba store this router can see, read as its
+        // principal (router home, router store). Pkg runtime, engine-asset
+        // placements, trust and transcript usage are reported unavailable in
+        // `sources`, never as an empty or zeroed set. Body in `rpc_claude`.
+        "ngwa_snapshot" => rpc_claude::ngwa_snapshot(&state).await,
 
         // --- fs family + actions / keybindings / trust (WP-19 slice 5a) ---
         //

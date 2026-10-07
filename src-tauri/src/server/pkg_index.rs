@@ -1,7 +1,8 @@
 //! The daemon's read-only index of the pkgs under `--pkgs-dir` (WP-19).
 //!
 //! Backs the `pkg_kernel_status`, `list_skill_actions`,
-//! `list_all_skill_actions` and `pkg_settings_get` RPC arms. Built once, in `create_router`, from the
+//! `list_all_skill_actions`, `pkg_settings_get` and `pkg_health_scan` RPC
+//! arms, and the pkg half of `ngwa_snapshot`. Built once, in `create_router`, from the
 //! same directory walk that feeds [`super::PkgStaticService`], so the two can
 //! never disagree about which directories are pkgs.
 //!
@@ -43,18 +44,82 @@
 //! Non-iframe pkgs (`component` / `webview` routes, or no UI at all) are
 //! included: status reports what is installed. Whether the daemon can *serve*
 //! an iframe bundle is `PkgStaticService`'s concern, not this one's.
+//!
+//! # Health (`pkg_health_scan`)
+//!
+//! The index also keeps what it could NOT take — a directory whose manifest
+//! failed to load, an api-incompatible pkg, a pkg its `ui_routes` registry
+//! rejected — in the desktop's `PkgHealthIssue` wire shape. A second
+//! directory claiming a served id is listed as `pkgs_dir_duplicate`, never as
+//! unloadable: its id names the pkg that IS served, so it must not read as
+//! that pkg being broken. It has no install records to audit (no `pkg_installed` table), so
+//! [`PkgIndex::health_scan`] always leads with one `records_unavailable` row
+//! saying so: the answer is never a bare `[]` that reads as "healthy".
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use serde::Serialize;
 use tracing::{info, warn};
 
-use crate::pkg::manifest::{Package, SettingsField, IKENGA_API_VERSION};
+use crate::pkg::manifest::{
+    Package, SettingsField, IKENGA_API_MIN_SUPPORTED, IKENGA_API_VERSION,
+};
 use crate::pkg::registries::{ActivityBarBadge, ActivityBarRegistry, UiRoutesRegistry, ViewsRegistry};
 use crate::pkg::registry::Registry;
 use crate::pkg::skill_actions::{list_actions_for_pkg, SkillAction};
 use crate::pkg::{assemble_status, InstallSource, InstalledSummary, KernelStatus};
+
+/// One `--pkgs-dir` issue, in the desktop's `PkgHealthIssue` wire shape
+/// (`pkg::kernel`, desktop-only; mirrored as `PkgHealthIssue` in
+/// `tauri-cmd.ts`) — keep the three in lockstep.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct HealthIssue {
+    pub id: String,
+    pub install_path: String,
+    pub enabled: bool,
+    pub issue: HealthIssueKind,
+    pub detail: String,
+}
+
+/// The subset of the desktop's `HealthIssueKind` the daemon can observe, plus
+/// `PkgsDirDuplicate` and `RecordsUnavailable`, which only the daemon emits.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HealthIssueKind {
+    /// On disk under `--pkgs-dir` but not served: the manifest failed to load
+    /// or its `ikenga_api` is outside the supported window.
+    PkgsDirUnloadable,
+    /// A second `--pkgs-dir` directory claiming an id an earlier directory
+    /// already serves. NOT a broken pkg: `id` is the shared manifest id, which
+    /// IS served (from `served_path`), so the frontend must never mark that id
+    /// broken or offer to reinstall it; `install_path` is the ignored copy.
+    /// The desktop never emits this (its pkgs-dir scan skips tracked ids).
+    PkgsDirDuplicate { served_path: String },
+    /// Loads and is compatible, but a registry rejected it, so none of its
+    /// routes are mounted.
+    RegisterFailed,
+    /// Not an issue with any pkg: install-record health (the desktop's
+    /// `pkg_installed` audit) is not checked on this server at all.
+    RecordsUnavailable,
+}
+
+/// The id of the `records_unavailable` row.
+pub const RECORDS_UNAVAILABLE_ID: &str = "install-records";
+
+/// The `records_unavailable` row's detail.
+pub const RECORDS_NOT_SERVED: &str = "install-record health is not available on this server: the \
+     headless daemon serves pkgs read-only from --pkgs-dir and keeps no install records, so broken \
+     or orphaned records cannot be checked here. Only the pkgs folder was scanned.";
+
+/// What [`scan_dir`] found: the pkgs it loaded, and the directories it had to
+/// skip, as health issues.
+#[derive(Default)]
+pub struct DirScan {
+    pub pkgs: Vec<Package>,
+    pub skipped: Vec<HealthIssue>,
+}
 
 /// Walk `pkgs_dir` and load every valid pkg in it, sorted by directory path.
 ///
@@ -64,21 +129,29 @@ use crate::pkg::{assemble_status, InstallSource, InstalledSummary, KernelStatus}
 /// by id, so a second directory claiming the same id is skipped (the first in
 /// path order wins, which makes the choice deterministic across restarts).
 pub fn scan(pkgs_dir: Option<&Path>) -> Vec<Package> {
+    scan_dir(pkgs_dir).pkgs
+}
+
+/// [`scan`], also returning each skipped pkg directory (one holding a
+/// `manifest.json`) as a health issue: `pkgs_dir_unloadable`, or
+/// `pkgs_dir_duplicate` for a second directory claiming a served id.
+pub fn scan_dir(pkgs_dir: Option<&Path>) -> DirScan {
+    let mut out = DirScan::default();
     let Some(dir) = pkgs_dir else {
-        return Vec::new();
+        return out;
     };
     if !dir.is_dir() {
         warn!(
             "--pkgs-dir {} is not a directory; no pkgs will be served or indexed",
             dir.display()
         );
-        return Vec::new();
+        return out;
     }
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
             warn!("--pkgs-dir {} unreadable: {e}", dir.display());
-            return Vec::new();
+            return out;
         }
     };
 
@@ -97,27 +170,86 @@ pub fn scan(pkgs_dir: Option<&Path>) -> Vec<Package> {
         .collect();
     dirs.sort();
 
-    let mut out: Vec<Package> = Vec::with_capacity(dirs.len());
+    // A folder that fails to load is held back until every folder has been
+    // tried: when its raw id names a pkg another folder serves (whichever sorts
+    // first), it is a duplicate copy, not a broken pkg — reporting it as
+    // `pkgs_dir_unloadable` under the served id would mark the working pkg broken.
+    let mut unloadable: Vec<(PathBuf, String)> = Vec::new();
     for path in dirs {
         let pkg = match Package::load(&path) {
             Ok(p) => p,
             Err(e) => {
                 warn!("[pkg_index] skipping {}: {e:#}", path.display());
+                unloadable.push((path, format!("{e:#}")));
                 continue;
             }
         };
-        if let Some(first) = out.iter().find(|p| p.manifest.id == pkg.manifest.id) {
+        if let Some(first) = out.pkgs.iter().find(|p| p.manifest.id == pkg.manifest.id) {
             warn!(
                 "[pkg_index] duplicate pkg id {} — keeping {}, ignoring {}",
                 pkg.manifest.id,
                 first.install_path.display(),
                 path.display()
             );
+            out.skipped.push(HealthIssue {
+                id: pkg.manifest.id.clone(),
+                install_path: path.display().to_string(),
+                enabled: false,
+                issue: HealthIssueKind::PkgsDirDuplicate {
+                    served_path: first.install_path.display().to_string(),
+                },
+                detail: format!(
+                    "duplicate, not served: {} is served from {}; this copy is ignored",
+                    pkg.manifest.id,
+                    first.install_path.display()
+                ),
+            });
             continue;
         }
-        out.push(pkg);
+        out.pkgs.push(pkg);
+    }
+    for (path, err) in unloadable {
+        let id = raw_manifest_id(&path);
+        let served = out.pkgs.iter().find(|p| p.manifest.id == id);
+        out.skipped.push(match served {
+            Some(first) => HealthIssue {
+                id,
+                install_path: path.display().to_string(),
+                enabled: false,
+                issue: HealthIssueKind::PkgsDirDuplicate {
+                    served_path: first.install_path.display().to_string(),
+                },
+                detail: format!(
+                    "duplicate, not served: {} is served from {}; this copy also failed to load: {err}",
+                    first.manifest.id,
+                    first.install_path.display()
+                ),
+            },
+            None => HealthIssue {
+                id,
+                install_path: path.display().to_string(),
+                enabled: false,
+                issue: HealthIssueKind::PkgsDirUnloadable,
+                detail: format!("on disk but failed to load: {err}"),
+            },
+        });
     }
     out
+}
+
+/// The manifest's `id` when it can be read at all, else the directory name —
+/// the desktop's `scan_pkgs_dir` rule for naming an unloadable folder.
+fn raw_manifest_id(path: &Path) -> String {
+    std::fs::read_to_string(path.join("manifest.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("id").and_then(|s| s.as_str().map(String::from)))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
 }
 
 /// `manifest.json`'s mtime in Unix milliseconds, or `0` when the filesystem
@@ -145,10 +277,24 @@ pub struct PkgIndex {
     /// the same `settings_values::declared_schema`, and only for pkgs that go
     /// live (compatible + registered).
     settings_schemas: HashMap<String, Vec<SettingsField>>,
+    /// What the index could not take, for `pkg_health_scan`: skipped
+    /// directories, incompatible pkgs and registry rejections.
+    issues: Vec<HealthIssue>,
 }
 
 impl PkgIndex {
+    /// The index over a [`scan_dir`] walk, keeping its skipped directories
+    /// as health issues.
+    pub fn from_scan(scan: &DirScan) -> Self {
+        let mut index = Self::from_packages(&scan.pkgs);
+        let mut issues = scan.skipped.clone();
+        issues.append(&mut index.issues);
+        index.issues = issues;
+        index
+    }
+
     pub fn from_packages(pkgs: &[Package]) -> Self {
+        let mut issues = Vec::new();
         let ui_routes = UiRoutesRegistry::new();
         let views = ViewsRegistry::new();
         let activity_bar = ActivityBarRegistry::new();
@@ -167,6 +313,13 @@ impl PkgIndex {
                         "[pkg_index] skipping {}: ui_routes rejected it: {e:#}",
                         pkg.manifest.id
                     );
+                    issues.push(HealthIssue {
+                        id: pkg.manifest.id.clone(),
+                        install_path: pkg.install_path.display().to_string(),
+                        enabled: true,
+                        issue: HealthIssueKind::RegisterFailed,
+                        detail: format!("on disk but not served: ui_routes rejected it: {e:#}"),
+                    });
                     continue;
                 }
                 if let Err(e) = views.register(pkg) {
@@ -190,6 +343,16 @@ impl PkgIndex {
                      reported as incompatible, not registered",
                     pkg.manifest.id, pkg.manifest.ikenga_api
                 );
+                issues.push(HealthIssue {
+                    id: pkg.manifest.id.clone(),
+                    install_path: pkg.install_path.display().to_string(),
+                    enabled: false,
+                    issue: HealthIssueKind::PkgsDirUnloadable,
+                    detail: format!(
+                        "on disk but not served: ikenga_api={} outside supported window {}..={}",
+                        pkg.manifest.ikenga_api, IKENGA_API_MIN_SUPPORTED, IKENGA_API_VERSION
+                    ),
+                });
             }
             let install_path = pkg.install_path.display().to_string();
             installed.push(InstalledSummary {
@@ -224,7 +387,23 @@ impl PkgIndex {
             views,
             activity_bar,
             settings_schemas,
+            issues,
         }
+    }
+
+    /// The `pkg_health_scan` payload: the `records_unavailable` row first,
+    /// then every issue the index recorded (see the module docs).
+    pub fn health_scan(&self) -> Vec<HealthIssue> {
+        let mut out = Vec::with_capacity(self.issues.len() + 1);
+        out.push(HealthIssue {
+            id: RECORDS_UNAVAILABLE_ID.to_string(),
+            install_path: String::new(),
+            enabled: false,
+            issue: HealthIssueKind::RecordsUnavailable,
+            detail: RECORDS_NOT_SERVED.to_string(),
+        });
+        out.extend(self.issues.iter().cloned());
+        out
     }
 
     /// The declared settings schema for `pkg_id`, or `None` — for a pkg that
@@ -333,6 +512,39 @@ mod tests {
 
         assert!(scan(None).is_empty());
         assert!(scan(Some(&root.join("missing"))).is_empty());
+    }
+
+    /// A copy of a served id that fails to load is a duplicate whichever side
+    /// of the served folder it sorts — never `pkgs_dir_unloadable`, which the
+    /// frontend keys by id and would mark the served pkg broken.
+    #[test]
+    fn unloadable_copy_of_a_served_id_is_a_duplicate_in_either_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let half = r#"{"id":"com.test.hello","ikenga_api":"1"}"#;
+        write_manifest(root, "a-broken-copy", half);
+        write_manifest(root, "m-hello", &manifest("com.test.hello", "1", ""));
+        write_manifest(root, "z-broken-copy", half);
+        write_manifest(root, "lonely", r#"{"id":"com.test.lonely"}"#);
+
+        let scan = scan_dir(Some(root));
+        assert_eq!(scan.pkgs.len(), 1);
+        assert!(scan.pkgs[0].install_path.ends_with("m-hello"));
+        let kind_of = |dir: &str| {
+            let row = scan.skipped.iter().find(|i| i.install_path.ends_with(dir)).unwrap();
+            (row.id.clone(), row.issue.clone())
+        };
+        for dir in ["a-broken-copy", "z-broken-copy"] {
+            let (id, issue) = kind_of(dir);
+            assert_eq!(id, "com.test.hello");
+            assert!(
+                matches!(&issue, HealthIssueKind::PkgsDirDuplicate { served_path } if served_path.ends_with("m-hello")),
+                "{dir}: {issue:?}"
+            );
+        }
+        let (id, issue) = kind_of("lonely");
+        assert_eq!(id, "com.test.lonely");
+        assert!(matches!(issue, HealthIssueKind::PkgsDirUnloadable), "{issue:?}");
     }
 
     /// `settings_schema` holds what the desktop `SettingsRegistry` would: the

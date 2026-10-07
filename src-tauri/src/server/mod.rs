@@ -708,9 +708,9 @@ fn build_router(
     // included — gets the same view of `--pkgs-dir`. Walked ONCE: the static
     // server and the status index are built from the same list, so they can
     // never disagree about which directories are pkgs. Both log what they found.
-    let pkgs = pkg_index::scan(config.pkgs_dir.as_deref());
-    let pkg_static = PkgStaticService::from_packages(config.pkgs_dir.as_deref(), &pkgs);
-    let pkg_index = Arc::new(PkgIndex::from_packages(&pkgs));
+    let scanned = pkg_index::scan_dir(config.pkgs_dir.as_deref());
+    let pkg_static = PkgStaticService::from_packages(config.pkgs_dir.as_deref(), &scanned.pkgs);
+    let pkg_index = Arc::new(PkgIndex::from_scan(&scanned));
     let settings = match (&pa_db, &config.data_dir, &home) {
         (Some(db), Some(dir), Some(home)) => Some(Arc::new(rpc_local::DaemonSettings::new(
             db.clone(),

@@ -20,20 +20,60 @@ import {
 } from '@/lib/registry/primitives';
 import type { ClaudeStoreEntry, ClaudeStoreKind } from '@/lib/tauri-cmd';
 
-export type TrustFacetValue = 'builtin' | 'signed' | 'unsigned' | 'review';
+export type TrustFacetValue = 'builtin' | 'signed' | 'unsigned' | 'review' | 'unavailable';
+
+/** An item's trust as the frontend holds it: the wire `NgwaTrust`, plus the
+ *  server's reason when the host does not evaluate trust at all (the headless
+ *  daemon — see {@link markTrustUnavailable}). Not on the wire. */
+export type NgwaTrustView = NgwaTrust & { unavailable?: string };
+
+/** The server's reason this item's trust was never evaluated, or null. */
+export function trustUnavailableReason(trust: NgwaTrust): string | null {
+	return (trust as NgwaTrustView).unavailable ?? null;
+}
 
 /**
  * Resolves the D-02 Trust facet value for an item per Gate §5:
+ * - unavailable: the host does not evaluate trust (never "unsigned")
  * - builtin: auto_trusted === true (builtin / dev)
  * - signed: signed === true (manifest signature present)
  * - unsigned: signed === false && state !== 'needs_approval'
  * - review: state === 'needs_approval' || review_pending === true
  */
 export function resolveTrustFacet(trust: NgwaTrust): TrustFacetValue {
+	if (trustUnavailableReason(trust)) return 'unavailable';
 	if (trust.state === 'needs_approval' || trust.review_pending) return 'review';
 	if (trust.auto_trusted) return 'builtin';
 	if (trust.signed) return 'signed';
 	return 'unsigned';
+}
+
+/** A trust facet as a badge reads it. */
+export function trustFacetLabel(facet: TrustFacetValue): string {
+	return facet === 'unavailable' ? 'not available on this server' : facet;
+}
+
+/** A pkg-backed item: its id is the manifest id, which is also its name.
+ *  Every other item's id is `kind:scope:name` (gate §2 item identity). */
+export function isPkgItem(item: NgwaItem): boolean {
+	return item.id === item.name;
+}
+
+/**
+ * When the snapshot's trust source says the host does not evaluate trust
+ * (`sources.trust.error` carries "not available on this server"), the join
+ * gave every pkg `trust.state: 'not_applicable'` — which would otherwise read
+ * as "unsigned". Mark those pkg items with the reason instead. Skills,
+ * agents and the rest are genuinely not applicable and are left alone.
+ * `reason === null` (trust evaluated, e.g. on the desktop) returns `items`.
+ */
+export function markTrustUnavailable(items: NgwaItem[], reason: string | null): NgwaItem[] {
+	if (!reason) return items;
+	return items.map((it) => {
+		if (!isPkgItem(it) || it.trust.state !== 'not_applicable') return it;
+		const trust: NgwaTrustView = { ...it.trust, unavailable: reason };
+		return { ...it, trust };
+	});
 }
 
 /**

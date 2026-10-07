@@ -40,6 +40,7 @@ pub mod fs;
 pub mod git;
 pub mod identity;
 pub mod model_catalog;
+pub mod ngwa;
 pub mod notifications;
 pub mod pa_actions;
 pub mod pkg_db;

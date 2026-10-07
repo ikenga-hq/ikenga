@@ -118,6 +118,21 @@ describe('deriveFromQueries', () => {
 		).toBe('violations failed');
 	});
 
+	it('a server that does not evaluate trust is trustUnavailable, not an error and not "none"', () => {
+		const reason =
+			'pkg_trust_list: trust evaluation is not available on this server: no trust store';
+		const d = deriveFromQueries({
+			statusData: { installed: [] },
+			trustError: new Error(reason),
+		});
+		expect(d.error).toBeNull();
+		expect(d.trustUnavailable).toBe(reason);
+		// Any other trust failure stays an error.
+		const e = deriveFromQueries({ statusData: undefined, trustError: new Error('db locked') });
+		expect(e.error).toBe('db locked');
+		expect(e.trustUnavailable).toBeNull();
+	});
+
 	describe('origin classification', () => {
 		it('classifies engine-kind manifests as engine regardless of source', () => {
 			const d = deriveFromQueries({

@@ -77,6 +77,9 @@ pub mod source;
 pub mod status;
 #[cfg(feature = "desktop")]
 pub mod trust;
+// The `TrustState` wire shape + the sensitive-perms summary, ungated for the
+// shared Ngwa snapshot join; `trust` re-exports them.
+pub mod trust_state;
 #[cfg(feature = "desktop")]
 pub(crate) mod uninstall_dir;
 #[cfg(feature = "desktop")]

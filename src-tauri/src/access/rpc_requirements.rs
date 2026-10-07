@@ -67,6 +67,8 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("pkg_activity_bar_set_badge", req!(shared[Files])),
     ("pkg_trust_list_pending", req!(shared[Files])),
     ("pkg_is_trusted_for_elevated", req!(shared[Files])),
+    ("pkg_trust_list", req!(shared[Files])),
+    ("pkg_health_scan", req!(shared[Files])),
     // ── secrets ──
     ("secrets_get", req!(owner[Secrets])),
     ("secrets_get_scoped", req!(owner[Secrets])),
@@ -199,6 +201,9 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("oba_set_auto_update", req!(owner[Install])),
     ("oba_relink_dependents", req!(owner[Install])),
     ("oba_unlink_one", req!(owner[Install])),
+    // ── Ngwa snapshot: reads the Owner's personal `~/.claude` scan (as
+    // `claude_config_load` does), so owner-class like it ──
+    ("ngwa_snapshot", req!(owner[Files])),
     // ── actions / trust ──
     ("actions_read_files", req!(shared[Files])),
     ("actions_trust_status", req!(shared[Files])),
