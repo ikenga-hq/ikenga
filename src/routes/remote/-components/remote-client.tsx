@@ -21,11 +21,27 @@ import {
 	disabledReason,
 	parseAccessError,
 } from '@/lib/access/client';
-import { chiList, notificationsList, ptyTerminalList, ptyWrite } from '@/lib/tauri-cmd';
+import {
+	chiList,
+	chiResume,
+	notificationsList,
+	ptyForeground,
+	ptyForegroundSnapshot,
+	ptyTerminalList,
+	ptyWrite,
+} from '@/lib/tauri-cmd';
 import { D05_FOCUS } from '@/shell/people/focus';
 
 import { RemoteInbox, SectionHead } from './inbox';
-import { type AnnotatedRow, credentialLine, type SessionRow, sessionRows } from './remote-model';
+import {
+	type AnnotatedRow,
+	credentialLine,
+	dispatchTargets,
+	foregroundRefusal,
+	NO_AGENT_TARGET,
+	type SessionRow,
+	sessionRows,
+} from './remote-model';
 
 const POLL_MS = 3000;
 
@@ -41,12 +57,13 @@ function useRemoteData() {
 			const st = await accessStatus();
 			setStatus(st);
 			setConnected(true);
-			const [terms, runs, rows] = await Promise.all([
+			const [terms, runs, rows, foreground] = await Promise.all([
 				ptyTerminalList().catch(() => []),
 				chiList(null, 20).catch(() => []),
 				notificationsList({ kinds: ['permission'], limit: 20 }).catch(() => []),
+				ptyForegroundSnapshot().catch(() => ({})),
 			]);
-			setSessions(sessionRows(terms, runs));
+			setSessions(sessionRows(terms, runs, foreground));
 			setAsks(rows as AnnotatedRow[]);
 			setError(null);
 		} catch (e) {
@@ -137,43 +154,86 @@ export function RemoteClient() {
 	);
 }
 
-function DispatchBar({ status, sessions }: { status: AccessStatus; sessions: SessionRow[] }) {
-	const targets = useMemo(() => sessions.filter((s) => s.ptyId), [sessions]);
+export function DispatchBar({
+	status,
+	sessions,
+}: {
+	status: AccessStatus;
+	sessions: SessionRow[];
+}) {
+	const targets = useMemo(() => dispatchTargets(sessions), [sessions]);
+	// No implicit default: the user picks a target for every send.
 	const [target, setTarget] = useState<string>('');
 	const [text, setText] = useState('');
 	const [note, setNote] = useState<string | null>(null);
-	const blocked = disabledReason('pty_write', status);
-	const chosen = targets.find((t) => t.ptyId === target) ?? targets[0];
+	const [busy, setBusy] = useState(false);
+	const chosen = targets.find((t) => t.key === target);
+	const blocked = disabledReason(chosen?.kind === 'chi' ? 'chi_resume' : 'pty_write', status);
+	const pickBlocked =
+		disabledReason('pty_write', status) !== null && disabledReason('chi_resume', status) !== null;
+	const empty = targets.length === 0;
 
 	const send = async (e: FormEvent) => {
 		e.preventDefault();
-		if (!chosen?.ptyId || !text.trim() || blocked) return;
+		if (!chosen || !text.trim() || blocked || busy) return;
+		setBusy(true);
 		try {
-			await ptyWrite(chosen.ptyId, `${text}\r`);
+			if (chosen.kind === 'pty') {
+				// The foreground can change between picking and sending (the agent
+				// exits back to its shell). Re-read it right before the write and
+				// refuse unless an agent CLI is still in front.
+				const refusal = foregroundRefusal(chosen, await ptyForeground(chosen.ptyId));
+				if (refusal) {
+					setTarget('');
+					setNote(refusal);
+					return;
+				}
+				await ptyWrite(chosen.ptyId, `${text}\r`);
+			} else {
+				const res = await chiResume(chosen.runId, text);
+				if (res.status === 'failed' || res.error) {
+					setNote(res.error ?? `Chi run ${res.status}`);
+					return;
+				}
+			}
 			setText('');
-			setNote('Sent.');
+			setTarget('');
+			setNote(`Sent to ${chosen.label}.`);
 		} catch (err) {
 			setNote(parseAccessError(err).message);
+		} finally {
+			setBusy(false);
 		}
 	};
+
+	const hint = empty
+		? NO_AGENT_TARGET
+		: blocked
+			? blocked
+			: chosen
+				? `↵ send to ${chosen.label}`
+				: 'Choose an agent to send to';
 
 	return (
 		<form
 			onSubmit={send}
 			aria-label="Dispatch"
-			data-dispatch={blocked ? 'disabled' : 'enabled'}
+			data-dispatch={blocked || empty ? 'disabled' : 'enabled'}
 			className="border-t border-[var(--border-soft)] px-3 py-2.5"
 		>
 			<select
 				aria-label="Send to"
-				value={chosen?.ptyId ?? ''}
-				onChange={(e) => setTarget(e.target.value)}
-				disabled={targets.length === 0 || Boolean(blocked)}
+				value={chosen?.key ?? ''}
+				onChange={(e) => {
+					setTarget(e.target.value);
+					setNote(null);
+				}}
+				disabled={empty || pickBlocked}
 				className="mb-2 max-w-full rounded-full border border-[var(--border)] bg-[var(--bg-sunken)] px-2.5 py-1 font-mono text-[length:var(--text-micro)] text-[var(--fg)]"
 			>
-				{targets.length === 0 && <option value="">no terminal to send to</option>}
+				<option value="">{empty ? 'no agent to send to' : 'Choose an agent…'}</option>
 				{targets.map((t) => (
-					<option key={t.id} value={t.ptyId ?? ''}>
+					<option key={t.key} value={t.key}>
 						{t.label}
 					</option>
 				))}
@@ -184,20 +244,20 @@ function DispatchBar({ status, sessions }: { status: AccessStatus; sessions: Ses
 					value={text}
 					onChange={(e) => setText(e.target.value)}
 					placeholder={blocked ?? 'Dispatch an instruction…'}
-					disabled={Boolean(blocked) || targets.length === 0}
+					disabled={Boolean(blocked) || empty}
 					className="min-w-0 flex-1 bg-transparent py-2 text-[length:var(--text-body-sm)] text-[var(--fg)] outline-none"
 				/>
 				<button
 					type="submit"
 					aria-label="Send to session"
-					disabled={Boolean(blocked) || !text.trim() || !chosen}
+					disabled={Boolean(blocked) || !text.trim() || !chosen || busy}
 					className="text-[var(--fg-muted)] hover:text-[var(--fg)] disabled:opacity-40"
 				>
 					<Send className="h-4 w-4" />
 				</button>
 			</div>
-			<p className="m-0 mt-1 text-[length:var(--text-micro)] text-[var(--fg-faint)]">
-				{note ?? (blocked ? blocked : '↵ send to session')}
+			<p role="status" className="m-0 mt-1 text-[length:var(--text-micro)] text-[var(--fg-faint)]">
+				{note ?? hint}
 			</p>
 		</form>
 	);
