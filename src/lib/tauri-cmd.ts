@@ -3430,8 +3430,9 @@ export async function pkgDbDiag(): Promise<PkgDbDiag> {
 }
 
 // ─── pkg health (install-integrity check + cleanup) ──────────────────────────
-// Mirrors the Rust `PkgHealthIssue` / `HealthIssueKind` serde (kernel.rs) — keep
-// in lockstep. `issue.kind` is the tagged-union discriminant.
+// Mirrors the Rust `PkgHealthIssue` / `HealthIssueKind` serde (kernel.rs, and
+// the daemon's `server/pkg_index.rs`) — keep in lockstep. `issue.kind` is the
+// tagged-union discriminant.
 export type PkgHealthIssueKind =
 	| { kind: 'manifest_missing' }
 	| { kind: 'manifest_unreadable' }
@@ -3442,10 +3443,27 @@ export type PkgHealthIssueKind =
 	 *  (or register) at boot: on disk, absent from the kernel. */
 	| { kind: 'pkgs_dir_unloadable' }
 	/** An enabled install record, loadable, that a registry rejected at boot. */
-	| { kind: 'register_failed' };
+	| { kind: 'register_failed' }
+	/** The headless daemon only: a second pkgs-folder directory claiming an id
+	 *  an earlier directory already serves (from `served_path`). `id` names a
+	 *  pkg that IS served and working — never mark it broken or offer to
+	 *  reinstall it; `install_path` is the ignored copy. */
+	| { kind: 'pkgs_dir_duplicate'; served_path: string }
+	/** Not an issue with any pkg: the headless daemon's statement that install
+	 *  records are not checked on that server at all (it keeps none). Its scan
+	 *  always leads with this one row, so the answer never reads as "healthy";
+	 *  `detail` says why. Never emitted by the desktop. */
+	| { kind: 'records_unavailable' };
+
+/** The daemon's "install records not checked here" row — a statement about
+ *  the scan, not an issue to count or remove. */
+export function isRecordsUnavailableIssue(kind: PkgHealthIssueKind): boolean {
+	return kind.kind === 'records_unavailable';
+}
 
 /** Issue kinds for a pkg that is on disk but not registered in the kernel —
- *  the ones Ngwa offers "Reinstall from registry" for. */
+ *  the ones Ngwa offers "Reinstall from registry" for. A `pkgs_dir_duplicate`
+ *  is not one: its id is served. */
 export function isUnregisteredPkgIssue(kind: PkgHealthIssueKind): boolean {
 	return kind.kind === 'pkgs_dir_unloadable' || kind.kind === 'register_failed';
 }

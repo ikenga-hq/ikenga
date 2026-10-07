@@ -22,7 +22,8 @@ import {
 	Trash2,
 } from 'lucide-react';
 import type { NgwaItem } from '@ikenga/contract';
-import { resolveTrustFacet } from '@/lib/ngwa/enrichment';
+import { resolveTrustFacet, trustFacetLabel, trustUnavailableReason } from '@/lib/ngwa/enrichment';
+import { NOT_AVAILABLE_ON_SERVER_LABEL } from '@/lib/transport/unavailable';
 import {
 	useRemoteCheck,
 	type NgwaAct,
@@ -59,7 +60,7 @@ export function NgwaDetailPane({ item, actions }: NgwaDetailPaneProps) {
 					{item.version && <span className="v">v{item.version}</span>}
 					<span className={`badge t-${trustFacet}`}>
 						<Shield className="h-3 w-3" />
-						{trustFacet}
+						{trustFacetLabel(trustFacet)}
 					</span>
 				</div>
 
@@ -218,12 +219,25 @@ export function NgwaDetailPane({ item, actions }: NgwaDetailPaneProps) {
 
 				{activeTab === 'perms' && (
 					<div>
-						{item.trust.perms ? (
+						{trustUnavailableReason(item.trust) && (
+							<div className="drow" data-trust-unavailable>
+								<span className="k2">Trust</span>
+								<span className="val text-muted-foreground">
+									{NOT_AVAILABLE_ON_SERVER_LABEL}: {trustUnavailableReason(item.trust)}
+									{item.trust.perms
+										? '. Listed below is only what the manifest declares — not evaluated or approved.'
+										: '. The manifest could not be read, so its declared permissions are unknown.'}
+								</span>
+							</div>
+						)}
+						{trustUnavailableReason(item.trust) && !item.trust.perms ? null : item.trust.perms ? (
 							<>
-								<div className="drow">
-									<span className="k2">Enforced by</span>
-									<span className="val">Pkg Kernel (manifest sandbox)</span>
-								</div>
+								{!trustUnavailableReason(item.trust) && (
+									<div className="drow">
+										<span className="k2">Enforced by</span>
+										<span className="val">Pkg Kernel (manifest sandbox)</span>
+									</div>
+								)}
 								<div className="subhead">Declared Permissions</div>
 								{item.trust.perms.shell_execute.length > 0 && (
 									<div className="drow">
@@ -243,6 +257,12 @@ export function NgwaDetailPane({ item, actions }: NgwaDetailPaneProps) {
 										<span className="val">
 											{item.trust.perms.fs_write_outside_sandbox.join(', ')}
 										</span>
+									</div>
+								)}
+								{item.trust.perms.vault_keys.length > 0 && (
+									<div className="drow">
+										<span className="k2 mono">vault_keys</span>
+										<span className="val">{item.trust.perms.vault_keys.join(', ')}</span>
 									</div>
 								)}
 							</>

@@ -195,10 +195,6 @@ tag = "desktop-only-forever"
 reason = "Resolves a pending wait-for-condition round trip targeting the app's own rendered window."
 
 
-[ngwa_snapshot]
-tag = "WP-19"
-reason = "ngwa_snapshot_inner needs the live pkg kernel: kernel.status() (registries, sidecars, installed set) and trust evaluation of each installed pkg against app_data_dir, plus a ~/.claude/projects usage scan. The daemon has no kernel, only the read-only --pkgs-dir PkgIndex, so it has no honest snapshot to return."
-
 [notifications_record_update]
 tag = "WP-19"
 reason = "Not served with the rest of notifications_* (slice 4). It emits nothing, so events are not the blocker: after recording the row it sweeps update rows against the running shell's app.package_info() version and the live pkg kernel's installed set (app.try_state::<KernelState>(), commands/notifications.rs sweep_installed_updates). The daemon has neither (no shell package_info; its --pkgs-dir PkgIndex is a read-only view, not an install record), so it could record 'update available' rows it can never honestly resolve, leaving them stale; and producers::update lives in the desktop-only notifications::producers (it leans on engines::claude_code)."
@@ -271,10 +267,6 @@ reason = "kernel.purge_install_record deletes a pkg_installed row + child rows v
 tag = "WP-19"
 reason = "kernel.purge_all_broken bulk-deletes broken records/orphans via SQL and retires unloadable pkgs-dir folders via uninstall_dir::retire (rename to a backup under the app-data pkgs dir); no spawn."
 
-[pkg_health_scan]
-tag = "WP-19"
-reason = "kernel.health_scan is documented read-only, scans pkg_installed rows for broken/orphaned records; no spawn."
-
 [pkg_install_cancel]
 tag = "WP-18b"
 reason = "Sets the cancel flag of an in-flight pkg_install_from_registry, which the daemon does not serve yet; it is served together with that command."
@@ -330,10 +322,6 @@ reason = "kernel.resume_after_review -> register(); SidecarSupervisor then spawn
 [pkg_trust_grant]
 tag = "WP-19"
 reason = "Resolves the pkg via kernel.installed_summary() and reloads its installed manifest to pin the granted version; the daemon has no kernel install registry (its --pkgs-dir index installs nothing), so there is no installed manifest to grant against."
-
-[pkg_trust_list]
-tag = "WP-19"
-reason = "Walks kernel.list_installed() and evaluates each pkg against its trust row + app_data_dir; the daemon has no kernel install registry, so it would answer an empty list that reads as \"nothing needs trust\"."
 
 [pkg_trust_preview]
 tag = "WP-19"

@@ -31,6 +31,7 @@ vi.mock('@/lib/tauri-cmd', async (orig) => {
 		dataHealthDbSize: vi.fn(),
 		backupList: vi.fn(),
 		detectAgent: vi.fn(),
+		isRemoteWebSession: vi.fn(() => false),
 	};
 });
 
@@ -107,6 +108,7 @@ function healthItems() {
 }
 
 beforeEach(() => {
+	m.isRemoteWebSession.mockReturnValue(false);
 	m.ngwaSnapshot.mockResolvedValue(mkSnapshot(healthItems()));
 	m.pkgPermissionViolationsList.mockResolvedValue(VIOLATIONS);
 	m.pkgPermissionViolationsClear.mockResolvedValue(3);
@@ -510,5 +512,104 @@ describe('/ngwa/health — auditline and ?section=', () => {
 	it('?section=data focuses the Data panel', async () => {
 		mount('/ngwa/health?section=data');
 		await waitFor(() => expect(document.activeElement?.getAttribute('data-panel')).toBe('data'));
+	});
+});
+
+describe('/ngwa/health — a remote web session on the headless daemon', () => {
+	const RECORDS = 'install-record health is not available on this server: no install records here.';
+	const TRUST = 'trust evaluation is not available on this server: no trust store';
+	const na = (what: string) => ({ ok: false, error: `${what} is not available on this server`, count: 0 });
+	const ok = { ok: true, error: null, count: 1 };
+	const RECORDS_ROW: cmd.PkgHealthIssue = {
+		id: 'install-records',
+		install_path: '',
+		enabled: false,
+		issue: { kind: 'records_unavailable' },
+		detail: RECORDS,
+	};
+
+	beforeEach(() => {
+		m.isRemoteWebSession.mockReturnValue(true);
+		// The daemon's `pkg_kernel_status` lists only the registries it runs.
+		m.pkgKernelStatus.mockResolvedValue({
+			installed: [],
+			api_version: 5,
+			registries: { ui_routes: { entries: [] } },
+		} as unknown as cmd.PkgKernelStatus);
+		m.pkgHealthScan.mockResolvedValue([
+			RECORDS_ROW,
+			{
+				id: 'com.x.broken',
+				install_path: '/pkgs/x',
+				enabled: false,
+				issue: { kind: 'pkgs_dir_unloadable' },
+				detail: 'on disk but failed to load: bad json',
+			},
+		]);
+		m.ngwaSnapshot.mockResolvedValue(
+			mkSnapshot(healthItems(), {
+				sources: {
+					kernel: na('pkg runtime state'),
+					oba: ok,
+					engine_config: ok,
+					engine_assets: na('engine asset placements'),
+					trust: { ok: false, error: TRUST, count: 0 },
+					usage: na('transcript usage'),
+				},
+			})
+		);
+	});
+
+	afterEach(() => {
+		m.isRemoteWebSession.mockReturnValue(false);
+	});
+
+	it('sidecars and pkg cron read "Not available on this server", never "registry missing"', async () => {
+		mount();
+		await waitFor(() => expect(document.querySelector('[data-unavailable="sidecars"]')).not.toBeNull());
+		expect(document.querySelector('[data-unavailable="pkgcron"]')?.textContent).toContain(
+			'Not available on this server'
+		);
+		expect(panel('sidecars').textContent).toContain('Not available on this server');
+		expect(panel('sidecars').querySelector('[role="alert"]')).toBeNull();
+		expect(document.body.textContent).not.toContain('registry missing from kernel status');
+	});
+
+	it('install records read unavailable, not healthy; pkgs-folder rows are listed but not removable', async () => {
+		mount();
+		await waitFor(() => expect(document.querySelector('[data-install="com.x.broken"]')).not.toBeNull());
+		expect(document.querySelector('[data-install="install-records"]')).toBeNull();
+		expect(document.querySelector('[data-unavailable="installs"]')?.textContent).toContain(RECORDS);
+		expect(document.querySelector('[data-empty="installs"]')).toBeNull();
+		expect(document.querySelector('[data-violn]')).toBeNull();
+		const rm = document.querySelector<HTMLButtonElement>('[data-remove="com.x.broken"]');
+		expect(rm?.disabled).toBe(true);
+		expect(rm?.title).toBe('Desktop app only');
+		expect(document.querySelector<HTMLButtonElement>('[data-act="remove-all"]')?.disabled).toBe(true);
+	});
+
+	it('with nothing wrong in the pkgs folder it still never says "All install records healthy"', async () => {
+		m.pkgHealthScan.mockResolvedValue([RECORDS_ROW]);
+		mount();
+		await waitFor(() => expect(document.querySelector('[data-unavailable="installs"]')).not.toBeNull());
+		expect(document.body.textContent).not.toContain('All install records healthy');
+		expect(document.querySelectorAll('[data-install]').length).toBe(0);
+	});
+
+	it('trust and the other unserved sources read not available — not unreadable, not a count', async () => {
+		mount();
+		await waitFor(() => expect(document.querySelector('[data-unsigned-unavailable]')).not.toBeNull());
+		expect(document.querySelector('[data-unsigned-unknown]')).toBeNull();
+		expect(document.querySelector('[data-unsigned]')).toBeNull();
+		expect(document.querySelector('[data-unsignedn]')?.textContent).toContain('—');
+		expect(panel('trust').textContent).toContain(TRUST);
+		await waitFor(() =>
+			expect(document.querySelector('[data-audit-unavailable]')?.textContent).toContain('sidecar supervisor')
+		);
+		const unavailable = document.querySelector('[data-audit-unavailable]')?.textContent ?? '';
+		for (const s of ['trust', 'usage', 'install records', 'pkg cron registry']) {
+			expect(unavailable).toContain(s);
+		}
+		expect(document.querySelector('[data-auditline]')?.textContent).not.toMatch(/could not read:[^.]*trust/);
 	});
 });
