@@ -53,8 +53,17 @@ export const KIND_META: Record<NotificationKind, { label: string; fg: string; bo
 	invite: { label: 'invite', fg: 'var(--agent)', border: 'var(--agent-soft)' },
 };
 
-function KindTag({ kind }: { kind: NotificationKind }) {
-	const meta = KIND_META[kind];
+/** A row's tag. WSL network rows ride the `violation` kind (so the mute list
+ *  is unchanged) but read as what they are, not as a policy violation. */
+function kindMetaFor(row: NotificationRow): { label: string; fg: string; border: string } {
+	if (row.action?.kind === 'fix.wsl_network') {
+		return { label: 'wsl network', fg: 'var(--achievement)', border: 'var(--achievement-soft)' };
+	}
+	return KIND_META[row.kind];
+}
+
+function KindTag({ row }: { row: NotificationRow }) {
+	const meta = kindMetaFor(row);
 	return (
 		<span
 			className="inline-flex h-4 shrink-0 items-center rounded-[var(--radius-xs)] border px-1.5 font-mono text-[10px] tracking-wide"
@@ -87,7 +96,7 @@ function NotificationRowItem({ row, block }: { row: NotificationRow; block: stri
 			)}
 		>
 			<div className="flex items-start gap-2">
-				<KindTag kind={row.kind} />
+				<KindTag row={row} />
 				<span className="min-w-0 flex-1 text-xs leading-snug text-foreground" title={row.title}>
 					{row.title}
 				</span>

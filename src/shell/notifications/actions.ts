@@ -37,6 +37,7 @@ import { iykeFetch } from '@/lib/iyke/client';
 import { asKnownNotificationAction } from '@/lib/notifications/action-kind';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { type NotificationRow, notificationsList } from '@/lib/tauri-cmd';
+import { primaryFixForState } from '@/lib/wsl-health/copy';
 
 // Duplicated from `src/shell/status-bar.tsx`'s `NGWA_LINKS` rather than
 // imported: this module is reached from the popover, and `status-bar.tsx`
@@ -45,6 +46,8 @@ import { type NotificationRow, notificationsList } from '@/lib/tauri-cmd';
 // sync by hand.
 const NGWA_UPDATES_ROUTE = '/packages?filter=updates';
 const NGWA_VIOLATIONS_ROUTE = '/packages?filter=review';
+/** Where the WSL health row (and its fixes) lives (WP-2, D-2). */
+const WSL_HEALTH_ROUTE = '/settings/engines';
 
 export interface NotificationActionButton {
 	label: string;
@@ -352,6 +355,32 @@ export function notificationActionButtons(
 			return [{ label: 'View update', variant: 'ghost', run: () => navigate(NGWA_UPDATES_ROUTE) }];
 		case 'open.violations':
 			return [{ label: 'Review', variant: 'primary', run: () => navigate(NGWA_VIOLATIONS_ROUTE) }];
+		case 'fix.wsl_network': {
+			// honest-failure-states WP-2. A resolved row is a past episode:
+			// WSL came back, no fix to offer. The fix goes through the shared
+			// flow (lazy: it pulls in the terminal store), which confirms the
+			// disruptive ones first and relaunches sessions after (D-5).
+			const details: NotificationActionButton = {
+				label: 'Details',
+				variant: 'ghost',
+				run: () => navigate(WSL_HEALTH_ROUTE),
+			};
+			if (row.resolvedAt != null) return [];
+			const fix = primaryFixForState(action.state);
+			if (!fix) return [details];
+			const { distro } = action;
+			return [
+				{
+					label: fix.label,
+					variant: 'primary',
+					run: () =>
+						void import('@/lib/wsl-health/fix-flow').then((m) =>
+							m.requestWslFix(fix.action, distro ?? 'default')
+						),
+				},
+				details,
+			];
+		}
 		default:
 			return row.kind === 'invite'
 				? [{ label: 'Open People', variant: 'ghost', run: () => navigate('/settings/people') }]

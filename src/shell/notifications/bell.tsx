@@ -14,6 +14,7 @@ import { useQuery } from '@tanstack/react-query';
 import { Bell } from 'lucide-react';
 import { useState } from 'react';
 import { NotificationToastBridge } from '@/components/ui/floating-toast-chip';
+import { WslFixDialogHost } from '@/shell/wsl-health/wsl-fix-dialog';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { notificationsUnreadCountQueryOptions } from '@/lib/queries/notifications';
 import { NotificationsPopoverContent } from './popover';
@@ -60,6 +61,7 @@ export function NotificationsBell({ tabIndex }: { tabIndex?: number } = {}) {
 				</PopoverContent>
 			</Popover>
 			<NotificationToastBridge />
+			<WslFixDialogHost />
 		</>
 	);
 }

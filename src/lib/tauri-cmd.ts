@@ -585,7 +585,14 @@ export type KnownNotificationAction =
 	  }
 	| { kind: 'open.release_notes'; source: 'shell'; version: string }
 	| { kind: 'open.pkg_updates'; pkgId: string; version: string }
-	| { kind: 'open.violations'; pkgId: string };
+	| { kind: 'open.violations'; pkgId: string }
+	| {
+			/** WSL has no network (honest-failure-states WP-2): offer the fix
+			 *  that fits `state`. `distro` null = the default distro. */
+			kind: 'fix.wsl_network';
+			distro: string | null;
+			state: 'no_route' | 'dns_only' | 'wsl_down';
+	  };
 
 export type KnownNotificationActionKind = KnownNotificationAction['kind'];
 

@@ -41,6 +41,7 @@ import {
 } from '@/terminal/single-terminal';
 import { buildAgentWrappedCmd, type AgentEngineKind } from '@/terminal/claude-wrap';
 import { SettingsFieldRow, useSettingsSection } from '@/shell/settings/field';
+import { WslHealthSettingsRow } from '@/shell/wsl-health/wsl-health-settings-row';
 
 const OFFLINE_AGENT_ID = 'engine-noop';
 
@@ -510,6 +511,10 @@ function TerminalSectionBody() {
 							))}
 						</select>
 					</SettingsFieldRow>
+				)}
+
+				{isWindows && currentAgentEnv === 'wsl' && wslProfiles.length > 0 && (
+					<WslHealthSettingsRow distro={currentAgentDistro} />
 				)}
 
 				<SettingsFieldRow

@@ -14,6 +14,11 @@ const mocks = vi.hoisted(() => ({
 	permissionDecide: vi.fn((_id: number, _d: string) => Promise.resolve({ resolved: true })),
 	accessStatus: vi.fn(),
 	accessRoutingGet: vi.fn(),
+	requestWslFix: vi.fn(),
+}));
+
+vi.mock('@/lib/wsl-health/fix-flow', () => ({
+	requestWslFix: mocks.requestWslFix,
 }));
 
 vi.mock('@/lib/access/client', async (orig) => ({
@@ -326,6 +331,49 @@ describe('notificationActionButtons', () => {
 		expect(buttons[0]?.variant).toBe('primary');
 		buttons[0]?.run();
 		expect(mocks.navigateFocused).toHaveBeenCalledWith('/packages?filter=review');
+	});
+
+	it('fix.wsl_network offers the fix for its state, then Details', async () => {
+		const buttons = notificationActionButtons(
+			row({
+				kind: 'violation',
+				action: { kind: 'fix.wsl_network', distro: 'Ubuntu', state: 'dns_only' },
+			})
+		);
+		expect(buttons.map((b) => [b.label, b.variant])).toEqual([
+			['Repair DNS', 'primary'],
+			['Details', 'ghost'],
+		]);
+		buttons[0]?.run();
+		await vi.waitFor(() => expect(mocks.requestWslFix).toHaveBeenCalledWith('repair_dns', 'Ubuntu'));
+		buttons[1]?.run();
+		expect(mocks.navigateFocused).toHaveBeenCalledWith('/settings/engines');
+	});
+
+	it('fix.wsl_network for the default distro asks for "default", never null', async () => {
+		mocks.requestWslFix.mockClear();
+		const buttons = notificationActionButtons(
+			row({
+				kind: 'violation',
+				action: { kind: 'fix.wsl_network', distro: null, state: 'no_route' },
+			})
+		);
+		expect(buttons[0]?.label).toBe('Restart WSL networking (needs admin)');
+		buttons[0]?.run();
+		await vi.waitFor(() =>
+			expect(mocks.requestWslFix).toHaveBeenCalledWith('restart_networking', 'default')
+		);
+	});
+
+	it('a resolved fix.wsl_network row (WSL came back) offers nothing', () => {
+		const buttons = notificationActionButtons(
+			row({
+				kind: 'violation',
+				resolvedAt: 5,
+				action: { kind: 'fix.wsl_network', distro: 'Ubuntu', state: 'wsl_down' },
+			})
+		);
+		expect(buttons).toEqual([]);
 	});
 
 	it('invite with no action yet (no D-05 producer) still offers Open People', () => {

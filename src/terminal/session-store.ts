@@ -19,6 +19,8 @@ import { Pty } from './pty-bridge';
 import { attachCapture } from './pty-output-buffer';
 import { acquirePty, disposePty, getPty } from './pty-registry';
 import { buildSpawnOpts } from './spawn-opts';
+import { createNetworkErrnoScanner } from '@/lib/wsl-health/errno';
+import { isWslTab, wslTabDistro } from '@/lib/wsl-health/tabs';
 import type { HookEventPayload } from './tool-call-feed';
 
 const STORAGE_KEY = 'terminal.tabs';
@@ -328,6 +330,15 @@ export function openTabPty(tab: TerminalTab, opts: { forceEphemeral?: boolean } 
 			// their hooks to the live bridge. Failure is non-fatal: the session
 			// falls back to running without live telemetry.
 			await loadClaudeSettingsPath().catch(() => {});
+			// WP-2 (D-7): probe WSL's network before a WSL launch (cached 30 s).
+			// Fire-and-forget — it only feeds the pane banner, never gates or
+			// fails the spawn. Lazy so this store doesn't load the query layer.
+			if (isWslTab(tab)) {
+				const distro = wslTabDistro(tab);
+				void import('@/lib/wsl-health/query')
+					.then((m) => m.prelaunchWslProbe(distro))
+					.catch(() => {});
+			}
 			const spawnOpts = buildSpawnOpts(tab, tab.id);
 			// `forceEphemeral`: an in-process PTY Rust can see (a seat's terminal,
 			// G-SEATS P-10), never the daemon.
@@ -335,7 +346,24 @@ export function openTabPty(tab: TerminalTab, opts: { forceEphemeral?: boolean } 
 		},
 		(pty) => {
 			const store = useTerminalStore.getState();
+			// WP-2 (D-7): a WSL tab printing a network errno (EAI_AGAIN, …)
+			// forces a WSL health probe (debounced, once per episode). A
+			// passive tee like `attachCapture` below: it renders nothing, and
+			// the replay-buffer retention rule (pty-bridge.ts) is unchanged —
+			// the capture is already a non-rendering subscriber.
+			let offErrno: (() => void) | null = null;
+			if (isWslTab(tab)) {
+				const distro = wslTabDistro(tab);
+				offErrno = pty.onData(
+					createNetworkErrnoScanner(() => {
+						void import('@/lib/wsl-health/query')
+							.then((m) => m.reportWslNetworkErrno(distro))
+							.catch(() => {});
+					})
+				);
+			}
 			pty.onExit((code) => {
+				offErrno?.();
 				// Drop the dead PTY from the registry so a click-to-respawn finds
 				// a clean slate, and forget its resume id.
 				disposePty(tab.id);
