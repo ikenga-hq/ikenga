@@ -4347,6 +4347,18 @@ export interface DetectedAgent {
 	/** Human-readable hint when `authed === false` or probe was inconclusive. */
 	auth_hint: string | null;
 	capabilities: AgentCapabilities;
+	/** Present only when detection couldn't check for this agent at all —
+	 *  today, WSL couldn't be asked (D-10). Such an agent is neither installed
+	 *  nor missing: `version` / `authed` are null and it is not runnable.
+	 *  Absent on older daemons and on every agent that was checked. */
+	unavailable?: AgentUnavailable | null;
+}
+
+/** Why detection couldn't check an agent. `kind` names the dependency that
+ *  failed (`'wsl'` today); `reason` is the probe's own detail. */
+export interface AgentUnavailable {
+	kind: 'wsl' | (string & {});
+	reason: string;
 }
 
 export interface AgentConfigInventory {
