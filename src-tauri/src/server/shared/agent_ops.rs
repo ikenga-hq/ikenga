@@ -191,7 +191,8 @@ pub(crate) fn err_value(code: &str, status: Option<u16>, error: impl Into<String
 /// The body of the desktop's `agent_ops_run_now` (which passes
 /// `platform::home_dir()`), moved here unchanged in WP-19 slice 6 so the
 /// daemon's approve-gate arms can wake the mutation worker rooted at the
-/// router home. The daemon never passes a caller-supplied `job_id`.
+/// router home. The daemon's `agent_ops_run_now` arm passes a caller-supplied
+/// `job_id` only after checking it names one of the principal's own jobs.
 pub(crate) async fn run_now(home_dir: Option<&Path>, job_id: &str) -> Result<Value, String> {
     // SECURITY: the id becomes a path segment of a POST that carries the
     // daemon's secret. Validate + encode it before reading the lock or touching

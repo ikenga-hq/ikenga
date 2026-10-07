@@ -13,7 +13,9 @@
 import { PackageX, RefreshCw, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { FeedbackState } from '@/components/ui/feedback-state';
+import { desktopOnlyReason } from '@/lib/desktop-only';
 import {
+	isRecordsUnavailableIssue,
 	pkgHealthRemove,
 	pkgHealthRemoveAll,
 	pkgHealthScan,
@@ -39,18 +41,25 @@ function kindLabel(kind: PkgHealthIssueKind): string {
 			return 'failed to load';
 		case 'register_failed':
 			return 'not registered';
+		case 'pkgs_dir_duplicate':
+			return 'duplicate, not served';
+		case 'records_unavailable':
+			return 'not available on this server';
 	}
 }
 
-/** Orphan rows are lower-severity (no parent to break); broken installs are
- *  the loud case. */
-function kindTone(kind: PkgHealthIssueKind): 'broken' | 'orphan' {
-	return kind.kind === 'orphan_row' ? 'orphan' : 'broken';
+/** Orphan rows and ignored duplicates are lower-severity (nothing is
+ *  broken); broken installs are the loud case. The daemon's
+ *  `records_unavailable` row is no issue at all — a statement about the scan. */
+function kindTone(kind: PkgHealthIssueKind): 'broken' | 'orphan' | 'info' {
+	if (isRecordsUnavailableIssue(kind)) return 'info';
+	return kind.kind === 'orphan_row' || kind.kind === 'pkgs_dir_duplicate' ? 'orphan' : 'broken';
 }
 
 const TONE_CLASSES: Record<string, string> = {
 	broken: 'border-destructive/40 bg-destructive/10 text-destructive',
 	orphan: 'border-border bg-muted/40 text-muted-foreground',
+	info: 'border-border bg-muted/20 text-muted-foreground',
 };
 
 function KindBadge({ kind }: { kind: PkgHealthIssueKind }) {
@@ -83,8 +92,15 @@ export function PkgHealthPanel() {
 		onSuccess: () => qc.invalidateQueries({ queryKey: ['pkg'] }),
 	});
 
-	const rows: PkgHealthIssue[] = healthQuery.data ?? [];
+	const scanRows: PkgHealthIssue[] = healthQuery.data ?? [];
+	// The headless daemon leads its scan with one `records_unavailable` row:
+	// install records are not checked there. Informational — never counted,
+	// never "broken", never removable — and shown apart from the issues.
+	const recordsUnavailable = scanRows.find((r) => isRecordsUnavailableIssue(r.issue)) ?? null;
+	const rows = scanRows.filter((r) => !isRecordsUnavailableIssue(r.issue));
 	const busy = removeMut.isPending || removeAllMut.isPending;
+	// Removal is desktop-only: the headless daemon serves no pkg_health_remove*.
+	const removeDisabled = desktopOnlyReason();
 
 	return (
 		<div className="space-y-6 p-6">
@@ -111,7 +127,8 @@ export function PkgHealthPanel() {
 							size="sm"
 							variant="ghost"
 							className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-							disabled={busy}
+							disabled={busy || removeDisabled !== false}
+							title={removeDisabled || undefined}
 							onClick={() => removeAllMut.mutate()}
 						>
 							<Trash2 className="mr-1 h-3.5 w-3.5" />
@@ -131,6 +148,16 @@ export function PkgHealthPanel() {
 			</div>
 
 			{healthQuery.isLoading && <FeedbackState variant="loading" heading="Scanning installs…" />}
+			{recordsUnavailable && (
+				<div
+					className="flex items-center gap-2 rounded-sm border border-border bg-muted/20 px-3 py-2 text-[11.5px] text-muted-foreground"
+					role="status"
+					data-records-unavailable
+				>
+					<KindBadge kind={recordsUnavailable.issue} />
+					<span>{recordsUnavailable.detail}</span>
+				</div>
+			)}
 			{healthQuery.error && (
 				<FeedbackState
 					variant="error"
@@ -138,7 +165,7 @@ export function PkgHealthPanel() {
 					body={(healthQuery.error as Error).message}
 				/>
 			)}
-			{!healthQuery.isLoading && rows.length === 0 && (
+			{!healthQuery.isLoading && !healthQuery.error && rows.length === 0 && !recordsUnavailable && (
 				<FeedbackState
 					variant="empty"
 					heading="All installs healthy."
@@ -167,7 +194,11 @@ export function PkgHealthPanel() {
 						</thead>
 						<tbody className="divide-y divide-border">
 							{rows.map((r) => (
-								<tr key={`${r.id}:${r.issue.kind}`} className="bg-background hover:bg-muted/20">
+								<tr
+									key={`${r.id}:${r.issue.kind}:${r.install_path}`}
+									className="bg-background hover:bg-muted/20"
+									data-row={r.id}
+								>
 									<td className="max-w-[180px] px-3 py-2">
 										<div className="truncate font-mono text-[11px] text-foreground">{r.id}</div>
 										{r.install_path && (
@@ -190,7 +221,9 @@ export function PkgHealthPanel() {
 									<td className="px-3 py-2 text-right">
 										<button
 											type="button"
-											disabled={busy}
+											disabled={busy || removeDisabled !== false}
+											title={removeDisabled || undefined}
+											data-remove={r.id}
 											onClick={() => removeMut.mutate(r.id)}
 											className="inline-flex items-center gap-1 rounded-sm border border-border bg-background px-2 py-0.5 font-mono text-[11px] text-muted-foreground hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive disabled:opacity-50"
 										>

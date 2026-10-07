@@ -9,7 +9,7 @@
 import { useState, useMemo } from 'react';
 import { ChevronRight, X, Layers, Search } from 'lucide-react';
 import type { NgwaItem } from '@ikenga/contract';
-import { resolveTrustFacet } from '@/lib/ngwa/enrichment';
+import { resolveTrustFacet, trustFacetLabel } from '@/lib/ngwa/enrichment';
 
 export interface NgwaFacetsState {
 	kind: string; // '*' or NgwaKind
@@ -75,6 +75,12 @@ const TRUSTS: Array<{ id: string; label: string }> = [
 	{ id: 'unsigned', label: 'unsigned' },
 	{ id: 'review', label: 'review' },
 ];
+
+/** Pkgs whose trust the host never evaluated (the headless daemon). Not one
+ *  of the four D-02 values, so it is offered only when some item carries it
+ *  (or it is the active filter) — the desktop bar is unchanged — and then
+ *  those pkgs are counted honestly instead of vanishing from every chip. */
+const TRUST_UNAVAILABLE = { id: 'unavailable', label: trustFacetLabel('unavailable') };
 
 const USAGES: Array<{ id: string; label: string }> = [
 	{ id: '*', label: 'all' },
@@ -201,7 +207,7 @@ export function NgwaFacetBar({ items, facets, onChange }: NgwaFacetBarProps) {
 		}
 
 		const trustCounts: Record<string, number> = {};
-		for (const tr of TRUSTS) {
+		for (const tr of [...TRUSTS, TRUST_UNAVAILABLE]) {
 			trustCounts[tr.id] = items.filter(
 				(it) => (tr.id === '*' || resolveTrustFacet(it.trust) === tr.id) && matchExcept(it, 'trust')
 			).length;
@@ -228,6 +234,15 @@ export function NgwaFacetBar({ items, facets, onChange }: NgwaFacetBarProps) {
 			usage: usageCounts,
 		};
 	}, [items, facets]);
+
+	const trustOptions = useMemo(
+		() =>
+			facets.trust === TRUST_UNAVAILABLE.id ||
+			items.some((it) => resolveTrustFacet(it.trust) === TRUST_UNAVAILABLE.id)
+				? [...TRUSTS, TRUST_UNAVAILABLE]
+				: TRUSTS,
+		[items, facets.trust]
+	);
 
 	return (
 		<div className="facetbar" data-ifacets>
@@ -313,7 +328,7 @@ export function NgwaFacetBar({ items, facets, onChange }: NgwaFacetBarProps) {
 
 					<div className="frow2">
 						<span className="flabel">Trust</span>
-						{TRUSTS.map((tr) => {
+						{trustOptions.map((tr) => {
 							const on = facets.trust === tr.id;
 							const cnt = counts.trust[tr.id] ?? 0;
 							return (
@@ -322,6 +337,7 @@ export function NgwaFacetBar({ items, facets, onChange }: NgwaFacetBarProps) {
 									type="button"
 									className={`chip ${on ? 'on' : ''}`}
 									aria-pressed={on}
+									data-trust-facet={tr.id}
 									disabled={cnt === 0 && !on}
 									onClick={() => onChange({ ...facets, trust: on && tr.id !== '*' ? '*' : tr.id })}
 								>

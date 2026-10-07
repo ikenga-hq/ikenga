@@ -29,6 +29,7 @@ use serde_json::Value;
 use tokio::sync::OnceCell;
 use tracing::warn;
 
+use super::events::Topic;
 use super::rpc::RpcResponse;
 use super::rpc_shell::targ;
 use super::shared::chi::OutputFiles;
@@ -158,8 +159,11 @@ pub(super) fn supabase_config_clear(state: &AppState) -> RpcResponse {
 // ─── Settings ────────────────────────────────────────────────────────────────
 
 /// The daemon's `SettingsManager`: the desktop's, rooted at `--data-dir`
-/// (`ikenga.db` for `settings_kv`, `screenshot-config.json`) with no change
-/// notifier — so no `settings://changed` emits and no file watchers.
+/// (`ikenga.db` for `settings_kv`, `screenshot-config.json`). Its notifier
+/// (the router passes `server::events::settings_notifier`) publishes
+/// `settings://changed` after the manager's own writes, as the desktop's
+/// does; it starts no file watchers, so a hand edit on the server is seen by
+/// the next read rather than announced.
 ///
 /// Initialized on first use, not at boot: `PaDb` is lazy so a daemon nobody
 /// queries never touches `ikenga.db`, and `initialize` opens it (and runs the
@@ -173,11 +177,25 @@ pub(crate) struct DaemonSettings {
 }
 
 impl DaemonSettings {
-    pub(crate) fn new(db: Arc<PaDb>, data_dir: PathBuf, home: PathBuf) -> Self {
+    pub(crate) fn new(
+        db: Arc<PaDb>,
+        data_dir: PathBuf,
+        home: PathBuf,
+        notifier: Option<crate::server::shared::settings::ChangeNotifier>,
+    ) -> Self {
         Self {
-            manager: SettingsManager::with_notifier(None, db, data_dir, home),
+            manager: SettingsManager::with_notifier(notifier, db, data_dir, home)
+                .without_file_watchers(),
             ready: OnceCell::new(),
         }
+    }
+
+    /// `workspace.notifications.mutedKinds`, for the `muted` flag the event
+    /// bus stamps on `notifications://changed` (`server::events`).
+    pub(crate) async fn muted_kinds(
+        &self,
+    ) -> Vec<crate::server::shared::notifications::NotificationKind> {
+        crate::server::shared::notifications::mute::muted_kinds(self.manager().await)
     }
 
     async fn manager(&self) -> &SettingsManager {
@@ -312,12 +330,9 @@ pub(super) fn backup_delete(state: &AppState, args: &Value) -> RpcResponse {
 /// An unknown pkg is the desktop's answer: `schema: null` + whatever rows the
 /// table holds for that id — not an error.
 ///
-/// `pkg_settings_set` is NOT served (see `desktop_only.toml`):
-/// `pkg_settings.pkg_id` REFERENCES `pkg_installed(id)` and sqlx enforces
-/// foreign keys, so an upsert needs an installed row — which the daemon, which
-/// installs nothing, never has. On a daemon `ikenga.db` the stored rows here
-/// are therefore whatever the file already holds; normally none, so `values`
-/// is the manifest defaults.
+/// The stored rows are those `pkg_settings_set` (`server::rpc_exec`) wrote
+/// to this daemon's `ikenga.db` — under T1, the principal's own — over the
+/// manifest defaults.
 pub(super) async fn pkg_settings_get(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let pkg_id = req_str(args, &["pkgId", "pkg_id"])?;
@@ -365,7 +380,7 @@ impl DaemonChi {
 /// router home as the default cwd, output files confined to the cache dir,
 /// and `~`-only cwd expansion (this process's env holds the operator's
 /// `IKENGA_SECRET_*` defaults).
-fn chi_env(state: &AppState) -> Result<chi_exec::ChiEnv, String> {
+pub(super) fn chi_env(state: &AppState) -> Result<chi_exec::ChiEnv, String> {
     let db = state
         .pa_db
         .clone()
@@ -507,9 +522,10 @@ pub(super) async fn chi_list(state: &AppState, args: &Value) -> RpcResponse {
 // manages the same `~/.atelier/skill-agent-ops/jobs.json`; under T1 this must
 // be the calling principal's home. Each core resolves `{ ok, ... }` exactly
 // as the desktop command does (a missing home is its `io_error`), so these
-// are RPC successes carrying that value. `agent_ops_run_now` is not served
-// (see `desktop_only.toml`); the approve gate's hardcoded mutation-worker wake
-// below is the only daemon caller of `agent_ops::run_now`.
+// are RPC successes carrying that value. `agent_ops_run_now` lives in
+// `server::rpc_exec`, confined to the principal's own jobs and agent-ops
+// daemon; the approve gate's hardcoded mutation-worker wake below is the other
+// daemon caller of `agent_ops::run_now`.
 //
 // A fresh host has no `jobs.json` (gap audit 2026-10-06 rank 12), so list and
 // upsert pass `MissingConfig::Empty`: an empty list, and the first upsert
@@ -663,11 +679,10 @@ pub(super) fn os_username() -> RpcResponse {
 // Over `server::shared::{pa_actions, pkg_db}` — the cores the desktop commands
 // call — and the daemon's `ikenga.db`; without `--data-dir` each is `NO_DB`.
 //
-// **No events.** After the same writes the desktop emits `pa-action-paused`,
-// `pa-action-committed`, `pa-action-retried` and `pa-action-rejected`. The
-// daemon has no event channel (the web transport's `listen()` is a no-op), so
-// these arms change the same rows and emit nothing; `/outbox/approvals` polls
-// `pa_actions_list`, and the FE invalidates on each call's own result.
+// **Events.** After the same writes the desktop emits `pa-action-paused`,
+// `pa-action-committed`, `pa-action-retried` and `pa-action-rejected`; these
+// arms publish the same names and payloads on the daemon's event bus
+// (`server::events`, delivered over `/ws/events`).
 //
 // **The wake.** Commit and retry then wake the mutation worker the way the
 // desktop does: a detached, fire-and-forget POST to the local agent-ops
@@ -693,7 +708,12 @@ pub(super) async fn pa_actions_pause(state: &AppState, args: &Value) -> RpcRespo
         let batch_id: String = targ(args, &["batchId", "batch_id"])?;
         let action_id: String = targ(args, &["actionId", "action_id"])?;
         let drafts: Vec<pa_actions::PaPauseDraftInput> = targ(args, &["drafts"])?;
-        pa_actions::pause(pa_db(state)?, &batch_id, &action_id, &drafts).await
+        let count = pa_actions::pause(pa_db(state)?, &batch_id, &action_id, &drafts).await?;
+        state.events.publish(
+            Topic::PaActionPaused,
+            pa_actions::PaActionPausedEvent { batch_id, count },
+        );
+        Ok(count)
     }
     .await;
     respond_named("pa_actions_pause", r)
@@ -725,9 +745,9 @@ pub(super) async fn pa_actions_update(state: &AppState, args: &Value) -> RpcResp
 pub(super) async fn pa_actions_commit(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let draft_id: String = targ(args, &["draftId", "draft_id"])?;
-        // The returned row is the desktop's `pa-action-committed` payload;
-        // there is no channel to emit it on here.
-        pa_actions::commit(pa_db(state)?, &draft_id).await?;
+        // The returned row is the desktop's `pa-action-committed` payload.
+        let committed = pa_actions::commit(pa_db(state)?, &draft_id).await?;
+        state.events.publish(Topic::PaActionCommitted, committed);
         drop(pa_actions::wake_send_worker(state.home.clone()));
         Ok(())
     }
@@ -740,6 +760,10 @@ pub(super) async fn pa_actions_retry(state: &AppState, args: &Value) -> RpcRespo
         let draft_id: String = targ(args, &["draftId", "draft_id"])?;
         pa_actions::retry(pa_db(state)?, &draft_id).await?;
         drop(pa_actions::wake_send_worker(state.home.clone()));
+        state.events.publish(
+            Topic::PaActionRetried,
+            serde_json::json!({ "draftId": draft_id }),
+        );
         Ok(())
     }
     .await;
@@ -749,7 +773,12 @@ pub(super) async fn pa_actions_retry(state: &AppState, args: &Value) -> RpcRespo
 pub(super) async fn pa_actions_reject(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let draft_id: String = targ(args, &["draftId", "draft_id"])?;
-        pa_actions::reject(pa_db(state)?, &draft_id).await
+        pa_actions::reject(pa_db(state)?, &draft_id).await?;
+        state.events.publish(
+            Topic::PaActionRejected,
+            pa_actions::PaActionRejectedEvent { draft_id },
+        );
+        Ok(())
     }
     .await;
     respond("pa_actions_reject", r)

@@ -13,6 +13,7 @@
 // the kernel default and let the consumer code degrade gracefully.)
 
 import { type PkgKernelStatus, pkgInstallFromPath, pkgKernelStatus } from '@/lib/tauri-cmd';
+import { honestRpcError } from '@/lib/transport/unavailable';
 
 import { findCatalogEntry, ONBOARDING_PKG_CATALOG } from './pkg-catalog';
 
@@ -91,7 +92,7 @@ export async function triggerPkgInstalls(input: InstallQueueInput): Promise<PkgI
 				display,
 				ok: false,
 				skipped: false,
-				error: (err as Error).message ?? String(err),
+				error: honestRpcError(err),
 			});
 		}
 	}

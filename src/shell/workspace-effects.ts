@@ -12,18 +12,20 @@ import { initOsFileDrop } from '@/lib/dnd/os-file-drop';
 import { useIykeBridge } from '@/lib/iyke/bridge';
 import { useIykeControlListener } from '@/lib/iyke/control-listener';
 import { useIykeShellSync } from '@/lib/iyke/use-iyke-shell-sync';
-import { loadPaneTree, persistPaneTree } from '@/lib/panes/pane-persistence';
+import { loadPaneTree, persistPaneTree, type PaneTreeSnapshot } from '@/lib/panes/pane-persistence';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { useRouterPaneSync } from '@/lib/panes/router-pane-sync';
+import { applyBootDeepLink, urlPathForView } from '@/lib/panes/url-sync';
 import { loadPanelSizes, registerPanelSizesSetter } from '@/lib/shell/panel-sizes';
 import { useProjectsSync } from '@/lib/shell/use-projects-sync';
+import { useRemoteConfigFocusRefetch } from '@/lib/queries/claude-config';
 import { usePaActionsListener } from '@/lib/use-pa-actions';
 import { usePreloadViewers } from '@/lib/use-preload-viewers';
 import { useScreenshotListener } from '@/lib/use-screenshot-listener';
 import { installUnloadGuard } from '@/lib/window/unload-guard';
 import { loadClaudeSettingsPath } from '@/terminal/claude-settings';
 import { useTerminalStore } from '@/terminal/session-store';
-import { isTauri } from '@/lib/transport';
+import { isRemoteWebSession, isTauri } from '@/lib/transport';
 
 /**
  * `useIykeShellSync` on the desktop, a no-op anywhere else (gap audit rank
@@ -43,6 +45,22 @@ function noop(): void {}
 
 const useDesktopIykeShellSync = pickIykeShellSync();
 
+/**
+ * Hydrate the pane store from the restored layout. In a remote web session
+ * the first pane opened the page URL's route before the saved layout
+ * arrived; keep that deep link over the restored layout (url-sync.ts). The
+ * link is read from the store at hydrate time, so a navigation made while
+ * the layout loaded survives too. Desktop hydrates the snapshot as saved.
+ */
+export function hydrateRestoredLayout(
+	snapshot: PaneTreeSnapshot,
+	web: boolean = isRemoteWebSession()
+): void {
+	const store = usePaneStore.getState();
+	const deepLink = web ? urlPathForView(store.focusedView()) : null;
+	store.hydrate(applyBootDeepLink(snapshot, deepLink));
+}
+
 export function useWorkspaceEffects(
 	setInitialSizes: Dispatch<SetStateAction<[number, number] | null>>
 ) {
@@ -58,6 +76,9 @@ export function useWorkspaceEffects(
 	// Phase A: console + fetch shims, DOM/click/type/key/wait/query-cache
 	// listeners. Mount once at workspace level only.
 	useIykeBridge();
+	// Browser sessions only: refetch Claude-config queries on window focus (no
+	// server-side watcher events yet).
+	useRemoteConfigFocusRefetch();
 	// Warm the `--settings` path so the first `claude` terminal already carries
 	// it. `buildAgentArgs` is synchronous, so it can only read a primed value;
 	// unprimed it omits the flag and the session loses the shell's live view.
@@ -189,7 +210,7 @@ export function useWorkspaceEffects(
 			if (cancelled) return;
 			const snapshot = await raceTimeout(loadPaneTree(), 2000, 'loadPaneTree');
 			if (cancelled) return;
-			if (snapshot) usePaneStore.getState().hydrate(snapshot);
+			if (snapshot) hydrateRestoredLayout(snapshot);
 			unsubPersist = usePaneStore.subscribe((state) => {
 				persistPaneTree({
 					root: state.root,

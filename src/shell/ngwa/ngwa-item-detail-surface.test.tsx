@@ -355,3 +355,71 @@ describe('NgwaItemDetailSurface (WP-17 / D-08)', () => {
 		expect(screen.queryByRole('tab', { name: 'Flow' })).toBeNull();
 	});
 });
+
+describe('NgwaItemDetailSurface — trust the server never evaluated', () => {
+	it('Permissions reads "Not available on this server": no unsigned/untrusted claim, no approve/revoke, no "sandboxed"', () => {
+		const REASON = 'trust evaluation is not available on this server: no trust store';
+		const item = makeItem({
+			id: 'com.x.app',
+			name: 'com.x.app',
+			trust: {
+				state: 'not_applicable',
+				signed: false,
+				auto_trusted: false,
+				review_pending: false,
+				perms: null,
+				last_granted_at_ms: null,
+				unavailable: REASON,
+			} as NgwaItem['trust'],
+		});
+		const { container } = renderWithClient(<NgwaItemDetailSurface item={item} />);
+		fireEvent.click(screen.getByRole('tab', { name: 'Permissions' }));
+		const note = container.querySelector('[data-trust-unavailable]') as HTMLElement;
+		expect(note.textContent).toContain('Not available on this server');
+		expect(note.textContent).toContain(REASON);
+		expect(container.querySelector('.badge.t-unsigned')).toBeNull();
+		for (const badge of container.querySelectorAll('.badge')) {
+			expect(badge.textContent).not.toMatch(/unsigned|untrusted/i);
+		}
+		expect(container.textContent).not.toContain('Runs fully sandboxed');
+		expect(screen.queryByRole('button', { name: /Revoke trust|Approve permissions/ })).toBeNull();
+		// No manifest perms: unknown, never "none requested".
+		expect(note.textContent).toContain('declared permissions are unknown');
+		expect(container.querySelector('[data-perms-heading]')).toBeNull();
+	});
+
+	it('Permissions shows what the manifest DECLARES, marked not evaluated, with no approve/revoke', () => {
+		const REASON = 'trust evaluation is not available on this server: no trust store';
+		const item = makeItem({
+			id: 'com.x.app',
+			name: 'com.x.app',
+			trust: {
+				state: 'not_applicable',
+				signed: false,
+				auto_trusted: false,
+				review_pending: false,
+				perms: {
+					shell_execute: ['git *'],
+					fs_write_outside_sandbox: ['$home/out/**'],
+					net: [],
+					vault_keys: [],
+				},
+				last_granted_at_ms: null,
+				unavailable: REASON,
+			} as NgwaItem['trust'],
+		});
+		const { container } = renderWithClient(<NgwaItemDetailSurface item={item} />);
+		fireEvent.click(screen.getByRole('tab', { name: 'Permissions' }));
+		expect(container.querySelector('[data-trust-unavailable]')?.textContent).toContain(
+			'nothing here evaluated or approved it'
+		);
+		expect(container.querySelector('[data-perms-heading]')?.textContent).toBe(
+			'Sensitive permissions declared in the manifest — not evaluated (2)'
+		);
+		const list = container.querySelector('[data-perms-declared]') as HTMLElement;
+		expect(list.textContent).toContain('shell:exec · git *');
+		expect(list.textContent).toContain('fs:write · $home/out/**');
+		expect(container.textContent).not.toContain('Runs fully sandboxed');
+		expect(screen.queryByRole('button', { name: /Revoke trust|Approve permissions/ })).toBeNull();
+	});
+});

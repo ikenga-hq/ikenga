@@ -7,6 +7,8 @@ import {
 	formatUsageDisplay,
 	formatUsageTooltip,
 	resolveTrustFacet,
+	markTrustUnavailable,
+	trustFacetLabel,
 	buildStoreCatalog,
 	mergeCatalogIntoStore,
 	registryMatchesCatalog,
@@ -472,5 +474,43 @@ describe('R57 · mergeCatalogIntoStore (Q2: one row per name)', () => {
 			[vaultEntry('design-language', { version: '3e1a9c0ffff', fromCatalog: false })]
 		);
 		expect(primitives[0].isUpdate).toBe(false);
+	});
+});
+
+describe('trust the server never evaluated (the headless daemon)', () => {
+	const NA: NgwaTrust = {
+		state: 'not_applicable',
+		signed: false,
+		auto_trusted: false,
+		review_pending: false,
+		perms: null,
+		last_granted_at_ms: null,
+	};
+	const REASON = 'trust evaluation is not available on this server: no trust store';
+
+	it('marks pkg items "unavailable" — never "unsigned" — and leaves primitives alone', () => {
+		const pkg = makeItem({ id: 'com.x.app', name: 'com.x.app', kind: 'app', trust: NA });
+		const skill = makeItem({ id: 'skill:personal:tidy', name: 'tidy', trust: NA });
+		expect(resolveTrustFacet(pkg.trust)).toBe('unsigned');
+
+		const [p, s] = markTrustUnavailable([pkg, skill], REASON);
+		expect(resolveTrustFacet(p.trust)).toBe('unavailable');
+		expect(trustFacetLabel(resolveTrustFacet(p.trust))).toBe('not available on this server');
+		expect(s).toBe(skill);
+	});
+
+	it('is a no-op when trust was evaluated (the desktop)', () => {
+		const items = [makeItem({ id: 'com.x.app', name: 'com.x.app', kind: 'app', trust: NA })];
+		expect(markTrustUnavailable(items, null)).toBe(items);
+	});
+
+	it('never overrides an evaluated state', () => {
+		const granted = makeItem({
+			id: 'com.x.app',
+			name: 'com.x.app',
+			kind: 'app',
+			trust: { ...NA, state: 'granted', signed: true },
+		});
+		expect(markTrustUnavailable([granted], REASON)[0]).toBe(granted);
 	});
 });

@@ -48,6 +48,15 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("fs_mime", req!(shared[Files])),
     ("fs_search", req!(shared[Files])),
     ("fs_roots_list", req!(owner[Files])),
+    // Gap audit 2026-10-06 rank 1 (user decision 2026-10-07): each principal
+    // edits its own allowlist, in its own child; the broker routes an
+    // admin's edit of another principal's (`broker::fs_roots_admin`). This
+    // supersedes §1.6's pending `operator` default, which no T1 principal
+    // could ever reach. `settings` limits it to the owner's password
+    // session, the T0 host bearer, or a `full` device (P-26 strength).
+    ("fs_roots_add", req!(owner[Files, Settings])),
+    ("fs_roots_remove", req!(owner[Files, Settings])),
+    ("fs_roots_reset", req!(owner[Files, Settings])),
     ("fs_home", req!(owner[Files])),
     // ── fs write (P-2: files + dispatch) ──
     ("fs_write", req!(shared[Files, Dispatch])),
@@ -67,6 +76,8 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("pkg_activity_bar_set_badge", req!(shared[Files])),
     ("pkg_trust_list_pending", req!(shared[Files])),
     ("pkg_is_trusted_for_elevated", req!(shared[Files])),
+    ("pkg_trust_list", req!(shared[Files])),
+    ("pkg_health_scan", req!(shared[Files])),
     // ── secrets ──
     ("secrets_get", req!(owner[Secrets])),
     ("secrets_get_scoped", req!(owner[Secrets])),
@@ -111,6 +122,20 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("chi_run", req!(owner[Dispatch])),
     ("chi_resume", req!(owner[Dispatch])),
     ("chi_cancel", req!(owner[Dispatch])),
+    // ── Chi seats (owner-class: a share never reaches the seat store) ──
+    ("seats_list", req!(owner[Sessions])),
+    ("seats_get", req!(owner[Sessions])),
+    ("seats_engines", req!(owner[Sessions])),
+    ("seats_resolve", req!(owner[Dispatch])),
+    ("seats_create", req!(owner[Dispatch])),
+    ("seats_move", req!(owner[Dispatch])),
+    ("seats_resume", req!(owner[Dispatch])),
+    ("seats_fill", req!(owner[Dispatch])),
+    ("seats_queue", req!(owner[Dispatch])),
+    ("seats_clear", req!(owner[Dispatch])),
+    ("seats_rename", req!(owner[Dispatch])),
+    ("seats_remove", req!(owner[Dispatch])),
+    ("seats_release", req!(owner[Dispatch])),
     ("agent_ops_list_jobs", req!(owner[Sessions])),
     ("agent_ops_tail_run", req!(owner[Sessions])),
     ("agent_ops_upsert_job", req!(owner[Settings, Dispatch])),
@@ -199,6 +224,9 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("oba_set_auto_update", req!(owner[Install])),
     ("oba_relink_dependents", req!(owner[Install])),
     ("oba_unlink_one", req!(owner[Install])),
+    // ── Ngwa snapshot: reads the Owner's personal `~/.claude` scan (as
+    // `claude_config_load` does), so owner-class like it ──
+    ("ngwa_snapshot", req!(owner[Files])),
     // ── actions / trust ──
     ("actions_read_files", req!(shared[Files])),
     ("actions_trust_status", req!(shared[Files])),
@@ -227,6 +255,15 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("pkg_preview_manifest", req!(owner[Files])),
     ("pkg_discover_workspace", req!(owner[Files])),
     ("pkg_scaffold", req!(owner[Install])),
+    // ── executor-routed + pkg settings (gap audit 2026-10-06 ranks 21/23/20).
+    // Owner-class: each spawns (or writes the pkg config) as the serving
+    // principal, and neither a sidecar's inputs, an action's run, a pin's
+    // PTY / chi run nor an agent-ops job is share-root-confined. ──
+    ("pkg_sidecar_call", req!(owner[Dispatch])),
+    ("action_exec", req!(owner[Dispatch])),
+    ("comment_route", req!(owner[Dispatch])),
+    ("agent_ops_run_now", req!(owner[Dispatch])),
+    ("pkg_settings_set", req!(owner[Settings])),
     // ── New (§9): G-ACCESS's own arms (WP-74a registers; W3–W5 fill) ──
     ("access_status", req!(access)),
     ("access_devices_list", req!(access)),
@@ -274,8 +311,9 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
 /// Not arms yet, so they are NOT in [`RPC_REQUIREMENTS`] (A-1 refuses a row
 /// that names no arm). WP-21 served the four `secrets_*` lock verbs, which
 /// moved into the table above (X-1); `app_lock_*` stays desktop-only (its
-/// PIN record is `app-lock.json`, not the secrets store) and `fs_roots_*`
-/// is not WP-21's. Whichever WP serves one of these moves its row up.
+/// PIN record is `app-lock.json`, not the secrets store). `fs_roots_*` moved
+/// up when the gap-audit rank-1 work served it. Whichever WP serves one of
+/// these moves its row up.
 pub const PENDING_WP21: &[(&str, Requirement)] = &[
     ("app_lock_status", req!(owner[])),
     ("app_lock_clear_secret", req!(owner[Settings])),
@@ -285,9 +323,6 @@ pub const PENDING_WP21: &[(&str, Requirement)] = &[
     ("app_lock_touch", req!(owner[Settings])),
     ("app_lock_unlock", req!(owner[Settings])),
     ("app_lock_unlock_biometric", req!(owner[Settings])),
-    ("fs_roots_add", req!(operator)),
-    ("fs_roots_remove", req!(operator)),
-    ("fs_roots_reset", req!(operator)),
 ];
 
 /// The requirement for `cmd`; §1.6 rule 2 for an unmapped one.

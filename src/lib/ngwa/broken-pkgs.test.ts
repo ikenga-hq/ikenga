@@ -37,4 +37,26 @@ describe('broken pkgs (on disk, failed to register)', () => {
 		expect(out[0]!.broken).toBe('com.ikenga.meetings: pkgs_dir_unloadable');
 		expect(out[1]!.broken).toBeUndefined();
 	});
+
+	it('a duplicate pkgs-folder copy never marks the SERVED pkg broken (daemon)', () => {
+		// The daemon names the ignored copy by the id it shares with the served
+		// pkg; that pkg works, so the Store must not offer Reinstall for it.
+		const records: PkgHealthIssue = {
+			id: 'install-records',
+			install_path: '',
+			enabled: false,
+			issue: { kind: 'records_unavailable' },
+			detail: 'not available on this server',
+		};
+		const map = brokenPkgMap([
+			records,
+			{
+				...issue('com.ikenga.hello', { kind: 'pkgs_dir_duplicate', served_path: '/pkgs/hello' }),
+				install_path: '/pkgs/zz-dup',
+			},
+		]);
+		expect(map.size).toBe(0);
+		const out = markBrokenEntries([entry('@ikenga/pkg-hello')], map);
+		expect(out[0]!.broken).toBeUndefined();
+	});
 });
