@@ -18,6 +18,7 @@
 // The parser is stateful — escape sequences span chunks routinely.
 
 import {
+	isBrowserHost,
 	sendNotification,
 	isNotificationPermissionGranted,
 	requestNotificationPermission,
@@ -191,7 +192,9 @@ export async function fireOscNotification(note: OscNotification): Promise<void> 
 		if (!granted) {
 			granted = (await requestNotificationPermission()) === 'granted';
 		}
-		if (!granted) return;
+		// A browser without permission (or without the Notification API at all)
+		// still gets the message: `sendNotification` falls back to a toast.
+		if (!granted && !isBrowserHost()) return;
 		await sendNotification({ title: note.title, body: note.body });
 	} catch (err) {
 		// Notification rejection shouldn't crash the terminal pane.

@@ -393,6 +393,26 @@ pub struct ServeArgs {
     #[arg(long, env = "IKENGA_MEMBER_INVITES_CREATE_ACCOUNTS")]
     pub member_invites_create_accounts: bool,
 
+    /// Turn Web Push off: no VAPID key is used and nothing is sent to any
+    /// push service (plans/pwa). `IKENGA_PUSH=off` does the same.
+    #[arg(long)]
+    pub no_push: bool,
+
+    /// The contact in the VAPID `sub` claim (`mailto:you@example.com` or an
+    /// https URL). Default: an https `--public-url`, else https://ikenga.dev.
+    #[arg(long, env = "IKENGA_PUSH_CONTACT")]
+    pub push_contact: Option<String>,
+
+    /// Also allow push endpoints under this host suffix (repeatable). The
+    /// built-in list covers Google, Mozilla, Apple and Microsoft.
+    #[arg(long = "push-endpoint-host")]
+    pub push_endpoint_hosts: Vec<String>,
+
+    /// Allow push endpoints at exactly this origin, http loopback included
+    /// (repeatable). For a local end-to-end test only; warned at startup.
+    #[arg(long = "push-allow-endpoint", hide = true)]
+    pub push_allow_endpoints: Vec<String>,
+
     /// Internal: run as a T1 principal child (launched by the broker as the
     /// principal's uid, G-PRINCIPAL §3).
     #[arg(long, hide = true, requires = "expected_uid")]
@@ -572,6 +592,18 @@ async fn async_main(cli: CliArgs) -> anyhow::Result<()> {
         max_accounts: args.max_accounts,
         invite_ttl_days: args.invite_ttl,
         member_invites_create_accounts: args.member_invites_create_accounts,
+        push: ikenga_desktop_lib::server::push::PushOptions {
+            disabled: args.no_push
+                || std::env::var("IKENGA_PUSH").is_ok_and(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "off" | "0" | "false" | "no"
+                    )
+                }),
+            contact: args.push_contact,
+            endpoint_hosts: args.push_endpoint_hosts,
+            allow_endpoints: args.push_allow_endpoints,
+        },
     };
 
     run_server_with(config, t1).await
@@ -1300,6 +1332,22 @@ mod tests {
         assert_eq!(args.serve.max_accounts, None);
         assert_eq!(args.serve.invite_ttl, None);
         assert!(!args.serve.member_invites_create_accounts);
+        assert!(!args.serve.no_push);
+        assert!(args.serve.push_endpoint_hosts.is_empty());
+        let args = CliArgs::try_parse_from([
+            "ikenga-server",
+            "--no-push",
+            "--push-contact",
+            "ops@example.com",
+            "--push-endpoint-host",
+            "push.example.org",
+            "--push-endpoint-host",
+            "push2.example.org",
+        ])
+        .unwrap();
+        assert!(args.serve.no_push);
+        assert_eq!(args.serve.push_contact.as_deref(), Some("ops@example.com"));
+        assert_eq!(args.serve.push_endpoint_hosts.len(), 2);
         let args = CliArgs::try_parse_from([
             "ikenga-server",
             "--public-url",

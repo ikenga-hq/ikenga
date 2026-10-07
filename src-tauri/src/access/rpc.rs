@@ -163,6 +163,13 @@ pub async fn dispatch(
         "access_audit_export" => super::audit::export::dispatch(env, ctx, args).await,
         "access_audit_record_local" => super::audit::list::record_local(env, ctx, args).await,
         "access_audit_reseal" => super::audit::reseal::dispatch(env, ctx, args).await,
+        // Web Push (plans/pwa S2 §7).
+        "access_push_config"
+        | "access_push_subscribe"
+        | "access_push_update"
+        | "access_push_unsubscribe"
+        | "access_push_list"
+        | "access_push_test" => crate::server::push::rpc::dispatch(env, ctx, cmd, args).await,
         other => Err(AccessError::new(
             Code::NotFound,
             format!("no access command `{other}`"),

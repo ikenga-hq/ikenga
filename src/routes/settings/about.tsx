@@ -3,6 +3,7 @@
 //
 // Surface order:
 //   1. Header strip — shell name, current version, last check time, [Check now]
+//   1b. Server updates (browser admins / the T0 operator only, WP-P9)
 //   2. Available-update card (conditional) — vX → vY, release notes, [Update]
 //      → [Restart now] once installed, [Defer 24h]
 //   3. Changelog feed — last 20 releases, collapsible
@@ -18,6 +19,7 @@ import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import { Markdown } from '@/components/markdown';
 import { cn } from '@/components/ui/utils';
+import { useServerUpdate } from '@/lib/queries/server-update';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { isTauri } from '@/lib/transport';
 import {
@@ -29,6 +31,7 @@ import { useShellVersion } from '@/lib/updater/use-shell-version';
 import { useUpdater } from '@/lib/updater/use-updater';
 import { useUpdaterSnooze } from '@/lib/updater/snooze';
 
+import { ServerUpdatePanel } from './-components/server-update-panel';
 import { SettingGroup } from './-components/setting-group';
 import { SettingRow } from './-components/setting-row';
 import { formatRelative, UpdateStatus } from './-components/update-status';
@@ -44,6 +47,8 @@ function AboutPage() {
 	const matchingRelease = findReleaseByVersion(releases.data, updater.available?.version ?? '');
 	// The in-app updater is desktop-only; a browser session never checks.
 	const desktop = isTauri();
+	// WP-P9: a browser admin (T1) or the T0 operator may update the server.
+	const serverUpdate = useServerUpdate();
 
 	return (
 		<div className="mx-auto w-full max-w-[720px] space-y-5 px-6 py-6">
@@ -56,6 +61,8 @@ function AboutPage() {
 					onCheck={() => void updater.check()}
 				/>
 			</SettingGroup>
+
+			{!desktop && serverUpdate.data && <ServerUpdatePanel />}
 
 			<AutoUpdateSettings />
 
@@ -83,6 +90,7 @@ function AboutPage() {
 				available={!!updater.available}
 				checking={updater.checking}
 				lastCheckedAt={updater.lastCheckedAt}
+				serverUpdates={!!serverUpdate.data}
 			/>
 
 			<ChangelogFeed

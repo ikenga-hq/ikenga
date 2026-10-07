@@ -94,3 +94,13 @@ describe('dedupeInstallLog', () => {
 		expect(dedupeInstallLog('a\n\n\nb\n')).toBe('a\nb');
 	});
 });
+
+describe('unserved install (gap rank 3)', () => {
+	const raw = "Command 'oba_install_with_deps' not implemented in headless daemon";
+	it('says it is not available on this server instead of "couldn\'t be installed"', () => {
+		const c = classifyInstallError(new Error(raw), 'Foo');
+		expect(c.kind).toBe('unavailable');
+		expect(c.message).toMatch(/^Not available on this server yet/);
+		expect(c.retryable).toBe(false);
+	});
+});

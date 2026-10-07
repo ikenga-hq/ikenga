@@ -267,7 +267,13 @@ export class WebRemoteTransport implements RpcTransport {
 		}
 		const json = await res.json();
 		if (!json.ok) {
-			throw new Error(json.error || `RPC command '${cmd}' failed`);
+			const err = new Error(json.error || `RPC command '${cmd}' failed`);
+			// A typed rejection (the seats' `{code, message, details?}`): the
+			// same fields a Tauri `invoke` rejects with, on the thrown Error.
+			if (json.error_data && typeof json.error_data === 'object') {
+				Object.assign(err, json.error_data);
+			}
+			throw err;
 		}
 		return json.data as T;
 	}
@@ -423,6 +429,36 @@ export function isRemoteWebSession(): boolean {
 	// A paired device (G-ACCESS §3.8, WP-74b): its HttpOnly cookie is the
 	// credential, so the boot path's `access_status` probe is the marker.
 	return !isTauri() && (isT1Session() || isDeviceSession() || getAuthToken() !== null);
+}
+
+/**
+ * True when this page is the SPA running in a browser tab against
+ * `ikenga-server`, including a T1 or paired-device tab that holds no token
+ * and a tab that has not yet finished the boot-time tier probe.
+ *
+ * {@link isRemoteWebSession} is the stricter, transport-level test. This one
+ * is the "what can this host do" question: a browser has no OS shell, no
+ * native window and no access to the server's filesystem, whatever its
+ * credential. Tauri, jsdom and Node imports are all false, so desktop
+ * behaviour and the mocked-`invoke` test harnesses are unchanged.
+ */
+export function isBrowserHost(): boolean {
+	return isBrowserSession();
+}
+
+/**
+ * True when this page is the SPA running in a normal browser tab against
+ * `ikenga-server` (any tier), as opposed to the Tauri desktop shell, a test
+ * harness or a Node import.
+ *
+ * Use this — not `isRemoteWebSession()` alone — to decide browser-only UI
+ * behaviour (browser shortcut layer, unload guard, drop guard): a T1 or
+ * paired-device tab has no bearer token, so `isRemoteWebSession()` can be
+ * false there before boot's tier probe lands. `isBrowserEntry()` is set by
+ * the first module `main.tsx` evaluates, so it covers that window.
+ */
+export function isBrowserSession(): boolean {
+	return !isTauri() && (isBrowserEntry() || isRemoteWebSession());
 }
 
 /**

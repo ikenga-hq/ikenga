@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { NgwaCreateSurface } from './ngwa-create-surface';
+import { KIND_DEFS, NgwaCreateSurface } from './ngwa-create-surface';
 import * as tauriCmd from '@/lib/tauri-cmd';
 import { useCompanionStore } from '@/shell/companion/companion-store';
 
@@ -189,5 +189,20 @@ describe('NgwaCreateSurface — WP-24 / locked D-02', () => {
 		expect(storeState.focusPending).toBe(true);
 		expect(storeState.draft).toContain('Brief for newly scaffolded Skill "release-notes"');
 		expect(storeState.draft).toContain('<!-- ikenga:auto -->');
+	});
+});
+
+describe('NgwaCreateSurface — the subhead claims only what is real', () => {
+	afterEach(() => {
+		cleanup();
+	});
+
+	it('names no snapshot it does not read, and counts the kinds it actually lists', () => {
+		const { container } = render(<NgwaCreateSurface />);
+		expect(container.textContent).not.toContain('ngwa_snapshot');
+		expect(container.textContent).not.toMatch(/snapshot .*live/);
+		expect(container.querySelector('[data-kind-count]')?.textContent).toBe(
+			`${KIND_DEFS.length} kinds`
+		);
 	});
 });

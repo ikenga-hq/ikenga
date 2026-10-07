@@ -12,6 +12,7 @@ import {
 	navigateFocused,
 	replaceActiveTab,
 	reorderTab,
+	setRouteTabPath,
 	setSplitSizes,
 	setTabPinned,
 	splitLeaf,
@@ -21,6 +22,7 @@ import {
 	type MoveTabMode,
 } from './pane-reducer';
 import { MAX_CLOSED_HISTORY, type PaneTreeSnapshot } from './pane-persistence';
+import { bootRoutePath, hasTauriGlobals } from './url-sync';
 
 /** Per-pane navigation history. Used by the URL bar in pane-toolbar to
  * provide back/forward across path-bearing view kinds (route, artifact).
@@ -64,6 +66,11 @@ interface PaneStoreState {
 	setTabPinned: (id: PaneId, tabIdx: number, pinned: boolean) => void;
 	toggleTabPinned: (id: PaneId, tabIdx: number) => void;
 	navigateFocused: (path: string) => void;
+	/** Write a route tab's own memory-router navigation (an in-pane `<Link>`)
+	 *  back into the tree: the tab whose `tabUid` is `uid` in leaf `paneId`
+	 *  takes `path` in place — identity, pin and active tab kept, no history
+	 *  entry. No-op (no store write) when nothing changes. */
+	syncRouteTabPath: (paneId: PaneId, uid: string, path: string) => void;
 	setSplitSizes: (path: number[], sizes: number[]) => void;
 	moveTab: (srcLeafId: PaneId, srcTabIdx: number, dstLeafId: PaneId, mode: MoveTabMode) => void;
 	/** Reorder a tab within the same leaf. */
@@ -110,7 +117,10 @@ interface PaneStoreState {
 }
 
 function initialState(): { root: PaneNode; focusedId: PaneId } {
-	const initialPath = typeof window !== 'undefined' ? window.location.pathname || '/' : '/';
+	// A browser tab keeps the deep link's query too (sanitised — this runs
+	// before the `?token=` strip); desktop keeps the bare pathname.
+	const initialPath =
+		typeof window !== 'undefined' ? bootRoutePath(window.location, hasTauriGlobals()) : '/';
 	const root = makeLeaf({ kind: 'route', path: initialPath });
 	return { root, focusedId: root.id };
 }
@@ -419,6 +429,12 @@ export const usePaneStore = create<PaneStoreState>((set, get) => ({
 	navigateFocused: (path) => {
 		const { root, focusedId } = get();
 		set({ root: navigateFocused(root, focusedId, path) });
+	},
+
+	syncRouteTabPath: (paneId, uid, path) => {
+		const { root } = get();
+		const next = setRouteTabPath(root, paneId, uid, path);
+		if (next !== root) set({ root: next });
 	},
 
 	setSplitSizes: (path, sizes) => {

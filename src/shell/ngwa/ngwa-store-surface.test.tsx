@@ -697,3 +697,37 @@ describe('NgwaStoreSurface — updates that need approval', () => {
 		expect(await screen.findByText('Capability review')).toBeDefined();
 	});
 });
+
+describe('NgwaStoreSurface — snapshot failure is not a registry outage', () => {
+	it('a snapshot error reads "Can\'t read installed packages" with its message and Retry', () => {
+		const onRetry = vi.fn();
+		const { container } = renderWithClient(
+			<NgwaStoreSurface
+				catalog={mockCatalog}
+				error={new Error("Command 'ngwa_snapshot' failed: boom")}
+				onRetry={onRetry}
+			/>
+		);
+		const state = container.querySelector('[data-state="ngwa-store-snapshot-error"]') as HTMLElement;
+		expect(state).not.toBeNull();
+		expect(state.textContent).toContain("Can't read installed packages");
+		expect(state.textContent).toContain("Command 'ngwa_snapshot' failed: boom");
+		expect(screen.queryByText(/Registry unreachable/)).toBeNull();
+		fireEvent.click(within(state).getByRole('button', { name: 'Retry' }));
+		expect(onRetry).toHaveBeenCalledTimes(1);
+	});
+
+	it('"Registry unreachable" is kept for a catalog that failed (catalogStatus error) only', () => {
+		const { container } = renderWithClient(
+			<NgwaStoreSurface
+				catalog={mockCatalog}
+				catalogStatus="error"
+				catalogError="fetch failed"
+			/>
+		);
+		const notice = container.querySelector('[data-catalog-unavailable]') as HTMLElement;
+		expect(notice.textContent).toContain('Registry unreachable');
+		expect(notice.textContent).toContain('fetch failed');
+		expect(container.querySelector('[data-state="ngwa-store-snapshot-error"]')).toBeNull();
+	});
+});

@@ -5,12 +5,12 @@ import { ListRow } from '@/components/ui/list-row';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { loadRecentArtifacts, type RecentArtifact } from '@/lib/shell/artifact-grid-recent-artifacts';
 import { usePathToManifestId } from '@/lib/shell/pins-store';
-import { writeClipboardText } from '@/lib/transport';
 import { handToChi } from '@/shell/companion/companion-store';
 import { EmptyState } from '@/components/states';
 import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import { PinArtifactDialog } from '@/shell/panes/pin-artifact-dialog';
 import type { ExplorerSectionContext } from '../section-registry';
+import { copyText } from '@/lib/clipboard';
 
 export function ArtifactsSection({ projectId }: ExplorerSectionContext) {
 	const query = useQuery<RecentArtifact[]>({
@@ -78,7 +78,7 @@ export function ArtifactsSection({ projectId }: ExplorerSectionContext) {
 						'copy-uri': () => {
 							const manifestId = pathToManifestId.get(art.path);
 							const uri = manifestId ? `ikenga://artifact/${manifestId}` : art.path;
-							void writeClipboardText(uri).catch(() => {});
+							void copyText(uri);
 						},
 						'reveal-files': () => usePaneStore.getState().revealPath(art.path),
 						'hand-to-chi': () => handToChi(art.path),

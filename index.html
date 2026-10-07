@@ -2,9 +2,19 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Ikenga</title>
+    <!-- plans/pwa S1: installable shell. The desktop (Tauri) build ignores these. -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Ikenga" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <!-- Dusk Wood --bg-base, dark hsl(28 18% 4%) and light hsl(36 22% 96%). -->
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0c0a08" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7f5f3" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link

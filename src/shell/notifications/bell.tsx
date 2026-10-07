@@ -12,10 +12,11 @@
 
 import { useQuery } from '@tanstack/react-query';
 import { Bell } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { NotificationToastBridge } from '@/components/ui/floating-toast-chip';
 import { WslFixDialogHost } from '@/shell/wsl-health/wsl-fix-dialog';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { OPEN_NOTIFICATIONS_EVENT } from '@/lib/pwa/deeplink';
 import { notificationsUnreadCountQueryOptions } from '@/lib/queries/notifications';
 import { NotificationsPopoverContent } from './popover';
 
@@ -26,6 +27,12 @@ export function NotificationsBell({ tabIndex }: { tabIndex?: number } = {}) {
 	const { data } = useQuery(notificationsUnreadCountQueryOptions());
 	const count = data?.total ?? 0;
 	const label = count > 0 ? `Notifications, ${count} unread` : 'Notifications, none unread';
+	// plans/pwa S4 §7: a tap on an approval / invite push opens the popover.
+	useEffect(() => {
+		const open = () => setOpen(true);
+		window.addEventListener(OPEN_NOTIFICATIONS_EVENT, open);
+		return () => window.removeEventListener(OPEN_NOTIFICATIONS_EVENT, open);
+	}, []);
 
 	return (
 		<>

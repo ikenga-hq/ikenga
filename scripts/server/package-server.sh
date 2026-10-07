@@ -28,6 +28,10 @@ set -euo pipefail
 # RHEL/Rocky/Alma 9 (glibc 2.34) as well as Ubuntu 20.04 and newer.
 GLIBC_FLOOR="${GLIBC_FLOOR:-2.31}"
 
+# First release published with server tarballs (#381): the default
+# min_upgrade_from for every later release.
+FIRST_SERVER_RELEASE="0.19.4"
+
 SHELL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MANIFEST_SCHEMA="ikenga-server-release/1"
 
@@ -188,9 +192,13 @@ cmd_pack() {
   [[ "$tag" == "v$version" ]] || die "tag '$tag' does not match version '$version'"
   [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || die "--commit must be a 40-character lowercase hex sha"
   [[ -n "$channel" ]] || { [[ "$version" == *-* ]] && channel=next || channel=stable; }
-  # No older server release exists to upgrade from yet, so by default the
-  # minimum supported starting point is this release itself.
-  [[ -n "$min_upgrade_from" ]] || min_upgrade_from="$version"
+  # The oldest release a server can upgrade from directly. Defaulting this to
+  # the release's own version made every published manifest refuse every
+  # upgrade (found upgrading a live box to v0.20.1). Default to the first
+  # release that shipped server tarballs; a release with a breaking migration
+  # raises it explicitly with --min-upgrade-from.
+  [[ -n "$min_upgrade_from" ]] || min_upgrade_from="$FIRST_SERVER_RELEASE"
+  [[ "$min_upgrade_from" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--min-upgrade-from must look like X.Y.Z"
   [[ -n "$published_at" ]] || published_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   mkdir -p "$out_dir"
@@ -298,7 +306,7 @@ cmd_pack() {
       const manifest = {
         schema: e.SCHEMA, version: e.VERSION, tag: e.TAG, commit: e.COMMIT,
         published_at: e.PUBLISHED_AT, channel: e.CHANNEL, glibc_floor: e.FLOOR,
-        min_upgrade_from: e.MIN_FROM, migrations: "forward-only", artifacts,
+        min_upgrade_from: e.MIN_FROM || null, migrations: "forward-only", artifacts,
       };
       process.stdout.write(JSON.stringify(manifest, null, 2) + "\n");
     ' > "$manifest"
