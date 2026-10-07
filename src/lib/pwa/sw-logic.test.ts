@@ -36,6 +36,7 @@ describe('classify', () => {
 			'/api',
 			'/ws/pty/abc',
 			'/ws/fs',
+			'/ws/events',
 			'/auth/login',
 			'/auth/me',
 			'/access/pair/start',

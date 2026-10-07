@@ -38,9 +38,10 @@
 //! every spawn goes through `executor::current()` — under T1, as the
 //! principal's own uid — and lands in the principal's own `chi_cache`.
 //!
-//! **No events yet.** The daemon has no server-to-browser event channel, so
-//! the `seats://changed` events the cores return are dropped here; the UI
-//! refetches after its own writes. A queued text the poller drops is logged.
+//! **Events.** The `seats://changed` events the cores return are published on
+//! the daemon's event bus (`server::events`, `/ws/events`) under the
+//! desktop's name and payload; so are the queue poller's. The scratchpad
+//! wake-ups (`Effects::pads`) are desktop-only and dropped.
 
 use std::sync::Arc;
 
@@ -48,6 +49,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
+use super::events::{EventBus, Topic};
 use super::rpc::RpcResponse;
 use super::rpc_local::chi_env;
 use super::rpc_shell::targ;
@@ -55,11 +57,18 @@ use super::shared::chi_exec::{self, ChiEnv, ChiRunOpts, NoInProcessEngines};
 use super::shared::seats::{
     active_project, clear_core, create_core, drain_one, engines_info, fill_locked, list_core,
     list_rows, move_core, queue_core, release_core, remove_core, rename_core, resolve_address,
-    resolve_core, resume_locked, store, view_of, CreateSeatReq, EngineCall, FillOpts, MoveOpts,
-    RemoveOpts, ResolveOpts, ResumeOpts, SeatActor, SeatAddress, SeatError, SeatSessionRef,
-    WorldSnapshot, ENGINE_CAPS, OPENROUTER_ENGINE, QUEUE_POLL, SEAT_RUN_OWNER,
+    resolve_core, resume_locked, store, view_of, CreateSeatReq, Effects, EngineCall, FillOpts,
+    MoveOpts, RemoveOpts, ResolveOpts, ResumeOpts, SeatActor, SeatAddress, SeatError,
+    SeatSessionRef, WorldSnapshot, ENGINE_CAPS, OPENROUTER_ENGINE, QUEUE_POLL, SEAT_RUN_OWNER,
 };
 use super::AppState;
+
+/// Publish each `seats://changed` a committed command produced.
+fn publish_effects(state: &AppState, effects: &Effects) {
+    for event in &effects.events {
+        state.events.publish(Topic::SeatsChanged, event);
+    }
+}
 
 /// Why no terminal can be seated on the daemon (see the module doc).
 pub(crate) const NO_TERMINAL_SEATS: &str =
@@ -224,7 +233,8 @@ pub(super) async fn seats_resolve(state: &AppState, args: &Value) -> RpcResponse
         let row = resolve_address(&pool, &seat).await?;
         let claim_resume = opts.map(|o| o.claim_resume).unwrap_or(false);
         let world = daemon_world(state);
-        let (route, _events) = resolve_core(&pool, &world, &row.id, &actor, claim_resume).await?;
+        let (route, effects) = resolve_core(&pool, &world, &row.id, &actor, claim_resume).await?;
+        publish_effects(state, &effects);
         Ok(route)
     }
     .await;
@@ -244,7 +254,8 @@ pub(super) async fn seats_create(state: &AppState, args: &Value) -> RpcResponse 
             );
         }
         let pool = pool(state).await?;
-        let (result, _events) = create_core(&pool, &daemon_world(state), req, &actor).await?;
+        let (result, effects) = create_core(&pool, &daemon_world(state), req, &actor).await?;
+        publish_effects(state, &effects);
         Ok(result)
     }
     .await;
@@ -261,7 +272,7 @@ pub(super) async fn seats_move(state: &AppState, args: &Value) -> RpcResponse {
         let pool = pool(state).await?;
         let claim = opts.and_then(|o| o.claim);
         let world = daemon_world(state);
-        let (result, _events) = move_core(
+        let (result, effects) = move_core(
             &pool,
             &world,
             &session,
@@ -270,6 +281,7 @@ pub(super) async fn seats_move(state: &AppState, args: &Value) -> RpcResponse {
             claim.as_deref(),
         )
         .await?;
+        publish_effects(state, &effects);
         Ok(result)
     }
     .await;
@@ -290,7 +302,7 @@ pub(super) async fn seats_resume(state: &AppState, args: &Value) -> RpcResponse 
         let _guard = store().lock_one(&seat_id).await;
         let world = daemon_world(state);
         let env = &env;
-        let (result, _events) = resume_locked(
+        let (result, effects) = resume_locked(
             &pool,
             &world,
             &seat_id,
@@ -300,6 +312,7 @@ pub(super) async fn seats_resume(state: &AppState, args: &Value) -> RpcResponse 
             move |call| async move { call_engine(env, call).await },
         )
         .await?;
+        publish_effects(state, &effects);
         Ok(result)
     }
     .await;
@@ -320,7 +333,7 @@ pub(super) async fn seats_fill(state: &AppState, args: &Value) -> RpcResponse {
         let world = daemon_world(state);
         let persistent = opts.map(|o| o.persistent).unwrap_or(false);
         let env = &env;
-        let (result, _events) = fill_locked(
+        let (result, effects) = fill_locked(
             &pool,
             &world,
             &seat_id,
@@ -330,6 +343,7 @@ pub(super) async fn seats_fill(state: &AppState, args: &Value) -> RpcResponse {
             move |call| async move { call_engine(env, call).await },
         )
         .await?;
+        publish_effects(state, &effects);
         Ok(result)
     }
     .await;
@@ -346,9 +360,10 @@ pub(super) async fn seats_queue(state: &AppState, args: &Value) -> RpcResponse {
         let pool = pool(state).await?;
         // Built first: a queue the poller could never send is refused here.
         let env = Arc::new(chi_env(state)?);
-        let (seat, _events) =
+        let (seat, effects) =
             queue_core(&pool, &daemon_world(state), &seat_id, prompt, &actor).await?;
-        watch_queue(seat_id, env);
+        publish_effects(state, &effects);
+        watch_queue(seat_id, env, state.events.clone());
         Ok(seat)
     }
     .await;
@@ -361,7 +376,8 @@ pub(super) async fn seats_clear(state: &AppState, args: &Value) -> RpcResponse {
         let seat_id = seat_id(args)?;
         let actor = actor(args)?;
         let pool = pool(state).await?;
-        let (seat, _events) = clear_core(&pool, &daemon_world(state), &seat_id, &actor).await?;
+        let (seat, effects) = clear_core(&pool, &daemon_world(state), &seat_id, &actor).await?;
+        publish_effects(state, &effects);
         Ok(seat)
     }
     .await;
@@ -375,7 +391,8 @@ pub(super) async fn seats_rename(state: &AppState, args: &Value) -> RpcResponse 
         let actor = actor(args)?;
         let pool = pool(state).await?;
         let world = daemon_world(state);
-        let (seat, _effects) = rename_core(&pool, &world, &seat_id, &name, &actor).await?;
+        let (seat, effects) = rename_core(&pool, &world, &seat_id, &name, &actor).await?;
+        publish_effects(state, &effects);
         Ok(seat)
     }
     .await;
@@ -388,7 +405,8 @@ pub(super) async fn seats_remove(state: &AppState, args: &Value) -> RpcResponse 
         let opts: RemoveOpts = targ(args, &["opts"])?;
         let actor = actor(args)?;
         let pool = pool(state).await?;
-        let (result, _effects) = remove_core(&pool, &seat_id, opts.remove_memory, &actor).await?;
+        let (result, effects) = remove_core(&pool, &seat_id, opts.remove_memory, &actor).await?;
+        publish_effects(state, &effects);
         Ok(result)
     }
     .await;
@@ -400,7 +418,8 @@ pub(super) async fn seats_release(state: &AppState, args: &Value) -> RpcResponse
         let seat_id = seat_id(args)?;
         let actor = actor(args)?;
         let pool = pool(state).await?;
-        let (seat, _events) = release_core(&pool, &daemon_world(state), &seat_id, &actor).await?;
+        let (seat, effects) = release_core(&pool, &daemon_world(state), &seat_id, &actor).await?;
+        publish_effects(state, &effects);
         Ok(seat)
     }
     .await;
@@ -416,7 +435,7 @@ pub(super) async fn seats_release(state: &AppState, args: &Value) -> RpcResponse
 // empties the slot before it sends, so a loop that outlives its text (a new
 // one was queued) never sends twice.
 
-fn watch_queue(seat_id: String, env: Arc<ChiEnv>) {
+fn watch_queue(seat_id: String, env: Arc<ChiEnv>, events: Arc<EventBus>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(QUEUE_POLL).await;
@@ -431,12 +450,15 @@ fn watch_queue(seat_id: String, env: Arc<ChiEnv>) {
                 }
             };
             let env = &env;
-            // The §10 event has no channel to the browser yet (see the module
-            // doc); a dropped text is logged by `drain_one`.
-            let _event = drain_one(&pool, &seat_id, move |call| async move {
+            // A sent or dropped text is a §10 event (`queue-dropped` carries the
+            // reason); a dropped one is also logged by `drain_one`.
+            let event = drain_one(&pool, &seat_id, move |call| async move {
                 call_engine(env, call).await
             })
             .await;
+            if let Some(event) = event {
+                events.publish(Topic::SeatsChanged, &event);
+            }
         }
     });
 }
