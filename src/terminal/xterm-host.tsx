@@ -10,6 +10,8 @@ import { fileUrlToPath, resolvePath } from '@/lib/paths/file-paths';
 import { isWindows } from '@/lib/platform';
 import { createOscObserver, fireOscNotification } from '@/lib/terminal/osc-notify';
 import { readClipboardText, writeClipboardText } from '@/lib/transport/shims';
+import { menuPasteBlockedHint, pasteKeyIsNative } from './paste-policy';
+import { FloatingToastChip } from '@/components/ui/floating-toast-chip';
 import { type KeyPeek, peekKeypress } from '@/lib/keymap/dispatcher';
 import { eventMatchesCombo, strokesFromEvent } from '@/lib/keymap/platform';
 import { evaluateTerminalKey, terminalKeyLabel } from './keybindings';
@@ -909,7 +911,14 @@ export function XTermHost({
 					})
 					.catch(() => {});
 			};
+			// In a browser, let the key do the browser's own paste: xterm handles
+			// the native `paste` event on its textarea, which needs no clipboard
+			// permission. Reading the clipboard ourselves (`navigator.clipboard`)
+			// needs a permission grant, isn't supported in Firefox, and failed
+			// silently — so Ctrl+V / Ctrl+Shift+V did nothing on a remote server.
+			// Returning false (without preventDefault) stops xterm sending ^V.
 			if (action === 'paste') {
+				if (pasteKeyIsNative()) return false;
 				e.preventDefault();
 				pasteNow();
 				return false;
@@ -926,6 +935,7 @@ export function XTermHost({
 				return false;
 			}
 			if (!mac && eventMatchesCombo(e, 'ctrl+v', false)) {
+				if (pasteKeyIsNative()) return false;
 				e.preventDefault();
 				pasteNow();
 				return false;
@@ -1216,6 +1226,8 @@ export function XTermHost({
 	}, []);
 
 	const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+	// Shown when a browser refuses a menu-driven clipboard read.
+	const [pasteHint, setPasteHint] = useState<string | null>(null);
 
 	useEffect(() => {
 		if (!contextMenu) return;
@@ -1255,6 +1267,15 @@ export function XTermHost({
 				flexDirection: 'column',
 			}}
 		>
+			{pasteHint && (
+				<FloatingToastChip
+					anchor="pane-corner"
+					variant="info"
+					label={pasteHint}
+					ttlMs={5000}
+					onDismiss={() => setPasteHint(null)}
+				/>
+			)}
 			{contextMenu && (
 				<div
 					role="menu"
@@ -1305,14 +1326,17 @@ export function XTermHost({
 					<button
 						type="button"
 						onClick={() => {
+							// term.paste keeps bracketed-paste mode (a multi-line paste
+							// doesn't run line by line), unlike a raw PTY write.
 							readClipboardText()
 								.then((t) => {
-									if (t) {
-										livePtyRef.current?.write(t).catch(() => {});
-										termRef.current?.focus();
-									}
+									if (t) termRef.current?.paste(t);
+									termRef.current?.focus();
 								})
-								.catch(() => {});
+								.catch(() => {
+									setPasteHint(menuPasteBlockedHint());
+									termRef.current?.focus();
+								});
 							setContextMenu(null);
 						}}
 						style={{
