@@ -331,7 +331,7 @@ async fn wsl_preflight_within(
             Ok(())
         }
         Some((health, _)) if health.state.is_wsl_fault() => {
-            Err(format!("WSL has no network — {}", health.detail))
+            Err(format!("Can't start the engine in WSL — {}", health.detail))
         }
         _ => Ok(()),
     }
@@ -471,6 +471,47 @@ pub(crate) fn not_detachable_warning(engine_id: &str) -> String {
          on the command line, where other users on this host can read it, so {engine_id} runs \
          only in-process. This run will NOT survive quitting the app."
     )
+}
+
+/// The engine binary `engine_id` launches (what [`build_engine_command_with`]
+/// resolves).
+fn engine_binary(engine_id: &str) -> Option<&'static str> {
+    match engine_id {
+        "claude-code" => Some("claude"),
+        "antigravity-cli" => Some("agy"),
+        "codex" => Some("codex"),
+        "opencode" => Some("opencode"),
+        "pi" => Some("pi"),
+        _ => None,
+    }
+}
+
+/// The warning a persistent run of an engine installed only inside WSL
+/// carries: chi-runner launches engines from the host PATH and has no WSL
+/// launch, so the run went in-process (where the WSL launch works) instead.
+pub(crate) fn wsl_only_warning(engine_id: &str) -> String {
+    format!(
+        "persistent run fell back to in-process: {engine_id} is installed only inside WSL,          which persistent runs don't support yet. This run will NOT survive quitting the app."
+    )
+}
+
+/// Whether a persistent run of `engine_id` can go to chi-runner, which
+/// launches engines from the host PATH only. `Ok(None)` = yes (a native
+/// engine, or one this check doesn't know); `Ok(Some(warning))` = the engine
+/// resolves only inside WSL, so the run must stay in-process; `Err` = the
+/// engine can't launch at all (not installed, WSL's pre-run check failed).
+async fn detached_launch_check(
+    resolver: &dyn EngineResolver,
+    engine_id: &str,
+    cwd: &str,
+) -> Result<Option<String>, String> {
+    let Some(binary) = engine_binary(engine_id) else {
+        return Ok(None);
+    };
+    match resolve_engine(binary, resolver, cwd).await? {
+        EngineLaunch::Native(_) => Ok(None),
+        EngineLaunch::Wsl { .. } => Ok(Some(wsl_only_warning(engine_id))),
+    }
 }
 
 impl ChiEnv {
@@ -2081,6 +2122,25 @@ pub(crate) async fn spawn_run(
         tracing::warn!(target: "ikenga::chi", "chi run {run_id}: {warning}");
         fallback_warning = Some(warning);
     } else if opts.persistent {
+        // chi-runner has no WSL launch: an engine found only inside WSL would
+        // not start there, so it stays in-process (which launches it through
+        // wsl.exe) and says so. An engine that can't launch at all fails here.
+        match detached_launch_check(&env.reporting_resolver(), &opts.engine_id, &cwd).await {
+            Ok(None) => {}
+            Ok(Some(warning)) => {
+                tracing::warn!(target: "ikenga::chi", "chi run {run_id}: {warning}");
+                fallback_warning = Some(warning);
+            }
+            Err(e) => {
+                tracing::warn!(target: "ikenga::chi", "chi run {run_id} failed to start: {e}");
+                cache_update_done(&env.db, &run_id, "failed", Some(&e), false, None)
+                    .await
+                    .ok();
+                return Err(e);
+            }
+        }
+    }
+    if opts.persistent && fallback_warning.is_none() {
         let model = runner_model(&opts.engine_id, opts.model.as_deref());
         let conf = chi_runner::RunnerConf {
             run_id: &run_id,

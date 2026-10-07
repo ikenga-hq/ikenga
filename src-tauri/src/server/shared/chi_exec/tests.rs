@@ -2042,7 +2042,7 @@ async fn a_wsl_launch_with_broken_wsl_networking_fails_before_building() {
             .unwrap_err();
         assert_eq!(
             err,
-            format!("WSL has no network — probe said {}", state.as_str()),
+            format!("Can't start the engine in WSL — probe said {}", state.as_str()),
             "{state:?}"
         );
         assert_eq!(*r.health_asked.lock().unwrap(), [Some("Ubuntu".to_string())]);
@@ -2106,7 +2106,7 @@ async fn a_run_on_broken_wsl_fails_immediately_and_raises_the_wsl_notification()
     .await
     .err()
     .unwrap();
-    assert_eq!(err, "WSL has no network — probe said no_route");
+    assert_eq!(err, "Can't start the engine in WSL — probe said no_route");
     let rows = cache_list(&db, Some("claude-code"), 10).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status, "failed");
@@ -2201,7 +2201,7 @@ async fn only_fresh_conclusive_probes_raise_the_wsl_notification() {
         .await
         .err()
         .unwrap();
-    assert_eq!(err, "WSL has no network — probe said no_route");
+    assert_eq!(err, "Can't start the engine in WSL — probe said no_route");
     assert!(open_wsl_rows(&db).await.is_empty(), "a cached probe re-reported");
 
     let inconclusive = env_with(
@@ -2256,9 +2256,74 @@ async fn a_resume_on_broken_wsl_fails_with_the_cause() {
         .await
         .err()
         .unwrap();
-    assert_eq!(err, "WSL has no network — probe said dns_only");
+    assert_eq!(err, "Can't start the engine in WSL — probe said dns_only");
     let row = crate::server::shared::chi::cache_get(&db, run_id).await.unwrap().unwrap();
     assert_eq!(row.status, "failed");
     assert_eq!(row.error.as_deref(), Some(err.as_str()));
+    assert_eq!(open_wsl_rows(&db).await, ["wsl:network:ubuntu"]);
+}
+
+// ── Persistent runs and WSL-only engines (WP-7, D-21) ────────────────────
+
+/// chi-runner launches engines from the host PATH only, so a persistent run
+/// of an engine found only inside WSL stays in-process (which launches it
+/// through wsl.exe) and says so; a native engine may go detached; an engine
+/// that can't launch at all fails with the same cause the in-process path
+/// would give.
+#[tokio::test]
+async fn detached_launch_check_keeps_wsl_only_engines_in_process() {
+    let native = FakeResolver::native(&["claude", "codex"]);
+    for engine in ["claude-code", "codex"] {
+        assert_eq!(
+            detached_launch_check(&native, engine, "/tmp").await,
+            Ok(None),
+            "{engine}"
+        );
+    }
+
+    let wsl_only = wsl_with_health(WslHealthState::Ok);
+    for engine in ["claude-code", "codex"] {
+        let warning = detached_launch_check(&wsl_only, engine, "/tmp")
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{engine}: went detached"));
+        assert_eq!(warning, wsl_only_warning(engine));
+        assert!(warning.contains("installed only inside WSL"), "{warning}");
+        assert!(warning.contains("NOT survive"), "{warning}");
+        assert!(warning.starts_with("persistent run fell back to in-process"), "{warning}");
+    }
+
+    let missing = FakeResolver::native(&[]);
+    let err = detached_launch_check(&missing, "claude-code", "/tmp")
+        .await
+        .unwrap_err();
+    assert!(err.contains("engine binary `claude` not found"), "{err}");
+
+    let broken = wsl_with_health(WslHealthState::NoRoute);
+    assert_eq!(
+        detached_launch_check(&broken, "claude-code", "/tmp").await,
+        Err("Can't start the engine in WSL — probe said no_route".to_string())
+    );
+}
+
+/// A persistent run on broken WSL fails at once with the cause — before any
+/// chi-runner is tried — and raises the WSL notification, like a one-off.
+#[tokio::test]
+async fn a_persistent_run_on_broken_wsl_fails_before_chi_runner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(test_db().await);
+    let env = env_with(&db, tmp.path(), wsl_with_health(WslHealthState::DnsOnly));
+    let mut o = opts("claude-code", "hi", Some("/tmp"));
+    o.persistent = true;
+    let err = spawn_run(&env, &NoInProcessEngines, o, "cli")
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err, "Can't start the engine in WSL — probe said dns_only");
+    let rows = cache_list(&db, Some("claude-code"), 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+    assert_eq!(rows[0].error.as_deref(), Some(err.as_str()));
+    assert_eq!(rows[0].pid, None, "no chi-runner was spawned");
     assert_eq!(open_wsl_rows(&db).await, ["wsl:network:ubuntu"]);
 }
