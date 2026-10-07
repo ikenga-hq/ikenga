@@ -47,6 +47,7 @@ pub mod pkg_scaffold;
 pub mod pkg_workspace;
 pub mod projects;
 pub mod seat_grammar;
+pub mod seats;
 pub mod settings;
 pub mod settings_cascade;
 pub mod shell_detect;

@@ -9,6 +9,7 @@ use tracing::debug;
 use super::rpc_claude;
 use super::rpc_files;
 use super::rpc_local;
+use super::rpc_seats;
 use super::rpc_shell;
 use super::AppState;
 use crate::pty::SpawnOpts;
@@ -97,6 +98,12 @@ pub struct RpcResponse {
     pub data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// A typed rejection's own fields, for a command whose desktop `invoke`
+    /// rejects with an object rather than a string (the seats' `SeatError`,
+    /// `{code, message, details?}`). The web transport assigns them onto the
+    /// `Error` it throws, so the frontend reads the same rejection on both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_data: Option<Value>,
 }
 
 impl RpcResponse {
@@ -105,14 +112,21 @@ impl RpcResponse {
             ok: true,
             data: serde_json::to_value(data).ok(),
             error: None,
+            error_data: None,
         }
     }
 
     pub fn error(msg: impl Into<String>) -> Self {
+        Self::error_with_data(msg, None)
+    }
+
+    /// [`RpcResponse::error`] carrying the typed rejection (see `error_data`).
+    pub fn error_with_data(msg: impl Into<String>, data: Option<Value>) -> Self {
         Self {
             ok: false,
             data: None,
             error: Some(msg.into()),
+            error_data: data,
         }
     }
 }
@@ -768,6 +782,26 @@ pub async fn rpc_handler(
         "pkg_preview_manifest" => rpc_files::pkg_preview_manifest(&state, &payload.args),
         "pkg_discover_workspace" => rpc_files::pkg_discover_workspace(&state, &payload.args),
         "pkg_scaffold" => rpc_files::pkg_scaffold(&state, &payload.args).await,
+
+        // --- Chi seats (gap audit 2026-10-06 rank 7) ---
+        //
+        // The desktop's seat store (`shared::seats`) over `--data-dir`'s
+        // ikenga.db; resume / fill / the §4.5 queue start their runs through
+        // `chi_exec` like `chi_run`. Bodies and the daemon's world in
+        // `server/rpc_seats.rs`.
+        "seats_list" => rpc_seats::seats_list(&state, &payload.args).await,
+        "seats_get" => rpc_seats::seats_get(&state, &payload.args).await,
+        "seats_engines" => rpc_seats::seats_engines(&state).await,
+        "seats_resolve" => rpc_seats::seats_resolve(&state, &payload.args).await,
+        "seats_create" => rpc_seats::seats_create(&state, &payload.args).await,
+        "seats_move" => rpc_seats::seats_move(&state, &payload.args).await,
+        "seats_resume" => rpc_seats::seats_resume(&state, &payload.args).await,
+        "seats_fill" => rpc_seats::seats_fill(&state, &payload.args).await,
+        "seats_queue" => rpc_seats::seats_queue(&state, &payload.args).await,
+        "seats_clear" => rpc_seats::seats_clear(&state, &payload.args).await,
+        "seats_rename" => rpc_seats::seats_rename(&state, &payload.args).await,
+        "seats_remove" => rpc_seats::seats_remove(&state, &payload.args).await,
+        "seats_release" => rpc_seats::seats_release(&state, &payload.args).await,
 
         // --- G-ACCESS §9.1 (WP-74a, skeleton-first §9.2) ---
         //

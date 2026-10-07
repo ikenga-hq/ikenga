@@ -365,7 +365,7 @@ impl DaemonChi {
 /// router home as the default cwd, output files confined to the cache dir,
 /// and `~`-only cwd expansion (this process's env holds the operator's
 /// `IKENGA_SECRET_*` defaults).
-fn chi_env(state: &AppState) -> Result<chi_exec::ChiEnv, String> {
+pub(super) fn chi_env(state: &AppState) -> Result<chi_exec::ChiEnv, String> {
     let db = state
         .pa_db
         .clone()

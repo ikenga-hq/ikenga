@@ -447,58 +447,6 @@ reason = "Sets the output directory for native-window screenshots; part of the s
 tag = "desktop-only-forever"
 reason = "Captures the native app window as PNG; explicit 'screenshots of the native window' category."
 
-[seats_clear]
-tag = "WP-19"
-reason = "clear_core mutates seat state in db and emits events; no spawn."
-
-[seats_create]
-tag = "WP-19"
-reason = "create_core inserts a seat db row and emits events via emit_effects; no call_engine/spawn."
-
-[seats_engines]
-tag = "WP-19"
-reason = "Read-only engine install-state info for the create form."
-
-[seats_fill]
-tag = "WP-18b"
-reason = "Calls call_engine(EngineCall::Start) which invokes chi.rs's spawn_chi_run; the chi core is daemon-served since WP-P10 (shared::chi_exec), but the seat store (iyke::seats) is AppHandle-bound, so no rpc.rs arm yet."
-
-[seats_get]
-tag = "WP-19"
-reason = "Read-only single seat view resolved by address."
-
-[seats_list]
-tag = "WP-19"
-reason = "Read-only seat view listing from db; doc comment 'Never writes'."
-
-[seats_move]
-tag = "WP-19"
-reason = "move_core rebinds a session to a seat in db and emits events; no call_engine."
-
-[seats_queue]
-tag = "WP-19"
-reason = "queue_core only enqueues a prompt row in db; actual send is deferred to a background poller, not this command's own spawn."
-
-[seats_release]
-tag = "WP-19"
-reason = "release_core frees a seat's hold in db; no spawn."
-
-[seats_remove]
-tag = "WP-19"
-reason = "remove_core deletes seat row(s) via db; no spawn."
-
-[seats_rename]
-tag = "WP-19"
-reason = "Renames a seat row in db; no spawn."
-
-[seats_resolve]
-tag = "WP-19"
-reason = "Routing decision only; doc comment 'Never resumes or starts anything', no call_engine."
-
-[seats_resume]
-tag = "WP-18b"
-reason = "Calls call_engine(EngineCall::ResumeRun) which invokes chi.rs's resume_chi_run; the chi core is daemon-served since WP-P10 (shared::chi_exec), but the seat store (iyke::seats) is AppHandle-bound, so no rpc.rs arm yet."
-
 [session_cancel]
 tag = "WP-19"
 reason = "No live FE caller in src/. AppHandle-free itself (cancel_streaming signals the child), but it can only cancel a turn session_send started, and session_send cannot run on the daemon: claude/session.rs emits every ChatEvent through a bare app.emit (emit_events), and the daemon has no AppHandle. Nor does the daemon's /ws/chat/:id have a Claude Code engine (EngineHandle::ClaudeCode is cfg(feature=\"desktop\"), compiled out of ikenga-server). Served alone it would be a permanent no-op. Prerequisite: the on_update callback refactor engines/antigravity_acp already had."

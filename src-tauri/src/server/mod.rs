@@ -42,6 +42,7 @@ pub mod rpc;
 mod rpc_claude;
 mod rpc_files;
 mod rpc_local;
+mod rpc_seats;
 mod rpc_shell;
 pub mod shared;
 pub mod static_files;
