@@ -8,8 +8,10 @@
 // (WP-19 slice 5b) — the daemon's session browser arm summarizes with it.
 pub use crate::server::shared::claude_sessions::transcript_parser as parser;
 pub mod usage;
+#[cfg(feature = "desktop")]
 pub mod watcher;
 
 pub use parser::{parse_line, TranscriptRecord};
 pub use usage::{scan_and_mirror_transcripts, UsageSnapshot};
+#[cfg(feature = "desktop")]
 pub use watcher::{read_new_records, watch_transcript_session};

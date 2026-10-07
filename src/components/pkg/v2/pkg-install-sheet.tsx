@@ -16,6 +16,8 @@ import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent } from '@/components/ui/sheet';
 import { cn } from '@/components/ui/utils';
 import { pkgInstallFromPath } from '@/lib/tauri-cmd';
+import { installUnavailableReason } from '@/lib/desktop-only';
+import { honestRpcError } from '@/lib/transport/unavailable';
 import { runInstallPlan } from '@/lib/registry/install-plan';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type { PkgRowV2 } from '@/lib/pkgs/use-derived';
@@ -280,13 +282,15 @@ export function PkgInstallSheet({
 	const planResolver = useInstallPlanResolver(indexUrl);
 	const refreshRegistry = useRefreshRegistry();
 
+	const installBlocked = installUnavailableReason();
+
 	const fromPathMut = useMutation({
 		mutationFn: () => pkgInstallFromPath(path),
 		onSuccess: () => {
 			void qc.refetchQueries({ queryKey: ['pkg'] });
 			onOpenChange(false);
 		},
-		onError: (e) => setInstallError((e as Error).message ?? String(e)),
+		onError: (e) => setInstallError(honestRpcError(e)),
 	});
 
 	const fromRegistryMut = useMutation({
@@ -320,7 +324,7 @@ export function PkgInstallSheet({
 			}, 800);
 		},
 		onError: (e) => {
-			setInstallError((e as Error).message ?? String(e));
+			setInstallError(honestRpcError(e));
 			setInstallProgress(null);
 		},
 	});
@@ -455,13 +459,21 @@ export function PkgInstallSheet({
 							</Button>
 							<Button
 								size="sm"
-								disabled={!detailQuery.data || fromRegistryMut.isPending || !!installProgress}
+								disabled={
+									!detailQuery.data ||
+									fromRegistryMut.isPending ||
+									!!installProgress ||
+									!!installBlocked
+								}
+								title={installBlocked || undefined}
 								onClick={() => fromRegistryMut.mutate()}
 							>
-								<Plus className="mr-1.5 h-3.5 w-3.5" />
-								{fromRegistryMut.isPending || installProgress
-									? `${isUpdate ? 'Updating' : 'Installing'}… ${installProgress?.done ?? 0}/${installProgress?.total ?? '?'}`
-									: `${isUpdate ? 'Update' : 'Install'} ${pkg.name}`}
+								{!installBlocked && <Plus className="mr-1.5 h-3.5 w-3.5" />}
+								{installBlocked
+									? installBlocked
+									: fromRegistryMut.isPending || installProgress
+										? `${isUpdate ? 'Updating' : 'Installing'}… ${installProgress?.done ?? 0}/${installProgress?.total ?? '?'}`
+										: `${isUpdate ? 'Update' : 'Install'} ${pkg.name}`}
 							</Button>
 						</div>
 					</>
@@ -566,9 +578,10 @@ export function PkgInstallSheet({
 								<Button
 									size="sm"
 									onClick={() => fromPathMut.mutate()}
-									disabled={!path || fromPathMut.isPending}
+									disabled={!path || fromPathMut.isPending || !!installBlocked}
+									title={installBlocked || undefined}
 								>
-									{fromPathMut.isPending ? 'Installing…' : 'Install'}
+									{installBlocked || (fromPathMut.isPending ? 'Installing…' : 'Install')}
 								</Button>
 							) : tab === 'manifest-url' ? (
 								<Button size="sm" disabled title="Use Registry for signed installs">

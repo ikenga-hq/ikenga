@@ -260,3 +260,73 @@ describe('NgwaTrustSheet (WP-18 / D-07)', () => {
 		});
 	});
 });
+
+describe('NgwaTrustSheet — trust the server never evaluated (the headless daemon)', () => {
+	const REASON = 'trust evaluation is not available on this server: no trust store';
+	const unavailableTrust = (perms: NgwaItem['trust']['perms']) =>
+		({
+			state: 'not_applicable',
+			signed: false,
+			auto_trusted: false,
+			review_pending: false,
+			perms,
+			last_granted_at_ms: null,
+			unavailable: REASON,
+		}) as NgwaItem['trust'];
+
+	it('says so, lists only what the manifest declares, and disables Grant with the reason', () => {
+		const item = makeItem({
+			trust: unavailableTrust({
+				shell_execute: ['git *'],
+				fs_write_outside_sandbox: [],
+				net: [],
+				vault_keys: [],
+			}),
+		});
+		const { container } = renderWithClient(
+			<NgwaTrustSheet open={true} onOpenChange={vi.fn()} item={item} mode="review" />
+		);
+		const note = container.querySelector('[data-trust-unavailable-note]') as HTMLElement;
+		expect(note.textContent).toContain('Not available on this server');
+		expect(note.textContent).toContain(REASON);
+		expect(note.textContent).toContain('manifest declares');
+		expect(container.textContent).toContain('declared in the manifest — not evaluated (1)');
+		expect(screen.getByText('shell:exec · git *')).toBeDefined();
+		expect(container.textContent).not.toContain('No sensitive permissions requested');
+		expect(container.textContent).not.toContain('standard process boundaries');
+		expect(container.textContent).not.toContain('Approval grants these capabilities');
+
+		const grant = container.querySelector<HTMLButtonElement>('[data-act="grant"]') as HTMLButtonElement;
+		expect(grant.disabled).toBe(true);
+		expect(grant.title).toMatch(/Not available on this server/);
+		fireEvent.click(grant);
+		expect(tauriCmd.pkgTrustGrant).not.toHaveBeenCalled();
+		expect(screen.queryByText('Revoke trust')).toBeNull();
+	});
+
+	it('an unreadable manifest: declared permissions unknown — never "none requested"', () => {
+		const item = makeItem({ trust: unavailableTrust(null) });
+		const { container } = renderWithClient(
+			<NgwaTrustSheet open={true} onOpenChange={vi.fn()} item={item} mode="review" />
+		);
+		expect(container.querySelector('[data-trust-unavailable-note]')?.textContent).toContain(
+			'declared permissions are unknown'
+		);
+		expect(container.textContent).not.toContain('No sensitive permissions requested');
+		expect(container.textContent).not.toMatch(/Declared sensitive capabilities \(0\)/);
+		expect(container.querySelector<HTMLButtonElement>('[data-act="grant"]')?.disabled).toBe(true);
+	});
+
+	it('a manifest declaring nothing sensitive: says so, never "standard process boundaries"', () => {
+		const item = makeItem({
+			trust: unavailableTrust({ shell_execute: [], fs_write_outside_sandbox: [], net: [], vault_keys: [] }),
+		});
+		const { container } = renderWithClient(
+			<NgwaTrustSheet open={true} onOpenChange={vi.fn()} item={item} mode="review" />
+		);
+		expect(container.textContent).toContain('The manifest declares no sensitive permissions.');
+		expect(container.textContent).not.toContain('No sensitive permissions requested');
+		expect(container.textContent).not.toContain('standard process boundaries');
+		expect(container.querySelector<HTMLButtonElement>('[data-act="grant"]')?.disabled).toBe(true);
+	});
+});

@@ -17,6 +17,7 @@ import { useNavigate } from '@tanstack/react-router';
 
 import { LoreTerm } from '@/components/lore/lore-term';
 import { Button } from '@/components/ui/button';
+import { installUnavailableReason } from '@/lib/desktop-only';
 import { dailyAddress } from '@/lib/lore';
 import { openSettingsFile } from '@/lib/settings/client';
 import { useOpenFile } from '@/lib/settings/use-open-file';
@@ -49,6 +50,9 @@ interface CardModel {
 	label: string;
 	value: string;
 	detail?: string;
+	/** Things that did not happen, one line each — rendered as errors, never as
+	 *  part of a success summary. */
+	problems?: string[];
 	skipped?: boolean;
 }
 
@@ -292,6 +296,18 @@ function SummaryCard({ card, onEdit }: { card: CardModel; onEdit: () => void }) 
 					{card.detail}
 				</div>
 			)}
+			{card.problems && card.problems.length > 0 && (
+				<ul
+					role="alert"
+					className="mt-2 grid gap-1 text-[12px]"
+					style={{ color: 'var(--danger)' }}
+					data-testid="summary-card-problems"
+				>
+					{card.problems.map((line) => (
+						<li key={line}>{line}</li>
+					))}
+				</ul>
+			)}
 		</div>
 	);
 }
@@ -393,7 +409,7 @@ function renderCard(
 			if (!p || rec.status !== 'completed') {
 				return { ...base, value: 'Not gathered' };
 			}
-			const pkgCount = p.selected.length;
+			const installs = describeInstalls(p);
 			const scaffold = p.scaffolding;
 			const scaffoldNoteFor: Record<string, string> = {
 				scaffold: ' · .claude/ scaffolded',
@@ -404,8 +420,9 @@ function renderCard(
 			const scaffoldNote = scaffold ? (scaffoldNoteFor[scaffold.choice] ?? '') : '';
 			return {
 				...base,
-				value: `${pkgCount} package${pkgCount === 1 ? '' : 's'}${scaffoldNote}`,
+				value: `${installs.headline}${scaffoldNote}`,
 				detail: p.selected.slice(0, 6).join(', ') || undefined,
+				problems: installs.problems,
 			};
 		}
 		case 'look': {
@@ -425,6 +442,40 @@ function renderCard(
 		default:
 			return base;
 	}
+}
+
+/** What the Ngwa step's install batch actually did. The card used to count the
+ *  packages the user *picked* ("3 packages"), so a batch that failed — or never
+ *  ran — read as a success. Only a recorded `ok` result counts as installed. */
+export function describeInstalls(p: EquipmentStepPayload): {
+	headline: string;
+	problems: string[];
+} {
+	const n = p.selected.length;
+	const noun = (c: number) => `package${c === 1 ? '' : 's'}`;
+	if (n === 0) return { headline: 'No packages selected', problems: [] };
+	const results = p.installResults;
+	if (!results) {
+		const blocked = installUnavailableReason();
+		if (blocked) {
+			return {
+				headline: `${n} ${noun(n)} selected, none installed`,
+				problems: [`${blocked} — packages can't be installed from the browser yet.`],
+			};
+		}
+		return {
+			headline: `${n} ${noun(n)} selected`,
+			problems: [
+				'Install status unknown — the install either has not finished or did not run. Check Ngwa → Store.',
+			],
+		};
+	}
+	const ok = results.filter((r) => r.ok).length;
+	const bad = results.filter((r) => !r.ok);
+	return {
+		headline: `${ok} of ${n} ${noun(n)} installed`,
+		problems: bad.map((r) => `${r.display}: ${r.error ?? 'not installed'}`),
+	};
 }
 
 function themeName(t: LookPayload['theme']): string {

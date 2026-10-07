@@ -12,6 +12,8 @@ import { useCallback, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, ArrowRight, Bot, Circle, CircleDot, HelpCircle, Minus } from 'lucide-react';
 import type { NgwaItem } from '@ikenga/contract';
 import type { EngineId } from '@/lib/tauri-cmd';
+import { NOT_AVAILABLE_ON_SERVER_LABEL } from '@/lib/transport/unavailable';
+import { fullyDown } from '@/lib/ngwa/scan-coverage';
 import { kindIcon } from './ngwa-list';
 import {
 	ENGINE_IDS,
@@ -50,7 +52,7 @@ export interface NgwaScopesSurfaceProps {
 	items: NgwaItem[];
 	isLoading?: boolean;
 	error?: Error | null;
-	unreadableSources?: Array<{ source: string; error: string | null }>;
+	unreadableSources?: Array<{ source: string; error: string | null; unavailable?: boolean }>;
 	scopes: ScopeColumn[];
 	/** The user's home directory — the personal scope root. `null` while it is
 	 *  unresolved; every path-checked action is then disabled with a reason. */
@@ -135,6 +137,7 @@ export function NgwaScopesSurface({
 		allRows,
 		conflicts,
 		unknownReason,
+		notScanned,
 		scopeLabel,
 		rootWhy,
 		enableBlock,
@@ -150,8 +153,14 @@ export function NgwaScopesSurface({
 		updatePersonalRequest,
 		pkgUninstallRequest,
 	} = ops;
-	const primitivesDown = unreadableSources.filter((s) => PRIMITIVE_SOURCES.includes(s.source));
+	const primitivesDown = fullyDown(
+		unreadableSources.filter((s) => PRIMITIVE_SOURCES.includes(s.source))
+	);
 	const unknown = unknownReason !== undefined;
+	// A source the server does not run (the headless daemon: trust, usage, pkg
+	// runtime, engine-asset placements) is named apart from one that failed.
+	const unreadable = unreadableSources.filter((s) => !s.unavailable);
+	const notServed = unreadableSources.filter((s) => s.unavailable);
 
 	const searchedRows = useMemo(() => {
 		const q = search?.trim().toLowerCase();
@@ -414,8 +423,14 @@ export function NgwaScopesSurface({
 		}
 		return targets;
 	}
-	function enableAllReason(where: string, targets: EnableTarget[]): string | undefined {
+	function enableAllReason(
+		where: string,
+		targets: EnableTarget[],
+		scopeKey?: string
+	): string | undefined {
 		if (unknownReason) return unknownReason;
+		const unscanned = scopeKey ? notScanned(scopeKey) : undefined;
+		if (unscanned) return unscanned;
 		if (targets.length === 0) return `Every eligible row is already enabled in ${where}`;
 		return undefined;
 	}
@@ -488,14 +503,23 @@ export function NgwaScopesSurface({
 
 	return (
 		<div className="view-ngwa flex-1 min-h-0 flex flex-col">
-			{unreadableSources.length > 0 && (
+			{unreadable.length > 0 && (
 				<div className="source-banner" role="alert" data-unreadable>
 					<AlertTriangle className="h-4 w-4" />
 					<span>
 						Unreadable:{' '}
-						{unreadableSources.map((s) => `${s.source}${s.error ? ` (${s.error})` : ''}`).join('; ')}.
+						{unreadable.map((s) => `${s.source}${s.error ? ` (${s.error})` : ''}`).join('; ')}.
 						Rows from those sources are missing, not absent
 						{unknown ? ', and actions that place or delete files are disabled' : ''}.
+					</span>
+				</div>
+			)}
+			{notServed.length > 0 && (
+				<div className="source-banner" role="status" data-unavailable>
+					<AlertTriangle className="h-4 w-4" />
+					<span>
+						{NOT_AVAILABLE_ON_SERVER_LABEL}:{' '}
+						{notServed.map((s) => `${s.source}${s.error ? ` (${s.error})` : ''}`).join('; ')}.
 					</span>
 				</div>
 			)}
@@ -534,15 +558,18 @@ export function NgwaScopesSurface({
 									<th className="left">Equipment</th>
 									{orderedScopes.map((col) => {
 										const targets = enableAllScope(col);
-										const why = enableAllReason(col.label, targets);
+										const why = enableAllReason(col.label, targets, col.key);
+										const unscanned = notScanned(col.key);
 										return (
 											<th
 												key={col.key}
 												className={col.active || col.key === focusScope ? 'active' : undefined}
 												data-col={col.key}
+												data-notscanned={unscanned ? '' : undefined}
+												title={unscanned}
 											>
 												<span className="colname">{col.label}</span>
-												<span className="colsub">{col.sub}</span>
+												<span className="colsub">{unscanned ? 'not scanned' : col.sub}</span>
 												<button
 													type="button"
 													className="chip enall"
@@ -592,7 +619,12 @@ export function NgwaScopesSurface({
 											</td>
 											{orderedScopes.map((col) => {
 												const id = `${row.key}|${col.key}`;
-												const mark = scopeMark(row, col.key, conflict, unknown);
+												const mark = scopeMark(
+													row,
+													col.key,
+													conflict,
+													unknown || notScanned(col.key) !== undefined
+												);
 												const v = row.byScope.get(col.key)?.version;
 												return (
 													<td key={col.key} className="cell">

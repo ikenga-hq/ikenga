@@ -67,8 +67,9 @@ import {
 	type RemoteUpdateRequest,
 } from '@/shell/ngwa/ngwa-remote-dialogs';
 import { placementTarget } from '@/shell/ngwa/ngwa-scope-model';
+import { DESKTOP_ONLY_REASON, installUnavailableReason } from '@/lib/desktop-only';
 import { canOpenLocalPath, openLocalPath, writeClipboardText } from '@/lib/transport';
-import { DESKTOP_ONLY_REASON } from '@/lib/desktop-only';
+import { honestRpcError } from '@/lib/transport/unavailable';
 import type { PkgViewEntry } from '@/lib/pkg/use-activity-bar-entries';
 import { handToChi } from '@/shell/companion/companion-store';
 import {
@@ -567,7 +568,7 @@ export function useNgwaItemActions({
 					requestApproval(e.approvals);
 					setStatus({ tone: 'ok', text: e.message });
 				} else {
-					setStatus({ tone: 'err', text: `${label} failed: ${errText(e)}` });
+					setStatus({ tone: 'err', text: `${label} failed: ${honestRpcError(e)}` });
 				}
 			} finally {
 				setPending(false);
@@ -594,6 +595,10 @@ export function useNgwaItemActions({
 			/** A writer is blocked while the last change settles (Scopes rule). */
 			const gate = (why: string | undefined) => why ?? (busy ? BUSY_REASON : undefined);
 			const open = (req: ConfirmRequest) => () => setConfirm(req);
+			// Gap audit rank 3: the daemon serves no oba_update yet, so in a
+			// browser session an actionable Update reads the honest reason
+			// instead of ending in a raw failure. Drop with `installUnavailableReason`.
+			const updateGate = (why: string | undefined) => installUnavailableReason() || gate(why);
 
 			// ── Disable / Enable ──
 			let toggle: NgwaAct;
@@ -702,7 +707,7 @@ export function useNgwaItemActions({
 								record,
 								check,
 								(target) => setUpdateReq({ item, record, target, links: record.links }),
-								gate
+								updateGate
 							),
 					}
 				: null;
@@ -723,7 +728,7 @@ export function useNgwaItemActions({
 				: entry?.isUpdate === true
 					? {
 							label: `Update to ${entry.latestVersion}`,
-							disabledReason: gate(undefined),
+							disabledReason: updateGate(undefined),
 							run: () =>
 								void exec(`Updated ${label} to ${entry.latestVersion}`, () => store.update(entry)),
 						}

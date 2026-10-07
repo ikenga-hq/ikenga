@@ -2,7 +2,9 @@
 // deep-link-aware hydrate (remote web session), and as saved on the desktop.
 // Every other workspace hook is stubbed; the pane store and url-sync are real.
 
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, renderHook, waitFor } from '@testing-library/react';
+import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PaneTreeSnapshot } from '@/lib/panes/pane-persistence';
 
@@ -47,6 +49,11 @@ import { usePaneStore } from '@/lib/panes/pane-store';
 import type { LeafNode, PaneNode } from '@/lib/panes/types';
 import { useWorkspaceEffects } from './workspace-effects';
 
+// useWorkspaceEffects reads the query client (remote focus refetch).
+const wrapper = ({ children }: { children: ReactNode }) => (
+	<QueryClientProvider client={new QueryClient()}>{children}</QueryClientProvider>
+);
+
 let routePane: LeafNode;
 let termPane: LeafNode;
 
@@ -69,7 +76,7 @@ afterEach(() => cleanup());
 describe('useWorkspaceEffects layout restore', () => {
 	it('remote web session: restores the layout with the deep link in the saved focused pane', async () => {
 		h.web = true;
-		renderHook(() => useWorkspaceEffects(() => {}));
+		renderHook(() => useWorkspaceEffects(() => {}), { wrapper });
 		await waitFor(() => expect(usePaneStore.getState().focusedId).toBe(routePane.id));
 		expect(usePaneStore.getState().focusedView()).toEqual({
 			kind: 'route',
@@ -79,7 +86,7 @@ describe('useWorkspaceEffects layout restore', () => {
 
 	it('desktop: restores the layout as saved', async () => {
 		h.web = false;
-		renderHook(() => useWorkspaceEffects(() => {}));
+		renderHook(() => useWorkspaceEffects(() => {}), { wrapper });
 		await waitFor(() => expect(usePaneStore.getState().focusedId).toBe(routePane.id));
 		expect(usePaneStore.getState().focusedView()).toEqual({ kind: 'route', path: '/settings' });
 	});
