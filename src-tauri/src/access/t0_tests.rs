@@ -245,6 +245,7 @@ async fn the_public_route_set_is_exactly_health_spa_and_pairing() {
         ("POST", "/api/rpc"),
         ("POST", "/api/shutdown"),
         ("GET", "/ws/fs"),
+        ("GET", "/ws/events"),
         ("GET", "/ws/pty/x"),
         ("GET", "/ws/chat/x"),
         ("GET", "/pkgs/x/index.html"),

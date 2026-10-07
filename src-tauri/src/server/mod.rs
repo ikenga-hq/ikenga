@@ -24,6 +24,10 @@ pub mod auth;
 pub mod broker;
 pub mod chat_ws;
 pub mod discovery;
+/// The daemon's event bus (`settings://changed`, `notifications://changed`,
+/// …) and its `/ws/events` delivery to browsers (gap audit rank 10).
+pub mod events;
+pub mod events_ws;
 pub mod fs_ws;
 pub mod health;
 /// T1 operator: the operator root, `operator/accounts.db`, passwords and the
@@ -37,11 +41,16 @@ pub mod pkg_static;
 #[cfg(target_os = "linux")]
 pub mod principal_child;
 pub mod pty_ws;
+/// Web Push (plans/pwa S2/S3).
+pub mod push;
 mod reserved;
 pub mod rpc;
 mod rpc_claude;
+mod rpc_exec;
 mod rpc_files;
+mod rpc_fs_roots;
 mod rpc_local;
+mod rpc_seats;
 mod rpc_shell;
 pub mod shared;
 pub mod static_files;
@@ -50,6 +59,8 @@ pub mod static_files;
 pub mod supervisor;
 /// Trusted proxy and client IP resolution (IKENGA_TRUSTED_PROXIES).
 pub mod trusted_proxy;
+/// In-app server updates (WP-P9): root's update files, the admin's request.
+pub mod update;
 
 /// Tauri-command ↔ daemon-RPC parity ratchet (WP-19). Test-only; reads
 /// `lib.rs` and `rpc.rs` as text so it compiles in both feature sets.
@@ -57,6 +68,10 @@ pub mod trusted_proxy;
 /// lexer.
 #[cfg(test)]
 pub(crate) mod parity;
+#[cfg(test)]
+mod events_ws_tests;
+#[cfg(test)]
+mod fs_roots_router_tests;
 #[cfg(test)]
 mod share_router_tests;
 
@@ -167,6 +182,10 @@ pub struct T1ServeOptions {
     /// `--member-invites-create-accounts` (G-ACCESS §4.4, N-11; T1). Off by
     /// default.
     pub member_invites_create_accounts: bool,
+    /// Web Push flags (plans/pwa S2): `--no-push`, `--push-contact`,
+    /// `--push-endpoint-host`, `--push-allow-endpoint`. Read by the T0
+    /// daemon and the T1 broker (the store owners).
+    pub push: push::PushOptions,
 }
 
 impl T1ServeOptions {
@@ -248,6 +267,14 @@ pub struct AppState {
     /// ever reachable from the process that started it. Share-mode clones of
     /// `AppState` keep the same `Arc`.
     pub(crate) chi: Arc<rpc_local::DaemonChi>,
+    /// The daemon's counterpart of the desktop's `app.emit` (see
+    /// `server::events`): arms that mirror a desktop emit publish here, and
+    /// `/ws/events` relays it to browsers. One per process — under T1, one
+    /// per principal child. Share-mode clones keep the same `Arc`.
+    pub(crate) events: Arc<events::EventBus>,
+    /// In-app updates (`server::update`): T0 with a `--data-dir` only. A
+    /// principal child never has one (the T1 broker answers those routes).
+    pub(crate) update: Option<Arc<update::UpdateCtl>>,
     /// Channel for triggering graceful server shutdown.
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -517,7 +544,13 @@ async fn auth_middleware(
         }
     }
     req.extensions_mut().insert(ctx);
-    let res = activity::track_request(next.run(req)).await;
+    // The broker's push long-poll (plans/pwa S2 §10) is not activity: a held
+    // poll would otherwise keep an idle principal child alive forever.
+    let res = if req.uri().path() == push::outbox::EVENTS_PATH {
+        next.run(req).await
+    } else {
+        activity::track_request(next.run(req)).await
+    };
     Ok(with_cookie(with_cookie(res, &set_cookie), &pkgs_cookie))
 }
 
@@ -599,7 +632,41 @@ pub(crate) fn create_router_with_access(
         crate::pkg::skill_actions::store_root(),
         access,
         None,
+        UpdateSource::Default,
     )
+}
+
+/// [`create_router_with_access`] with the update state injected, so tests
+/// point it at a temp dir instead of `/var/lib/ikenga-update`.
+#[cfg(test)]
+pub(crate) fn router_with_update(
+    config: ServerConfig,
+    access: Arc<crate::access::DaemonAccess>,
+    pty_manager: Arc<PtyManager>,
+    update: Option<Arc<update::UpdateCtl>>,
+) -> Router {
+    build_router(
+        config,
+        pty_manager,
+        Arc::new(EngineRegistry::new()),
+        None,
+        None,
+        None,
+        rpc_shell::PathGuard::allowlist(),
+        None,
+        access,
+        None,
+        UpdateSource::Given(update),
+    )
+}
+
+/// Where a router's [`update::UpdateCtl`] comes from.
+enum UpdateSource {
+    /// T0 with a `--data-dir`: root's state dir and `<data>/update-request.json`.
+    Default,
+    /// Tests.
+    #[cfg(test)]
+    Given(Option<Arc<update::UpdateCtl>>),
 }
 
 /// [`router_with_home`] with the path allowlist made explicit too, so tests
@@ -626,6 +693,7 @@ pub(crate) fn router_with(
         crate::pkg::skill_actions::store_root(),
         crate::access::DaemonAccess::unavailable(),
         None,
+        UpdateSource::Default,
     )
 }
 
@@ -653,6 +721,7 @@ pub(crate) fn router_with_store(
         store,
         crate::access::DaemonAccess::unavailable(),
         None,
+        UpdateSource::Default,
     )
 }
 
@@ -676,6 +745,34 @@ pub(crate) fn router_with_chi(
         crate::pkg::skill_actions::store_root(),
         crate::access::DaemonAccess::unavailable(),
         Some(chi),
+        UpdateSource::Default,
+    )
+}
+
+/// [`router_with`] with the Chi arms' state as well, for the executor-routed
+/// arms' tests (`server::rpc_exec`): a local allowlist, a stub engine and a
+/// PTY manager the test holds, all at once.
+#[cfg(test)]
+pub(crate) fn router_for_exec_tests(
+    config: ServerConfig,
+    pty_manager: Arc<PtyManager>,
+    pa_db: Option<Arc<crate::db::PaDb>>,
+    home: Option<PathBuf>,
+    path_guard: rpc_shell::PathGuard,
+    chi: Arc<rpc_local::DaemonChi>,
+) -> Router {
+    build_router(
+        config,
+        pty_manager,
+        Arc::new(EngineRegistry::new()),
+        pa_db,
+        None,
+        home,
+        path_guard,
+        crate::pkg::skill_actions::store_root(),
+        crate::access::DaemonAccess::unavailable(),
+        Some(chi),
+        UpdateSource::Default,
     )
 }
 
@@ -691,6 +788,7 @@ fn build_router(
     store: Option<PathBuf>,
     access: Arc<crate::access::DaemonAccess>,
     chi: Option<Arc<rpc_local::DaemonChi>>,
+    update: UpdateSource,
 ) -> Router {
     // Whatever the allowlist covers, no caller path reaches this daemon's own
     // state: its `--data-dir` (fs_roots.json, ikenga.db, supabase.json,
@@ -708,23 +806,31 @@ fn build_router(
     // included — gets the same view of `--pkgs-dir`. Walked ONCE: the static
     // server and the status index are built from the same list, so they can
     // never disagree about which directories are pkgs. Both log what they found.
-    let pkgs = pkg_index::scan(config.pkgs_dir.as_deref());
-    let pkg_static = PkgStaticService::from_packages(config.pkgs_dir.as_deref(), &pkgs);
-    let pkg_index = Arc::new(PkgIndex::from_packages(&pkgs));
+    let scanned = pkg_index::scan_dir(config.pkgs_dir.as_deref());
+    let pkg_static = PkgStaticService::from_packages(config.pkgs_dir.as_deref(), &scanned.pkgs);
+    let pkg_index = Arc::new(PkgIndex::from_scan(&scanned));
+    // The settings and actions managers publish their change signals here,
+    // as the desktop's emit them to the webview (`server::events`).
+    let events = events::EventBus::new();
     let settings = match (&pa_db, &config.data_dir, &home) {
         (Some(db), Some(dir), Some(home)) => Some(Arc::new(rpc_local::DaemonSettings::new(
             db.clone(),
             dir.clone(),
             home.clone(),
+            Some(events::settings_notifier(&events)),
         ))),
         _ => None,
     };
+    if let Some(settings) = &settings {
+        events.attach_settings(settings);
+    }
     let actions = match (&pa_db, &config.data_dir, &home) {
         (Some(db), Some(dir), Some(home)) => Some(Arc::new(rpc_files::daemon_actions(
             db.clone(),
             dir,
             home.clone(),
             path_guard.clone(),
+            Some(events::actions_notifier(&events)),
         ))),
         _ => None,
     };
@@ -733,6 +839,17 @@ fn build_router(
         config.data_dir.as_deref(),
         config.executor_tier,
     ));
+    let update = match update {
+        UpdateSource::Default => match (&access.mode, &config.data_dir) {
+            (crate::access::DaemonMode::T0, Some(dir)) => Some(Arc::new(update::UpdateCtl::new(
+                update::state_dir(),
+                dir.join(update::REQUEST_FILE),
+            ))),
+            _ => None,
+        },
+        #[cfg(test)]
+        UpdateSource::Given(u) => u,
+    };
     let state = Arc::new(AppState {
         config,
         spa_service: spa_service.clone(),
@@ -748,6 +865,8 @@ fn build_router(
         store,
         secrets,
         chi: chi.unwrap_or_else(|| Arc::new(rpc_local::DaemonChi::host())),
+        events,
+        update,
         shutdown_tx,
     });
 
@@ -770,9 +889,13 @@ fn build_router(
             post(rpc::rpc_handler).layer(axum::extract::DefaultBodyLimit::max(RPC_BODY_LIMIT)),
         )
         .route("/api/shutdown", post(shutdown_handler))
+        // In-app updates (WP-P9): operator only (`access::route_requirement`).
+        .route("/api/server/update", get(update::t0_status))
+        .route("/api/server/update/apply", post(update::t0_apply))
         .route("/ws/pty/:id", get(pty_ws::pty_ws_handler))
         .route("/ws/chat/:id", get(chat_ws::chat_ws_handler))
         .route("/ws/fs", get(fs_ws::fs_ws_handler))
+        .route("/ws/events", get(events_ws::events_ws_handler))
         // Installed pkg bundles, read-only. Inside the protected group on
         // purpose: pkg content is code, and the bearer token is the whole
         // trust boundary. No second per-mount token is minted.
@@ -783,11 +906,20 @@ fn build_router(
         // with no token at all. Verified against a live daemon; keep all three.
         .route("/pkgs/:id", get(pkg_static::pkg_static_root_handler))
         .route("/pkgs/:id/", get(pkg_static::pkg_static_root_handler))
-        .route("/pkgs/:id/*path", get(pkg_static::pkg_static_file_handler))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ));
+        .route("/pkgs/:id/*path", get(pkg_static::pkg_static_file_handler));
+    // plans/pwa S2 §10: a principal child's push outbox, drained by the T1
+    // broker only (`internal` class: the per-child token plus the broker's
+    // internal-call header; the broker never proxies `/internal/*`).
+    let protected_routes = match access.mode {
+        crate::access::DaemonMode::PrincipalChild => {
+            protected_routes.route(push::outbox::EVENTS_PATH, get(push::outbox::events_handler))
+        }
+        crate::access::DaemonMode::T0 => protected_routes,
+    };
+    let protected_routes = protected_routes.layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth_middleware,
+    ));
 
     // G-ACCESS §1.6: the public pairing endpoints (T0 only — a principal
     // child never pairs; the T1 broker serves its own), behind their own
@@ -852,6 +984,7 @@ pub async fn run_server_with(config: ServerConfig, t1: T1ServeOptions) -> anyhow
         config,
         SingleTenant {
             access: t1.access_options(),
+            push: t1.push.clone(),
             ..SingleTenant::default()
         },
     )
@@ -868,6 +1001,8 @@ struct SingleTenant {
     principal_child: bool,
     /// The Part B flags (G-ACCESS §10.1).
     access: crate::access::AccessOptions,
+    /// Web Push flags (plans/pwa S2); the T0 daemon owns the hub.
+    push: push::PushOptions,
 }
 
 /// Resolves on SIGINT, SIGTERM or a message on `shutdown_rx`.
@@ -931,7 +1066,20 @@ async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> an
     // but not the useful one. `--data-dir` is also where `ikenga.db` lives.
     if let Some(ref data_dir) = config.data_dir {
         std::fs::create_dir_all(data_dir)?;
-        match crate::fs_roots::FsRoots::load(data_dir.join("fs_roots.json")) {
+        // A T1 principal child seeds its principal's home (the `HOME` the
+        // broker launched it with) into a list nobody has set up yet — on
+        // its first launch, which is the principal's first authenticated
+        // request (gap audit 2026-10-06 rank 1). Not at account creation:
+        // `adopt-t0` requires a principal's `data/` to be empty until it has
+        // run. T0 keeps no seed.
+        let seed = if mode.principal_child {
+            crate::platform::home_dir()
+                .map(|h| vec![h.to_string_lossy().into_owned()])
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        match crate::fs_roots::FsRoots::load_seeded(data_dir.join("fs_roots.json"), seed) {
             Ok(roots) => {
                 if let Err(e) = crate::fs_roots::install(Arc::new(roots)) {
                     warn!("fs_roots install failed: {e:#}");
@@ -1008,6 +1156,23 @@ async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> an
         )
         .await
     };
+    // plans/pwa S2/S3: the T0 daemon owns subscriptions and the VAPID key
+    // (`<data-dir>/push/vapid.json`); a principal child only queues events
+    // for the broker. Either way, created notification rows become pushes.
+    if mode.principal_child {
+        push::install_outbox(Arc::new(push::outbox::Outbox::new()));
+        push::events::spawn_bridge();
+    } else if let (Some(store), Some(dir)) = (access.store(), config.data_dir.as_deref()) {
+        if let Some(hub) = push::hub::boot(
+            store.clone(),
+            &push::vapid::path_in(dir),
+            &mode.push,
+            mode.access.public_url.as_deref(),
+        ) {
+            push::install_hub(hub);
+            push::events::spawn_bridge();
+        }
+    }
     let router = create_router_with_access(
         config.clone(),
         pty_manager.clone(),
@@ -1216,6 +1381,7 @@ async fn t1_boot(config: ServerConfig, t1: T1ServeOptions) -> anyhow::Result<()>
         bootstrap,
         insecure_cookie: t1.insecure_cookie,
         access: access_options,
+        push: t1.push,
     })
     .await
 }
@@ -1266,6 +1432,7 @@ async fn principal_child_boot(mut config: ServerConfig, t1: T1ServeOptions) -> a
             lock: Some(lock),
             principal_child: true,
             access: t1.access_options(),
+            push: push::PushOptions::default(),
         },
     )
     .await

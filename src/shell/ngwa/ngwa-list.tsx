@@ -22,7 +22,7 @@ export { kindIcon };
 
 export interface NgwaListProps {
 	items: NgwaItem[];
-	unreadableSources?: Array<{ source: string; error: string | null }>;
+	unreadableSources?: Array<{ source: string; error: string | null; unavailable?: boolean }>;
 	isLoading?: boolean;
 	error?: Error | null;
 	/** D-02 actions for an item (detail action row + row context menu),
@@ -187,15 +187,26 @@ export function NgwaList({
 	return (
 		<div className="view-ngwa flex-1 min-h-0 flex flex-col">
 			{/* ── Unreadable Source Banners (Gate §2) ── */}
-			{unreadableSources.map((s) => (
-				<div key={s.source} className="source-banner" role="alert">
-					<AlertTriangle className="h-4 w-4 flex-none" />
-					<span>
-						<strong>{s.source} unreadable</strong>
-						{s.error ? `: ${s.error}` : ' — could not scan subsystem'}
-					</span>
-				</div>
-			))}
+			{unreadableSources.map((s) =>
+				// A source the server does not run is stated, not alarmed: the
+				// reason already says "not available on this server".
+				s.unavailable ? (
+					<div key={s.source} className="source-banner" role="status" data-unavailable={s.source}>
+						<AlertTriangle className="h-4 w-4 flex-none" />
+						<span>
+							<strong>{s.source}</strong>: {s.error}
+						</span>
+					</div>
+				) : (
+					<div key={s.source} className="source-banner" role="alert">
+						<AlertTriangle className="h-4 w-4 flex-none" />
+						<span>
+							<strong>{s.source} unreadable</strong>
+							{s.error ? `: ${s.error}` : ' — could not scan subsystem'}
+						</span>
+					</div>
+				)
+			)}
 
 			{/* ── Facet Bar ── */}
 			<NgwaFacetBar items={items} facets={facets} onChange={setFacets} />

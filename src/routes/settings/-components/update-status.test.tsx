@@ -16,9 +16,24 @@ describe('UpdateStatus', () => {
 		);
 		expect(screen.queryByText(/up to date/i)).toBeNull();
 		expect(screen.queryByText(/last checked/i)).toBeNull();
-		expect(screen.getByTestId('update-status-browser').textContent).toMatch(
-			/runs only in the desktop app/
+		expect(screen.getByTestId('update-status-browser').textContent).toBe(
+			"This browser session can't install app updates. The server is updated by its administrator."
 		);
+	});
+
+	it('points an admin who can update the server at the Server updates panel', () => {
+		render(
+			<UpdateStatus
+				desktop={false}
+				serverUpdates
+				available={false}
+				checking={false}
+				lastCheckedAt={Date.now()}
+			/>
+		);
+		const text = screen.getByTestId('update-status-browser').textContent ?? '';
+		expect(text).toMatch(/see Server updates below/);
+		expect(text).not.toMatch(/up to date/i);
 	});
 
 	it('keeps the desktop "up to date" line after a check', () => {

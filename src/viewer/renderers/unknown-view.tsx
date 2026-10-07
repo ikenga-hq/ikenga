@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { File } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { openExternalUrl } from '@/lib/transport';
+import { toast } from '@/lib/toast';
+import { isBrowserHost, openLocalPath } from '@/lib/transport';
 import { fsRead } from '@/lib/tauri-cmd';
 import { basename } from '../lib/path';
 
@@ -41,12 +42,17 @@ export function UnknownView({ path, mime }: UnknownViewProps) {
 				variant="outline"
 				size="sm"
 				onClick={() => {
-					// tauri-plugin-shell's `open` shells out to xdg-open / `open` /
-					// explorer.exe — the OS picks the default handler.
-					void openExternalUrl(path);
+					// Desktop: the OS picks the default handler. Browser: the path
+					// is on the server, so this downloads the file instead.
+					openLocalPath(path, { kind: 'file' }).catch((e) =>
+						toast({
+							label: `Could not open ${basename(path)}: ${e instanceof Error ? e.message : String(e)}`,
+							variant: 'error',
+						})
+					);
 				}}
 			>
-				Open in default app
+				{isBrowserHost() ? 'Download' : 'Open in default app'}
 			</Button>
 		</div>
 	);

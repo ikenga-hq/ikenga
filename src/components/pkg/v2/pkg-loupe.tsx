@@ -35,6 +35,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Dot, OriginChip, StateChip, TrustChip, UpdateChip, ViolationChip } from './atoms';
 import { PkgScreenshotCarousel, PkgScreenshotHero } from './pkg-screenshots';
 import { classifyScope, riskColor } from './scope-classifier';
+import { copyText } from '@/lib/clipboard';
 
 export type LoupeTab = 'overview' | 'permissions' | 'trust' | 'settings' | 'manifest';
 
@@ -668,12 +669,7 @@ function TabManifest({ row }: { row: PkgRowV2 }) {
 				{json}
 			</pre>
 			<div className="flex gap-1.5">
-				<Button
-					size="sm"
-					variant="outline"
-					className="h-7"
-					onClick={() => void navigator.clipboard?.writeText(json)}
-				>
+				<Button size="sm" variant="outline" className="h-7" onClick={() => void copyText(json)}>
 					<Copy className="mr-1.5 h-3.5 w-3.5" />
 					Copy
 				</Button>

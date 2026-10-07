@@ -1,6 +1,6 @@
 [package]
 name = "ikenga-desktop"
-version = "0.20.1"
+version = "0.21.3"
 description = "PA Desktop — Tauri + xterm + portable-pty"
 authors = ["Ikenga"]
 edition = "2021"
@@ -156,6 +156,11 @@ sha2 = "0.10"
 # transitively (hkdf 0.12.4, hmac 0.12.1), so no new version enters the tree.
 hkdf = "0.12"
 hmac = "0.12"
+# plans/pwa S2: Web Push — P-256 ECDH for RFC 8291 message encryption and
+# ES256 (raw r‖s) for the RFC 8292 VAPID JWT. Already in Cargo.lock (0.17.14)
+# through rustls / reqwest and compiled into both binaries, so no new crate
+# enters the tree.
+ring = "0.17"
 # G-ACCESS (WP-74b, §3.4, P-7): the SPAKE2 pairing handshake (host side,
 # `start_b`, Ed25519Group). Its deps (curve25519-dalek ^4, hkdf ^0.12,
 # sha2 ^0.10, rand_core ^0.6) are already in the lock; pinned exactly so the

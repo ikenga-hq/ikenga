@@ -3152,7 +3152,7 @@ dependencies = [
 
 [[package]]
 name = "ikenga-desktop"
-version = "0.20.1"
+version = "0.21.3"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3189,6 +3189,7 @@ dependencies = [
  "rand 0.8.7",
  "regex",
  "reqwest 0.12.28",
+ "ring",
  "rmp-serde",
  "rust-argon2 2.1.0",
  "serde",
@@ -3242,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "ikenga-server"
-version = "0.20.1"
+version = "0.21.3"
 dependencies = [
  "anyhow",
  "clap",

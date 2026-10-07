@@ -7,9 +7,8 @@
 //! `OnceLock` so the resolver doesn't need to thread Tauri `State` through
 //! every fs command and through non-command callers like `viewer_serve`.
 
-// `add` / `remove` / `reset` are driven by the desktop settings commands;
-// the daemon only ever reads the root set that `install()` seeded.
-#![cfg_attr(not(feature = "desktop"), allow(dead_code))]
+// `add` / `remove` / `reset` are driven by the desktop settings commands and
+// by the daemon's `fs_roots_*` arms (`server::rpc_fs_roots`).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -28,6 +27,13 @@ pub const DEFAULT_ROOTS: &[&str] = &[];
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedRoots {
     roots: Vec<String>,
+    /// True once the list has been seeded or edited (add / remove / reset).
+    /// It is what tells a list nobody has set up yet from one its owner
+    /// emptied on purpose: only the first is ever seeded
+    /// ([`FsRoots::load_seeded`]). Files written before the flag existed
+    /// read as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    initialized: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -42,9 +48,18 @@ struct Entry {
 }
 
 #[derive(Debug)]
+struct State {
+    entries: Vec<Entry>,
+    initialized: bool,
+}
+
+#[derive(Debug)]
 pub struct FsRoots {
     file: PathBuf,
-    state: RwLock<Vec<Entry>>,
+    /// What [`FsRoots::reset`] restores: the seed this set was loaded with,
+    /// or [`DEFAULT_ROOTS`] when it had none.
+    defaults: Vec<String>,
+    state: RwLock<State>,
 }
 
 static CURRENT: OnceLock<Arc<FsRoots>> = OnceLock::new();
@@ -67,45 +82,73 @@ fn resolve_input(input: &str) -> Result<PathBuf> {
     Ok(p.canonicalize().unwrap_or(p))
 }
 
+fn entries_of<S: AsRef<str>>(inputs: &[S]) -> Vec<Entry> {
+    inputs
+        .iter()
+        .filter_map(|s| {
+            let resolved = resolve_input(s.as_ref()).ok()?;
+            Some(Entry {
+                input: s.as_ref().to_string(),
+                resolved,
+            })
+        })
+        .collect()
+}
+
 impl FsRoots {
-    /// Load from disk, seeding defaults if the file is missing.
+    /// Load from disk, seeding defaults if the file is missing. The desktop's
+    /// loader; the daemon always goes through [`FsRoots::load_seeded`].
+    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
     pub fn load(file: PathBuf) -> Result<Self> {
-        let entries = if file.exists() {
+        Self::load_seeded(file, Vec::new())
+    }
+
+    /// [`FsRoots::load`] for a set that starts from `seed` rather than
+    /// [`DEFAULT_ROOTS`]: a T1 principal child seeds its principal's home
+    /// (gap audit 2026-10-06 rank 1). The seed is applied when the list is
+    /// empty **and** was never seeded or edited — a missing file, or one
+    /// written before the `initialized` flag existed (every account on a host
+    /// that predates this) — and never to a list its owner emptied on
+    /// purpose. `reset` restores the seed.
+    pub fn load_seeded(file: PathBuf, seed: Vec<String>) -> Result<Self> {
+        let (inputs, initialized) = if file.exists() {
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("read {}", file.display()))?;
             let persisted: PersistedRoots =
                 serde_json::from_str(&text).with_context(|| format!("parse {}", file.display()))?;
-            persisted
-                .roots
-                .into_iter()
-                .filter_map(|s| {
-                    let resolved = resolve_input(&s).ok()?;
-                    Some(Entry { input: s, resolved })
-                })
-                .collect()
+            (persisted.roots, persisted.initialized)
         } else {
-            DEFAULT_ROOTS
-                .iter()
-                .filter_map(|s| {
-                    let resolved = resolve_input(s).ok()?;
-                    Some(Entry {
-                        input: (*s).to_string(),
-                        resolved,
-                    })
-                })
-                .collect()
+            (DEFAULT_ROOTS.iter().map(|s| s.to_string()).collect(), false)
+        };
+        let defaults = if seed.is_empty() {
+            DEFAULT_ROOTS.iter().map(|s| s.to_string()).collect()
+        } else {
+            seed
+        };
+        let (inputs, initialized) = if !initialized && inputs.is_empty() && !defaults.is_empty() {
+            tracing::info!("[fs_roots] seeding {} with {defaults:?}", file.display());
+            (defaults.clone(), true)
+        } else {
+            (inputs, initialized)
         };
 
         let roots = Self {
             file,
-            state: RwLock::new(entries),
+            defaults,
+            state: RwLock::new(State {
+                entries: entries_of(&inputs),
+                initialized,
+            }),
         };
 
         // Persist on first boot so the defaults are visible to anyone
         // poking at the on-disk file. Best-effort — a failure here just
         // means we re-seed on the next launch.
-        if let Err(e) = roots.persist() {
-            log::warn!("[fs_roots] initial persist failed: {e:#}");
+        {
+            let guard = roots.state.read().expect("fs_roots state poisoned");
+            if let Err(e) = roots.persist(&guard) {
+                tracing::warn!("[fs_roots] initial persist failed: {e:#}");
+            }
         }
 
         Ok(roots)
@@ -115,13 +158,13 @@ impl FsRoots {
     /// frontend.
     pub fn list_inputs(&self) -> Vec<String> {
         let guard = self.state.read().expect("fs_roots state poisoned");
-        guard.iter().map(|e| e.input.clone()).collect()
+        guard.entries.iter().map(|e| e.input.clone()).collect()
     }
 
     /// Return true if `path` (already canonicalized) is under any active root.
     pub fn is_allowed(&self, path: &Path) -> bool {
         let guard = self.state.read().expect("fs_roots state poisoned");
-        guard.iter().any(|e| path.starts_with(&e.resolved))
+        guard.entries.iter().any(|e| path.starts_with(&e.resolved))
     }
 
     /// The active root that `path` (canonical) is, or holds — `path` is that
@@ -131,6 +174,7 @@ impl FsRoots {
     pub fn root_within(&self, path: &Path) -> Option<PathBuf> {
         let guard = self.state.read().expect("fs_roots state poisoned");
         guard
+            .entries
             .iter()
             .find(|e| e.resolved.starts_with(path))
             .map(|e| e.resolved.clone())
@@ -144,52 +188,53 @@ impl FsRoots {
             return Err(anyhow!("path is empty"));
         }
         let resolved = resolve_input(trimmed)?;
-        {
-            let mut guard = self.state.write().expect("fs_roots state poisoned");
-            if guard.iter().any(|e| e.input == trimmed) {
-                return Ok(guard.iter().map(|e| e.input.clone()).collect());
+        self.mutate(|entries| {
+            if entries
+                .iter()
+                .any(|e| e.input == trimmed || e.resolved == resolved)
+            {
+                return;
             }
-            guard.push(Entry {
+            entries.push(Entry {
                 input: trimmed.to_string(),
                 resolved,
             });
-        }
-        self.persist()?;
-        Ok(self.list_inputs())
+        })
     }
 
     /// Remove a root by its user-input string (the same string the UI shows).
     /// Returns the updated input list.
     pub fn remove(&self, input: &str) -> Result<Vec<String>> {
-        {
-            let mut guard = self.state.write().expect("fs_roots state poisoned");
-            guard.retain(|e| e.input != input);
-        }
-        self.persist()?;
-        Ok(self.list_inputs())
+        self.mutate(|entries| entries.retain(|e| e.input != input))
     }
 
-    /// Reset to the built-in defaults.
+    /// Reset to this set's defaults (its seed, if it was loaded with one).
     pub fn reset(&self) -> Result<Vec<String>> {
-        {
-            let mut guard = self.state.write().expect("fs_roots state poisoned");
-            guard.clear();
-            for s in DEFAULT_ROOTS {
-                if let Ok(resolved) = resolve_input(s) {
-                    guard.push(Entry {
-                        input: (*s).to_string(),
-                        resolved,
-                    });
-                }
-            }
-        }
-        self.persist()?;
-        Ok(self.list_inputs())
+        let defaults = entries_of(&self.defaults);
+        self.mutate(|entries| *entries = defaults)
     }
 
-    fn persist(&self) -> Result<()> {
-        let inputs = self.list_inputs();
-        let persisted = PersistedRoots { roots: inputs };
+    /// Apply `edit` to a copy of the entries, persist the result, and only
+    /// then make it live — all under the write lock, so a failed write
+    /// leaves the live set as it was, and two concurrent edits (two browser
+    /// tabs, say) never interleave their writes of the one `.tmp` file.
+    fn mutate(&self, edit: impl FnOnce(&mut Vec<Entry>)) -> Result<Vec<String>> {
+        let mut guard = self.state.write().expect("fs_roots state poisoned");
+        let mut next = State {
+            entries: guard.entries.clone(),
+            initialized: true,
+        };
+        edit(&mut next.entries);
+        self.persist(&next)?;
+        *guard = next;
+        Ok(guard.entries.iter().map(|e| e.input.clone()).collect())
+    }
+
+    fn persist(&self, state: &State) -> Result<()> {
+        let persisted = PersistedRoots {
+            roots: state.entries.iter().map(|e| e.input.clone()).collect(),
+            initialized: state.initialized,
+        };
         let json = serde_json::to_string_pretty(&persisted).context("serialize fs_roots")?;
         if let Some(parent) = self.file.parent() {
             std::fs::create_dir_all(parent)
@@ -289,6 +334,91 @@ mod tests {
         if let Some(o) = outside {
             assert!(!roots.is_allowed(&o));
         }
+    }
+
+    fn initialized_flag(file: &Path) -> bool {
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+        v["initialized"].as_bool().unwrap_or(false)
+    }
+
+    /// A T1 principal's first run: no file yet, so the seed (its home) is
+    /// the list, and the file records that it was seeded.
+    #[test]
+    fn a_new_principal_is_seeded_with_its_home() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let home_s = home.to_string_lossy().to_string();
+        let file = dir.path().join("fs_roots.json");
+        let roots = FsRoots::load_seeded(file.clone(), vec![home_s.clone()]).unwrap();
+        assert_eq!(roots.list_inputs(), vec![home_s.clone()]);
+        assert!(roots.is_allowed(&home.canonicalize().unwrap().join("x")));
+        assert!(initialized_flag(&file));
+        // A reload with the same seed changes nothing.
+        let again = FsRoots::load_seeded(file, vec![home_s.clone()]).unwrap();
+        assert_eq!(again.list_inputs(), vec![home_s]);
+    }
+
+    /// Accounts that predate seeding: their file is `{"roots": []}` with no
+    /// flag (what `load` wrote on the child's first boot). Never seeded, so
+    /// the next boot seeds it.
+    #[test]
+    fn an_existing_never_seeded_empty_list_is_seeded() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("fs_roots.json");
+        std::fs::write(&file, r#"{"roots": []}"#).unwrap();
+        let roots = FsRoots::load_seeded(file.clone(), vec!["/srv/home/ada".into()]).unwrap();
+        assert_eq!(roots.list_inputs(), vec!["/srv/home/ada".to_string()]);
+        assert!(initialized_flag(&file));
+    }
+
+    /// A list its owner emptied on purpose stays empty across boots.
+    #[test]
+    fn a_deliberately_emptied_list_is_not_reseeded() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("fs_roots.json");
+        let seed = vec!["/srv/home/ada".to_string()];
+        let roots = FsRoots::load_seeded(file.clone(), seed.clone()).unwrap();
+        assert!(roots.remove("/srv/home/ada").unwrap().is_empty());
+        drop(roots);
+        let reloaded = FsRoots::load_seeded(file.clone(), seed.clone()).unwrap();
+        assert!(reloaded.list_inputs().is_empty());
+        // `reset` is the way back to the seed.
+        assert_eq!(reloaded.reset().unwrap(), seed);
+    }
+
+    /// A list someone already filled is left alone, and a set loaded with
+    /// no seed (T0, the desktop) behaves exactly as before.
+    #[test]
+    fn a_configured_list_and_an_unseeded_set_are_left_alone() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("fs_roots.json");
+        std::fs::write(&file, r#"{"roots": ["/work"]}"#).unwrap();
+        let roots = FsRoots::load_seeded(file, vec!["/srv/home/ada".into()]).unwrap();
+        assert_eq!(roots.list_inputs(), vec!["/work".to_string()]);
+
+        let file = dir.path().join("t0.json");
+        std::fs::write(&file, r#"{"roots": []}"#).unwrap();
+        let t0 = FsRoots::load(file.clone()).unwrap();
+        assert!(t0.list_inputs().is_empty());
+        assert!(!initialized_flag(&file), "loading alone marks nothing");
+    }
+
+    /// A write that fails leaves the live set as it was (the edit is made
+    /// live only after it is on disk).
+    #[test]
+    fn a_failed_write_does_not_change_the_live_set() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("fs_roots.json");
+        let roots = FsRoots::load(file.clone()).unwrap();
+        let extra = dir.path().join("proj");
+        std::fs::create_dir_all(&extra).unwrap();
+        // The `.tmp` path is a directory, so the write fails.
+        std::fs::create_dir_all(file.with_extension("json.tmp")).unwrap();
+        assert!(roots.add(&extra.to_string_lossy()).is_err());
+        assert!(roots.list_inputs().is_empty());
+        assert!(!roots.is_allowed(&extra.canonicalize().unwrap()));
     }
 
     #[test]

@@ -46,6 +46,10 @@ struct FakeLauncher {
     seen: Mutex<Vec<Seen>>,
     /// How long a launch takes (a slow child start, for handshake races).
     delay_ms: AtomicU64,
+    /// What each child answers to `server_open_terminals` (WP-P9).
+    open_terminals: Arc<AtomicU64>,
+    /// How long a child takes to answer `server_open_terminals`.
+    open_delay_ms: Arc<AtomicU64>,
 }
 
 impl FakeLauncher {
@@ -88,10 +92,38 @@ impl ChildLauncher for FakeLauncher {
             }
             let requests = Arc::new(Mutex::new(Vec::new()));
             let (r1, r2) = (requests.clone(), requests.clone());
+            let (open, open_delay) = (self.open_terminals.clone(), self.open_delay_ms.clone());
             let app = Router::new()
                 .route(
                     "/api/rpc",
-                    post(move |req: Request<Body>| echo_http(r1.clone(), req)),
+                    post(move |req: Request<Body>| {
+                        let (r1, open, open_delay) = (r1.clone(), open.clone(), open_delay.clone());
+                        async move {
+                            let (parts, body) = req.into_parts();
+                            let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                            let asks_open = serde_json::from_slice::<Value>(&body)
+                                .is_ok_and(|v| v["cmd"] == "server_open_terminals");
+                            if !asks_open {
+                                return echo_http(r1, Request::from_parts(parts, Body::from(body)))
+                                    .await
+                                    .into_response();
+                            }
+                            r1.lock().unwrap().push((
+                                parts.uri.to_string(),
+                                parts.headers.clone(),
+                                String::from_utf8_lossy(&body).into_owned(),
+                            ));
+                            let delay = open_delay.load(Ordering::SeqCst);
+                            if delay > 0 {
+                                tokio::time::sleep(Duration::from_millis(delay)).await;
+                            }
+                            Json(json!({
+                                "ok": true,
+                                "data": { "open": open.load(Ordering::SeqCst) }
+                            }))
+                            .into_response()
+                        }
+                    }),
                 )
                 .route(
                     "/pkgs/*rest",
@@ -163,6 +195,14 @@ async fn insert_account(pool: &SqlitePool, username: &str, uid: u32, admin: bool
 }
 
 async fn harness_with(insecure_cookie: bool, hooks: impl FnOnce(&mut BrokerHooks)) -> Harness {
+    harness_state(insecure_cookie, |state, _| hooks(&mut state.hooks)).await
+}
+
+/// [`harness_with`], with the whole state (and the operator root) in reach.
+async fn harness_state(
+    insecure_cookie: bool,
+    set: impl FnOnce(&mut BrokerState, &crate::server::operator::OperatorRoot),
+) -> Harness {
     let (tmp, root) = test_support::temp_root();
     let pool = open_accounts(&root, Opener::Broker).await.unwrap();
     let launcher = Arc::new(FakeLauncher::default());
@@ -172,7 +212,7 @@ async fn harness_with(insecure_cookie: bool, hooks: impl FnOnce(&mut BrokerHooks
             .unwrap(),
     );
     let mut state = BrokerState::new(pool.clone(), verifier, launcher.clone()).unwrap();
-    hooks(&mut state.hooks);
+    set(&mut state, &root);
     let state = Arc::new(state);
     let store = backend::open_session_store(&root).await.unwrap();
     let app = router(
@@ -563,6 +603,7 @@ async fn i6_token_bearer_and_no_cookie_are_all_401() {
         ("GET", "/ws/pty/abc"),
         ("GET", "/ws/chat/t1"),
         ("GET", "/ws/fs"),
+        ("GET", "/ws/events"),
         ("GET", "/pkgs/com.x/index.html"),
         ("GET", "/pkgs/com.x/"),
         ("POST", "/api/shutdown"),
@@ -1321,3 +1362,395 @@ async fn a_narrowing_refusal_proxies_nothing() {
     }
     assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 0);
 }
+
+// ─── an admin's edit of another principal's folder list ────────────────────
+
+/// Gap audit 2026-10-06 rank 1: `fs_roots_*` naming another principal is an
+/// admin's call. The broker routes it into the TARGET's child with the
+/// argument removed and only `files, settings` granted; the caller's own
+/// child sees nothing.
+#[tokio::test]
+async fn an_admin_edits_another_principals_folder_list_in_their_child() {
+    let h = harness().await;
+    let ada = insert_account(&h.pool, "ada", 20_001, true).await;
+    let bob = insert_account(&h.pool, "bob", 20_002, false).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+
+    for (cmd, named) in [
+        ("fs_roots_add", json!("bob")),
+        ("fs_roots_list", json!(bob.to_string())),
+    ] {
+        let (status, body) = rpc(
+            &h.app,
+            Some(&cookie),
+            json!({"cmd": cmd, "args": {"path": "/srv/bob/work", "principal": named}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let reqs = h.launcher.seen_for(bob).requests.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2);
+    let (_, headers, sent) = &reqs[0];
+    let sent: Value = serde_json::from_str(sent).unwrap();
+    assert_eq!(
+        sent,
+        json!({"cmd": "fs_roots_add", "args": {"path": "/srv/bob/work"}})
+    );
+    assert_eq!(headers.get("x-ikenga-caps").unwrap(), "files,settings");
+    assert_eq!(headers.get("x-ikenga-principal").unwrap(), &bob.to_string());
+    assert!(
+        h.launcher
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|s| s.principal != ada),
+        "the admin's own child is never involved"
+    );
+}
+
+/// A non-admin naming someone else is refused before anything is looked up
+/// or launched — whether or not the name exists — and so is an admin
+/// demoted after signing in (the flag is read per call, not from the
+/// session).
+#[tokio::test]
+async fn a_non_admin_cannot_edit_another_principals_folder_list() {
+    let h = harness().await;
+    insert_account(&h.pool, "ada", 20_001, true).await;
+    let bob = insert_account(&h.pool, "bob", 20_002, false).await;
+    let bob_cookie = login_cookie(&h.app, "bob").await;
+    for named in ["ada", "nobody-here"] {
+        let (status, body) = rpc(
+            &h.app,
+            Some(&bob_cookie),
+            json!({"cmd": "fs_roots_reset", "args": {"principal": named}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], false);
+        assert!(
+            body["error"].as_str().unwrap().starts_with("forbidden:"),
+            "{body}"
+        );
+    }
+
+    let ada_cookie = login_cookie(&h.app, "ada").await;
+    sqlx::query("UPDATE accounts SET is_admin = 0 WHERE username = 'ada'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (_, body) = rpc(
+        &h.app,
+        Some(&ada_cookie),
+        json!({"cmd": "fs_roots_add", "args": {"path": "/", "principal": bob.to_string()}}),
+    )
+    .await;
+    assert!(
+        body["error"].as_str().unwrap().starts_with("forbidden:"),
+        "{body}"
+    );
+    assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 0);
+}
+
+/// Naming oneself is the own-scope call (to one's own child, argument
+/// removed); an unknown target is `not_found` for an admin; and other
+/// commands carrying a `principal` argument pass through untouched.
+#[tokio::test]
+async fn naming_oneself_unknown_targets_and_other_commands() {
+    let h = harness().await;
+    let ada = insert_account(&h.pool, "ada", 20_001, true).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+
+    let (_, body) = rpc(
+        &h.app,
+        Some(&cookie),
+        json!({"cmd": "fs_roots_list", "args": {"principal": "nobody-here"}}),
+    )
+    .await;
+    assert_eq!(
+        body["error"], "not_found: no active account `nobody-here`",
+        "{body}"
+    );
+    assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 0);
+
+    let (status, _) = rpc(
+        &h.app,
+        Some(&cookie),
+        json!({"cmd": "fs_roots_list", "args": {"principal": "ADA"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = rpc(
+        &h.app,
+        Some(&cookie),
+        json!({"cmd": "pty_list", "args": {"principal": "bob"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let reqs = h.launcher.seen_for(ada).requests.lock().unwrap().clone();
+    let bodies: Vec<Value> = reqs
+        .iter()
+        .map(|(_, _, b)| serde_json::from_str(b).unwrap())
+        .collect();
+    assert_eq!(
+        bodies,
+        vec![
+            json!({"cmd": "fs_roots_list", "args": {}}),
+            json!({"cmd": "pty_list", "args": {"principal": "bob"}}),
+        ]
+    );
+}
+
+// ─── in-app updates (WP-P9) ────────────────────────────────────────────────
+
+/// A broker whose update controller reads `<tmp>/update-state` and writes
+/// `<operator>/update-request.json`, as `serve()` wires it.
+async fn update_harness() -> (Harness, std::path::PathBuf, std::path::PathBuf) {
+    use crate::server::update::{UpdateCtl, REQUEST_FILE};
+    let mut paths = None;
+    let h = harness_state(false, |state, root| {
+        let state_dir = root.operator_dir().parent().unwrap().join("update-state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let request = root.operator_dir().join(REQUEST_FILE);
+        state.update = Some(Arc::new(UpdateCtl::with_version(
+            state_dir.clone(),
+            request.clone(),
+            "0.20.0",
+        )));
+        paths = Some((state_dir, request));
+    })
+    .await;
+    let (state_dir, request) = paths.unwrap();
+    std::fs::write(
+        state_dir.join("available.json"),
+        json!({
+            "schema": "ikenga-update-available/1", "checked_at": "2026-10-06T00:00:00Z",
+            "channel": "stable", "installed": "0.20.0", "latest": "0.21.0",
+            "min_upgrade_from": null, "blocked": false, "blocked_reason": null,
+            "notes_url": "https://github.com/ikenga-hq/ikenga/releases/tag/v0.21.0",
+            "published_at": "2026-10-05T12:00:00Z", "last_error": null
+        })
+        .to_string(),
+    )
+    .unwrap();
+    (h, state_dir, request)
+}
+
+async fn update_get(app: &Router, cookie: &str) -> (StatusCode, Value) {
+    let (s, _, j) = send(
+        app,
+        request("GET", "/api/server/update")
+            .header("cookie", cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    (s, j)
+}
+
+async fn update_apply(app: &Router, cookie: &str, origin: &str, ack: u64) -> (StatusCode, Value) {
+    let (s, _, j) = send(
+        app,
+        request("POST", "/api/server/update/apply")
+            .header("cookie", cookie)
+            .header("origin", origin)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"version": "0.21.0", "acknowledged_open_terminals": ack}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    (s, j)
+}
+
+fn same_origin() -> String {
+    format!("https://{HOST}")
+}
+
+#[tokio::test]
+async fn update_routes_refuse_a_member_without_leaking_versions() {
+    let (h, _, request_path) = update_harness().await;
+    insert_account(&h.pool, "bob", 20_002, false).await;
+    let cookie = login_cookie(&h.app, "bob").await;
+    let (s, body) = update_get(&h.app, &cookie).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "forbidden");
+    assert!(!body.to_string().contains("0.21.0") && !body.to_string().contains("0.20.0"));
+    let (s, body) = update_apply(&h.app, &cookie, &same_origin(), 0).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(!body.to_string().contains("0.21.0"));
+    assert!(!request_path.exists());
+    assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_admin_sees_the_update_and_terminals_summed_across_children() {
+    let (h, _, request_path) = update_harness().await;
+    let ada = insert_account(&h.pool, "ada", 20_001, true).await;
+    let bob = insert_account(&h.pool, "bob", 20_002, false).await;
+    let ada_cookie = login_cookie(&h.app, "ada").await;
+    let bob_cookie = login_cookie(&h.app, "bob").await;
+
+    // No child running: nothing to ask, nothing launched.
+    let (s, body) = update_get(&h.app, &ada_cookie).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["available"]["version"], "0.21.0");
+    assert_eq!(body["data"]["open_terminals"], 0);
+    assert_eq!(body["data"]["open_terminals_partial"], false);
+    assert_eq!(
+        h.launcher.launches.load(Ordering::SeqCst),
+        0,
+        "GET never launches"
+    );
+
+    // Two children running, three terminals each.
+    h.launcher.open_terminals.store(3, Ordering::SeqCst);
+    for c in [&ada_cookie, &bob_cookie] {
+        assert_eq!(
+            rpc(&h.app, Some(c), json!({"cmd":"pty_list"})).await.0,
+            StatusCode::OK
+        );
+    }
+    let (s, body) = update_get(&h.app, &ada_cookie).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["data"]["open_terminals"], 6);
+    assert_eq!(body["data"]["open_terminals_partial"], false);
+
+    // The broker's internal call: the per-child token, the principal, the
+    // internal marker, no caps header.
+    let seen = h.launcher.seen_for(bob);
+    let reqs = seen.requests.lock().unwrap().clone();
+    let (_, headers, sent) = reqs
+        .iter()
+        .find(|(_, _, b)| b.contains("server_open_terminals"))
+        .expect("bob's child was asked")
+        .clone();
+    assert_eq!(
+        headers.get("authorization").unwrap(),
+        &format!("Bearer {}", seen.token)
+    );
+    assert_eq!(headers.get("x-ikenga-principal").unwrap(), &bob.to_string());
+    assert_eq!(
+        headers.get(crate::access::INTERNAL_CALL_HEADER).unwrap(),
+        "1"
+    );
+    assert!(headers.get("x-ikenga-caps").is_none());
+    assert!(sent.contains("server_open_terminals"));
+
+    // Acknowledging fewer terminals than are open re-prompts with the count.
+    let (s, body) = update_apply(&h.app, &ada_cookie, &same_origin(), 2).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "terminals_open");
+    assert_eq!(body["open_terminals"], 6);
+    assert!(!request_path.exists());
+
+    let (s, body) = update_apply(&h.app, &ada_cookie, &same_origin(), 6).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{body}");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&request_path).unwrap()).unwrap();
+    assert_eq!(doc["version"], "0.21.0");
+    assert_eq!(doc["requested_by"], "ada");
+    assert_eq!(doc["acknowledged_open_terminals"], 6);
+
+    // Nothing under /api/server ever reached a child.
+    for id in [ada, bob] {
+        for (uri, _, _) in h.launcher.seen_for(id).requests.lock().unwrap().iter() {
+            assert!(!uri.starts_with("/api/server"), "{uri} was forwarded");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_slow_child_makes_the_count_partial() {
+    let (h, _, _) = update_harness().await;
+    insert_account(&h.pool, "ada", 20_001, true).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+    assert_eq!(
+        rpc(&h.app, Some(&cookie), json!({"cmd":"pty_list"}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    h.launcher.open_terminals.store(4, Ordering::SeqCst);
+    h.launcher.open_delay_ms.store(2_500, Ordering::SeqCst);
+    let (s, body) = update_get(&h.app, &cookie).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["data"]["open_terminals"], 0);
+    assert_eq!(body["data"]["open_terminals_partial"], true);
+}
+
+#[tokio::test]
+async fn a_demoted_or_disabled_admin_is_refused_on_the_next_request() {
+    let (h, _, request_path) = update_harness().await;
+    let ada = insert_account(&h.pool, "ada", 20_001, true).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+    assert_eq!(update_get(&h.app, &cookie).await.0, StatusCode::OK);
+
+    sqlx::query("UPDATE accounts SET is_admin = 0 WHERE principal_id = ?")
+        .bind(ada.to_string())
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(update_get(&h.app, &cookie).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        update_apply(&h.app, &cookie, &same_origin(), 0).await.0,
+        StatusCode::FORBIDDEN
+    );
+
+    // Re-promoted, then disabled without a session-epoch bump: the fresh
+    // read alone still refuses.
+    sqlx::query("UPDATE accounts SET is_admin = 1, disabled_at = 1 WHERE principal_id = ?")
+        .bind(ada.to_string())
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (s, _) = update_apply(&h.app, &cookie, &same_origin(), 0).await;
+    assert!(
+        matches!(s, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED),
+        "{s}"
+    );
+    assert!(!request_path.exists());
+}
+
+#[tokio::test]
+async fn a_cross_origin_apply_is_refused_and_writes_nothing() {
+    let (h, _, request_path) = update_harness().await;
+    insert_account(&h.pool, "ada", 20_001, true).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+    let (s, _) = update_apply(&h.app, &cookie, "https://evil.example", 0).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(!request_path.exists());
+}
+
+#[tokio::test]
+async fn without_an_update_controller_the_admin_gets_unsupported() {
+    let h = harness().await;
+    insert_account(&h.pool, "ada", 20_001, true).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+    let (s, body) = update_get(&h.app, &cookie).await;
+    assert_eq!(
+        (s, body["code"].as_str()),
+        (StatusCode::NOT_FOUND, Some("unsupported"))
+    );
+}
+
+#[tokio::test]
+async fn running_endpoints_never_launches() {
+    let h = harness().await;
+    insert_account(&h.pool, "ada", 20_001, false).await;
+    let (eps, partial) = h.state.children.running_endpoints();
+    assert!(eps.is_empty() && !partial);
+    let cookie = login_cookie(&h.app, "ada").await;
+    assert_eq!(
+        rpc(&h.app, Some(&cookie), json!({"cmd":"pty_list"}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (eps, partial) = h.state.children.running_endpoints();
+    assert_eq!((eps.len(), partial), (1, false));
+    assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 1);
+}
+
+/// `/ws/events` under T1 (principal isolation through the proxy).
+mod events;

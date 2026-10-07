@@ -28,10 +28,14 @@
 //! `RootGuard`). The shared scope layer refuses a symlinked file or
 //! `.ikenga/` directory on both surfaces.
 //!
-//! **No events.** The desktop manager emits `actions://changed` from its
-//! watcher and on a trust grant / revoke. The daemon's manager has no
-//! notifier (there is no event channel — the web transport's `listen()` is a
-//! no-op), so it starts no watcher and emits nothing; the browser re-reads.
+//! **Events.** The desktop manager emits `actions://changed` from its
+//! watcher and on a trust grant / revoke. The daemon's manager publishes the
+//! trust-change half on the event bus (`server::events`, `/ws/events`) and
+//! starts no watcher; instead `actions_write` / `keybindings_write` publish
+//! the same `{ path, file, scope }` event once a file was written, which is
+//! what the desktop's watcher reports ~250 ms after the same write. A hand
+//! edit on the server is not announced; the browser sees it on its next
+//! read.
 //!
 //! **Trust.** A remote write cannot bypass the trust gate: `actions_write` /
 //! `keybindings_write` never touch the trust record (see
@@ -298,6 +302,7 @@ pub(crate) fn daemon_actions(
     data_dir: &Path,
     home: PathBuf,
     guard: PathGuard,
+    notifier: Option<super::shared::actions::watch::ActionsNotifier>,
 ) -> ActionsManager {
     let root_guard: RootGuard = Arc::new(move |root: &Path| {
         guard.check_maybe_missing(root).map_err(|e| {
@@ -307,10 +312,12 @@ pub(crate) fn daemon_actions(
             )
         })
     });
-    ActionsManager::with_notifier(None, db, data_dir, home).with_root_guard(root_guard)
+    ActionsManager::with_notifier(notifier, db, data_dir, home)
+        .without_file_watcher()
+        .with_root_guard(root_guard)
 }
 
-fn actions(state: &AppState) -> Result<&ActionsManager, String> {
+pub(super) fn actions(state: &AppState) -> Result<&ActionsManager, String> {
     match &state.actions {
         Some(m) => Ok(m),
         None if state.config.data_dir.is_none() || state.pa_db.is_none() => {
@@ -344,9 +351,23 @@ async fn write(
     let project_id: Option<String> = targ(args, &["projectId", "project_id"])?;
     let manager = actions(state)?;
     let scope = SettingsScope::parse(&scope)?;
-    manager
+    let result = manager
         .write(kind, scope, project_id.as_deref(), document)
-        .await
+        .await?;
+    // What the desktop's watcher reports for the same write (the daemon
+    // runs none); a refused document wrote nothing, so nothing changed.
+    if result.written {
+        state.events.publish(
+            super::events::Topic::ActionsChanged,
+            super::shared::actions::watch::ActionsChangeEvent {
+                path: result.path.clone(),
+                file: result.kind,
+                scope: result.scope,
+                reason: None,
+            },
+        );
+    }
+    Ok(result)
 }
 
 pub(super) async fn actions_write(state: &AppState, args: &Value) -> RpcResponse {
@@ -2144,13 +2165,20 @@ mod tests {
         assert!(!d.outside.join("new").exists());
     }
 
-    /// The daemon builds its manager without a notifier: no watcher is
-    /// started (so no `.ikenga/` is created to watch) and a trust change
-    /// emits nothing — there is no event channel.
+    /// The daemon's manager starts no watcher even with a notifier (so no
+    /// `.ikenga/` is created to watch); its notifier hears trust changes
+    /// only, and the write arms announce written files themselves.
     #[tokio::test]
     async fn the_daemon_manager_watches_nothing() {
         let d = daemon();
-        let manager = super::daemon_actions(d.db.clone(), &d.data, d.home.clone(), d.guard.clone());
+        let bus = crate::server::events::EventBus::new();
+        let manager = super::daemon_actions(
+            d.db.clone(),
+            &d.data,
+            d.home.clone(),
+            d.guard.clone(),
+            Some(crate::server::events::actions_notifier(&bus)),
+        );
         manager.refresh_watch().await.unwrap();
         assert!(
             !d.home.join(".ikenga").exists(),

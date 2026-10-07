@@ -127,3 +127,18 @@ describe('summariseBatch', () => {
 		});
 	});
 });
+
+describe('triggerPkgInstalls — unserved install (gap rank 3)', () => {
+	it('records the honest reason, never a raw "not implemented" string, and never ok', async () => {
+		const results = await triggerPkgInstalls({
+			selectedPkgIds: ['com.ikenga.tasks'],
+			catalogResolver: () => ({ installPath: '/tmp/tasks' }),
+			kernelStatus: makeKernelStatus([]),
+			install: vi.fn(async () => {
+				throw new Error("Command 'pkg_install_from_path' not implemented in headless daemon");
+			}),
+		});
+		expect(results[0]?.ok).toBe(false);
+		expect(results[0]?.error).toBe('Not available on this server yet');
+	});
+});

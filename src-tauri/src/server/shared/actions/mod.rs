@@ -24,8 +24,10 @@
 //!
 //! What varies between the two surfaces is injected, never branched on:
 //! - an optional [`watch::ActionsNotifier`] — the desktop's emits
-//!   `actions://changed`; the daemon passes none (it has no event channel),
-//!   so it starts no watcher and a trust change emits nothing;
+//!   `actions://changed`; the daemon's publishes on its event bus
+//!   (`server::events`) for trust changes and starts no watcher
+//!   ([`ActionsManager::without_file_watcher`]) — its arms announce a
+//!   written file themselves;
 //! - where the trust record lives — `<app_data_dir>` on the desktop,
 //!   `<data-dir>` on the daemon; always user-side, never under a project;
 //! - an optional [`RootGuard`] — the daemon's refuses a project whose root is
@@ -160,12 +162,14 @@ struct ResolvedProject {
 }
 
 pub struct ActionsManager {
-    /// `None` on the daemon: no event channel, so no emits.
+    /// The desktop's emits `actions://changed`; the daemon's publishes on
+    /// its event bus. `None` (tests): no emits.
     notifier: Option<ActionsNotifier>,
     db: Arc<PaDb>,
     home: PathBuf,
     trust: TrustStore,
-    /// `None` exactly when `notifier` is: a watcher exists only to emit.
+    /// `None` when `notifier` is (a watcher exists only to emit), and on the
+    /// daemon ([`ActionsManager::without_file_watcher`]).
     watcher: Option<ActionsWatcher>,
     root_guard: Option<RootGuard>,
     write_lock: AsyncMutex<()>,
@@ -248,6 +252,14 @@ impl ActionsManager {
         }
     }
 
+    /// Never start a file watcher, whatever the notifier: the daemon's
+    /// manager tells only about trust changes, and its arms announce a
+    /// written file themselves (`server::rpc_files`).
+    pub fn without_file_watcher(mut self) -> Self {
+        self.watcher = None;
+        self
+    }
+
     /// Every resolved project root is checked by `guard` before anything
     /// under it is read or written (the daemon's fs-allowlist boundary).
     pub fn with_root_guard(mut self, guard: RootGuard) -> Self {
@@ -257,7 +269,8 @@ impl ActionsManager {
 
     /// Starts the watchers for the personal and the active project's
     /// `.ikenga/` directories. Called at boot and on
-    /// `projects:active-changed`. A no-op without a notifier (the daemon).
+    /// `projects:active-changed`. A no-op without a watcher (no notifier, or
+    /// the daemon).
     pub async fn refresh_watch(&self) -> Result<(), String> {
         let Some(watcher) = self.watcher.as_ref() else {
             return Ok(());
@@ -628,8 +641,8 @@ impl ActionsManager {
     /// DEC-55 / DEC-65: a grant or revoke changes which project rules and
     /// runs are in force without touching either file, so the watcher never
     /// sees it; tell the client to re-read.
-    /// No notifier (the daemon) → nothing to tell; the browser re-reads on
-    /// its own schedule.
+    /// No notifier → nothing to tell. The daemon's publishes on its event
+    /// bus (`/ws/events`).
     fn emit_trust_change(&self, project: &ResolvedProject, files: &[FileKind]) {
         let Some(notifier) = self.notifier.as_ref() else {
             return;

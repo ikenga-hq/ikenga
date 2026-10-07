@@ -101,7 +101,7 @@ Every later credential kind (OIDC login, device grant, PAT) *adds a way to obtai
 
 ### 2.3 WebSockets and the `?token=` trick
 
-`?token=` exists because a browser can't set headers on `new WebSocket` (`server/mod.rs:188-189`; FE `src/lib/transport/index.ts:202-203`, `chat-client.ts:6`). Browsers do send same-origin cookies on the WS handshake, so **under T1, `/ws/pty/:id`, `/ws/chat/:id` and `/ws/fs` authenticate by session cookie, and `?token=` is not accepted.**
+`?token=` exists because a browser can't set headers on `new WebSocket` (`server/mod.rs:188-189`; FE `src/lib/transport/index.ts:202-203`, `chat-client.ts:6`). Browsers do send same-origin cookies on the WS handshake, so **under T1, `/ws/pty/:id`, `/ws/chat/:id`, `/ws/fs` and `/ws/events` authenticate by session cookie, and `?token=` is not accepted.**
 
 A cookie also closes the gap `pkg_static.rs:25-39` records: iframe subresources arriving with no credential. That file names a cookie as "a daemon-wide auth change … deliberately out of scope". This contract is that change for T1. The single-file-bundle rule from G-95 (`04` Round 13 `:65`) stays in force for desktop parity.
 

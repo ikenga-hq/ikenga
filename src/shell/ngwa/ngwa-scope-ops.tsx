@@ -12,6 +12,7 @@
 import { useEffect, useMemo, useRef, type CSSProperties, type RefObject } from 'react';
 import type { NgwaItem, NgwaPlacement } from '@ikenga/contract';
 import type { ClaudeStoreKind, EngineId } from '@/lib/tauri-cmd';
+import { fullyDown, notScannedReason, rootNotScanned } from '@/lib/ngwa/scan-coverage';
 import {
 	PlacementNature,
 	ROOT_UNKNOWN,
@@ -90,11 +91,25 @@ export function createScopeOps({
 	const rootOf = (key: string) => rootInfo(key).root;
 	const rootWhy = (key: string) => rootInfo(key).why ?? ROOT_UNKNOWN;
 
-	const primitivesDown = unreadableSources.filter((s) => PRIMITIVE_SOURCES.includes(s.source));
+	// A partially unreadable scan (it skipped a root or a file) leaves the
+	// rows it read knowable; only a source that failed outright makes every
+	// primitive cell unknown.
+	const primitivesDown = fullyDown(
+		unreadableSources.filter((s) => PRIMITIVE_SOURCES.includes(s.source))
+	);
 	const unknownReason =
 		primitivesDown.length > 0
 			? `State unknown: ${primitivesDown.map((s) => s.source).join(', ')} unreadable`
 			: undefined;
+	// A project column whose root the config scan did not read (on the
+	// daemon: outside the fs allowlist): its state is unknown, not empty.
+	const configError = unreadableSources.find((s) => s.source === 'engine_config')?.error ?? null;
+	function notScanned(key: string): string | undefined {
+		if (key === 'personal') return undefined;
+		const col = scopes.find((s) => s.key === key);
+		const why = rootNotScanned(configError, col?.root);
+		return why === null ? undefined : notScannedReason(col?.label ?? key, why);
+	}
 
 	const allRows = buildRows(items);
 	const conflicts = new Map<string, ScopeConflict>();
@@ -118,6 +133,8 @@ export function createScopeOps({
 	/** Why Enable here (claude, scope `key`) must not run, or undefined. */
 	function enableBlock(row: MatrixRow, key: string): string | undefined {
 		if (unknownReason) return unknownReason;
+		const unscanned = notScanned(key);
+		if (unscanned) return unscanned;
 		const sk = row.storeKind;
 		if (!sk) return 'This kind has no scope writer';
 		const settings = sk === 'hook' || sk === 'mcp';
@@ -164,6 +181,8 @@ export function createScopeOps({
 	/** Why Move/Copy into `key` must not run, or undefined. */
 	function moveCopyBlock(row: MatrixRow, key: string, from?: string): string | undefined {
 		if (unknownReason) return unknownReason;
+		const unscanned = notScanned(key);
+		if (unscanned) return unscanned;
 		const sk = row.storeKind;
 		if (!sk) return 'This kind has no scope writer';
 		const src = moveSource(row, key, from);
@@ -181,6 +200,8 @@ export function createScopeOps({
 	/** The claude placement at the exact path Disable/Remove delete, or a reason. */
 	function claudeTarget(row: MatrixRow, key: string): NgwaPlacement | string {
 		if (unknownReason) return unknownReason;
+		const unscanned = notScanned(key);
+		if (unscanned) return unscanned;
 		const sk = row.storeKind;
 		const cp = claudePlacement(row.byScope.get(key), key);
 		if (sk === 'hook' || sk === 'mcp') {
@@ -447,6 +468,7 @@ export function createScopeOps({
 		allRows,
 		conflicts,
 		unknownReason,
+		notScanned,
 		scopeLabel,
 		rootOf,
 		rootWhy,
