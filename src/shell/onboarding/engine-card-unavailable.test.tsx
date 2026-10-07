@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 // doesn't pull the whole shell (store, registry, IPC) in.
 vi.mock('@/lib/tauri-cmd', () => ({
 	detectAgent: vi.fn(),
+	isRemoteWebSession: () => false,
 	pkgInstallFromRegistry: vi.fn(),
 	pkgKernelStatus: vi.fn(),
 }));
