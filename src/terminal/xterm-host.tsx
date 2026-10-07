@@ -11,6 +11,7 @@ import { isWindows } from '@/lib/platform';
 import { createOscObserver, fireOscNotification } from '@/lib/terminal/osc-notify';
 import { readClipboardText, writeClipboardText } from '@/lib/transport/shims';
 import { menuPasteBlockedHint, pasteKeyIsNative } from './paste-policy';
+import { FloatingToastChip } from '@/components/ui/floating-toast-chip';
 import { type KeyPeek, peekKeypress } from '@/lib/keymap/dispatcher';
 import { eventMatchesCombo, strokesFromEvent } from '@/lib/keymap/platform';
 import { evaluateTerminalKey, terminalKeyLabel } from './keybindings';
@@ -1227,11 +1228,6 @@ export function XTermHost({
 	const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
 	// Shown when a browser refuses a menu-driven clipboard read.
 	const [pasteHint, setPasteHint] = useState<string | null>(null);
-	useEffect(() => {
-		if (!pasteHint) return;
-		const t = setTimeout(() => setPasteHint(null), 4000);
-		return () => clearTimeout(t);
-	}, [pasteHint]);
 
 	useEffect(() => {
 		if (!contextMenu) return;
@@ -1272,25 +1268,13 @@ export function XTermHost({
 			}}
 		>
 			{pasteHint && (
-				<div
-					role="status"
-					data-testid="terminal-paste-hint"
-					style={{
-						position: 'absolute',
-						right: 12,
-						bottom: 12,
-						zIndex: 60,
-						maxWidth: 320,
-						padding: '6px 10px',
-						borderRadius: 6,
-						fontSize: 12,
-						background: 'var(--bg-elevated, #1c1916)',
-						color: 'var(--fg, #e8e2d9)',
-						border: '1px solid var(--border-soft, rgba(127,127,127,0.3))',
-					}}
-				>
-					{pasteHint}
-				</div>
+				<FloatingToastChip
+					anchor="pane-corner"
+					variant="info"
+					label={pasteHint}
+					ttlMs={5000}
+					onDismiss={() => setPasteHint(null)}
+				/>
 			)}
 			{contextMenu && (
 				<div
