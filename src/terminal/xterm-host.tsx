@@ -10,6 +10,7 @@ import { fileUrlToPath, resolvePath } from '@/lib/paths/file-paths';
 import { isWindows } from '@/lib/platform';
 import { createOscObserver, fireOscNotification } from '@/lib/terminal/osc-notify';
 import { copyText } from '@/lib/clipboard';
+import { isRemoteWebSession } from '@/lib/transport';
 import { readClipboardText } from '@/lib/transport/shims';
 import { handleOsc52, handleTerminalCopyKey, openTerminalUrl } from './clipboard-actions';
 import { explainEmptyPaste, onTerminalPasteEvent } from './paste-image';
@@ -21,6 +22,7 @@ import { eventMatchesCombo, strokesFromEvent } from '@/lib/keymap/platform';
 import { evaluateTerminalKey, terminalKeyLabel } from './keybindings';
 import { registerPathLinks } from './path-links';
 import { setupSemanticPrompts, type SemanticPromptsManager } from './osc133';
+import { shouldFocusTerminalOnMount } from './mount-focus';
 import { Pty, type PtySpawnOpts } from './pty-bridge';
 import { resyncPtySizeOnWindowFocus } from './resync-on-focus';
 import { readCaptureWithOffset } from './pty-output-buffer';
@@ -65,10 +67,11 @@ interface Props {
 	 */
 	sessionId?: string;
 	/**
-	 * Whether the pane hosting this terminal currently has focus. Only
-	 * consulted on a cache-hit remount (re-parenting a previously-cached
-	 * terminal) to decide whether to steal DOM focus; a fresh terminal
-	 * always focuses on creation, matching prior behavior.
+	 * Whether the pane hosting this terminal currently has focus. Consulted
+	 * on a cache-hit remount (re-parenting a previously-cached terminal) to
+	 * decide whether to steal DOM focus; a fresh terminal always focuses on
+	 * creation on the desktop, and in a remote web session only when this is
+	 * `true` or omitted (see `./mount-focus.ts`).
 	 */
 	focused?: boolean;
 	/**
@@ -1039,12 +1042,21 @@ export function XTermHost({
 		});
 		resizeObserver.observe(container);
 
-		if (cachedEntry) {
-			// Re-parented an already-live terminal — only steal focus if the
-			// hosting pane is actually the focused one.
-			if (focusedRef.current) term.focus();
-		} else if (pty) {
-			// Fresh attach-mode mount — always focus, matching prior behavior.
+		// DOM focus here moves PANE focus too (pane.tsx `onFocusCapture`), so
+		// the rule lives in `shouldFocusTerminalOnMount`: a re-parent only
+		// when the hosting pane is focused; a fresh attach always on desktop,
+		// and in a browser tab only when its pane is the focused one — a
+		// restored layout mounts every live terminal at once and must not
+		// pull focus (and the address bar) off the saved / deep-linked pane.
+		const remoteWeb = isRemoteWebSession();
+		if (
+			(cachedEntry || pty) &&
+			shouldFocusTerminalOnMount({
+				reparent: !!cachedEntry,
+				hostFocused: focusedRef.current,
+				remoteWeb,
+			})
+		) {
 			term.focus();
 		}
 
@@ -1077,7 +1089,15 @@ export function XTermHost({
 					detachExit = wired.detachExit;
 					onDataDispose = wired.onDataDispose;
 					onResizeDispose = wired.onResizeDispose;
-					term.focus();
+					if (
+						shouldFocusTerminalOnMount({
+							reparent: false,
+							hostFocused: focusedRef.current,
+							remoteWeb,
+						})
+					) {
+						term.focus();
+					}
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
 					term.write(`\r\n[spawn failed] ${msg}\r\n`);
