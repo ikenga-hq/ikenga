@@ -6,6 +6,8 @@ mark('boot:js-start');
 
 import './styles.css';
 import { installInstrumentation } from '@/lib/iyke/bridge';
+import { recoverStaleShell, registerServiceWorker } from '@/lib/pwa/register';
+import { isTauri } from '@/lib/transport';
 import { isDetachedWindow } from '@/lib/window/window-context';
 import { installZoom } from '@/lib/window/zoom';
 
@@ -86,10 +88,26 @@ async function boot(): Promise<void> {
 		try {
 			await loadBoot();
 		} catch (err2) {
+			// plans/pwa S1: an installed app can be running a cached shell whose
+			// chunks a server update deleted. If a newer service worker is (or
+			// now becomes) waiting, take it and reload instead of erroring.
+			if (await recoverStaleShell()) return;
 			console.error('[boot] retry failed — surfacing error screen', err2);
 			renderBootError(err2);
 		}
 	}
 }
 
-void boot();
+void boot().finally(() => {
+	// plans/pwa S1 (W1/W2): browser-served production builds only — refuses
+	// under Tauri, in dev, and outside a secure context. After boot, so the
+	// worker's precache never competes with the first paint.
+	void registerServiceWorker().then(() => {
+		// plans/pwa S4 §4: repair a push subscription the user already turned
+		// on (a rotated server key, a lost row). Never prompts. Lazy: the
+		// access client is not part of the entry chunk.
+		if (!isTauri()) {
+			void import('@/lib/pwa/push-client').then((m) => m.reconcilePush()).catch(() => undefined);
+		}
+	});
+});

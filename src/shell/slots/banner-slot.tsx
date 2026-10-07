@@ -18,6 +18,12 @@
 //               failure / success strip)
 //   info      — ConnectorBanner
 //
+// plans/pwa S1 adds two browser-only banners (both render nothing under
+// Tauri): PwaUpdateBanner ("Reload to update", `update` tier, after the
+// app-binary updater) and InstalledTokenBanner (an installed app on a T0 link
+// token, `info` tier). S4 adds PushOpenBanner (`info`): it consumes a
+// notification tap and says when the ask was already answered elsewhere.
+//
 // The banner components are untouched — their own eligibility logic, dismiss
 // / snooze persistence keys and updater wiring stay exactly as they were. Each
 // is mounted in its own wrapper, always (so PkgAutoUpdater's background
@@ -32,6 +38,9 @@ import type { ComponentType } from 'react';
 import { ConnectionBanner } from '@/shell/connection-banner';
 import { ConnectorBanner } from '@/shell/connector-banner';
 import { PkgAutoUpdater } from '@/shell/pkg-auto-updater';
+import { InstalledTokenBanner } from '@/shell/pwa/install-hint';
+import { PushOpenBanner } from '@/shell/pwa/push-open';
+import { PwaUpdateBanner } from '@/shell/pwa/pwa-update-banner';
 import { TrustReviewBanner } from '@/shell/trust-review-banner';
 // WP-41: moved into src/shell/updater/ (absorbed folder) — see that folder's
 // update-sheet.tsx / status-bar-slot.tsx / post-restart-toast.tsx for the
@@ -55,7 +64,10 @@ export const BANNER_QUEUE: BannerQueueEntry[] = [
 	{ id: 'updater', tier: 'update', Component: UpdaterBanner },
 	{ id: 'server-update', tier: 'update', Component: ServerUpdateBanner },
 	{ id: 'pkg-auto-updater', tier: 'update', Component: PkgAutoUpdater },
+	{ id: 'pwa-update', tier: 'update', Component: PwaUpdateBanner },
 	{ id: 'connector', tier: 'info', Component: ConnectorBanner },
+	{ id: 'pwa-token-session', tier: 'info', Component: InstalledTokenBanner },
+	{ id: 'push-open', tier: 'info', Component: PushOpenBanner },
 ];
 
 /** Mount order before WP-09, recorded for the PR (DoD T4). */

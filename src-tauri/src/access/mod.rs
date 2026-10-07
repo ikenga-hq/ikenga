@@ -301,6 +301,7 @@ impl DaemonAccess {
             .and_then(|s| s.meta().owner_principal_id)
             .unwrap_or_else(PrincipalId::new_v7);
         let registry = pairing::Registry::new();
+        registry.set_on_awaiting(crate::server::push::pairing_hook());
         if let Some(store) = &store {
             pairing::spawn_sweeper(&registry, store.clone());
         }
@@ -569,6 +570,9 @@ pub fn route_requirement(path: &str) -> Option<Requirement> {
         Some(Requirement::shared(&[Cap::Files]))
     } else if path.starts_with("/pkgs/") || path == "/pkgs" {
         Some(Requirement::shared(&[Cap::Files]))
+    } else if path == crate::server::push::outbox::EVENTS_PATH {
+        // plans/pwa S2 §10: the broker's push long-poll, broker → child only.
+        Some(Requirement::internal())
     } else {
         None
     }
@@ -840,6 +844,10 @@ mod tests {
             ArmClass::Shared
         );
         assert!(route_requirement("/api/rpc").is_none());
+        assert_eq!(
+            route_requirement("/internal/push/events").unwrap().class,
+            ArmClass::Internal
+        );
     }
 
     /// A-32: a principal child has no store and answers access arms with

@@ -53,6 +53,15 @@ vi.mock('@/shell/pkg-auto-updater', async () => ({
 vi.mock('@/shell/connector-banner', async () => ({
 	ConnectorBanner: make(await import('react'), 'connector'),
 }));
+vi.mock('@/shell/pwa/pwa-update-banner', async () => ({
+	PwaUpdateBanner: make(await import('react'), 'pwa-update'),
+}));
+vi.mock('@/shell/pwa/install-hint', async () => ({
+	InstalledTokenBanner: make(await import('react'), 'pwa-token-session'),
+}));
+vi.mock('@/shell/pwa/push-open', async () => ({
+	PushOpenBanner: make(await import('react'), 'push-open'),
+}));
 
 import { BANNER_QUEUE, BannerSlot, LEGACY_BANNER_MOUNT_ORDER } from './banner-slot';
 
@@ -83,15 +92,14 @@ describe('<BannerSlot />', () => {
 			'update:updater',
 			'update:server-update',
 			'update:pkg-auto-updater',
+			'update:pwa-update',
 			'info:connector',
+			'info:pwa-token-session',
+			'info:push-open',
 		]);
 		// Every banner that mounted before still mounts — nothing dropped.
-		// (`server-update` is new since WP-09: WP-P9.)
-		expect([...LEGACY_BANNER_MOUNT_ORDER].sort()).toEqual(
-			BANNER_QUEUE.map((b) => b.id)
-				.filter((id) => id !== 'server-update')
-				.sort()
-		);
+		const ids = BANNER_QUEUE.map((b) => b.id);
+		for (const legacy of LEGACY_BANNER_MOUNT_ORDER) expect(ids).toContain(legacy);
 	});
 
 	it('T4: renders only one banner when three are eligible — the violation', async () => {

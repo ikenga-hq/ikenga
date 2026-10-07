@@ -21,6 +21,7 @@ import {
 	disabledReason,
 	parseAccessError,
 } from '@/lib/access/client';
+import { useOnline } from '@/lib/pwa/use-online';
 import {
 	chiList,
 	chiResume,
@@ -31,6 +32,11 @@ import {
 	ptyWrite,
 } from '@/lib/tauri-cmd';
 import { D05_FOCUS } from '@/shell/people/focus';
+import { closeResolvedNotifications } from '@/lib/pwa/deeplink';
+import { InstallHint } from '@/shell/pwa/install-hint';
+import { PushNudge } from '@/shell/pwa/push-nudge';
+import { PushOpenNotice, usePushOpenHandling } from '@/shell/pwa/push-open';
+import { PwaUpdateBanner } from '@/shell/pwa/pwa-update-banner';
 
 import { RemoteInbox, SectionHead } from './inbox';
 import {
@@ -65,6 +71,9 @@ function useRemoteData() {
 			]);
 			setSessions(sessionRows(terms, runs, foreground));
 			setAsks(rows as AnnotatedRow[]);
+			// plans/pwa S4 §7: drop "Approval needed" notifications for asks
+			// already answered (here or on another device).
+			void closeResolvedNotifications(rows).catch(() => 0);
 			setError(null);
 		} catch (e) {
 			setConnected(false);
@@ -83,7 +92,10 @@ function useRemoteData() {
 
 export function RemoteClient() {
 	const { status, sessions, asks, error, connected, refresh } = useRemoteData();
+	const online = useOnline();
 	const host = typeof window === 'undefined' ? '' : window.location.host;
+	// A notification tap lands here on a phone; the inbox is the target.
+	usePushOpenHandling();
 
 	return (
 		<div
@@ -91,6 +103,7 @@ export function RemoteClient() {
 			className={`${D05_FOCUS} grid min-h-dvh justify-items-center bg-[var(--bg-base)] sm:py-6`}
 		>
 			<div className="flex min-h-dvh w-full max-w-[390px] flex-col overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface)] text-[var(--fg)] sm:min-h-0 sm:rounded-xl sm:border">
+				<PwaUpdateBanner />
 				<header className="flex items-start gap-2 px-3 py-2.5">
 					<div className="min-w-0">
 						<div className="truncate text-[length:var(--text-body-sm)] font-semibold">
@@ -103,7 +116,7 @@ export function RemoteClient() {
 					</div>
 					<span className="ml-auto">
 						<StatusChip tone={connected ? 'live' : 'warn'} dot>
-							{connected ? 'connected' : 'reconnecting'}
+							{connected ? 'connected' : online ? 'reconnecting' : 'offline'}
 						</StatusChip>
 					</span>
 				</header>
@@ -144,9 +157,14 @@ export function RemoteClient() {
 				<div className="flex-1" />
 				{error && (
 					<p role="alert" className="m-0 px-3 py-1 text-[11px] text-[var(--danger)]">
-						{error}
+						{connected || online
+							? error
+							: "Can't reach the Ikenga server — this device is offline."}
 					</p>
 				)}
+				<PushOpenNotice className="border-t border-[var(--border-soft)] px-3 py-2" />
+				<PushNudge className="border-t border-[var(--border-soft)] px-3 py-2.5" />
+				<InstallHint className="border-t border-[var(--border-soft)] px-3 py-2" />
 				{status && <DispatchBar status={status} sessions={sessions} />}
 				{status && <ForgetDevice status={status} />}
 			</div>
