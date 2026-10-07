@@ -426,6 +426,21 @@ export function isRemoteWebSession(): boolean {
 }
 
 /**
+ * True when this page is the SPA running in a browser tab against
+ * `ikenga-server`, including a T1 or paired-device tab that holds no token
+ * and a tab that has not yet finished the boot-time tier probe.
+ *
+ * {@link isRemoteWebSession} is the stricter, transport-level test. This one
+ * is the "what can this host do" question: a browser has no OS shell, no
+ * native window and no access to the server's filesystem, whatever its
+ * credential. Tauri, jsdom and Node imports are all false, so desktop
+ * behaviour and the mocked-`invoke` test harnesses are unchanged.
+ */
+export function isBrowserHost(): boolean {
+	return !isTauri() && (isRemoteWebSession() || isBrowserEntry());
+}
+
+/**
  * True for a real browser tab opened on a daemon-served page that holds no
  * token yet: a first visit, or a visit by a bare URL with no `?token=`.
  *
