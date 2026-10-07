@@ -39,7 +39,10 @@ vi.mock('@/lib/shell-profiles', () => ({}));
 vi.mock('@/lib/settings/client', () => ({ writeSettingsField: vi.fn() }));
 vi.mock('@/terminal/single-terminal', () => ({}));
 vi.mock('@/terminal/claude-wrap', () => ({ buildAgentWrappedCmd: vi.fn() }));
-vi.mock('@/lib/transport', () => ({ openExternalUrl: vi.fn() }));
+vi.mock('@/lib/transport', () => ({
+	openExternalUrl: vi.fn(),
+	listen: vi.fn(() => Promise.resolve(() => {})),
+}));
 vi.mock('@/lib/panes/pane-store', () => ({ usePaneStore: vi.fn() }));
 
 import { EngineSectionBody } from './engines';
