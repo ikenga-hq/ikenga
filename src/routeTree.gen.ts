@@ -75,6 +75,7 @@ import { Route as SettingsDevicesRouteImport } from './routes/settings/devices'
 import { Route as SettingsEnginesRouteImport } from './routes/settings/engines'
 import { Route as SettingsIntegrationsRouteImport } from './routes/settings/integrations'
 import { Route as SettingsMembersRouteImport } from './routes/settings/members'
+import { Route as SettingsNotificationsRouteImport } from './routes/settings/notifications'
 import { Route as SettingsOnboardingRouteImport } from './routes/settings/onboarding'
 import { Route as SettingsPackagesRouteImport } from './routes/settings/packages'
 import { Route as SettingsPeopleRouteImport } from './routes/settings/people'
@@ -423,6 +424,11 @@ const SettingsMembersRoute = SettingsMembersRouteImport.update({
   path: '/members',
   getParentRoute: () => SettingsRouteRoute,
 } as any)
+const SettingsNotificationsRoute = SettingsNotificationsRouteImport.update({
+  id: '/notifications',
+  path: '/notifications',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
 const SettingsOnboardingRoute = SettingsOnboardingRouteImport.update({
   id: '/onboarding',
   path: '/onboarding',
@@ -570,6 +576,7 @@ export interface FileRoutesByFullPath {
   '/settings/engines': typeof SettingsEnginesRoute
   '/settings/integrations': typeof SettingsIntegrationsRoute
   '/settings/members': typeof SettingsMembersRoute
+  '/settings/notifications': typeof SettingsNotificationsRoute
   '/settings/onboarding': typeof SettingsOnboardingRoute
   '/settings/packages': typeof SettingsPackagesRoute
   '/settings/people': typeof SettingsPeopleRoute
@@ -652,6 +659,7 @@ export interface FileRoutesByTo {
   '/settings/engines': typeof SettingsEnginesRoute
   '/settings/integrations': typeof SettingsIntegrationsRoute
   '/settings/members': typeof SettingsMembersRoute
+  '/settings/notifications': typeof SettingsNotificationsRoute
   '/settings/onboarding': typeof SettingsOnboardingRoute
   '/settings/packages': typeof SettingsPackagesRoute
   '/settings/people': typeof SettingsPeopleRoute
@@ -738,6 +746,7 @@ export interface FileRoutesById {
   '/settings/engines': typeof SettingsEnginesRoute
   '/settings/integrations': typeof SettingsIntegrationsRoute
   '/settings/members': typeof SettingsMembersRoute
+  '/settings/notifications': typeof SettingsNotificationsRoute
   '/settings/onboarding': typeof SettingsOnboardingRoute
   '/settings/packages': typeof SettingsPackagesRoute
   '/settings/people': typeof SettingsPeopleRoute
@@ -825,6 +834,7 @@ export interface FileRouteTypes {
     | '/settings/engines'
     | '/settings/integrations'
     | '/settings/members'
+    | '/settings/notifications'
     | '/settings/onboarding'
     | '/settings/packages'
     | '/settings/people'
@@ -907,6 +917,7 @@ export interface FileRouteTypes {
     | '/settings/engines'
     | '/settings/integrations'
     | '/settings/members'
+    | '/settings/notifications'
     | '/settings/onboarding'
     | '/settings/packages'
     | '/settings/people'
@@ -992,6 +1003,7 @@ export interface FileRouteTypes {
     | '/settings/engines'
     | '/settings/integrations'
     | '/settings/members'
+    | '/settings/notifications'
     | '/settings/onboarding'
     | '/settings/packages'
     | '/settings/people'
@@ -1525,6 +1537,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsMembersRouteImport
       parentRoute: typeof SettingsRouteRoute
     }
+    '/settings/notifications': {
+      id: '/settings/notifications'
+      path: '/notifications'
+      fullPath: '/settings/notifications'
+      preLoaderRoute: typeof SettingsNotificationsRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
     '/settings/onboarding': {
       id: '/settings/onboarding'
       path: '/onboarding'
@@ -1719,6 +1738,7 @@ interface SettingsRouteRouteChildren {
   SettingsEnginesRoute: typeof SettingsEnginesRoute
   SettingsIntegrationsRoute: typeof SettingsIntegrationsRoute
   SettingsMembersRoute: typeof SettingsMembersRoute
+  SettingsNotificationsRoute: typeof SettingsNotificationsRoute
   SettingsOnboardingRoute: typeof SettingsOnboardingRoute
   SettingsPackagesRoute: typeof SettingsPackagesRoute
   SettingsPeopleRoute: typeof SettingsPeopleRoute
@@ -1748,6 +1768,7 @@ const SettingsRouteRouteChildren: SettingsRouteRouteChildren = {
   SettingsEnginesRoute: SettingsEnginesRoute,
   SettingsIntegrationsRoute: SettingsIntegrationsRoute,
   SettingsMembersRoute: SettingsMembersRoute,
+  SettingsNotificationsRoute: SettingsNotificationsRoute,
   SettingsOnboardingRoute: SettingsOnboardingRoute,
   SettingsPackagesRoute: SettingsPackagesRoute,
   SettingsPeopleRoute: SettingsPeopleRoute,

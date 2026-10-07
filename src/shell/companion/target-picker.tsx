@@ -27,6 +27,7 @@ import { applyTarget, copyText, openSessionInPane, sameTarget } from './seat-act
 import { atName, engineShort, seatChipRest, seatSessionRef, stateDotColor, UNREPORTED } from './seat-model';
 import { type SeatRoster, terminalEngine, type UnseatedSession } from './seat-roster';
 import { figuresOf, sessionName, useSessionFiguresStore } from './seat-sessions';
+import { copyText as copyToClipboard } from '@/lib/clipboard';
 
 type Group = 'Seats' | 'Unseated' | 'New session on…' | 'Persistent run' | 'Seat' | 'Session';
 
@@ -214,7 +215,7 @@ export function TargetPicker({ roster }: { roster: SeatRoster }) {
 				id: 'copy',
 				group: 'Session',
 				label: 'Copy session id',
-				run: () => void navigator.clipboard?.writeText(sessionId).catch(() => {}),
+				run: () => void copyToClipboard(sessionId),
 			});
 			if (terminals.some((t) => t.id === sessionId)) {
 				out.push({ id: 'open', group: 'Session', label: 'Open session in a pane', run: () => openSessionInPane(sessionId) });

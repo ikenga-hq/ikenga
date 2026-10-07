@@ -3,13 +3,13 @@ import { describe, expect, it } from 'vitest';
 import { SETTINGS_SECTIONS } from './nav';
 import { searchSettings } from './search';
 
-// D-03 conformance: cross-section search must cover all nine sections
+// D-03 conformance: cross-section search must cover all ten sections
 // (Secrets, Integrations and People included — search.tsx's own empty-state
-// copy claims "in all nine sections"), and Secrets must never index a real
+// copy claims "in all ten sections"), and Secrets must never index a real
 // secret value, only static row/control labels.
 describe('settings cross-section search', () => {
-	it('gives every one of the nine sections at least one searchable field', () => {
-		expect(SETTINGS_SECTIONS).toHaveLength(9);
+	it('gives every one of the ten sections at least one searchable field', () => {
+		expect(SETTINGS_SECTIONS).toHaveLength(10);
 		for (const section of SETTINGS_SECTIONS) {
 			expect(section.fields.length, `section "${section.id}" has no searchable fields`).toBeGreaterThan(0);
 		}
@@ -27,6 +27,11 @@ describe('settings cross-section search', () => {
 		const hits = searchSettings('supabase');
 		const sections = new Set(hits.map((h) => h.sectionId));
 		expect(sections.has('integrations')).toBe(true);
+	});
+
+	it('finds the push notification settings (plans/pwa)', () => {
+		const hits = searchSettings('push');
+		expect(hits.some((h) => h.sectionId === 'notifications')).toBe(true);
 	});
 
 	it('finds hits in People & devices', () => {

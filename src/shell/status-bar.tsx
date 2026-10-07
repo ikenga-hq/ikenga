@@ -39,6 +39,7 @@ import {
 	DropdownMenuSeparator,
 	DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { ToastHost } from '@/components/ui/toast-host';
 import { useEffectiveMenu } from '@/lib/actions/store';
 import { resolveMenuItems } from '@/shell/menu/resolve';
 import { MenuRunNoticeHost } from '@/shell/menu/run-notice';
@@ -481,6 +482,8 @@ export function StatusBar() {
 			{/* WP-55: where a menu-run action's refusal / failure is shown (and
 			    the trust sheet it may open). Always in the frame, like this bar. */}
 			<MenuRunNoticeHost />
+			{/* General client toast (`toast()` from `@/lib/toast`) — works in the browser too. */}
+			<ToastHost />
 		</div>
 	);
 }
