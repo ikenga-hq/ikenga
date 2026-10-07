@@ -415,24 +415,30 @@ function remoteFsSocket(): ReturnType<typeof getFsSocketClient> | null {
 // ─── FS allowlist (user-configurable) ────────────────────────────────────────
 //
 // The allowlist is owned by Rust (`src-tauri/src/fs_roots.rs`, persisted to
-// `app_data_dir/fs_roots.json`). Every mutation returns the canonical list so
+// `<data-dir>/fs_roots.json`). Every mutation returns the canonical list so
 // the frontend can sync from the response rather than maintaining a parallel
-// store. Default roots: `~/royalti-co`, `~/.claude/projects`, `~/.company`.
+// store. Empty by default; on a multi-user (T1) server each person's list
+// starts with their home folder. `principal` (a username or principal id)
+// names someone else's list — an admin's call on a T1 server only
+// (`server::broker::fs_roots_admin`); the desktop has one list.
 
-export async function fsRootsList(): Promise<string[]> {
-	return invoke('fs_roots_list');
+const withPrincipal = (args: Record<string, unknown>, principal?: string) =>
+	principal ? { ...args, principal } : args;
+
+export async function fsRootsList(principal?: string): Promise<string[]> {
+	return invoke('fs_roots_list', withPrincipal({}, principal));
 }
 
-export async function fsRootsAdd(path: string): Promise<string[]> {
-	return invoke('fs_roots_add', { path });
+export async function fsRootsAdd(path: string, principal?: string): Promise<string[]> {
+	return invoke('fs_roots_add', withPrincipal({ path }, principal));
 }
 
-export async function fsRootsRemove(path: string): Promise<string[]> {
-	return invoke('fs_roots_remove', { path });
+export async function fsRootsRemove(path: string, principal?: string): Promise<string[]> {
+	return invoke('fs_roots_remove', withPrincipal({ path }, principal));
 }
 
-export async function fsRootsReset(): Promise<string[]> {
-	return invoke('fs_roots_reset');
+export async function fsRootsReset(principal?: string): Promise<string[]> {
+	return invoke('fs_roots_reset', withPrincipal({}, principal));
 }
 
 /** OS-level username fallback (`$USER`/`%USERNAME%`, or `"unknown"`). Used
@@ -549,7 +555,9 @@ export type NotificationKind =
 	| 'run_failed'
 	| 'update'
 	| 'violation'
-	| 'invite';
+	| 'invite'
+	/** An environment problem blocking work, e.g. WSL has no network (D-19). */
+	| 'system';
 
 /**
  * `{ kind, ...params }` for the action kinds producers emit; the centre
@@ -585,7 +593,14 @@ export type KnownNotificationAction =
 	  }
 	| { kind: 'open.release_notes'; source: 'shell'; version: string }
 	| { kind: 'open.pkg_updates'; pkgId: string; version: string }
-	| { kind: 'open.violations'; pkgId: string };
+	| { kind: 'open.violations'; pkgId: string }
+	| {
+			/** WSL has no network (honest-failure-states WP-2): offer the fix
+			 *  that fits `state`. `distro` null = the default distro. */
+			kind: 'fix.wsl_network';
+			distro: string | null;
+			state: 'no_route' | 'dns_only' | 'wsl_down';
+	  };
 
 export type KnownNotificationActionKind = KnownNotificationAction['kind'];
 
@@ -664,6 +679,9 @@ export interface NotificationsListOptions {
 export type NotificationsChangeReason =
 	| 'created'
 	| 'coalesced'
+	/** A row's copy changed within an open episode (D-20): refresh lists,
+	 *  never toast. */
+	| 'updated'
 	| 'read'
 	| 'read_all'
 	| 'mute_changed';
@@ -671,7 +689,7 @@ export type NotificationsChangeReason =
 /** Payload of `notifications://changed`. */
 export interface NotificationsChangedEvent {
 	reason: NotificationsChangeReason;
-	/** Present for `created` / `coalesced`. */
+	/** Present for `created` / `coalesced` / `updated`. */
 	notification: NotificationRow | null;
 	/** True when the row's kind is muted — the toast bridge stays quiet. */
 	muted: boolean;
@@ -738,6 +756,60 @@ export async function notificationsRecordUpdate(
 		pkgId: args.pkgId ?? null,
 		pkgName: args.pkgName ?? null,
 	});
+}
+
+// ─── WSL network health (honest-failure-states WP-2) ─────────────────────────
+// Rust: src-tauri/src/commands/wsl_health.rs over server/shared/wsl_health.rs.
+// Windows-only in effect; elsewhere the probe answers `not_installed` and every
+// fix `failed`.
+
+export type WslHealthState =
+	| 'ok'
+	| 'host_offline'
+	| 'no_route'
+	| 'dns_only'
+	| 'wsl_down'
+	| 'not_installed';
+
+export interface WslHealth {
+	state: WslHealthState;
+	/** The distro probed; `null` = the default distro. */
+	distro: string | null;
+	/** One short sentence naming the cause. */
+	detail: string;
+	/** Newest "falling back to networkingMode None" WSL event this boot. */
+	mirroredFailure: { at: number; errorCode: string | null } | null;
+	/** `[wsl2] networkingMode` from .wslconfig (lower-case); null = unset/unreadable. */
+	networkingMode: string | null;
+	/** Unix ms. */
+	checkedAt: number;
+}
+
+export type WslFixAction = 'repair_dns' | 'restart_networking' | 'switch_to_nat';
+
+export type WslFixOutcome =
+	| { outcome: 'done'; health: WslHealth }
+	| { outcome: 'cancelled_by_user' }
+	| { outcome: 'failed'; reason: string };
+
+/** Probe WSL networking. `distro` omitted = `engines.agentWslDistro`; results
+ *  are cached 30 s per distro unless `force`. */
+export async function wslHealthProbe(
+	args: { distro?: string | null; force?: boolean } = {},
+): Promise<WslHealth> {
+	return invoke<WslHealth>('wsl_health_probe', {
+		distro: args.distro ?? null,
+		force: args.force ?? false,
+	});
+}
+
+/** Run one WSL network fix. `restart_networking` (UAC prompt) and
+ *  `switch_to_nat` shut WSL down — confirm first, relaunch sessions after. */
+export async function wslHealthFix(
+	action: WslFixAction,
+	distro?: string | null,
+): Promise<WslFixOutcome> {
+	return invoke<WslFixOutcome>('wsl_health_fix', { action, distro: distro ?? null });
 }
 
 // ─── Secrets (Stronghold) ─────────────────────────────────────────────────────
@@ -3430,8 +3502,9 @@ export async function pkgDbDiag(): Promise<PkgDbDiag> {
 }
 
 // ─── pkg health (install-integrity check + cleanup) ──────────────────────────
-// Mirrors the Rust `PkgHealthIssue` / `HealthIssueKind` serde (kernel.rs) — keep
-// in lockstep. `issue.kind` is the tagged-union discriminant.
+// Mirrors the Rust `PkgHealthIssue` / `HealthIssueKind` serde (kernel.rs, and
+// the daemon's `server/pkg_index.rs`) — keep in lockstep. `issue.kind` is the
+// tagged-union discriminant.
 export type PkgHealthIssueKind =
 	| { kind: 'manifest_missing' }
 	| { kind: 'manifest_unreadable' }
@@ -3442,10 +3515,27 @@ export type PkgHealthIssueKind =
 	 *  (or register) at boot: on disk, absent from the kernel. */
 	| { kind: 'pkgs_dir_unloadable' }
 	/** An enabled install record, loadable, that a registry rejected at boot. */
-	| { kind: 'register_failed' };
+	| { kind: 'register_failed' }
+	/** The headless daemon only: a second pkgs-folder directory claiming an id
+	 *  an earlier directory already serves (from `served_path`). `id` names a
+	 *  pkg that IS served and working — never mark it broken or offer to
+	 *  reinstall it; `install_path` is the ignored copy. */
+	| { kind: 'pkgs_dir_duplicate'; served_path: string }
+	/** Not an issue with any pkg: the headless daemon's statement that install
+	 *  records are not checked on that server at all (it keeps none). Its scan
+	 *  always leads with this one row, so the answer never reads as "healthy";
+	 *  `detail` says why. Never emitted by the desktop. */
+	| { kind: 'records_unavailable' };
+
+/** The daemon's "install records not checked here" row — a statement about
+ *  the scan, not an issue to count or remove. */
+export function isRecordsUnavailableIssue(kind: PkgHealthIssueKind): boolean {
+	return kind.kind === 'records_unavailable';
+}
 
 /** Issue kinds for a pkg that is on disk but not registered in the kernel —
- *  the ones Ngwa offers "Reinstall from registry" for. */
+ *  the ones Ngwa offers "Reinstall from registry" for. A `pkgs_dir_duplicate`
+ *  is not one: its id is served. */
 export function isUnregisteredPkgIssue(kind: PkgHealthIssueKind): boolean {
 	return kind.kind === 'pkgs_dir_unloadable' || kind.kind === 'register_failed';
 }
@@ -4230,7 +4320,8 @@ export interface SystemCheck {
 export interface SystemReport {
 	os: string;
 	arch: string;
-	disk_free_gb: number;
+	/** Null when no mounted volume matched the app-data dir (unknown, not zero). */
+	disk_free_gb: number | null;
 	app_data_dir: string;
 	app_data_writable: boolean;
 	vault_key_present: boolean;
@@ -4257,6 +4348,18 @@ export interface DetectedAgent {
 	/** Human-readable hint when `authed === false` or probe was inconclusive. */
 	auth_hint: string | null;
 	capabilities: AgentCapabilities;
+	/** Present only when detection couldn't check for this agent at all —
+	 *  today, WSL couldn't be asked (D-10). Such an agent is neither installed
+	 *  nor missing: `version` / `authed` are null and it is not runnable.
+	 *  Absent on older daemons and on every agent that was checked. */
+	unavailable?: AgentUnavailable | null;
+}
+
+/** Why detection couldn't check an agent. `kind` names the dependency that
+ *  failed (`'wsl'` today); `reason` is the probe's own detail. */
+export interface AgentUnavailable {
+	kind: 'wsl' | (string & {});
+	reason: string;
 }
 
 export interface AgentConfigInventory {

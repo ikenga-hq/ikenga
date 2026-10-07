@@ -34,6 +34,7 @@ import { type TerminalTab, useTerminalStore } from '@/terminal/session-store';
 import { SingleTerminal } from '@/terminal/single-terminal';
 import { ToolCallFeed } from '@/terminal/tool-call-feed';
 import { TranscriptReplay } from '@/terminal/transcript-replay';
+import { WslHealthBanner } from '@/shell/wsl-health/wsl-health-banner';
 import { DetachedSurfacePlaceholder } from './detached-placeholder';
 
 interface TerminalViewProps {
@@ -153,6 +154,9 @@ export function TerminalView({ sessionId }: TerminalViewProps) {
 		<div className="relative flex h-full w-full flex-col overflow-hidden">
 			{/* WP-03: Cost & Context Telemetry HUD */}
 			<CostHud sessionId={sessionId} />
+
+			{/* honest-failure-states WP-2: WSL network banner (WSL tabs only) */}
+			<WslHealthBanner sessionId={sessionId} />
 
 			<div className="relative flex-1 flex h-full w-full overflow-hidden">
 				<div className="absolute right-1.5 top-1.5 z-50 flex items-center gap-1">

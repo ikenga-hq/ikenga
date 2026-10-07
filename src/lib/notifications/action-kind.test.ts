@@ -24,6 +24,15 @@ describe('asKnownNotificationAction', () => {
 		expect(KNOWN_NOTIFICATION_ACTION_KINDS).toContain('permission.decide');
 	});
 
+	it('knows fix.wsl_network (WP-2) and keeps its params', () => {
+		const raw: NotificationAction = { kind: 'fix.wsl_network', distro: null, state: 'no_route' };
+		const a = asKnownNotificationAction(raw);
+		expect(KNOWN_NOTIFICATION_ACTION_KINDS).toContain('fix.wsl_network');
+		let state: string | null = null;
+		if (a?.kind === 'fix.wsl_network') state = a.state;
+		expect(state).toBe('no_route');
+	});
+
 	it('narrows on kind so params are typed', () => {
 		const raw: NotificationAction = { kind: 'open.thread', threadId: 'th-1', requestId: 'req-1' };
 		const a = asKnownNotificationAction(raw);

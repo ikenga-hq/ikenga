@@ -98,6 +98,7 @@ describe('notifications queries', () => {
 			'run_failed',
 			'update',
 			'invite',
+			'system',
 		]);
 	});
 

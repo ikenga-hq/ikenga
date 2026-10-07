@@ -28,6 +28,8 @@ import { Button } from '@/components/ui/button';
 import { StatusChip } from '@/components/ui/status-chip';
 import { AuthPill } from './auth-pill';
 import { cn } from '@/components/ui/utils';
+import { WslUnavailableChip, WslUnavailableNotice } from '@/components/wsl-unavailable-notice';
+import { firstAgentUnavailableText } from '@/lib/agent-unavailable';
 import {
 	fetchIndex,
 	fetchPkgDetail,
@@ -46,6 +48,8 @@ import { type DetectedAgent, pkgInstallFromRegistry, pkgKernelStatus } from '@/l
 import { WritesNote } from '@/shell/onboarding/footer';
 import { EngineLogo } from '@/shell/onboarding/engine-logo';
 
+import { installUnavailableReason } from '@/lib/desktop-only';
+import { offlineInstallErrorMessage } from './offline-install-error';
 import { useOnboardingStep } from './use-onboarding-step';
 
 export interface EngineStepPayload {
@@ -65,8 +69,6 @@ interface EngineBodyProps {
 const OFFLINE_AGENT_ID = 'engine-noop';
 const ENGINE_NOOP_NPM_NAME = '@ikenga/pkg-engine-noop';
 const ENGINE_NOOP_PKG_ID = 'com.ikenga.engine-noop';
-const REGISTRY_UNREACHABLE_MSG =
-	"Couldn't reach the registry — you can install the offline engine later from Ngwa → Store.";
 
 // Stable display order. The Rust side already knows about these ids in
 // `KNOWN_AGENTS`; the wizard surfaces them whether the binary is present
@@ -271,7 +273,7 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 			} else {
 				console.error('[onboarding] engine-noop install failed', e);
 			}
-			setOfflineError(REGISTRY_UNREACHABLE_MSG);
+			setOfflineError(offlineInstallErrorMessage(e));
 		},
 	});
 
@@ -283,10 +285,23 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 
 	const anyDetected = SUPPORTED_ENGINE_IDS.some((id) => results[id]?.status === 'detected');
 	const anyPending = SUPPORTED_ENGINE_IDS.some((id) => results[id]?.status === 'pending');
-	const anyUnknown = SUPPORTED_ENGINE_IDS.some((id) => results[id]?.status === 'unknown');
+	const anyUnknown = SUPPORTED_ENGINE_IDS.some(
+		(id) => results[id]?.status === 'unknown' || results[id]?.status === 'unavailable'
+	);
 	const allMissing = computeAllMissing(results);
+	// D-18: one notice above the grid for every engine WSL couldn't check;
+	// the cards themselves carry only a short chip.
+	const wslNotice = firstAgentUnavailableText(
+		SUPPORTED_ENGINE_IDS.map((id) =>
+			results[id]?.status === 'unavailable' ? results[id]?.agent : null
+		)
+	);
 
+	// Gap audit rank 3: offline mode installs the engine-noop pkg, which the
+	// daemon can't do yet — say so up front instead of failing on click.
+	const offlineBlocked = installUnavailableReason();
 	const offlineButtonLabel = (long: boolean) => {
+		if (offlineBlocked && !isOffline) return offlineBlocked;
 		if (offlineMut.isPending) return 'Installing offline engine…';
 		if (isOffline) return 'Offline selected';
 		return long ? 'Use offline mode' : 'Continue offline';
@@ -319,6 +334,18 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 					Re-scan
 				</Button>
 			</div>
+
+			{wslNotice && (
+				<WslUnavailableNotice
+					text={wslNotice}
+					className="mb-4"
+					actions={
+						<Button variant="ghost" size="sm" onClick={() => refresh()}>
+							Re-check
+						</Button>
+					}
+				/>
+			)}
 
 			{/* ── Engine grid (always 7 cards; status reveals per-engine) ── */}
 			<div className="grid gap-4 md:grid-cols-2" data-testid="agents-grid">
@@ -428,7 +455,8 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 					variant={isOffline ? 'default' : 'secondary'}
 					size="sm"
 					onClick={handleOffline}
-					disabled={offlineMut.isPending}
+					disabled={offlineMut.isPending || (!!offlineBlocked && !isOffline)}
+					title={offlineBlocked || undefined}
 					data-testid="agents-offline-cta"
 				>
 					{offlineButtonLabel(false)}
@@ -483,7 +511,8 @@ interface EngineCardProps {
 	onOpenDocs: () => void;
 }
 
-function EngineCard({ meta, entry, selected, onSelect, onOpenDocs }: EngineCardProps) {
+/** Exported for tests. */
+export function EngineCard({ meta, entry, selected, onSelect, onOpenDocs }: EngineCardProps) {
 	const interactive = entry.status === 'detected';
 	// `div role="button"` (not a real <button>) so the "Docs →" affordance can
 	// nest inside — the HTML spec and React forbid <button> inside <button>.
@@ -559,51 +588,59 @@ function EngineCard({ meta, entry, selected, onSelect, onOpenDocs }: EngineCardP
 				)}
 			</div>
 
-			<div
-				className="mt-3 border-t border-dashed pt-3 text-xs"
-				style={{ borderColor: 'var(--border-soft)' }}
-			>
-				{entry.status === 'pending' ? (
-					<SkeletonRow />
-				) : entry.status === 'detected' && entry.agent ? (
-					<div className="flex gap-3">
-						<span className="w-20 flex-none" style={{ color: 'var(--fg-faint)' }}>
-							Binary
-						</span>
-						<span className="truncate font-mono text-[11.5px]" title={entry.agent.executable_path}>
-							{entry.agent.executable_path}
-						</span>
-					</div>
-				) : entry.status === 'unknown' ? (
-					<div className="flex items-center justify-between gap-2">
-						<span
-							className="truncate text-[11.5px]"
-							style={{ color: 'var(--danger, #ef4444)' }}
-							title={entry.error}
-							data-testid="agent-probe-error"
-						>
-							{entry.error ? `Error: ${entry.error}` : "Couldn't check engine status"}
-						</span>
-					</div>
-				) : (
-					<div className="flex items-center justify-between gap-2">
-						<span style={{ color: 'var(--fg-faint)' }}>
-							Not on $PATH. Try: <span className="font-mono text-[11.5px]">{meta.binaryHint}</span>
-						</span>
-						<button
-							type="button"
-							onClick={(e) => {
-								e.stopPropagation();
-								onOpenDocs();
-							}}
-							className="text-[11.5px] underline-offset-2 hover:underline"
-							style={{ color: 'var(--primary)' }}
-						>
-							Docs →
-						</button>
-					</div>
-				)}
-			</div>
+			{/* D-18: an unchecked card shows only its chip — the WSL reason is in
+			    the one notice above the grid. */}
+			{entry.status !== 'unavailable' && (
+				<div
+					className="mt-3 border-t border-dashed pt-3 text-xs"
+					style={{ borderColor: 'var(--border-soft)' }}
+				>
+					{entry.status === 'pending' ? (
+						<SkeletonRow />
+					) : entry.status === 'detected' && entry.agent ? (
+						<div className="flex gap-3">
+							<span className="w-20 flex-none" style={{ color: 'var(--fg-faint)' }}>
+								Binary
+							</span>
+							<span
+								className="truncate font-mono text-[11.5px]"
+								title={entry.agent.executable_path}
+							>
+								{entry.agent.executable_path}
+							</span>
+						</div>
+					) : entry.status === 'unknown' ? (
+						<div className="flex items-center justify-between gap-2">
+							<span
+								className="truncate text-[11.5px]"
+								style={{ color: 'var(--danger, #ef4444)' }}
+								title={entry.error}
+								data-testid="agent-probe-error"
+							>
+								{entry.error ? `Error: ${entry.error}` : "Couldn't check engine status"}
+							</span>
+						</div>
+					) : (
+						<div className="flex items-center justify-between gap-2">
+							<span style={{ color: 'var(--fg-faint)' }}>
+								Not on $PATH. Try:{' '}
+								<span className="font-mono text-[11.5px]">{meta.binaryHint}</span>
+							</span>
+							<button
+								type="button"
+								onClick={(e) => {
+									e.stopPropagation();
+									onOpenDocs();
+								}}
+								className="text-[11.5px] underline-offset-2 hover:underline"
+								style={{ color: 'var(--primary)' }}
+							>
+								Docs →
+							</button>
+						</div>
+					)}
+				</div>
+			)}
 			{entry.status === 'missing' && meta.installCmd && (
 				<div
 					className="mt-2 font-mono text-[11px]"
@@ -648,6 +685,13 @@ function StatusPill({ entry }: { entry: AgentDetectEntry }) {
 				<StatusChip tone="live" dot>
 					Detected
 				</StatusChip>
+			</span>
+		);
+	}
+	if (entry.status === 'unavailable') {
+		return (
+			<span data-testid="status-pill" data-status="unavailable">
+				<WslUnavailableChip title={entry.error} />
 			</span>
 		);
 	}

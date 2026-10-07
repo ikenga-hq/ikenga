@@ -64,6 +64,7 @@ pub mod supabase_config;
 pub mod trust;
 pub mod viewer;
 pub mod window;
+pub mod wsl_health;
 
 pub use action_exec::{action_exec, action_git_branch};
 pub use actions::{

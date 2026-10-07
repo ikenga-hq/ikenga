@@ -16,6 +16,7 @@ export const KNOWN_NOTIFICATION_ACTION_KINDS = [
 	'open.release_notes',
 	'open.pkg_updates',
 	'open.violations',
+	'fix.wsl_network',
 ] as const satisfies readonly KnownNotificationActionKind[];
 
 /**

@@ -158,76 +158,92 @@ fn detect_windows_shells(profiles: &mut Vec<ShellProfile>) {
 
 #[cfg(windows)]
 fn detect_wsl_distributions(profiles: &mut Vec<ShellProfile>) {
-    let wsl_bin = PathBuf::from(r"C:\Windows\System32\wsl.exe");
-    if !wsl_bin.is_file() && which::which("wsl.exe").is_err() {
+    if !crate::server::shared::wsl::wsl_exe_present() {
         return;
     }
-
-    // Query distros via registry or wsl.exe -l -q
-    let distros = read_wsl_distros_from_wsl_exe();
-
-    if !distros.is_empty() {
-        for distro in distros {
-            profiles.push(ShellProfile {
-                id: format!("wsl:{distro}"),
-                label: format!("WSL: {distro}"),
-                icon: "wsl".to_string(),
-                cmd: vec!["wsl.exe".to_string(), "-d".to_string(), distro.clone()],
-                is_default: false,
-                kind: "wsl".to_string(),
-                distro: Some(distro),
-            });
-        }
-    } else {
-        // Fallback default WSL profile if wsl.exe exists
-        profiles.push(ShellProfile {
-            id: "wsl:default".to_string(),
-            label: "WSL (Default)".to_string(),
-            icon: "wsl".to_string(),
-            cmd: vec!["wsl.exe".to_string()],
-            is_default: false,
-            kind: "wsl".to_string(),
-            distro: None,
-        });
+    // A profile per user distro. No distro listed — or `wsl.exe -l -q`
+    // failing, timing out, or listing nothing — offers no WSL profile at
+    // all: a "WSL (Default)" entry there opens a terminal that only prints
+    // WSL's own error.
+    match read_wsl_distros_from_wsl_exe() {
+        Ok(distros) => profiles.extend(wsl_profiles(distros)),
+        Err(e) => tracing::warn!(target: "ikenga::terminal", "listing WSL distros: {e}"),
     }
 }
 
+/// One terminal profile per WSL distro.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wsl_profiles(distros: Vec<String>) -> impl Iterator<Item = ShellProfile> {
+    distros.into_iter().map(|distro| ShellProfile {
+        id: format!("wsl:{distro}"),
+        label: format!("WSL: {distro}"),
+        icon: "wsl".to_string(),
+        cmd: vec!["wsl.exe".to_string(), "-d".to_string(), distro.clone()],
+        is_default: false,
+        kind: "wsl".to_string(),
+        distro: Some(distro),
+    })
+}
+
+/// How long `wsl.exe -l -q` may take. Listing doesn't boot the VM, so this
+/// only trips on a wedged WSL service — which would otherwise hang shell
+/// detection (and the terminal menu) indefinitely.
 #[cfg(windows)]
-fn read_wsl_distros_from_wsl_exe() -> Vec<String> {
-    use std::process::Command;
+const WSL_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-    let mut distros = Vec::new();
+/// The user distros `wsl.exe -l -q` lists (Docker Desktop's dropped), or why
+/// it couldn't say.
+#[cfg(windows)]
+fn read_wsl_distros_from_wsl_exe() -> Result<Vec<String>, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    use crate::platform::NoConsoleWindow;
+
     let mut cmd = Command::new("wsl.exe");
-    cmd.args(["-l", "-q"]);
+    cmd.args(["-l", "-q"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.no_console_window();
+    let mut child = cmd.spawn().map_err(|e| format!("couldn't start wsl.exe: {e}"))?;
 
-    #[cfg(windows)]
-    {
-        use crate::platform::NoConsoleWindow;
-        cmd.no_console_window();
-    }
-
-    if let Ok(output) = cmd.output() {
-        if output.status.success() {
-            // wsl.exe -l -q outputs UTF-16LE or UTF-8 depending on Windows build
-            let text = if output.stdout.len() >= 2 && (output.stdout[1] == 0 || output.stdout[0] == 0xff && output.stdout[1] == 0xfe) {
-                let u16s: Vec<u16> = output.stdout
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                    .collect();
-                String::from_utf16_lossy(&u16s)
-            } else {
-                String::from_utf8_lossy(&output.stdout).to_string()
-            };
-
-            for line in text.lines() {
-                let clean = line.trim().trim_matches('\0').trim();
-                if !clean.is_empty() && !distros.contains(&clean.to_string()) {
-                    distros.push(clean.to_string());
-                }
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= WSL_LIST_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "wsl.exe -l -q did not answer within {}s",
+                    WSL_LIST_TIMEOUT.as_secs()
+                ));
             }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Err(e) => return Err(format!("waiting for wsl.exe: {e}")),
         }
+    };
+    let mut stdout = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_end(&mut stdout);
     }
-    distros
+    if !status.success() {
+        let mut stderr = Vec::new();
+        if let Some(mut err) = child.stderr.take() {
+            let _ = err.read_to_end(&mut stderr);
+        }
+        // `-l -q` with no distro installed exits non-zero and explains on
+        // stdout; either stream may carry the reason.
+        let text = crate::server::shared::wsl::decode_wsl_output(if stderr.is_empty() {
+            &stdout
+        } else {
+            &stderr
+        });
+        let reason = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        return Err(format!("wsl.exe -l -q exited {status}: {reason}"));
+    }
+    Ok(crate::server::shared::wsl::parse_distro_list(&stdout))
 }
 
 #[cfg(not(windows))]
@@ -268,5 +284,22 @@ fn detect_unix_shells(profiles: &mut Vec<ShellProfile>) {
                 added_ids.insert(id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each listed distro becomes a `wsl -d <distro>` profile; nothing listed
+    /// means no WSL profile (no "WSL (Default)" fallback that can't open).
+    #[test]
+    fn wsl_profiles_name_each_distro_and_none_when_empty() {
+        let profiles: Vec<ShellProfile> = wsl_profiles(vec!["Ubuntu".into()]).collect();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, "wsl:Ubuntu");
+        assert_eq!(profiles[0].cmd, ["wsl.exe", "-d", "Ubuntu"]);
+        assert_eq!(profiles[0].distro.as_deref(), Some("Ubuntu"));
+        assert_eq!(wsl_profiles(Vec::new()).count(), 0);
     }
 }

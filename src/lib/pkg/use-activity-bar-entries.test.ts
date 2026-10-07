@@ -15,6 +15,7 @@ vi.mock('@/lib/transport', () => ({
 
 vi.mock('@/lib/tauri-cmd', () => ({
 	pkgKernelStatus: vi.fn(),
+	isRemoteWebSession: () => false,
 	activityPinsList: vi.fn(async () => []),
 	activityPinsAdd: vi.fn(),
 }));

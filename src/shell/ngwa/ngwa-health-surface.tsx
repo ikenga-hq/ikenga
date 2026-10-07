@@ -18,6 +18,11 @@
 //   6. Engines   — the shared installed-engine signal + `detectAgent` probes.
 // Anything not measured reads "—". Every failure renders as an error, never as
 // an empty list or a zero. Destructive actions confirm first (DEC-30).
+//
+// In a remote web session (the headless daemon) some sources do not exist at
+// all — no sidecar supervisor, no cron registry, no install records, no trust
+// store. Those read "Not available on this server", never as a missing-registry
+// error, an empty list, or "healthy"; the desktop wording is unchanged.
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
@@ -40,6 +45,8 @@ import {
 	dataHealthDbSize,
 	dataHealthScan,
 	detectAgent,
+	isRemoteWebSession,
+	isRecordsUnavailableIssue,
 	isUnregisteredPkgIssue,
 	pkgHealthRemove,
 	pkgHealthRemoveAll,
@@ -57,7 +64,10 @@ import {
 	type PkgHealthRemoveResult,
 	type PkgKernelStatus,
 } from '@/lib/tauri-cmd';
+import { agentUnavailableText } from '@/lib/agent-unavailable';
 import { handToChi } from '@/shell/companion/companion-store';
+import { desktopOnlyReason } from '@/lib/desktop-only';
+import { NOT_AVAILABLE_ON_SERVER_LABEL } from '@/lib/transport/unavailable';
 import { ngwaSnapshotQueryKey } from '@/lib/ngwa/use-ngwa-snapshot';
 import {
 	ENGINE_IDS,
@@ -77,7 +87,7 @@ export interface NgwaHealthSurfaceProps {
 	snapshot: Pick<NgwaSnapshot, 'as_of_ms' | 'sources'> | null;
 	isLoading?: boolean;
 	error?: Error | null;
-	unreadableSources?: Array<{ source: string; error: string | null }>;
+	unreadableSources?: Array<{ source: string; error: string | null; unavailable?: boolean }>;
 	section?: HealthSection;
 	onOpenBackup: () => void;
 	onOpenStore: () => void;
@@ -148,6 +158,10 @@ export function issueLabel(kind: PkgHealthIssueKind): string {
 			return 'failed to load';
 		case 'register_failed':
 			return 'not registered';
+		case 'pkgs_dir_duplicate':
+			return 'duplicate, not served';
+		case 'records_unavailable':
+			return 'not available on this server';
 	}
 }
 
@@ -254,12 +268,19 @@ export function summarizeRemoveAll(r: PkgHealthRemoveAllResult): Notice {
 interface RegistryRead<T> {
 	entries: T[] | null;
 	error: string | null;
+	/** The host does not run this registry at all (a remote web session on the
+	 *  headless daemon) — not a failure, and not an empty set. */
+	unavailable?: boolean;
 }
 
 function readRegistry<T>(status: PkgKernelStatus | undefined, name: string): RegistryRead<T> {
 	if (!status) return { entries: null, error: null };
 	const reg = status.registries?.[name] as Record<string, unknown> | undefined;
 	if (!reg || typeof reg !== 'object') {
+		// The daemon's `pkg_kernel_status` lists only the registries it runs.
+		if (isRemoteWebSession()) {
+			return { entries: null, error: NOT_AVAILABLE_ON_SERVER_LABEL, unavailable: true };
+		}
 		return { entries: null, error: `${name} registry missing from kernel status` };
 	}
 	if (typeof reg.error === 'string') return { entries: null, error: reg.error };
@@ -284,6 +305,16 @@ interface PkgCronEntry {
 	cron_id: string;
 	expr: string;
 	handler: string;
+}
+
+/** A source the host does not run: neutral, not an alert. */
+function Unavailable({ what, children }: { what: string; children?: ReactNode }) {
+	return (
+		<div className="hnote" data-unavailable={what}>
+			{NOT_AVAILABLE_ON_SERVER_LABEL}
+			{children}
+		</div>
+	);
 }
 
 function Err({ children }: { children: ReactNode }) {
@@ -363,7 +394,16 @@ export function NgwaHealthSurface({
 	const sidecars = readRegistry<SidecarEntry>(kernelQ.data, 'sidecar_supervisor');
 	const pkgCron = readRegistry<PkgCronEntry>(kernelQ.data, 'cron');
 	const violations = violationsQ.data ?? [];
-	const installs: PkgHealthIssue[] = installsQ.data ?? [];
+	// The daemon leads its scan with one `records_unavailable` row: install
+	// records are not checked there. It is a statement about the scan, not an
+	// issue — shown apart, never counted, never removable.
+	const scanRows: PkgHealthIssue[] = installsQ.data ?? [];
+	const recordsUnavailable = scanRows.find((r) => isRecordsUnavailableIssue(r.issue)) ?? null;
+	const installs = scanRows.filter((r) => !isRecordsUnavailableIssue(r.issue));
+	// Removal and registry reinstall are desktop-only (the daemon serves
+	// neither to a browser session).
+	const removeDisabled = desktopOnlyReason();
+	const reinstallDisabled = desktopOnlyReason();
 	const snapshotReady = !isLoading && !error && snapshot !== null;
 	const unsigned = useMemo(
 		() => items.filter((it) => it.trust.signed === false && it.trust.state !== 'needs_approval'),
@@ -372,6 +412,9 @@ export function NgwaHealthSurface({
 	const trustDown = unreadableSources.filter((s) =>
 		['trust', 'kernel', 'oba', 'engine_config'].includes(s.source)
 	);
+	// Trust is not evaluated on this host at all (the daemon), as opposed to
+	// a source that failed to read.
+	const trustNotServed = unreadableSources.find((s) => s.source === 'trust' && s.unavailable) ?? null;
 	const engines = useMemo(() => installedEngines(items), [items]);
 	const rows = useMemo(() => buildRows(items), [items]);
 
@@ -491,7 +534,7 @@ export function NgwaHealthSurface({
 	// ── auditline ──
 	const readSources: string[] = [];
 	if (violationsQ.isSuccess) readSources.push('permission audit');
-	if (installsQ.isSuccess) readSources.push('install records');
+	if (installsQ.isSuccess) readSources.push(recordsUnavailable ? 'pkgs folder' : 'install records');
 	if (kernelQ.isSuccess && sidecars.entries) readSources.push('sidecar supervisor');
 	if (kernelQ.isSuccess && pkgCron.entries) readSources.push('pkg cron registry');
 	if (agentOpsQ.isSuccess) readSources.push('agent-ops');
@@ -506,14 +549,25 @@ export function NgwaHealthSurface({
 				.map(([k]) => k)
 		: [];
 	const failedSources: string[] = [];
+	// Sources this host does not run: named, never "could not read".
+	const notServedSources: string[] = [];
 	if (snapshot) {
 		for (const [k, h] of Object.entries(snapshot.sources) as Array<[string, { ok: boolean }]>) {
-			if (!h.ok) failedSources.push(k);
+			if (h.ok) continue;
+			if (unreadableSources.some((s) => s.source === k && s.unavailable)) notServedSources.push(k);
+			else failedSources.push(k);
 		}
 	}
+	if (recordsUnavailable) notServedSources.push('install records');
+	if (kernelQ.isSuccess && sidecars.unavailable) notServedSources.push('sidecar supervisor');
+	if (kernelQ.isSuccess && pkgCron.unavailable) notServedSources.push('pkg cron registry');
 	if (violationsQ.isError) failedSources.push('permission audit');
 	if (installsQ.isError) failedSources.push('install records');
-	if (kernelQ.isError || (kernelQ.isSuccess && (sidecars.error || pkgCron.error))) {
+	if (
+		kernelQ.isError ||
+		(kernelQ.isSuccess &&
+			((sidecars.error && !sidecars.unavailable) || (pkgCron.error && !pkgCron.unavailable)))
+	) {
 		failedSources.push('kernel registries');
 	}
 	if (agentOpsQ.isError) failedSources.push('agent-ops');
@@ -523,10 +577,15 @@ export function NgwaHealthSurface({
 	ENGINE_IDS.forEach((e, i) => {
 		if (probes[i]?.isError) failedSources.push(`engine probe (${e})`);
 	});
-	const auditOk = !error && snapshot !== null && failedSources.length === 0;
+	const auditOk =
+		!error && snapshot !== null && failedSources.length === 0 && notServedSources.length === 0;
 	const ageMin = snapshot ? Math.max(0, Math.floor((now() - snapshot.as_of_ms) / 60_000)) : null;
 
-	const violationCount = violationsQ.isSuccess && installsQ.isSuccess ? violations.length + installs.length : null;
+	// Unmeasured when install records are not checked on this host.
+	const violationCount =
+		violationsQ.isSuccess && installsQ.isSuccess && !recordsUnavailable
+			? violations.length + installs.length
+			: null;
 	const agentJobs: AgentOpsRawJob[] = agentOpsQ.data?.jobs ?? [];
 	const cronCount =
 		agentOpsQ.isSuccess && pkgCron.entries ? agentJobs.length + pkgCron.entries.length : null;
@@ -556,10 +615,17 @@ export function NgwaHealthSurface({
 					</h3>
 
 					{/* install integrity: broken / unregistered pkgs first — they are what blocks a view */}
+					{recordsUnavailable && installs.length > 0 && (
+						<Unavailable what="installs">{' '}— {recordsUnavailable.detail}</Unavailable>
+					)}
 					{installsQ.isLoading ? (
 						<div className="hnote">Scanning installs…</div>
 					) : installsQ.error ? (
 						<Err>Health scan failed: {errText(installsQ.error)}</Err>
+					) : recordsUnavailable && installs.length === 0 ? (
+						<Unavailable what="installs">
+							{' '}— {recordsUnavailable.detail} No pkgs-folder problems found.
+						</Unavailable>
 					) : installs.length === 0 ? (
 						<div className="hnote" data-empty="installs">
 							All install records healthy.
@@ -570,18 +636,28 @@ export function NgwaHealthSurface({
 								const reinstall =
 									isUnregisteredPkgIssue(r.issue) && onReinstall && canReinstall?.(r.id);
 								return (
-									<div key={`${r.id}:${r.issue.kind}`} className="hrow" data-install={r.id}>
+									<div
+										key={`${r.id}:${r.issue.kind}:${r.install_path}`}
+										className="hrow"
+										data-install={r.id}
+									>
 										<AlertTriangle className="hico h-4 w-4 flex-none" />
 										<div className="txt">
 											<span className="t1">
 												{r.id}{' '}
 												<span
-													className={`tag ${r.issue.kind === 'orphan_row' ? '' : 'bad'}`}
+													className={`tag ${
+														r.issue.kind === 'orphan_row' || r.issue.kind === 'pkgs_dir_duplicate'
+															? ''
+															: 'bad'
+													}`}
 													data-issue={r.issue.kind}
 												>
 													{issueLabel(r.issue)}
 												</span>
-												{!r.enabled && r.issue.kind !== 'pkgs_dir_unloadable' && (
+												{!r.enabled &&
+													r.issue.kind !== 'pkgs_dir_unloadable' &&
+													r.issue.kind !== 'pkgs_dir_duplicate' && (
 													<span className="tag">disabled</span>
 												)}
 											</span>
@@ -601,7 +677,11 @@ export function NgwaHealthSurface({
 													type="button"
 													className="chip on"
 													data-reinstall={r.id}
-													title="Fetch it again from the signed registry. The Store sheet asks for consent first."
+													disabled={reinstallDisabled !== false}
+													title={
+														reinstallDisabled ||
+														'Fetch it again from the signed registry. The Store sheet asks for consent first.'
+													}
 													onClick={() => onReinstall(r.id)}
 												>
 													Reinstall from registry
@@ -611,10 +691,12 @@ export function NgwaHealthSurface({
 												type="button"
 												className="chip danger"
 												data-remove={r.id}
+												disabled={removeDisabled !== false}
 												title={
-													r.issue.kind === 'pkgs_dir_unloadable'
+													removeDisabled ||
+													(r.issue.kind === 'pkgs_dir_unloadable'
 														? 'Move its folder to a recoverable backup'
-														: 'Delete this record'
+														: 'Delete this record')
 												}
 												onClick={() => askRemove(r)}
 											>
@@ -741,7 +823,14 @@ export function NgwaHealthSurface({
 							Rescan
 						</button>
 						{installs.length > 0 && (
-							<button type="button" className="chip danger" data-act="remove-all" onClick={askRemoveAll}>
+							<button
+								type="button"
+								className="chip danger"
+								data-act="remove-all"
+								disabled={removeDisabled !== false}
+								title={removeDisabled || undefined}
+								onClick={askRemoveAll}
+							>
 								Remove all…
 							</button>
 						)}
@@ -761,6 +850,10 @@ export function NgwaHealthSurface({
 						<div className="hnote">Reading the supervisor…</div>
 					) : kernelQ.error ? (
 						<Err>Kernel status failed: {errText(kernelQ.error)}</Err>
+					) : sidecars.unavailable ? (
+						<Unavailable what="sidecars">
+							{' '}— the server runs no sidecar supervisor, so no pkg process is started or tracked.
+						</Unavailable>
 					) : sidecars.error ? (
 						<Err>{sidecars.error}</Err>
 					) : sidecars.entries && sidecars.entries.length === 0 ? (
@@ -941,6 +1034,8 @@ export function NgwaHealthSurface({
 						<div className="hnote">Reading the cron registry…</div>
 					) : kernelQ.error ? (
 						<Err>Kernel status failed: {errText(kernelQ.error)}</Err>
+					) : pkgCron.unavailable ? (
+						<Unavailable what="pkgcron">{' '}— the server runs no pkg cron registry.</Unavailable>
 					) : pkgCron.error ? (
 						<Err>{pkgCron.error}</Err>
 					) : pkgCron.entries && pkgCron.entries.length === 0 ? (
@@ -1110,6 +1205,13 @@ export function NgwaHealthSurface({
 								</span>
 							) : error ? (
 								<span className="t1 herr">Snapshot failed: {error.message}</span>
+							) : trustNotServed ? (
+								<>
+									<span className="t1" data-unsigned-unavailable>
+										Unsigned count: {NOT_AVAILABLE_ON_SERVER_LABEL.toLowerCase()}
+									</span>
+									<span className="t2">{trustNotServed.error}</span>
+								</>
 							) : trustDown.length > 0 ? (
 								<span className="t1 herr" data-unsigned-unknown>
 									Unsigned count unknown: {trustDown.map((s) => s.source).join(', ')} unreadable.
@@ -1137,7 +1239,9 @@ export function NgwaHealthSurface({
 								title={
 									!snapshotReady
 										? 'Waiting for the snapshot'
-										: trustDown.length > 0
+										: trustNotServed
+											? NOT_AVAILABLE_ON_SERVER_LABEL
+											: trustDown.length > 0
 											? 'Trust data is unreadable'
 											: unsigned.length === 0
 												? 'Nothing unsigned'
@@ -1201,7 +1305,9 @@ export function NgwaHealthSurface({
 											? 'Probing the CLI…'
 											: probe?.error
 												? `CLI probe failed: ${errText(probe.error)}`
-												: agent
+												: agentUnavailableText(agent)
+													? `Couldn't check the CLI: ${agentUnavailableText(agent)}`
+													: agent
 													? `CLI at ${agent.executable_path} · auth ${
 															agent.authed === null ? 'unknown' : agent.authed ? 'ok' : 'not signed in'
 														}`
@@ -1245,6 +1351,12 @@ export function NgwaHealthSurface({
 							</>
 						) : (
 							<>Snapshot not read yet</>
+						)}
+						{notServedSources.length > 0 && (
+							<span data-audit-unavailable>
+								{' '}
+								· {NOT_AVAILABLE_ON_SERVER_LABEL.toLowerCase()}: {notServedSources.join(', ')}
+							</span>
 						)}
 						{failedSources.length > 0 && <> · could not read: {failedSources.join(', ')}</>}
 						{readSources.length > 0 && <> · also read: {readSources.join(', ')}</>}. Anything not

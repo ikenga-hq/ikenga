@@ -23,6 +23,7 @@
 //! none, accepts none, and `/api/shutdown` doesn't exist here.
 
 pub mod children;
+pub mod fs_roots_admin;
 pub mod proxy;
 pub mod ws_registry;
 

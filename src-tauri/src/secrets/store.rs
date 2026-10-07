@@ -16,6 +16,8 @@ pub enum StoreErrorKind {
     Unknown,
 }
 
+const NOT_CONFIGURED_MESSAGE: &str = "secrets passphrase is not configured";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreError {
     kind: StoreErrorKind,
@@ -34,6 +36,19 @@ impl StoreError {
 
     pub fn locked() -> Self {
         Self::with_kind(StoreErrorKind::Locked, "secret store is locked", false)
+    }
+
+    /// The vault has no passphrase set up yet. Same `Locked` kind as
+    /// [`StoreError::locked`] (nothing can be read until a passphrase
+    /// exists), but its own message so a health check doesn't tell the user
+    /// to unlock with a passphrase they never created.
+    pub fn not_configured() -> Self {
+        Self::with_kind(StoreErrorKind::Locked, NOT_CONFIGURED_MESSAGE, false)
+    }
+
+    /// True for [`StoreError::not_configured`].
+    pub fn is_not_configured(&self) -> bool {
+        self.kind == StoreErrorKind::Locked && self.message == NOT_CONFIGURED_MESSAGE
     }
 
     pub fn unavailable(message: impl Into<String>) -> Self {
@@ -107,7 +122,8 @@ impl From<StoreError> for String {
 impl From<UnlockError> for StoreError {
     fn from(error: UnlockError) -> Self {
         match error {
-            UnlockError::Locked | UnlockError::NotConfigured => Self::locked(),
+            UnlockError::Locked => Self::locked(),
+            UnlockError::NotConfigured => Self::not_configured(),
             UnlockError::EnvelopeMissing => {
                 Self::unavailable(UnlockError::EnvelopeMissing.to_string())
             }
@@ -266,6 +282,17 @@ impl SecretsStore for UnavailableSecretStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn not_configured_unlock_error_stays_distinct_from_locked() {
+        let not_configured = StoreError::from(UnlockError::NotConfigured);
+        assert_eq!(not_configured.kind(), StoreErrorKind::Locked);
+        assert!(not_configured.is_not_configured());
+
+        let locked = StoreError::from(UnlockError::Locked);
+        assert_eq!(locked.kind(), StoreErrorKind::Locked);
+        assert!(!locked.is_not_configured());
+    }
 
     #[test]
     fn unavailable_store_fails_all_access_paths() {

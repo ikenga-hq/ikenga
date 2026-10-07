@@ -37,6 +37,7 @@ import { useUpdateSheetStore } from '@/lib/updater/sheet-store';
 import { useUpdater } from '@/lib/updater/use-updater';
 import { useGitHubReleases, findReleaseByVersion } from '@/lib/updater/use-github-releases';
 import type { PkgTrustReview } from '@/lib/tauri-cmd';
+import { installUnavailableReason } from '@/lib/desktop-only';
 import { RestartWarning } from './restart-warning';
 
 export function UpdateSheet() {
@@ -49,7 +50,7 @@ export function UpdateSheet() {
 
 	return (
 		<Sheet open={open} onOpenChange={(v) => (v ? openSheet(source) : close())}>
-			<SheetContent side="right" className="w-full sm:max-w-md">
+			<SheetContent side="right" className="flex w-full flex-col sm:max-w-md">
 				<SheetHeader>
 					<SheetTitle>Update</SheetTitle>
 					<SheetDescription className="sr-only">
@@ -84,7 +85,7 @@ export function UpdateSheet() {
 						Apps and extensions ({pkgCount})
 					</button>
 				</div>
-				<div className="flex-1 overflow-y-auto px-4 py-3">
+				<div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
 					{source === 'shell' ? <ShellUpdatePanel /> : <PkgUpdatePanel />}
 				</div>
 			</SheetContent>
@@ -210,6 +211,8 @@ function ShellUpdatePanel() {
 function PkgUpdatePanel() {
 	const pkgs = usePkgsDerived();
 	const updatePkgs = useUpdatePkgs();
+	// Gap audit rank 3: no pkg install on a browser session's server yet.
+	const installBlocked = installUnavailableReason();
 	const [progress, setProgress] = useState<UpdateProgress | null>(null);
 	const [failures, setFailures] = useState<UpdateFailure[]>([]);
 	const [doneIds, setDoneIds] = useState<Set<string>>(new Set());
@@ -367,10 +370,16 @@ function PkgUpdatePanel() {
 				others.
 			</p>
 			<SheetFooter className="gap-2 px-0">
-				<Button onClick={runBatch} disabled={updatePkgs.isPending}>
-					{updatePkgs.isPending
-						? `Updating ${progress ? `${progress.done}/${progress.total}` : '…'}`
-						: `Update all (${pkgs.updates.length})`}
+				<Button
+					onClick={runBatch}
+					disabled={updatePkgs.isPending || !!installBlocked}
+					title={installBlocked || undefined}
+				>
+					{installBlocked
+						? installBlocked
+						: updatePkgs.isPending
+							? `Updating ${progress ? `${progress.done}/${progress.total}` : '…'}`
+							: `Update all (${pkgs.updates.length})`}
 				</Button>
 				{hasRunResult && !updatePkgs.isPending && (
 					<Button type="button" variant="outline" onClick={resetBatch}>

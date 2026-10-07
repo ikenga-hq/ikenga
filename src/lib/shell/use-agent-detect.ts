@@ -6,9 +6,13 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import { agentUnavailableText } from '@/lib/agent-unavailable';
 import { detectAgent, type DetectedAgent } from '@/lib/tauri-cmd';
 
-export type AgentDetectStatus = 'pending' | 'detected' | 'missing' | 'unknown';
+/** `unavailable` = the probe ran but couldn't check (WSL couldn't be asked,
+ *  D-10): `agent` names it, `error` carries "WSL unavailable — <reason>". It is
+ *  neither detected (not runnable) nor missing. */
+export type AgentDetectStatus = 'pending' | 'detected' | 'missing' | 'unknown' | 'unavailable';
 
 export interface AgentDetectEntry {
 	status: AgentDetectStatus;
@@ -39,7 +43,10 @@ export function entryFromProbe(
 	if (error != null) {
 		return { status: 'unknown', error: String((error as Error)?.message ?? error) };
 	}
-	return agent ? { status: 'detected', agent } : { status: 'missing' };
+	if (!agent) return { status: 'missing' };
+	const unavailable = agentUnavailableText(agent);
+	if (unavailable) return { status: 'unavailable', agent, error: unavailable };
+	return { status: 'detected', agent };
 }
 
 /** Pure reducer for the run-token guard: returns the next map if `token`
@@ -57,15 +64,14 @@ export function applyProbeResult(
 }
 
 /** Pure helper to compute if all engines in `engineIds` are missing.
- *  Returns false if any engine is detected, pending, or unknown (error). */
+ *  Returns false if any engine is detected, pending, unknown (error) or
+ *  unavailable (couldn't be checked) — only a confirmed miss counts. */
 export function computeAllMissing(
 	results: AgentDetectMap,
 	engineIds: readonly string[]
 ): boolean {
-	const anyDetected = engineIds.some((id) => results[id]?.status === 'detected');
-	const anyPending = engineIds.some((id) => results[id]?.status === 'pending');
-	const anyUnknown = engineIds.some((id) => results[id]?.status === 'unknown');
-	return !anyPending && !anyUnknown && !anyDetected;
+	// An id with no entry yet counts as missing, as it always has.
+	return engineIds.every((id) => (results[id]?.status ?? 'missing') === 'missing');
 }
 
 export function useAgentDetect(engineIds: readonly string[]): UseAgentDetectResult {

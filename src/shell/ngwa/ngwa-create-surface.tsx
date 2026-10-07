@@ -454,17 +454,15 @@ only rewrites between the fences.
 
 	return (
 		<div className="ngwa-create-container flex flex-1 min-h-0 overflow-hidden" data-testid="ngwa-create-surface">
-			{/* Subhead bar */}
+			{/* Subhead bar. Create reads no snapshot (it scaffolds from local
+			    templates), so it claims none; the kind count is the real list. */}
 			<div className="ngwa-create-subhead flex items-center justify-between px-4 py-2 border-b border-[var(--border-subtle)] bg-[var(--surface-base)] text-xs text-[var(--fg-muted)]">
 				<div className="flex items-center gap-2">
 					<span className="font-mono text-[var(--fg-base)]">/ngwa/create</span>
 					<span>·</span>
-					<span>12 kinds</span>
+					<span data-kind-count>{KIND_DEFS.length} kinds</span>
 					<span>·</span>
 					<span>scaffold-first</span>
-				</div>
-				<div className="flex items-center gap-3">
-					<span>snapshot ngwa_snapshot · live</span>
 				</div>
 			</div>
 

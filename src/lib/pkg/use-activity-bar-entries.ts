@@ -22,7 +22,7 @@
 
 import { listen } from '@/lib/transport';
 import { useEffect, useState } from 'react';
-import { pkgKernelStatus } from '@/lib/tauri-cmd';
+import { isRemoteWebSession, pkgKernelStatus } from '@/lib/tauri-cmd';
 
 /** Shape mirrors the Rust `ActivityBarBadge` in
  *  `pkg/registries/activity_bar.rs` (WP-11). */
@@ -185,6 +185,24 @@ export function availablePkgIdsOf(status: {
 	return ids;
 }
 
+/** Pkg ids whose every `ui_routes` entry is `kind: "webview"`. A native
+ *  webview is a desktop-only surface that a browser session can never mount
+ *  (2026-10-06 gap audit, rank 20), so the rail and the Views list drop these
+ *  pkgs in a remote session instead of offering an entry that errors. A pkg
+ *  with at least one iframe route stays: it still has something to show. */
+export function webviewOnlyPkgIdsOf(status: { registries?: Record<string, unknown> }): Set<string> {
+	const reg = status.registries?.ui_routes as
+		| { entries?: Array<{ pkg_id?: unknown; kind?: unknown }> }
+		| undefined;
+	const hasWebview = new Set<string>();
+	const hasOther = new Set<string>();
+	for (const e of reg?.entries ?? []) {
+		if (typeof e?.pkg_id !== 'string') continue;
+		(e.kind === 'webview' ? hasWebview : hasOther).add(e.pkg_id);
+	}
+	return new Set([...hasWebview].filter((id) => !hasOther.has(id)));
+}
+
 export function usePkgActivityBarEntries(): PkgActivityBarState {
 	const [entries, setEntries] = useState<PkgActivityBarEntry[]>([]);
 	const [views, setViews] = useState<PkgViewEntry[]>([]);
@@ -210,8 +228,14 @@ export function usePkgActivityBarEntries(): PkgActivityBarState {
 				for (const s of supervisor.entries ?? []) {
 					parkedByPkg.set(s.pkg_id, s);
 				}
-				const viewEntries = viewsReg.entries ?? [];
-				const merged = mergeRegistries(viewEntries, activityBar.entries ?? [], parkedByPkg);
+				const hidden = isRemoteWebSession() ? webviewOnlyPkgIdsOf(status) : null;
+				const keep = <T extends { pkg_id: string }>(e: T) => !hidden?.has(e.pkg_id);
+				const viewEntries = (viewsReg.entries ?? []).filter(keep);
+				const merged = mergeRegistries(
+					viewEntries,
+					(activityBar.entries ?? []).filter(keep),
+					parkedByPkg
+				);
 				if (!cancelled) {
 					setViews(viewEntries);
 					setEntries(merged);

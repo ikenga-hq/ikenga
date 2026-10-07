@@ -24,6 +24,10 @@ pub mod auth;
 pub mod broker;
 pub mod chat_ws;
 pub mod discovery;
+/// The daemon's event bus (`settings://changed`, `notifications://changed`,
+/// …) and its `/ws/events` delivery to browsers (gap audit rank 10).
+pub mod events;
+pub mod events_ws;
 pub mod fs_ws;
 pub mod health;
 /// T1 operator: the operator root, `operator/accounts.db`, passwords and the
@@ -44,7 +48,9 @@ pub mod rpc;
 mod rpc_claude;
 mod rpc_exec;
 mod rpc_files;
+mod rpc_fs_roots;
 mod rpc_local;
+mod rpc_seats;
 mod rpc_shell;
 pub mod shared;
 pub mod static_files;
@@ -62,6 +68,10 @@ pub mod update;
 /// lexer.
 #[cfg(test)]
 pub(crate) mod parity;
+#[cfg(test)]
+mod events_ws_tests;
+#[cfg(test)]
+mod fs_roots_router_tests;
 #[cfg(test)]
 mod share_router_tests;
 
@@ -257,6 +267,11 @@ pub struct AppState {
     /// ever reachable from the process that started it. Share-mode clones of
     /// `AppState` keep the same `Arc`.
     pub(crate) chi: Arc<rpc_local::DaemonChi>,
+    /// The daemon's counterpart of the desktop's `app.emit` (see
+    /// `server::events`): arms that mirror a desktop emit publish here, and
+    /// `/ws/events` relays it to browsers. One per process — under T1, one
+    /// per principal child. Share-mode clones keep the same `Arc`.
+    pub(crate) events: Arc<events::EventBus>,
     /// In-app updates (`server::update`): T0 with a `--data-dir` only. A
     /// principal child never has one (the T1 broker answers those routes).
     pub(crate) update: Option<Arc<update::UpdateCtl>>,
@@ -791,23 +806,31 @@ fn build_router(
     // included — gets the same view of `--pkgs-dir`. Walked ONCE: the static
     // server and the status index are built from the same list, so they can
     // never disagree about which directories are pkgs. Both log what they found.
-    let pkgs = pkg_index::scan(config.pkgs_dir.as_deref());
-    let pkg_static = PkgStaticService::from_packages(config.pkgs_dir.as_deref(), &pkgs);
-    let pkg_index = Arc::new(PkgIndex::from_packages(&pkgs));
+    let scanned = pkg_index::scan_dir(config.pkgs_dir.as_deref());
+    let pkg_static = PkgStaticService::from_packages(config.pkgs_dir.as_deref(), &scanned.pkgs);
+    let pkg_index = Arc::new(PkgIndex::from_scan(&scanned));
+    // The settings and actions managers publish their change signals here,
+    // as the desktop's emit them to the webview (`server::events`).
+    let events = events::EventBus::new();
     let settings = match (&pa_db, &config.data_dir, &home) {
         (Some(db), Some(dir), Some(home)) => Some(Arc::new(rpc_local::DaemonSettings::new(
             db.clone(),
             dir.clone(),
             home.clone(),
+            Some(events::settings_notifier(&events)),
         ))),
         _ => None,
     };
+    if let Some(settings) = &settings {
+        events.attach_settings(settings);
+    }
     let actions = match (&pa_db, &config.data_dir, &home) {
         (Some(db), Some(dir), Some(home)) => Some(Arc::new(rpc_files::daemon_actions(
             db.clone(),
             dir,
             home.clone(),
             path_guard.clone(),
+            Some(events::actions_notifier(&events)),
         ))),
         _ => None,
     };
@@ -842,6 +865,7 @@ fn build_router(
         store,
         secrets,
         chi: chi.unwrap_or_else(|| Arc::new(rpc_local::DaemonChi::host())),
+        events,
         update,
         shutdown_tx,
     });
@@ -871,6 +895,7 @@ fn build_router(
         .route("/ws/pty/:id", get(pty_ws::pty_ws_handler))
         .route("/ws/chat/:id", get(chat_ws::chat_ws_handler))
         .route("/ws/fs", get(fs_ws::fs_ws_handler))
+        .route("/ws/events", get(events_ws::events_ws_handler))
         // Installed pkg bundles, read-only. Inside the protected group on
         // purpose: pkg content is code, and the bearer token is the whole
         // trust boundary. No second per-mount token is minted.
@@ -1041,7 +1066,20 @@ async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> an
     // but not the useful one. `--data-dir` is also where `ikenga.db` lives.
     if let Some(ref data_dir) = config.data_dir {
         std::fs::create_dir_all(data_dir)?;
-        match crate::fs_roots::FsRoots::load(data_dir.join("fs_roots.json")) {
+        // A T1 principal child seeds its principal's home (the `HOME` the
+        // broker launched it with) into a list nobody has set up yet — on
+        // its first launch, which is the principal's first authenticated
+        // request (gap audit 2026-10-06 rank 1). Not at account creation:
+        // `adopt-t0` requires a principal's `data/` to be empty until it has
+        // run. T0 keeps no seed.
+        let seed = if mode.principal_child {
+            crate::platform::home_dir()
+                .map(|h| vec![h.to_string_lossy().into_owned()])
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        match crate::fs_roots::FsRoots::load_seeded(data_dir.join("fs_roots.json"), seed) {
             Ok(roots) => {
                 if let Err(e) = crate::fs_roots::install(Arc::new(roots)) {
                     warn!("fs_roots install failed: {e:#}");

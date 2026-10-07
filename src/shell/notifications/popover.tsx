@@ -51,10 +51,18 @@ export const KIND_META: Record<NotificationKind, { label: string; fg: string; bo
 	run_finished: { label: 'run finished', fg: 'var(--live)', border: 'var(--live-soft)' },
 	update: { label: 'update', fg: 'var(--info)', border: 'var(--info-soft)' },
 	invite: { label: 'invite', fg: 'var(--agent)', border: 'var(--agent-soft)' },
+	// Environment problems (D-19): a calm warning, not a danger. The tokens
+	// define no --warning-soft, so the muted border is mixed from --warning
+	// (a bare var(--warning-soft) would fall back to a hard amber outline).
+	system: {
+		label: 'system',
+		fg: 'var(--warning)',
+		border: 'var(--warning-soft, color-mix(in srgb, var(--warning) 30%, transparent))',
+	},
 };
 
-function KindTag({ kind }: { kind: NotificationKind }) {
-	const meta = KIND_META[kind];
+function KindTag({ row }: { row: NotificationRow }) {
+	const meta = KIND_META[row.kind];
 	return (
 		<span
 			className="inline-flex h-4 shrink-0 items-center rounded-[var(--radius-xs)] border px-1.5 font-mono text-[10px] tracking-wide"
@@ -87,7 +95,7 @@ function NotificationRowItem({ row, block }: { row: NotificationRow; block: stri
 			)}
 		>
 			<div className="flex items-start gap-2">
-				<KindTag kind={row.kind} />
+				<KindTag row={row} />
 				<span className="min-w-0 flex-1 text-xs leading-snug text-foreground" title={row.title}>
 					{row.title}
 				</span>
@@ -223,7 +231,7 @@ export function NotificationsPopoverContent({ onClose }: NotificationsPopoverCon
 					data-state="notifications-empty"
 					icon={Bell}
 					heading="Nothing yet"
-					body="Permission requests, run results, updates, violations and invites collect here."
+					body="Permission requests, run results, updates, violations, invites and system problems collect here."
 					action={{ label: 'Notification settings', onClick: openNotificationSettings }}
 				/>
 			) : (

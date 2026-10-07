@@ -89,6 +89,12 @@ export const SETTINGS_SECTIONS: readonly SettingsSectionMeta[] = [
 			{ field: 'engines.customShellProfiles', label: 'Custom shell profiles' },
 			{ field: 'engines.agentEnvironment', label: 'Agent execution target', help: 'native or wsl' },
 			{ field: 'engines.agentWslDistro', label: 'WSL distribution' },
+			{
+				field: null,
+				label: 'WSL health',
+				help: 'WSL network status and fixes',
+				keywords: 'wsl network dns offline internet mirrored nat resolv.conf repair restart',
+			},
 			{ field: 'engines.resumeTerminals', label: 'Resume terminals on start' },
 		],
 	},
@@ -209,7 +215,10 @@ export const SETTINGS_SECTIONS: readonly SettingsSectionMeta[] = [
 		label: 'Storage & backup',
 		Icon: HardDrive,
 		description: 'Screenshot destination, caches, backup and restore, danger zone.',
-		fields: [{ field: 'storage.screenshotDirectory', label: 'Screenshot directory' }],
+		fields: [
+			{ field: null, label: 'Folders you can open', help: 'file roots, fs allowlist' },
+			{ field: 'storage.screenshotDirectory', label: 'Screenshot directory' },
+		],
 	},
 	{
 		id: 'about',

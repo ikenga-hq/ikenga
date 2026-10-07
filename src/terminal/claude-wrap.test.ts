@@ -9,6 +9,10 @@ import {
 	buildAgentEnv,
 	buildAgentWrappedCmd,
 	buildClaudeWrappedCmd,
+	buildLoginCmd,
+	buildWslCmd,
+	toWslPath,
+	wslDistroArgs,
 } from './claude-wrap';
 import { buildSpawnOpts } from './spawn-opts';
 import type { TerminalTab } from './session-store';
@@ -284,5 +288,38 @@ describe('WP-11 launch options (role, appendSystemPrompt, pluginDirs)', () => {
 		expect(buildSpawnOpts(tab, 't1').env).toEqual({ FOO: '1', CLAUDE_CODE_PLUGIN_DIRS: '/p' });
 		const plain = { ...tab, spec: { ...tab.spec, wrap: {} } } as unknown as TerminalTab;
 		expect(buildSpawnOpts(plain, 't1').env).toEqual({ FOO: '1' });
+	});
+});
+
+describe('WSL launches (WP-3)', () => {
+	it('runs a WSL-only CLI login inside WSL, not the "(WSL)" display string', () => {
+		const cmd = buildLoginCmd('/usr/bin/claude (WSL)', 'Debian');
+		expect(cmd.slice(0, 3)).toEqual(['wsl.exe', '-d', 'Debian']);
+		expect(cmd.slice(3, -1)).toEqual(['-e', 'bash', '-l', '-i', '-c']);
+		expect(cmd.at(-1)).toBe("'/usr/bin/claude' login");
+		expect(cmd.join(' ')).not.toContain('(WSL)');
+	});
+
+	it('runs a host CLI login directly', () => {
+		const host = String.raw`C:\npm\claude.cmd`;
+		expect(buildLoginCmd(host, 'Debian')).toEqual([host, 'login']);
+	});
+
+	it('treats a blank or "default" distro as the default distro', () => {
+		expect(wslDistroArgs(null)).toEqual([]);
+		expect(wslDistroArgs('  ')).toEqual([]);
+		expect(wslDistroArgs('default')).toEqual([]);
+		expect(wslDistroArgs('Ubuntu')).toEqual(['-d', 'Ubuntu']);
+		const cmd = buildClaudeWrappedCmd({ shellTarget: 'wsl', wslDistro: 'default' });
+		expect(cmd).not.toContain('-d');
+		expect(buildWslCmd('true')).toEqual(['wsl.exe', '-e', 'bash', '-l', '-i', '-c', 'true']);
+	});
+
+	it('maps WSL share paths into the distro', () => {
+		expect(toWslPath(String.raw`\\wsl.localhost\Ubuntu\home\me\f.json`)).toBe('/home/me/f.json');
+		expect(toWslPath('\\\\wsl$\\Debian\\srv\\')).toBe('/srv');
+		expect(toWslPath(String.raw`\\wsl.localhost\Ubuntu`)).toBe('/');
+		expect(toWslPath(String.raw`C:\Users\x`)).toBe('/mnt/c/Users/x');
+		expect(toWslPath('/already/linux')).toBe('/already/linux');
 	});
 });

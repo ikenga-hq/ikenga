@@ -7,6 +7,7 @@
 import { useCallback, useMemo } from 'react';
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { z } from 'zod';
+import { installUnavailableReason } from '@/lib/desktop-only';
 import { markBrokenEntries, registryNameMatches, useBrokenPkgs } from '@/lib/ngwa/broken-pkgs';
 import { mergeCatalogIntoStore } from '@/lib/ngwa/enrichment';
 import { useNgwaSnapshot } from '@/lib/ngwa/use-ngwa-snapshot';
@@ -91,6 +92,11 @@ function NgwaStorePage() {
 	useObaAutoUpdateOnMount(catalogQuery.isSuccess, pins);
 
 	const ctx = { catalog: catalogEntries, vault: vault.entries };
+	// Gap audit rank 3: the daemon serves no install or update yet. Leaving the
+	// handlers off makes the surface disable Install / Update / Update all
+	// before the click (with its own "not available here" reason) instead of
+	// letting a click end in a raw error. Drop this gate once they are served.
+	const installBlocked = installUnavailableReason() !== false;
 
 	return (
 		<div className="view-ngwa flex-1 min-h-0 flex flex-col">
@@ -103,9 +109,9 @@ function NgwaStorePage() {
 				loadDetail={indexUrl ? loadDetail : undefined}
 				activeProjectName={activeProjectName}
 				activeProjectId={activeProjectId}
-				onInstall={store.install}
-				onUpdate={store.update}
-				onUpdateAll={store.updateAll}
+				onInstall={installBlocked ? undefined : store.install}
+				onUpdate={installBlocked ? undefined : store.update}
+				onUpdateAll={installBlocked ? undefined : store.updateAll}
 				updateApprovals={approvals}
 				primitives={primitives}
 				catalogEntries={catalogEntries}
@@ -113,13 +119,18 @@ function NgwaStorePage() {
 				catalogStatus={catalogStatus}
 				catalogError={catalogQuery.error ? (catalogQuery.error as Error).message : null}
 				onRecheckCatalog={() => void catalogQuery.refetch()}
-				onInstallPrimitive={(row, scope, onStage) =>
-					store.installPrimitive(row, scope, { ...ctx, onStage })
+				onInstallPrimitive={
+					installBlocked
+						? undefined
+						: (row, scope, onStage) => store.installPrimitive(row, scope, { ...ctx, onStage })
 				}
-				onUpdatePrimitive={store.updatePrimitive}
+				onUpdatePrimitive={installBlocked ? undefined : store.updatePrimitive}
 				onResolveSource={store.resolveSource}
-				onInstallResolved={(resolved, scope, onStage) =>
-					store.installResolved(resolved, scope, { ...ctx, onStage })
+				onInstallResolved={
+					installBlocked
+						? undefined
+						: (resolved, scope, onStage) =>
+								store.installResolved(resolved, scope, { ...ctx, onStage })
 				}
 				onOpenInstalled={(name) =>
 					void navigate({ to: '/ngwa/installed', search: { search: name } })

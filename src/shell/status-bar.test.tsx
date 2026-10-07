@@ -84,6 +84,7 @@ function derived(counts: { installed?: number; updates?: number; violations?: nu
 		sidecarsRunning: 0,
 		isLoading: false,
 		error: null,
+		trustUnavailable: null,
 	} satisfies DerivedPkgs;
 }
 

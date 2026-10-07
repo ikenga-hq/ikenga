@@ -44,6 +44,23 @@ describe('canContinueFromPreflight', () => {
 		expect(canContinueFromPreflight(r)).toBe(true);
 	});
 
+	it('allows continue when free disk space is unknown (null)', () => {
+		const r = {
+			...makeReport([
+				{ id: 'os', level: 'pass', message: 'ok', fix_hint: null },
+				{
+					id: 'disk_free',
+					level: 'warn',
+					message: "Couldn't determine free space: no mounted volume matched /tmp/test",
+					fix_hint: "This doesn't block setup.",
+				},
+			]),
+			disk_free_gb: null,
+		} satisfies SystemReport;
+		expect(r.disk_free_gb).toBeNull();
+		expect(canContinueFromPreflight(r)).toBe(true);
+	});
+
 	it('blocks continue when any check fails', () => {
 		const r = makeReport([
 			{ id: 'os', level: 'pass', message: 'ok', fix_hint: null },

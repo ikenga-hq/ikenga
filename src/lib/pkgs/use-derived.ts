@@ -23,6 +23,7 @@ import {
 import { useRegistryIndex, type RegistryEntry } from '@/lib/registry/use-registry';
 import { entryMatchesPkgId } from '@/lib/registry/use-updates-available';
 import { semverCompare } from '@ikenga/registry-client';
+import { isNotAvailableOnServer } from '@/lib/transport/unavailable';
 
 export type RowOrigin = 'builtin' | 'engine' | 'user' | 'registry';
 export type RowState = 'running' | 'idle' | 'disabled' | 'not-installed';
@@ -75,6 +76,8 @@ export interface DerivedPkgs {
 	installed: PkgRowV2[];
 	registry: PkgRowV2[];
 	updates: PkgRowV2[];
+	/** Rows needing trust review. Empty when {@link trustUnavailable} is set —
+	 *  unknown there, not "none". */
 	trust: PkgRowV2[];
 	violations: PkgRowV2[];
 	builtin: PkgRowV2[];
@@ -83,6 +86,11 @@ export interface DerivedPkgs {
 	sidecarsRunning: number;
 	isLoading: boolean;
 	error: string | null;
+	/** The server does not evaluate trust at all (the headless daemon refuses
+	 *  `pkg_trust_list` with "not available on this server"): its reason.
+	 *  Every row's `trust` is then null meaning unknown — not untrusted, not
+	 *  OK — and the refusal is not an `error`. */
+	trustUnavailable: string | null;
 }
 
 const EMPTY: DerivedPkgs = {
@@ -98,6 +106,7 @@ const EMPTY: DerivedPkgs = {
 	sidecarsRunning: 0,
 	isLoading: false,
 	error: null,
+	trustUnavailable: null,
 };
 
 function classifyOrigin(p: PkgInstalledSummary, kind: string): RowOrigin {
@@ -178,10 +187,16 @@ export function deriveFromQueries(inputs: DeriveInputs): DerivedPkgs {
 		registryEntries = [],
 	} = inputs;
 
-	const error = statusError?.message ?? trustError?.message ?? violationsError?.message ?? null;
+	const trustUnavailable =
+		trustError && isNotAvailableOnServer(trustError.message) ? trustError.message : null;
+	const error =
+		statusError?.message ??
+		(trustUnavailable ? null : trustError?.message) ??
+		violationsError?.message ??
+		null;
 
 	if (!statusData) {
-		return { ...EMPTY, isLoading: statusLoading, error };
+		return { ...EMPTY, isLoading: statusLoading, error, trustUnavailable };
 	}
 
 	const trustByPkg = new Map<string, PkgTrustEntry>();
@@ -315,6 +330,7 @@ export function deriveFromQueries(inputs: DeriveInputs): DerivedPkgs {
 		sidecarsRunning,
 		isLoading: statusLoading || trustLoading,
 		error,
+		trustUnavailable,
 	};
 }
 

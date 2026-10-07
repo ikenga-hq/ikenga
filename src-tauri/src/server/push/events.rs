@@ -12,6 +12,7 @@
 //! | `run_finished` / `run_failed` | same | `run:<runId>` |
 //! | `invite` | — (the T1 broker pushes it at accept, `access::invites`) | |
 //! | `update` / `violation` | — (the desktop app's own updater; violations stay in-app) | |
+//! | `system` | — (a local environment problem, e.g. WSL networking; stays on the machine it's about) | |
 //!
 //! `run_cancelled` has no row (`notifications::run`): `chi_exec` calls
 //! [`super::emit_run_cancelled`] directly.
@@ -48,9 +49,10 @@ pub fn from_notification(n: &Notification, now_ms: i64) -> Option<PushEvent> {
             };
             (kind, format!("run:{run_id}"), None)
         }
-        NotificationKind::Invite | NotificationKind::Update | NotificationKind::Violation => {
-            return None
-        }
+        NotificationKind::Invite
+        | NotificationKind::Update
+        | NotificationKind::Violation
+        | NotificationKind::System => return None,
     };
     if !super::valid_ref(&r) {
         return None;

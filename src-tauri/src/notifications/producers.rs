@@ -13,6 +13,7 @@
 //! | `run_finished` / `run_failed` | [`run_terminal_with_artifacts`] (in `server::shared::notifications::run`) | `server::shared::chi_exec::cache_update_done` |
 //! | `update` | [`update`] | `commands::notifications::notifications_record_update` (FE updater + pkg registry check) |
 //! | `violation` | [`violation`] | `pkg::permissions_check::record_violation` |
+//! | `system` | [`wsl_network`] | `commands::wsl_health` (a fresh probe with a WSL-caused failure; resolved by the next `ok` probe) |
 //! | `invite` | — | **no producer**: D-05's people surface does not exist yet |
 //!
 //! Action JSON is `{ "kind": "<action kind>", ...params }`; the UI (WP-40b)
@@ -34,6 +35,9 @@
 //!   `SessionEnd`.
 //! * `open.chi_run`, `open.release_notes`, `open.pkg_updates`,
 //!   `open.violations`.
+//! * `fix.wsl_network` — `{ kind, distro, state }`: WSL in `distro` (`null`
+//!   = the default distro) has no working network; the UI offers the fixes
+//!   for `state` (`wsl_health_fix`). Resolves when a probe returns `ok`.
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -48,6 +52,7 @@ pub use crate::server::shared::notifications::run::{
     run_terminal, run_terminal_with_artifacts, SOURCE_CHI,
 };
 pub const SOURCE_UPDATER: &str = "updater";
+pub const SOURCE_WSL_HEALTH: &str = "wsl.health";
 
 // The text helpers are shared with the run producer, which moved to the
 // ungated `server::shared::notifications::run` (WP-P10).
@@ -462,6 +467,102 @@ pub fn violation(pkg_id: &str, scope_kind: &str, attempted: &str) -> NewNotifica
 // `server::shared::notifications::run` (WP-P10: the daemon's Chi runs produce
 // them too) and are re-exported at the top of this file.
 
+// ─── wsl network ────────────────────────────────────────────────────────────
+
+/// Prefix shared by every [`wsl_network_key`].
+pub const WSL_NETWORK_KEY_PREFIX: &str = "wsl:network:";
+
+/// Dedupe key of a distro's WSL network problem: `wsl:network:<distro>`
+/// (lower-cased; `default` for the default distro). One row per episode
+/// ([`Coalesce::WhileUnresolved`]); resolved by the next `ok` probe.
+pub fn wsl_network_key(distro: Option<&str>) -> String {
+    format!(
+        "{WSL_NETWORK_KEY_PREFIX}{}",
+        distro.map_or_else(|| "default".to_string(), str::to_ascii_lowercase)
+    )
+}
+
+/// A WSL network problem worth telling the user about (D-2, D-8), or `None`
+/// when `health` isn't WSL's fault (`ok`, `host_offline`, `not_installed`).
+/// Uses the `system` kind (D-19): an environment problem, not a pkg's
+/// denial, and mutable on its own.
+pub fn wsl_network(
+    health: &crate::server::shared::wsl_health::WslHealth,
+) -> Option<NewNotification> {
+    use crate::server::shared::wsl_health::WslHealthState;
+    let title = match health.state {
+        WslHealthState::NoRoute => "WSL has no network",
+        WslHealthState::DnsOnly => "WSL can't resolve names",
+        WslHealthState::WslDown => "WSL isn't starting",
+        _ => return None,
+    };
+    let distro = health.distro.as_deref();
+    Some(NewNotification {
+        kind: NotificationKind::System,
+        title: truncate(
+            &format!("{title} · {}", distro.unwrap_or("default distro")),
+            TITLE_MAX,
+        ),
+        body: Some(truncate(&health.detail, BODY_MAX)),
+        action: Some(json!({
+            "kind": "fix.wsl_network",
+            "distro": distro,
+            "state": health.state.as_str(),
+        })),
+        source: SOURCE_WSL_HEALTH.into(),
+        dedupe_key: Some(wsl_network_key(distro)),
+        coalesce: Coalesce::WhileUnresolved,
+    })
+}
+
+/// The open `fix.wsl_network` rows a freshly measured `health` ends, given
+/// the open rows under [`WSL_NETWORK_KEY_PREFIX`] as `(key, action)`.
+///
+/// * `ok` ends its own distro's row, and every row whose state was
+///   `no_route` / `wsl_down`: all WSL 2 distros share one VM and one network,
+///   so those can't still hold when any distro is online. (This is also what
+///   ties a row raised for `default` to a probe of the same distro by name.)
+///   Another distro's `dns_only` stays: `/etc/resolv.conf` is per distro.
+/// * `not_installed` ends its own row (the distro is gone), and every row
+///   when it is about WSL as a whole (no distro named).
+/// * Anything else ends nothing (`host_offline` says nothing about WSL).
+pub fn wsl_network_keys_to_resolve(
+    health: &crate::server::shared::wsl_health::WslHealth,
+    open: &[(String, Option<Value>)],
+) -> Vec<String> {
+    use crate::server::shared::wsl_health::WslHealthState;
+    let own = wsl_network_key(health.distro.as_deref());
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |k: &str| {
+        if !out.iter().any(|x| x == k) {
+            out.push(k.to_string());
+        }
+    };
+    match health.state {
+        WslHealthState::Ok => {
+            push(&own);
+            for (key, action) in open {
+                let state = action.as_ref().and_then(|a| a.get("state")).and_then(Value::as_str);
+                if matches!(state, Some("no_route" | "wsl_down")) {
+                    push(key);
+                }
+            }
+        }
+        WslHealthState::NotInstalled => {
+            push(&own);
+            if health.distro.is_none() {
+                for (key, _) in open {
+                    push(key);
+                }
+            }
+        }
+        _ => {}
+    }
+    // Only rows that are actually open (and in this family).
+    out.retain(|k| open.iter().any(|(o, _)| o == k));
+    out
+}
+
 // ─── update ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -539,6 +640,76 @@ pub fn update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wsl_health(
+        state: crate::server::shared::wsl_health::WslHealthState,
+        distro: Option<&str>,
+    ) -> crate::server::shared::wsl_health::WslHealth {
+        crate::server::shared::wsl_health::WslHealth {
+            state,
+            distro: distro.map(str::to_string),
+            detail: "WSL has no network: only the loopback interface is up.".into(),
+            mirrored_failure: None,
+            networking_mode: Some("mirrored".into()),
+            checked_at: 1,
+        }
+    }
+
+    #[test]
+    fn wsl_network_is_one_fix_row_per_distro() {
+        use crate::server::shared::wsl_health::WslHealthState as S;
+        let n = wsl_network(&wsl_health(S::NoRoute, Some("Ubuntu"))).unwrap();
+        assert_eq!(n.kind, NotificationKind::System);
+        assert_eq!(n.title, "WSL has no network · Ubuntu");
+        assert_eq!(n.dedupe_key.as_deref(), Some("wsl:network:ubuntu"));
+        assert_eq!(n.coalesce, Coalesce::WhileUnresolved);
+        assert_eq!(n.source, SOURCE_WSL_HEALTH);
+        assert_eq!(
+            n.action,
+            Some(json!({ "kind": "fix.wsl_network", "distro": "Ubuntu", "state": "no_route" }))
+        );
+        let d = wsl_network(&wsl_health(S::DnsOnly, None)).unwrap();
+        assert_eq!(d.dedupe_key.as_deref(), Some("wsl:network:default"));
+        assert_eq!(
+            d.action,
+            Some(json!({ "kind": "fix.wsl_network", "distro": null, "state": "dns_only" }))
+        );
+        assert!(wsl_network(&wsl_health(S::WslDown, None)).is_some());
+        for quiet in [S::Ok, S::HostOffline, S::NotInstalled] {
+            assert_eq!(wsl_network(&wsl_health(quiet, Some("Ubuntu"))), None);
+        }
+    }
+
+    #[test]
+    fn wsl_recovery_ends_vm_wide_rows_but_not_another_distros_dns() {
+        use crate::server::shared::wsl_health::WslHealthState as S;
+        let row = |key: &str, state: &str| {
+            (key.to_string(), Some(json!({ "kind": "fix.wsl_network", "state": state })))
+        };
+        let open = vec![
+            row("wsl:network:default", "no_route"),
+            row("wsl:network:ubuntu", "dns_only"),
+            row("wsl:network:debian", "dns_only"),
+            row("wsl:network:arch", "wsl_down"),
+        ];
+        // `Ubuntu` is online: its own row, plus the VM-wide ones (the
+        // `default` row raised from a tab without -d included).
+        let mut got = wsl_network_keys_to_resolve(&wsl_health(S::Ok, Some("Ubuntu")), &open);
+        got.sort();
+        assert_eq!(got, ["wsl:network:arch", "wsl:network:default", "wsl:network:ubuntu"]);
+        // A removed distro ends its own row; WSL gone entirely ends all.
+        assert_eq!(
+            wsl_network_keys_to_resolve(&wsl_health(S::NotInstalled, Some("Debian")), &open),
+            ["wsl:network:debian"]
+        );
+        assert_eq!(wsl_network_keys_to_resolve(&wsl_health(S::NotInstalled, None), &open).len(), 4);
+        // Still failing, or the PC offline: nothing ends.
+        for s in [S::HostOffline, S::NoRoute, S::DnsOnly, S::WslDown] {
+            assert!(wsl_network_keys_to_resolve(&wsl_health(s, Some("Ubuntu")), &open).is_empty());
+        }
+        // No open row for the probed distro: nothing to resolve.
+        assert!(wsl_network_keys_to_resolve(&wsl_health(S::Ok, Some("Alpine")), &[]).is_empty());
+    }
 
     /// G-ACCESS §5.7 (WP-75): desktop asks are the Owner's own work, sorted
     /// into the project their cwd sits in and classified against its root.

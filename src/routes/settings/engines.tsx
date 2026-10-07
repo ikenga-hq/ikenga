@@ -16,6 +16,12 @@ import {
 import { Banner } from '@/components/ui/banner';
 import { Button } from '@/components/ui/button';
 import { StatusChip } from '@/components/ui/status-chip';
+import { WslUnavailableChip, WslUnavailableNotice } from '@/components/wsl-unavailable-notice';
+import {
+	agentUnavailableText,
+	engineFacts,
+	firstAgentUnavailableText,
+} from '@/lib/agent-unavailable';
 import { isWindows } from '@/lib/platform';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import {
@@ -27,20 +33,13 @@ import {
 	useShellProfiles,
 } from '@/lib/shell-profiles';
 import { useShellStore } from '@/lib/shell/shell-store';
-import {
-	type DetectedAgent,
-	detectAgents,
-	settingsGet,
-	settingsSet,
-} from '@/lib/tauri-cmd';
+import { type DetectedAgent, detectAgents, settingsGet, settingsSet } from '@/lib/tauri-cmd';
 import { writeSettingsField } from '@/lib/settings/client';
 import type { SettingsAgentEnvironment, SettingsWriteOptions } from '@/lib/settings/types';
-import {
-	createClaudeTerminalSession,
-	createTerminalSession,
-} from '@/terminal/single-terminal';
+import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
 import { buildAgentWrappedCmd, type AgentEngineKind } from '@/terminal/claude-wrap';
 import { SettingsFieldRow, useSettingsSection } from '@/shell/settings/field';
+import { WslHealthSettingsRow } from '@/shell/wsl-health/wsl-health-settings-row';
 import { CustomShellsStatus } from './-components/custom-shells-status';
 
 const OFFLINE_AGENT_ID = 'engine-noop';
@@ -73,7 +72,8 @@ function EnginesPage() {
 	);
 }
 
-function EngineSectionBody() {
+/** Exported for tests. */
+export function EngineSectionBody() {
 	const navigate = useNavigate();
 	const selectedAgentId = useShellStore((s) => s.onboarding.selectedAgentId);
 	const defaultEngineId = useShellStore((s) => s.defaultEngineId);
@@ -105,10 +105,15 @@ function EngineSectionBody() {
 
 	const live = detected?.find((a) => a.id === selectedAgentId) ?? null;
 	const isOffline = selectedAgentId === OFFLINE_AGENT_ID;
-	const authed = live?.authed ?? payload?.authed ?? null;
+	// Detection couldn't check the selected agent (WSL couldn't be asked): say
+	// so, and don't fall back to the onboarding payload's stale auth verdict.
+	// The same goes for the path and version: unknown, not the stale payload.
+	const unavailable = agentUnavailableText(live);
+	const { authed, execPath, version } = engineFacts(live, payload);
 	const display = live?.display ?? payload?.display ?? selectedAgentId ?? 'Not selected';
-	const execPath = live?.executable_path ?? payload?.executablePath;
-	const version = live?.version ?? payload?.version;
+	// D-18: one notice above the rows when any agent couldn't be checked; the
+	// selected agent's row carries only a short chip.
+	const wslNotice = firstAgentUnavailableText(detected ?? []);
 
 	function handleChange() {
 		enterOnboardingEdit('engine');
@@ -141,9 +146,23 @@ function EngineSectionBody() {
 					>
 						<div className="text-[13px] font-semibold">Engine detection failed</div>
 						<div className="mt-1 text-xs" style={{ color: 'var(--fg-muted)' }}>
-							{error instanceof Error ? error.message : String(error ?? 'Could not check installed engines')}
+							{error instanceof Error
+								? error.message
+								: String(error ?? 'Could not check installed engines')}
 						</div>
 					</Banner>
+				</div>
+			)}
+			{wslNotice && (
+				<div className="border-b border-[var(--border-soft)] px-4 py-3">
+					<WslUnavailableNotice
+						text={wslNotice}
+						actions={
+							<Button variant="ghost" size="sm" onClick={() => refetch()}>
+								Re-check
+							</Button>
+						}
+					/>
 				</div>
 			)}
 			<div className="divide-y divide-border">
@@ -184,7 +203,11 @@ function EngineSectionBody() {
 									Whether the selected agent is currently signed in / has a working API key.
 								</div>
 							</div>
-							<AuthBadge authed={authed} loading={isLoading} />
+							{unavailable ? (
+								<WslUnavailableChip title={unavailable} testId="engine-auth-unavailable" />
+							) : (
+								<AuthBadge authed={authed} loading={isLoading} />
+							)}
 						</div>
 						<div className="grid grid-cols-[1fr_auto] items-center gap-4 px-4 py-3">
 							<div className="min-w-0 space-y-0.5">
@@ -390,8 +413,7 @@ function TerminalSectionBody() {
 	});
 
 	const wslProfiles = profiles.filter((p) => p.kind === 'wsl');
-	const currentAgentEnv =
-		(isProject ? agentEnvOverride : agentEnvQuery.data) ?? 'native';
+	const currentAgentEnv = (isProject ? agentEnvOverride : agentEnvQuery.data) ?? 'native';
 	const currentAgentDistro =
 		(isProject ? agentWslDistroOverride : agentWslDistroQuery.data) ??
 		(wslProfiles.length > 0 ? (wslProfiles[0].distro ?? 'default') : null);
@@ -556,6 +578,10 @@ function TerminalSectionBody() {
 					</SettingsFieldRow>
 				)}
 
+				{isWindows && currentAgentEnv === 'wsl' && wslProfiles.length > 0 && (
+					<WslHealthSettingsRow distro={currentAgentDistro} />
+				)}
+
 				<SettingsFieldRow
 					field="engines.resumeTerminals"
 					label="Resume terminals on start"
@@ -570,7 +596,9 @@ function TerminalSectionBody() {
 							onChange={(e) => resumeTerminalsMutation.mutate(e.target.checked)}
 							disabled={(resumeTerminalsQuery.isLoading && !isProject) || resumeTerminalsReadError}
 						/>
-						<span className={!resumeTerminalsEffective ? 'text-muted-foreground' : ''}>Enabled</span>
+						<span className={!resumeTerminalsEffective ? 'text-muted-foreground' : ''}>
+							Enabled
+						</span>
 					</label>
 					{resumeTerminalsReadError && (
 						<div role="alert" className="mt-1 flex items-center gap-2 text-xs" style={{ color: 'var(--danger)' }}>
@@ -653,7 +681,9 @@ function TerminalSectionBody() {
 						<div className="flex items-center gap-2 text-sm font-medium text-foreground">
 							<Bot className="h-4 w-4 text-primary" /> Gemini CLI
 						</div>
-						<div className="text-xs text-muted-foreground">Interactive Google Gemini CLI session.</div>
+						<div className="text-xs text-muted-foreground">
+							Interactive Google Gemini CLI session.
+						</div>
 					</div>
 					<Button
 						variant="outline"
@@ -753,7 +783,12 @@ function TerminalSectionBody() {
 							/>
 						</div>
 						<div className="flex items-center justify-end gap-2">
-							<Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => setIsAddingCustom(false)}>
+							<Button
+								variant="ghost"
+								size="sm"
+								className="h-7 text-xs"
+								onClick={() => setIsAddingCustom(false)}
+							>
 								Cancel
 							</Button>
 							<Button
