@@ -13,6 +13,7 @@ use super::rpc_fs_roots;
 use super::rpc_local;
 use super::rpc_seats;
 use super::rpc_shell;
+use super::term_hooks;
 use super::AppState;
 use crate::pty::SpawnOpts;
 
@@ -214,6 +215,34 @@ pub async fn rpc_handler(
                 })
                 .unwrap_or_default();
 
+            // The per-terminal claude hook settings (`server::term_hooks`):
+            // the frontend already put `--settings <path>` in `cmd`, so the
+            // file has to exist before the child execs. A path the daemon
+            // cannot honestly serve fails the spawn with the reason, rather
+            // than starting a claude that dies on a missing settings file.
+            let settings_path = payload
+                .args
+                .get("settingsPath")
+                .or_else(|| payload.args.get("settings_path"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let grant = match (&settings_path, &terminal_id) {
+                (Some(path), Some(term_id)) => {
+                    match state.term_hooks.wire(&state.config, term_id, path) {
+                        Ok(grant) => Some(grant),
+                        Err(e) => {
+                            return Json(crate::access::postfilter(
+                                ctx.as_ref(),
+                                &payload.cmd,
+                                RpcResponse::error(format!("pty_spawn: {e}")),
+                            ))
+                        }
+                    }
+                }
+                _ => None,
+            };
+
             match state
                 .pty_manager
                 .spawn_headless(SpawnOpts {
@@ -227,10 +256,34 @@ pub async fn rpc_handler(
                 })
                 .await
             {
-                Ok(pty_id) => RpcResponse::success(serde_json::json!({ "pty_id": pty_id })),
-                Err(e) => RpcResponse::error(e.to_string()),
+                Ok(pty_id) => {
+                    if let Some(grant) = grant {
+                        // The secret dies with the terminal.
+                        let hooks = state.term_hooks.clone();
+                        let pty = state.pty_manager.clone();
+                        let id = pty_id.clone();
+                        tokio::spawn(async move {
+                            pty.wait_for_exit(&id).await;
+                            hooks.revoke(&grant);
+                        });
+                    }
+                    RpcResponse::success(serde_json::json!({ "pty_id": pty_id }))
+                }
+                Err(e) => {
+                    if let Some(grant) = grant {
+                        state.term_hooks.revoke(&grant);
+                    }
+                    RpcResponse::error(e.to_string())
+                }
             }
         }
+        // Claude terminal hooks for the browser (gap audit rank 11): where the
+        // per-terminal settings live (or why there are none), the HUD's
+        // snapshots, and the permission inbox's answer to a held gate. Not
+        // Tauri commands — the desktop reaches these through the iyke bridge.
+        "term_hooks_info" => term_hooks::info_arm(&state),
+        "term_hooks_statusline_snapshot" => term_hooks::snapshot_arm(&state),
+        "term_hooks_decide" => term_hooks::decide_arm(&state, &payload.args),
         "pty_write" => {
             let id = payload
                 .args

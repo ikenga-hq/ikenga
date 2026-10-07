@@ -16,7 +16,7 @@
 
 import { useEffect } from 'react';
 import { create } from 'zustand';
-import { iykeFetch } from '@/lib/iyke/client';
+import { fetchStatuslineSnapshots } from '@/lib/iyke/terminal-hooks';
 import type { SeatSession } from '@/lib/tauri-cmd';
 import { listen } from '@/lib/transport';
 import type { StatuslineSnapshot } from '@/terminal/cost-hud';
@@ -88,9 +88,8 @@ let feedStarted = false;
 function ensureFiguresFeed(): void {
 	if (feedStarted) return;
 	feedStarted = true;
-	iykeFetch('/iyke/statusline/snapshot')
-		.then((res) => (res.ok ? res.json() : null))
-		.then((data: Record<string, StatuslineSnapshot> | null) => {
+	fetchStatuslineSnapshots<StatuslineSnapshot>()
+		.then((data) => {
 			if (data && typeof data === 'object') {
 				useSessionFiguresStore.setState((s) => ({ snaps: { ...data, ...s.snaps } }));
 			}

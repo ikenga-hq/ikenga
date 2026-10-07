@@ -227,10 +227,13 @@ async fn ready_names_every_live_topic_and_never_an_unproduced_one() {
         "pa-action-retried",
         "pa-action-rejected",
         "seats://changed",
+        "hooks://event",
+        "hooks://decision",
+        "statusline://snapshot",
     ] {
         assert!(events.contains(&name), "{name} missing from {ready}");
     }
-    for name in ["hooks://event", "statusline://snapshot"] {
+    for name in ["runtime://bun", "pkg-installed"] {
         assert!(!events.contains(&name), "{name} has no daemon producer");
     }
 }

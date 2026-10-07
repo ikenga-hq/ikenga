@@ -14,7 +14,12 @@ const mocks = vi.hoisted(() => ({
 	permissionDecide: vi.fn((_id: number, _d: string) => Promise.resolve({ resolved: true })),
 	accessStatus: vi.fn(),
 	accessRoutingGet: vi.fn(),
+	remote: false,
+	decideRemote: vi.fn(),
 }));
+
+vi.mock('@/lib/transport', () => ({ isRemoteWebSession: () => mocks.remote }));
+vi.mock('@/lib/iyke/terminal-hooks', () => ({ decideHookGateRemote: mocks.decideRemote }));
 
 vi.mock('@/lib/access/client', async (orig) => ({
 	...(await orig<typeof import('@/lib/access/client')>()),
@@ -126,6 +131,24 @@ describe('notificationActionButtons', () => {
 	});
 
 	// Review WP78a-R5: a 2xx that reached no held gate is not an answer.
+	it('postHookDecision answers a daemon terminal through the daemon arm in a browser', async () => {
+		mocks.remote = true;
+		try {
+			mocks.decideRemote.mockResolvedValueOnce(true);
+			expect(await postHookDecision('perm-1', 'approved')).toBeNull();
+			expect(mocks.decideRemote).toHaveBeenCalledWith('perm-1', 'approved');
+			// Already answered / timed out: never presented as decided.
+			mocks.decideRemote.mockResolvedValueOnce(false);
+			expect(await postHookDecision('perm-1', 'denied')).toBe(ASK_ALREADY_OVER);
+			// A refusal is shown, not swallowed.
+			mocks.decideRemote.mockRejectedValueOnce(new Error('forbidden: missing approve'));
+			expect(await postHookDecision('perm-1', 'approved')).toContain('missing approve');
+			expect(mocks.iykeFetch).not.toHaveBeenCalled();
+		} finally {
+			mocks.remote = false;
+		}
+	});
+
 	it('postHookDecision reads `gated: false` as "already over", not answered', async () => {
 		const json = (body: unknown) =>
 			new Response(JSON.stringify(body), {

@@ -236,5 +236,8 @@ export const RPC_REQUIREMENTS: Readonly<Record<string, ArmRequirement>> = {
 	supabase_config_clear: { caps: ['settings', 'secrets'], class: 'owner' },
 	supabase_config_get: { caps: ['secrets'], class: 'owner' },
 	supabase_config_set: { caps: ['settings', 'secrets'], class: 'owner' },
+	term_hooks_decide: { caps: ['approve'], class: 'owner' },
+	term_hooks_info: { caps: ['sessions'], class: 'owner' },
+	term_hooks_statusline_snapshot: { caps: ['sessions'], class: 'owner' },
 	terminal_detect_shells: { caps: [], class: 'owner' },
 };

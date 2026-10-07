@@ -41,6 +41,7 @@ pub mod engine_layout;
 pub mod failure_class;
 pub mod fs;
 pub mod git;
+pub mod hook_settings;
 pub mod identity;
 pub mod model_catalog;
 pub mod ngwa;

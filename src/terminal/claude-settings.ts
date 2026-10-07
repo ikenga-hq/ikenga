@@ -13,8 +13,17 @@
 // If priming hasn't finished, or the file couldn't be written, the getter
 // returns null and the wrapper omits `--settings`: the session runs normally,
 // just without the shell's live view of it.
+//
+// In a browser session there is no iyke bridge to ask: the daemon says where
+// it keeps the per-terminal files (`term_hooks_info`) and writes them itself
+// at `pty_spawn`. Any answer, a refusal included, is final for the page, so a
+// server that can't do it is asked once and the terminals simply launch
+// without `--settings` (the HUD then says why), instead of failing the prime
+// again on every launch.
 
 import { getEndpoint } from '@/lib/iyke/client';
+import { primeRemoteHooksInfo } from '@/lib/iyke/terminal-hooks';
+import { isRemoteWebSession } from '@/lib/transport';
 
 let cachedAppDataDir: string | null = null;
 /** Distinguishes "primed, and the answer is null" from "never primed". */
@@ -23,6 +32,13 @@ let inFlight: Promise<string | null> | null = null;
 
 export function loadClaudeSettingsPath(): Promise<string | null> {
 	if (primed) return Promise.resolve(cachedAppDataDir);
+	if (!inFlight && isRemoteWebSession()) {
+		inFlight = primeRemoteHooksInfo().then((info) => {
+			cachedAppDataDir = info.settingsDir;
+			primed = true;
+			return cachedAppDataDir;
+		});
+	}
 	if (!inFlight) {
 		inFlight = getEndpoint()
 			.then((ep) => {

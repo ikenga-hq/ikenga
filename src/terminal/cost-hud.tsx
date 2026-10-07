@@ -1,7 +1,11 @@
 import { isRemoteWebSession, listen } from '@/lib/transport';
 import { Activity, AlertTriangle, Cpu, DollarSign, Gauge, ShieldAlert } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { iykeFetch } from '@/lib/iyke/client';
+import {
+	fetchStatuslineSnapshots,
+	primeRemoteHooksInfo,
+	useClaudeHooksUnavailableReason,
+} from '@/lib/iyke/terminal-hooks';
 
 export interface StatuslineSnapshot {
 	ikenga_terminal_id?: string;
@@ -51,23 +55,29 @@ function NoSessionEmpty() {
 
 export function CostHud({ sessionId }: { sessionId?: string | null }) {
 	const [snapshot, setSnapshot] = useState<StatuslineSnapshot | null>(null);
+	const unavailable = useClaudeHooksUnavailableReason();
+
+	useEffect(() => {
+		// A reloaded browser tab may never have launched a terminal, so nothing
+		// else has asked yet whether this server can take claude's statusline.
+		if (isRemoteWebSession()) void primeRemoteHooksInfo();
+	}, []);
 
 	useEffect(() => {
 		if (!sessionId) return;
-		// Initial fetch from backend snapshot REST endpoint if available.
-		// Live endpoint + bearer token — see the note in tool-call-feed.tsx.
-		// The endpoint now returns a per-terminal map; we pick this terminal's
-		// snapshot and ignore events from siblings.
-		iykeFetch('/iyke/statusline/snapshot')
-			.then((res) => (res.ok ? res.json() : null))
-			.then((data: Record<string, StatuslineSnapshot> | null) => {
+		// Initial fetch of the snapshot map (the iyke bridge on the desktop, the
+		// daemon's arm in a browser): we pick this terminal's snapshot and
+		// ignore events from siblings.
+		fetchStatuslineSnapshots<StatuslineSnapshot>()
+			.then((data) => {
 				if (data) {
 					setSnapshot(data[sessionId] ?? null);
 				}
 			})
 			.catch(() => {});
 
-		// Subscribe to real-time statusline updates over Tauri event bus
+		// Subscribe to real-time statusline updates (Tauri's event bus on the
+		// desktop, the daemon's `/ws/events` in a browser)
 		let unlisten: (() => void) | undefined;
 		listen<StatuslineSnapshot>('statusline://snapshot', (event) => {
 			if (event.payload?.ikenga_terminal_id === sessionId) {
@@ -91,12 +101,11 @@ export function CostHud({ sessionId }: { sessionId?: string | null }) {
 			<div className="flex h-7 items-center justify-between border-b border-border/40 bg-card px-3 text-[11px] text-muted-foreground backdrop-blur font-mono select-none">
 				<div className="flex items-center gap-1.5">
 					<Gauge className="h-3 w-3 text-muted-foreground/60" />
-					{/* A browser session never receives `statusline://snapshot` (no
-					    server-to-browser event channel yet, gap audit rank 10), so
-					    "listening" would wait forever. */}
+					{/* A server that can't wire claude's statusline would leave
+					    "listening" waiting forever: say why instead. */}
 					<span>
-						{isRemoteWebSession()
-							? "Statusline telemetry isn't available in the browser yet"
+						{isRemoteWebSession() && unavailable
+							? `Statusline telemetry: ${unavailable}`
 							: 'HUD: listening for statusline telemetry...'}
 					</span>
 				</div>

@@ -39,12 +39,14 @@
 //! | `notifications://changed` | every `notifications::record` / read / mute change, via [`EventBus::subscribe`]'s bridge | `NotificationEvent`, `muted` stamped |
 //! | `pa-action-paused` / `-committed` / `-retried` / `-rejected` | the `pa_actions_*` arms | the desktop's structs |
 //! | `seats://changed` | every `seats_*` write arm and the queue poller (`server::rpc_seats`) | `SeatsChangedEvent` |
+//! | `hooks://event` | a daemon terminal's claude hooks, the inbox's subset only (`server::term_hooks`) | the desktop's `HookPayload`, minus `tool_output` |
+//! | `hooks://decision` | `term_hooks_decide`, or a held gate timing out as a deny | `{ requestId, decision }` |
+//! | `statusline://snapshot` | a daemon terminal's claude statusline (`server::term_hooks`) | the statusline JSON + `ikenga_terminal_id` |
 //!
 //! What the daemon does **not** do that the desktop does: it starts no file
 //! watcher, so a hand edit of `settings.json` / `actions.json` on the server
 //! is picked up by the browser's next read, not announced. Event names with no
-//! daemon producer at all (`hooks://event`, `statusline://snapshot`,
-//! `runtime://bun`, `pkg-installed`, …) are not topics here; the browser is
+//! daemon producer at all (`runtime://bun`, `pkg-installed`, …) are not topics here; the browser is
 //! told which names are live (the socket's `ready` frame) and notes the rest
 //! once.
 
@@ -77,10 +79,17 @@ pub enum Topic {
     /// Every seat command's (`server::rpc_seats`) `SeatsChangedEvent`, and
     /// the queue poller's.
     SeatsChanged,
+    /// A daemon terminal's hook events the permission inbox reads (see
+    /// `server::term_hooks`): asks, what resolves them, `Notification`.
+    HooksEvent,
+    /// A held `PreToolUse` was answered, or timed out as a deny.
+    HooksDecision,
+    /// A daemon terminal's Claude statusline snapshot (the cost HUD).
+    StatuslineSnapshot,
 }
 
 impl Topic {
-    pub const ALL: [Topic; 9] = [
+    pub const ALL: [Topic; 12] = [
         Topic::SettingsChanged,
         Topic::ProjectsActiveChanged,
         Topic::ActionsChanged,
@@ -90,6 +99,9 @@ impl Topic {
         Topic::PaActionRetried,
         Topic::PaActionRejected,
         Topic::SeatsChanged,
+        Topic::HooksEvent,
+        Topic::HooksDecision,
+        Topic::StatuslineSnapshot,
     ];
 
     /// The wire name — exactly the desktop's `app.emit` name.
@@ -104,6 +116,9 @@ impl Topic {
             Topic::PaActionRetried => "pa-action-retried",
             Topic::PaActionRejected => "pa-action-rejected",
             Topic::SeatsChanged => "seats://changed",
+            Topic::HooksEvent => "hooks://event",
+            Topic::HooksDecision => "hooks://decision",
+            Topic::StatuslineSnapshot => "statusline://snapshot",
         }
     }
 
@@ -124,6 +139,11 @@ impl Topic {
             | Topic::PaActionRetried
             | Topic::PaActionRejected => "pa_actions_list",
             Topic::SeatsChanged => "seats_list",
+            // About terminals: whoever may attach to `/ws/pty` (owner,
+            // `sessions`) may see their asks and their cost.
+            Topic::HooksEvent | Topic::HooksDecision | Topic::StatuslineSnapshot => {
+                "pty_terminal_list"
+            }
         }
     }
 
@@ -301,7 +321,7 @@ mod tests {
         for t in Topic::ALL {
             assert_eq!(Topic::parse(t.name()), Some(t));
         }
-        assert_eq!(Topic::parse("hooks://event"), None);
+        assert_eq!(Topic::parse("runtime://bun"), None);
         assert_eq!(
             Topic::NotificationsChanged.name(),
             "notifications://changed"
