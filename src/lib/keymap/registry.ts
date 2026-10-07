@@ -15,6 +15,7 @@
 // start it) it is the defaults. Callers never read `DEFAULT_KEYMAP` directly.
 
 import { useEffect, useRef } from 'react';
+import { defaultKeymap } from './browser-layer';
 import { type ContextKeys, getContextKeys, getEvalOptions } from './context-keys';
 import { DEFAULT_KEYMAP, type KeymapEntry, type KeymapScope, type KeymapSource } from './defaults';
 // WP-55: `useKey` registers in the one dispatcher's command table instead of
@@ -50,7 +51,7 @@ const keymapListeners = new Set<() => void>();
  * publishes a merge.
  */
 export function getKeymap(): KeymapEntry[] {
-	return effectiveKeymap ?? DEFAULT_KEYMAP;
+	return effectiveKeymap ?? defaultKeymap();
 }
 
 /**
