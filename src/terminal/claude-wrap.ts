@@ -69,6 +69,13 @@ function psQuote(arg: string): string {
  * found".
  */
 export function toWslPath(p: string): string {
+	// `\\wsl.localhost\<distro>\…` / `\\wsl$\<distro>\…` → the path inside
+	// the distro (`wsl_cd` in `chi_exec.rs` does the same for a run's cwd).
+	const share = /^[\\/]{2}(?:wsl\.localhost|wsl\$)[\\/][^\\/]+(.*)$/i.exec(p);
+	if (share) {
+		const inner = share[1].replace(/\\/g, '/').replace(/\/+$/, '');
+		return inner === '' ? '/' : inner;
+	}
 	const m = /^([A-Za-z]):[\\/](.*)$/.exec(p);
 	if (!m) return p;
 	return `/mnt/${m[1].toLowerCase()}/${m[2].replace(/\\/g, '/')}`;
@@ -166,6 +173,54 @@ export function buildAgentEnv(opts: AgentWrapOpts = {}): Record<string, string> 
 	return { [PLUGIN_DIRS_ENV]: dirs.join(isWindows ? ';' : ':') };
 }
 
+/** The `-d <distro>` for a configured distro. Blank and `"default"` (what
+ *  the settings page stores for the unnamed default profile) mean the
+ *  default distro — no flag. */
+export function wslDistroArgs(distro: string | null | undefined): string[] {
+	const name = distro?.trim();
+	if (!name || name.toLowerCase() === 'default') return [];
+	return ['-d', name];
+}
+
+/**
+ * `wsl.exe [-d <distro>] [--cd <cwd>] -e bash -l -i -c <script>` — how every
+ * agent launch enters WSL. The headless Chi runtime launches the same shape
+ * (`chi_exec.rs`, `EngineLaunch::Wsl`).
+ */
+export function buildWslCmd(
+	script: string,
+	opts: { wslDistro?: string | null; cwd?: string | null } = {}
+): string[] {
+	const wslCmd = ['wsl.exe', ...wslDistroArgs(opts.wslDistro)];
+	if (opts.cwd) {
+		// Convert Windows path separators to forward slashes for WSL compatibility
+		wslCmd.push('--cd', opts.cwd.replace(/\\/g, '/'));
+	}
+	// `-e` execs bash directly. Without it wsl.exe hands the command line to
+	// the distro's login shell first, which expands `$__status` / `$?` to
+	// empty before bash sees the script → `[: -ne: unary operator expected`.
+	wslCmd.push('-e', 'bash', '-l', '-i', '-c', script);
+	return wslCmd;
+}
+
+/** Detection's display suffix for a CLI found only inside WSL
+ *  (`/usr/bin/claude (WSL)`, `agents.rs`). */
+const WSL_DISPLAY_SUFFIX = ' (WSL)';
+
+/**
+ * The terminal command for `<cli> login`, from a detected agent's
+ * `executable_path`. A WSL-only CLI is reported as `"/usr/bin/claude (WSL)"`
+ * — a display string, not a path — so it runs inside WSL, in the configured
+ * distro, the way the agent terminal launches it.
+ */
+export function buildLoginCmd(executablePath: string, wslDistro?: string | null): string[] {
+	if (executablePath.endsWith(WSL_DISPLAY_SUFFIX)) {
+		const bin = executablePath.slice(0, -WSL_DISPLAY_SUFFIX.length);
+		return buildWslCmd(`${shQuote(bin)} login`, { wslDistro });
+	}
+	return [executablePath, 'login'];
+}
+
 export function buildAgentWrappedCmd(opts: AgentWrapOpts = {}): string[] {
 	const engine = opts.engine ?? 'claude';
 	const args = buildAgentArgs(opts);
@@ -179,19 +234,7 @@ export function buildAgentWrappedCmd(opts: AgentWrapOpts = {}): string[] {
 			`__status=$?; ` +
 			`if [ $__status -ne 0 ]; then printf '\\n\\033[31m[${engine} exited %d]\\033[0m\\n' $__status; fi; ` +
 			`exec "\${SHELL:-bash}" -i`;
-		const wslCmd = ['wsl.exe'];
-		if (opts.wslDistro) {
-			wslCmd.push('-d', opts.wslDistro);
-		}
-		if (opts.cwd) {
-			// Convert Windows path separators to forward slashes for WSL compatibility
-			wslCmd.push('--cd', opts.cwd.replace(/\\/g, '/'));
-		}
-		// `-e` execs bash directly. Without it wsl.exe hands the command line to
-		// the distro's login shell first, which expands `$__status` / `$?` to
-		// empty before bash sees the script → `[: -ne: unary operator expected`.
-		wslCmd.push('-e', 'bash', '-l', '-i', '-c', script);
-		return wslCmd;
+		return buildWslCmd(script, { wslDistro: opts.wslDistro, cwd: opts.cwd });
 	}
 
 	if (target === 'bash' || target === 'posix') {

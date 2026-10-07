@@ -14,15 +14,14 @@ import { useNavigate } from '@tanstack/react-router';
 import { Bot, ChevronDown, ChevronRight, User } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { EmptyState, OfflineState } from '@/components/states';
-import { usePaneStore } from '@/lib/panes/pane-store';
 import { type CompanionTarget, useShellStore } from '@/lib/shell/shell-store';
 import { useSeats } from '@/lib/queries/seats';
 import { chiList, type DetectedAgent, detectAgents, type SeatStatus, type SeatView } from '@/lib/tauri-cmd';
 import { viewLabel } from '@/shell/panes/pane-views';
 import { useTerminalStore } from '@/terminal/session-store';
-import { createTerminalSession } from '@/terminal/single-terminal';
 import { useTerminalTitles } from '@/terminal/use-terminal-titles';
 import { useCompanionStore } from './companion-store';
+import { openLoginTerminal } from './login-terminal';
 import { applyTarget, copyText, openSessionInPane, sameTarget } from './seat-actions';
 import { atName, engineShort, seatChipRest, seatSessionRef, stateDotColor, UNREPORTED } from './seat-model';
 import { type SeatRoster, terminalEngine, type UnseatedSession } from './seat-roster';
@@ -451,12 +450,7 @@ export function TargetPicker({ roster }: { roster: SeatRoster }) {
 								action={{
 									label: `Run ${unauthedEngine.id} login`,
 									onClick: () => {
-										const sessionId = createTerminalSession({
-											cmd: [unauthedEngine.executable_path, 'login'],
-											title: `${unauthedEngine.id} login`,
-										});
-										const panes = usePaneStore.getState();
-										panes.placeView(panes.focusedId, { kind: 'terminal', sessionId }, 'append');
+										void openLoginTerminal(unauthedEngine);
 										close();
 									},
 								}}

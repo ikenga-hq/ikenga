@@ -1,7 +1,9 @@
 //! `detect_agents` — PATH scan + version + auth probe for KNOWN_AGENTS.
 //!
 //! Subprocess spawns are wrapped in `tokio::time::timeout` so a hanging CLI
-//! can't stall the wizard. All probes execute in parallel via `join_all`.
+//! (or a wedged `wsl.exe`) can't stall the wizard. Agents are probed
+//! concurrently via `join_all`. Probes that go through WSL use the configured
+//! `engines.agentWslDistro` and a cold-start allowance (`super::wsl`).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -40,9 +42,37 @@ const PROBE_OUTPUT_OPTS: PipedOpts = PipedOpts {
 fn probe_output(
     spec: SpawnSpec,
 ) -> impl std::future::Future<Output = std::io::Result<std::process::Output>> {
-    let child = crate::executor::current().spawn_piped(spec, PROBE_OUTPUT_OPTS);
+    probe_output_with(spec, PROBE_OUTPUT_OPTS)
+}
+
+/// [`probe_output`] with explicit stdio.
+fn probe_output_with(
+    spec: SpawnSpec,
+    opts: PipedOpts,
+) -> impl std::future::Future<Output = std::io::Result<std::process::Output>> {
+    let child = crate::executor::current().spawn_piped(spec, opts);
     async { child?.wait_with_output().await }
 }
+
+/// The answer to "is `<name>` installed inside WSL?". Three outcomes, because
+/// a `wsl.exe` that couldn't start (no distro, VM failure, a hang) says
+/// nothing about whether the CLI is installed — reporting it as a miss tells
+/// the user to install something they already have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WslLookup {
+    /// The absolute path the distro's login shell resolves `name` to.
+    Found(String),
+    /// WSL answered, and `name` is not on the distro's login PATH (or this
+    /// machine has no `wsl.exe` at all).
+    NotFound,
+    /// WSL couldn't be asked. Carries the reason.
+    WslUnavailable(String),
+}
+
+/// Budget for `command -v` inside WSL: a warm distro answers in 0.5–2 s; a
+/// cold one needs [`super::wsl::COLD_START`] on top.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WSL_WHICH_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Windows cold start: a freshly-installed CLI's first exec can take
 // 500ms-1.7s+ while Defender scans the new binary before letting it run.
@@ -105,17 +135,14 @@ pub(crate) async fn detect_by_id_in(
     Some(detected)
 }
 
-/// Inlined tiny join_all so we don't drag in the full `futures` crate.
+/// Await every probe concurrently: one slow agent (a cold WSL start, a CLI
+/// Defender is scanning) must not serialise the rest behind it.
 async fn futures_join_all<I, F>(iter: I) -> Vec<F::Output>
 where
     I: IntoIterator<Item = F>,
     F: std::future::Future,
 {
-    let mut out = Vec::new();
-    for fut in iter {
-        out.push(fut.await);
-    }
-    out
+    futures_util::future::join_all(iter).await
 }
 
 async fn detect_one(def: &AgentDef, os: &str) -> Option<DetectedAgent> {
@@ -127,7 +154,13 @@ async fn detect_one_in(
     os: &str,
     search_path: &std::ffi::OsStr,
 ) -> Option<DetectedAgent> {
-    let exec_path = resolve_executable_in(def, os, search_path)?;
+    let exec_path = match resolve_executable_in(def, os, search_path) {
+        Some(p) => p,
+        #[cfg(windows)]
+        None => lookup_wsl_executable(def, super::wsl::configured_distro().as_deref()).await?,
+        #[cfg(not(windows))]
+        None => return None,
+    };
     let is_wsl = exec_path.to_string_lossy().starts_with("wsl:");
     let display_path = if is_wsl {
         let raw = exec_path.to_string_lossy();
@@ -165,6 +198,8 @@ fn resolve_executable(def: &AgentDef, os: &str) -> Option<PathBuf> {
     resolve_executable_in(def, os, crate::runtime::augmented_path())
 }
 
+/// The agent's executable on the host (PATH, then its `extra_dirs`). The WSL
+/// fallback is separate ([`lookup_wsl_executable`]) because it spawns.
 fn resolve_executable_in(
     def: &AgentDef,
     os: &str,
@@ -178,20 +213,15 @@ fn resolve_executable_in(
             return Some(found);
         }
     }
-    #[cfg(windows)]
-    {
-        if let Some(wsl_path) = lookup_wsl_executable(def) {
-            return Some(wsl_path);
-        }
-    }
     None
 }
 
+/// The agent inside WSL, as a `wsl:<name>:<path>` detection path. When WSL
+/// couldn't be asked the agent is skipped with a warning — not cached, not
+/// reported as a verdict — and the next detection asks again.
 #[cfg(windows)]
-fn lookup_wsl_executable(def: &AgentDef) -> Option<PathBuf> {
-    let has_wsl = which::which("wsl.exe").is_ok()
-        || std::path::Path::new(r"C:\Windows\System32\wsl.exe").exists();
-    if !has_wsl {
+async fn lookup_wsl_executable(def: &AgentDef, distro: Option<&str>) -> Option<PathBuf> {
+    if !super::wsl::wsl_exe_present() {
         return None;
     }
 
@@ -215,50 +245,99 @@ fn lookup_wsl_executable(def: &AgentDef) -> Option<PathBuf> {
             .unwrap_or(name);
 
         // One candidate name failing to resolve says nothing about the next
-        // one — keep probing instead of giving up on the agent.
-        if let Some(path_str) = wsl_which(clean_name) {
-            return Some(PathBuf::from(format!("wsl:{clean_name}:{path_str}")));
+        // one — keep probing instead of giving up on the agent. WSL itself
+        // failing does: every further name would wait out the same failure.
+        match wsl_which(clean_name, distro).await {
+            WslLookup::Found(path_str) => {
+                return Some(PathBuf::from(format!("wsl:{clean_name}:{path_str}")));
+            }
+            WslLookup::NotFound => {}
+            WslLookup::WslUnavailable(reason) => {
+                tracing::warn!(
+                    target: "ikenga::agents",
+                    "couldn't check WSL for {} — skipping it this scan, not reporting it absent: {reason}",
+                    def.id
+                );
+                return None;
+            }
         }
     }
     None
 }
 
-/// Absolute path of `name` inside the default WSL distro's login shell, or
-/// `None` when WSL is absent or the binary isn't on the distro's PATH. Shared
-/// by agent detection and the headless Chi runtime (`commands/chi.rs`), so
-/// both agree on whether a WSL-only CLI exists.
+/// Where `name` lives on `distro`'s login PATH (`None` = the default
+/// distro). Shared by agent detection, the headless Chi runtime
+/// (`chi_exec::HostResolver`) and seat install state, so all three agree on
+/// whether a WSL-only CLI exists. Async with a cold-start-sized timeout: a
+/// wedged `wsl.exe` used to hang detection and run start indefinitely.
 #[cfg(windows)]
-pub(crate) fn wsl_which(name: &str) -> Option<String> {
-    let has_wsl = which::which("wsl.exe").is_ok()
-        || std::path::Path::new(r"C:\Windows\System32\wsl.exe").exists();
-    if !has_wsl {
-        return None;
+pub(crate) async fn wsl_which(name: &str, distro: Option<&str>) -> WslLookup {
+    if !super::wsl::wsl_exe_present() {
+        return WslLookup::NotFound;
     }
+    let spec = wsl_bash(distro, &format!("command -v -- {}", sh_quote(name)));
+    let budget = WSL_WHICH_TIMEOUT + super::wsl::COLD_START;
+    let opts = PipedOpts {
+        stdin: StdioMode::Null,
+        ..PROBE_OUTPUT_OPTS
+    };
+    match timeout(budget, probe_output_with(spec, opts)).await {
+        Err(_) => WslLookup::WslUnavailable(format!(
+            "wsl.exe did not answer within {}s",
+            budget.as_secs()
+        )),
+        Ok(Err(e)) => WslLookup::WslUnavailable(format!("couldn't start wsl.exe: {e}")),
+        Ok(Ok(out)) => which_verdict(out.status.code(), &out.stdout, &out.stderr),
+    }
+}
+
+/// `wsl.exe [-d <distro>] -e bash -l -c <script>` — `-e` so the script is
+/// handed to bash as-is rather than re-parsed by the distro's login shell
+/// (the terminal launches the same way, `src/terminal/claude-wrap.ts`).
+#[cfg(windows)]
+fn wsl_bash(distro: Option<&str>, script: &str) -> SpawnSpec {
     let mut spec = SpawnSpec::new("wsl.exe");
-    spec.args(["bash", "-l", "-c", &format!("which {name}")]);
-    // std `Command::output()`'s stdio (stdin null, stdout + stderr captured)
-    // on the executor's blocking path; this whole chain is sync.
-    let output = crate::executor::current()
-        .spawn_output_blocking(
-            spec,
-            PipedOpts {
-                stdin: StdioMode::Null,
-                ..PROBE_OUTPUT_OPTS
-            },
-        )
-        .map_err(|e| tracing::warn!(target: "ikenga::agents", "wsl.exe spawn failed probing `{name}`: {e}"))
-        .ok()?;
-    if !output.status.success() {
-        // A miss and a WSL that couldn't start both land here; only the
-        // latter is worth a warning.
-        if let Some(class) =
-            super::failure_class::classify_output(&output.stdout, &output.stderr)
-        {
-            tracing::warn!(target: "ikenga::agents", "probing `{name}` in WSL: {}", class.describe());
-        }
-        return None;
+    spec.args(super::wsl::distro_args(distro));
+    spec.args(["-e", "bash", "-l", "-c", script]);
+    spec
+}
+
+/// Single-quote `s` for a POSIX shell.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Read a finished `wsl.exe … command -v <name>`. Only `command -v`'s own
+/// "no such command" (exit 1, nothing WSL-shaped in the output) is a miss;
+/// any other failure is WSL not answering.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn which_verdict(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> WslLookup {
+    use super::failure_class::{classify_output, FailureClass};
+    if classify_output(stdout, stderr) == Some(FailureClass::WslUnavailable) {
+        // wsl.exe's own error text — its `Wsl/…` code is the useful part —
+        // on one line, capped.
+        let detail = super::wsl::decode_wsl_output(stderr)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return WslLookup::WslUnavailable(if detail.is_empty() {
+            FailureClass::WslUnavailable.describe()
+        } else {
+            detail.chars().take(240).collect()
+        });
     }
-    which_output_path(&String::from_utf8_lossy(&output.stdout))
+    match code {
+        Some(0) => match which_output_path(&String::from_utf8_lossy(stdout)) {
+            Some(p) => WslLookup::Found(p),
+            None => WslLookup::NotFound,
+        },
+        Some(1) => WslLookup::NotFound,
+        Some(c) => WslLookup::WslUnavailable(format!("wsl.exe exited {c}")),
+        None => WslLookup::WslUnavailable("wsl.exe was terminated".into()),
+    }
 }
 
 /// The path `which` printed, from a login shell's stdout. Profile scripts
@@ -409,9 +488,10 @@ async fn probe_version(exec: &std::path::Path, arg: &str, re: Option<&str>) -> O
         let exec_str = exec.to_string_lossy();
         if let Some(rest) = exec_str.strip_prefix("wsl:") {
             let bin_name = rest.split(':').next().unwrap_or(rest);
-            let mut cmd = SpawnSpec::new("wsl.exe");
-            cmd.args(["bash", "-l", "-c", &format!("{bin_name} {arg}")]);
-            (timeout(DEFAULT_VERSION_TIMEOUT, probe_output(cmd)).await, re.unwrap_or(super::known::DEFAULT_VERSION_REGEX))
+            let distro = super::wsl::configured_distro();
+            let cmd = wsl_bash(distro.as_deref(), &format!("{bin_name} {arg}"));
+            let budget = super::wsl::probe_budget(exec, DEFAULT_VERSION_TIMEOUT);
+            (timeout(budget, probe_output(cmd)).await, re.unwrap_or(super::known::DEFAULT_VERSION_REGEX))
         } else {
             let mut cmd = create_agent_command(exec);
             cmd.arg(arg);
@@ -456,7 +536,7 @@ async fn probe_auth_with_hint(
                 (Some(false), Some(format!("{name} not set")))
             }
         }
-        AuthCheck::FilePresent { paths } => probe_auth_files(paths),
+        AuthCheck::FilePresent { paths } => probe_auth_files(exec, paths).await,
         AuthCheck::Any { checks } => {
             // First successful inner check short-circuits. Without one, the
             // verdict is "signed out" only if every inner check concluded so;
@@ -716,9 +796,8 @@ async fn probe_auth_exec(
             let exec_str = exec_fallback.to_string_lossy();
             if let Some(rest) = exec_str.strip_prefix("wsl:") {
                 let bin_name = rest.split(':').next().unwrap_or(cmd);
-                let mut command = SpawnSpec::new("wsl.exe");
-                command.args(["bash", "-l", "-c", &format!("{bin_name} {}", args.join(" "))]);
-                command
+                let distro = super::wsl::configured_distro();
+                wsl_bash(distro.as_deref(), &format!("{bin_name} {}", args.join(" ")))
             } else {
                 match host_auth_command(exec_fallback, cmd, args) {
                     Ok(c) => c,
@@ -734,10 +813,14 @@ async fn probe_auth_exec(
             }
         }
     };
-    match timeout(Duration::from_millis(timeout_ms), probe_output(command)).await {
+    let budget = super::wsl::probe_budget(exec_fallback, Duration::from_millis(timeout_ms));
+    match timeout(budget, probe_output(command)).await {
         Ok(Ok(out)) => exec_verdict(&out, &what),
         Ok(Err(e)) => (None, Some(format!("couldn't run `{what}`: {e}"))),
-        Err(_) => (None, Some(format!("`{what}` timed out after {timeout_ms}ms"))),
+        Err(_) => (
+            None,
+            Some(format!("`{what}` timed out after {}ms", budget.as_millis())),
+        ),
     }
 }
 
@@ -772,35 +855,189 @@ fn host_auth_command(
     Ok(command)
 }
 
-fn probe_auth_files(paths: &[&str]) -> (Option<bool>, Option<String>) {
-    let mut tried: Vec<String> = Vec::new();
+/// A `FilePresent` probe. Where the file has to be depends on where the CLI
+/// runs: a host CLI reads the host home, a WSL CLI (`wsl:` path) reads its
+/// distro's homes. A credential in the other place doesn't sign that CLI in,
+/// so it isn't counted.
+async fn probe_auth_files(exec: &std::path::Path, paths: &[&str]) -> (Option<bool>, Option<String>) {
+    #[cfg(windows)]
+    if exec.to_string_lossy().starts_with("wsl:") {
+        return probe_auth_files_in_wsl(exec, paths).await;
+    }
+    let _ = exec;
     for p in paths {
-        let expanded = expand_tilde(p);
-        if expanded.is_file() {
+        if expand_tilde(p).is_file() {
             return (Some(true), None);
         }
-        #[cfg(windows)]
-        {
-            let clean_p = p.strip_prefix("~/").unwrap_or(p);
-            for prefix in [r"\\wsl.localhost", r"\\wsl$"] {
-                let wsl_base = PathBuf::from(prefix);
-                if let Ok(distros) = std::fs::read_dir(&wsl_base) {
-                    for d in distros.flatten() {
-                        let home_dir = d.path().join("home");
-                        if let Ok(users) = std::fs::read_dir(&home_dir) {
-                            for u in users.flatten() {
-                                if u.path().join(clean_p).is_file() {
-                                    return (Some(true), None);
-                                }
-                            }
-                        }
+    }
+    (Some(false), Some(format!("missing: {}", paths.join(", "))))
+}
+
+/// [`probe_auth_files`] for a WSL CLI: scan the distro shares off the async
+/// runtime (`\\wsl.localhost` blocks while a cold distro starts), under a
+/// cold-start budget. A share that couldn't be read, or a scan that ran out
+/// of time, is "couldn't tell" — never "missing".
+#[cfg(windows)]
+async fn probe_auth_files_in_wsl(
+    exec: &std::path::Path,
+    paths: &[&str],
+) -> (Option<bool>, Option<String>) {
+    let distro = super::wsl::configured_distro();
+    let rels: Vec<String> = paths
+        .iter()
+        .map(|p| p.strip_prefix("~/").unwrap_or(p).to_string())
+        .collect();
+    let budget = super::wsl::probe_budget(exec, Duration::from_secs(5));
+    let scan = tokio::task::spawn_blocking(move || {
+        // The CLI runs in the configured (else the default) distro as that
+        // distro's default user; only that user's home signs it in. When
+        // the registry doesn't say, fall back to the configured distro (or
+        // every distro) and every home in it.
+        let identity = super::wsl::launch_identity(distro.as_deref());
+        let only = identity.as_ref().map(|(name, _)| name.clone()).or(distro);
+        let uid = identity.and_then(|(_, uid)| uid);
+        let roots = super::wsl::share_roots();
+        scan_wsl_shares(&roots, &rels, only.as_deref(), uid)
+    });
+    match timeout(budget, scan).await {
+        Ok(Ok(ShareScan::Found)) => (Some(true), None),
+        Ok(Ok(ShareScan::Missing)) => (
+            Some(false),
+            Some(format!("missing in WSL: {}", paths.join(", "))),
+        ),
+        Ok(Ok(ShareScan::Unreadable(why))) => {
+            (None, Some(format!("couldn't read the WSL share: {why}")))
+        }
+        Ok(Err(e)) => (None, Some(format!("WSL credential scan failed: {e}"))),
+        Err(_) => (
+            None,
+            Some(format!(
+                "WSL credential scan timed out after {}s",
+                budget.as_secs()
+            )),
+        ),
+    }
+}
+
+/// What a scan of the WSL shares for a credential file found.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+enum ShareScan {
+    Found,
+    Missing,
+    /// The shares (or a distro's `/home`) couldn't be listed — the file may
+    /// well be there.
+    Unreadable(String),
+}
+
+/// Look for any of `rels` (home-relative) in the WSL shares `roots` (the
+/// `\\wsl.localhost` and `\\wsl$` share roots, which list the same distros
+/// — the first one that lists answers). `only` limits the scan to the distro
+/// the CLI launches in; Docker Desktop's internal distros are never scanned.
+/// With `uid` (that distro's default user) only the home `/etc/passwd` gives
+/// it is read — a file in another user's home doesn't sign the CLI in.
+/// Without it, or when the distro's `/etc/passwd` doesn't name that uid,
+/// `/root` and every `/home/<user>` are read.
+///
+/// Permission-denied on a home is skipped, not an error: `/root` and other
+/// users' homes are normally closed to the share's (default) user, and that
+/// user's own home is the one its CLI reads. A share root that lists no
+/// distro to scan is "couldn't tell", not "missing".
+#[cfg_attr(not(windows), allow(dead_code))]
+fn scan_wsl_shares(
+    roots: &[PathBuf],
+    rels: &[String],
+    only: Option<&str>,
+    uid: Option<u32>,
+) -> ShareScan {
+    use std::io::ErrorKind;
+
+    // `Ok(true)` present, `Ok(false)` absent or closed to us, `Err` unknown.
+    let file_at = |p: &std::path::Path| -> Result<bool, String> {
+        match std::fs::metadata(p) {
+            Ok(m) => Ok(m.is_file()),
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
+                Ok(false)
+            }
+            Err(e) => Err(format!("{}: {e}", p.display())),
+        }
+    };
+
+    let mut root_errors: Vec<String> = Vec::new();
+    for root in roots {
+        let distros = match std::fs::read_dir(root) {
+            Ok(d) => d,
+            Err(e) => {
+                root_errors.push(format!("{}: {e}", root.display()));
+                continue;
+            }
+        };
+        let mut errors: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        for entry in distros {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    errors.push(format!("{}: {e}", root.display()));
+                    continue;
+                }
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if super::wsl::is_docker_desktop(&name) {
+                continue;
+            }
+            if only.is_some_and(|d| !d.eq_ignore_ascii_case(&name)) {
+                continue;
+            }
+            scanned += 1;
+            let base = entry.path();
+            let default_home = uid.and_then(|uid| {
+                let passwd = std::fs::read_to_string(base.join("etc").join("passwd")).ok()?;
+                super::wsl::home_for_uid(&passwd, uid)
+            });
+            let homes = match default_home {
+                Some(home) => vec![base.join(home.trim_start_matches('/'))],
+                None => {
+                    let mut homes = vec![base.join("root")];
+                    match std::fs::read_dir(base.join("home")) {
+                        Ok(users) => homes.extend(users.flatten().map(|u| u.path())),
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                ErrorKind::NotFound | ErrorKind::PermissionDenied
+                            ) => {}
+                        Err(e) => errors.push(format!("{}: {e}", base.join("home").display())),
+                    }
+                    homes
+                }
+            };
+            for home in &homes {
+                for rel in rels {
+                    match file_at(&home.join(rel)) {
+                        Ok(true) => return ShareScan::Found,
+                        Ok(false) => {}
+                        Err(e) => errors.push(e),
                     }
                 }
             }
         }
-        tried.push(p.to_string());
+        if scanned == 0 {
+            errors.push(match only {
+                Some(d) => format!("WSL distro `{d}` is not listed under {}", root.display()),
+                None => format!("no WSL distro listed under {}", root.display()),
+            });
+        }
+        return if errors.is_empty() {
+            ShareScan::Missing
+        } else {
+            ShareScan::Unreadable(errors.join("; "))
+        };
     }
-    (Some(false), Some(format!("missing: {}", tried.join(", "))))
+    ShareScan::Unreadable(if root_errors.is_empty() {
+        "no WSL share root".to_string()
+    } else {
+        root_errors.join("; ")
+    })
 }
 
 fn env_truthy(name: &str) -> bool {
@@ -1069,5 +1306,187 @@ mod tests {
         );
         assert_eq!(which_output_path("claude not found\n"), None);
         assert_eq!(which_output_path(""), None);
+    }
+
+    /// `command -v` exiting 1 is the only "not installed" verdict; a WSL that
+    /// couldn't start, a non-`command -v` exit or a killed wsl.exe is WSL
+    /// unavailable — and carries wsl.exe's own error code when it gave one.
+    #[test]
+    fn which_verdict_separates_a_miss_from_wsl_not_answering() {
+        assert_eq!(
+            which_verdict(Some(0), b"nvm banner\n/usr/bin/claude\n", b""),
+            WslLookup::Found("/usr/bin/claude".into())
+        );
+        assert_eq!(which_verdict(Some(1), b"", b""), WslLookup::NotFound);
+        assert_eq!(which_verdict(Some(0), b"", b""), WslLookup::NotFound);
+
+        let utf16: Vec<u8> = "Error code: Wsl/Service/CreateInstance/E_FAIL\r\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        match which_verdict(Some(-1), b"", &utf16) {
+            WslLookup::WslUnavailable(why) => {
+                assert!(why.contains("Wsl/Service/CreateInstance/E_FAIL"), "{why}")
+            }
+            other => panic!("expected WslUnavailable, got {other:?}"),
+        }
+        // Exit 1 with a WSL error in the output is still WSL, not a miss.
+        assert!(matches!(
+            which_verdict(Some(1), b"", b"There is no distribution with the supplied name."),
+            WslLookup::WslUnavailable(_)
+        ));
+        assert!(matches!(which_verdict(Some(127), b"", b""), WslLookup::WslUnavailable(_)));
+        assert!(matches!(which_verdict(None, b"", b""), WslLookup::WslUnavailable(_)));
+    }
+
+    #[test]
+    fn sh_quote_survives_single_quotes() {
+        assert_eq!(sh_quote("claude"), "'claude'");
+        assert_eq!(sh_quote("it's"), r"'it'\''s'");
+    }
+
+    /// Regression: the old `futures_join_all` awaited each probe in turn, so
+    /// one slow agent (a cold WSL start) delayed every other. Three 300 ms
+    /// probes must finish in roughly one probe's time, not three.
+    #[tokio::test]
+    async fn join_all_runs_probes_concurrently() {
+        let started = std::time::Instant::now();
+        let futs = (0..3).map(|i| async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            i
+        });
+        assert_eq!(futures_join_all(futs).await, vec![0, 1, 2]);
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A share tree on disk shaped like `\wsl.localhost`: `<distro>/root`,
+    /// `<distro>/home/<user>`.
+    fn fake_share(distros: &[(&str, &[&str])]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (distro, homes) in distros {
+            let base = dir.path().join(distro);
+            std::fs::create_dir_all(base.join("root")).unwrap();
+            std::fs::create_dir_all(base.join("home")).unwrap();
+            for h in *homes {
+                std::fs::create_dir_all(base.join("home").join(h)).unwrap();
+            }
+        }
+        dir
+    }
+
+    fn rels(r: &[&str]) -> Vec<String> {
+        r.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn wsl_share_scan_reads_root_and_user_homes() {
+        let share = fake_share(&[("Ubuntu", &["me"])]);
+        let roots = [share.path().to_path_buf()];
+        let rel = rels(&[".claude/.credentials.json"]);
+        assert_eq!(scan_wsl_shares(&roots, &rel, None, None), ShareScan::Missing);
+
+        let cred = share.path().join("Ubuntu/root/.claude/.credentials.json");
+        std::fs::create_dir_all(cred.parent().unwrap()).unwrap();
+        std::fs::write(&cred, "{}").unwrap();
+        assert_eq!(scan_wsl_shares(&roots, &rel, None, None), ShareScan::Found);
+    }
+
+    #[test]
+    fn wsl_share_scan_skips_docker_desktop_and_other_distros() {
+        let share = fake_share(&[("docker-desktop", &["u"]), ("Debian", &["u"]), ("Ubuntu", &["u"])]);
+        let roots = [share.path().to_path_buf()];
+        let rel = rels(&[".codex/auth.json"]);
+        for distro in ["docker-desktop", "Debian"] {
+            let f = share.path().join(distro).join("home/u/.codex/auth.json");
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, "{}").unwrap();
+        }
+        // docker-desktop never counts; Debian counts only when it is the
+        // configured distro (or none is configured).
+        assert_eq!(scan_wsl_shares(&roots, &rel, Some("Ubuntu"), None), ShareScan::Missing);
+        assert_eq!(scan_wsl_shares(&roots, &rel, Some("debian"), None), ShareScan::Found);
+        assert_eq!(scan_wsl_shares(&roots, &rel, None, None), ShareScan::Found);
+        std::fs::remove_file(share.path().join("Debian/home/u/.codex/auth.json")).unwrap();
+        assert_eq!(scan_wsl_shares(&roots, &rel, None, None), ShareScan::Missing);
+    }
+
+    /// A share that can't be listed (WSL down, the share not mounted) or a
+    /// configured distro that isn't there is "couldn't tell", not "missing".
+    #[test]
+    fn wsl_share_scan_read_errors_are_inconclusive() {
+        let gone = tempfile::tempdir().unwrap().path().join("no-such-share");
+        let rel = rels(&[".claude/.credentials.json"]);
+        assert!(matches!(
+            scan_wsl_shares(&[gone.clone(), gone], &rel, None, None),
+            ShareScan::Unreadable(_)
+        ));
+
+        let share = fake_share(&[("Ubuntu", &["me"])]);
+        let roots = [share.path().to_path_buf()];
+        match scan_wsl_shares(&roots, &rel, Some("Arch"), None) {
+            ShareScan::Unreadable(why) => assert!(why.contains("Arch"), "{why}"),
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
+
+        // A share root that lists nothing (no distro running) or only
+        // Docker Desktop's distros, with none configured: couldn't tell.
+        let empty = tempfile::tempdir().unwrap();
+        match scan_wsl_shares(&[empty.path().to_path_buf()], &rel, None, None) {
+            ShareScan::Unreadable(why) => assert!(why.contains("no WSL distro"), "{why}"),
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
+        let docker = fake_share(&[("docker-desktop", &["u"])]);
+        assert!(matches!(
+            scan_wsl_shares(&[docker.path().to_path_buf()], &rel, None, None),
+            ShareScan::Unreadable(_)
+        ));
+    }
+
+    /// With the distro's default uid known, only that user's home counts: a
+    /// stale credential in another user's home doesn't sign the CLI in. A
+    /// passwd that doesn't name the uid falls back to every home.
+    #[test]
+    fn wsl_share_scan_reads_only_the_default_users_home() {
+        let share = fake_share(&[("Ubuntu", &["me", "old"])]);
+        let roots = [share.path().to_path_buf()];
+        let rel = rels(&[".claude/.credentials.json"]);
+        std::fs::create_dir_all(share.path().join("Ubuntu/etc")).unwrap();
+        std::fs::write(
+            share.path().join("Ubuntu/etc/passwd"),
+            "root:x:0:0:root:/root:/bin/bash\nme:x:1000:1000::/home/me:/bin/bash\nold:x:1001:1001::/home/old:/bin/bash\n",
+        )
+        .unwrap();
+        let stale = share.path().join("Ubuntu/home/old/.claude/.credentials.json");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, "{}").unwrap();
+
+        assert_eq!(scan_wsl_shares(&roots, &rel, Some("Ubuntu"), Some(1000)), ShareScan::Missing);
+        assert_eq!(scan_wsl_shares(&roots, &rel, Some("Ubuntu"), Some(1001)), ShareScan::Found);
+        // uid not in passwd: every home, as before.
+        assert_eq!(scan_wsl_shares(&roots, &rel, Some("Ubuntu"), Some(4242)), ShareScan::Found);
+
+        let mine = share.path().join("Ubuntu/home/me/.claude/.credentials.json");
+        std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
+        std::fs::write(&mine, "{}").unwrap();
+        assert_eq!(scan_wsl_shares(&roots, &rel, Some("Ubuntu"), Some(1000)), ShareScan::Found);
+    }
+
+    /// A host CLI's credential is the host file; nothing under WSL counts.
+    #[tokio::test]
+    async fn host_auth_file_probe_reads_the_host_home_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cred.json");
+        let path = file.to_string_lossy().into_owned();
+        let paths = [path.as_str()];
+        let exec = std::path::Path::new("/usr/bin/claude");
+        let (val, hint) = probe_auth_files(exec, &paths).await;
+        assert_eq!(val, Some(false));
+        assert!(hint.unwrap().starts_with("missing: "));
+        std::fs::write(&file, "{}").unwrap();
+        assert_eq!(probe_auth_files(exec, &paths).await, (Some(true), None));
     }
 }
