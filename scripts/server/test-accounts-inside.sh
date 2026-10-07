@@ -616,4 +616,36 @@ grep -q 'app.git' /etc/gitconfig || fail "the remaining project's safe.directory
 ls /etc/gitconfig.bak-2020* >/dev/null 2>&1 && [[ ! -e /etc/gitconfig.bak-20200101000001 ]] || fail "the oldest backups were kept instead of the newest"
 pass "a removed project loses its safe.directory entry (data stays); /etc/gitconfig backups are pruned to the last five"
 
+# PROJECTS_DIR placement: root writes under it, so a path a member can
+# influence must be refused, never adopted (re-verify finding 2).
+cp "$PROFILE" "$PROFILE.orig"
+install -d -m 1777 /var/shared
+mkdir -p /root/cdir && echo canary > /root/cdir/config
+setpriv --reuid "$(id -u ik-ada)" --regid "$(id -g ik-ada)" --clear-groups mkdir -p /var/shared/proj
+setpriv --reuid "$(id -u ik-ada)" --regid "$(id -g ik-ada)" --clear-groups ln -s /root/cdir /var/shared/proj/app.git
+sed -i 's#^PROJECTS_DIR=.*#PROJECTS_DIR=/var/shared/proj#' "$PROFILE"
+grep -q '^PROJECTS_DIR=/var/shared/proj' "$PROFILE" || echo 'PROJECTS_DIR=/var/shared/proj' >> "$PROFILE"
+prov
+[[ $RC -ne 0 ]] || fail "PROJECTS_DIR under a world-writable parent was accepted"
+grep -q 'refusing' "$OUT" || fail "PROJECTS_DIR refusal did not say why"
+[[ "$(cat /root/cdir/config)" == canary ]] || fail "root wrote through a member's symlink under PROJECTS_DIR"
+# A member-owned PROJECTS_DIR under a root-only parent is refused too.
+install -d -m 0755 /srv/other
+install -d -m 0755 -o ik-ada /srv/other/proj
+sed -i 's#^PROJECTS_DIR=.*#PROJECTS_DIR=/srv/other/proj#' "$PROFILE"
+prov
+[[ $RC -ne 0 ]] && grep -q 'not owned by root' "$OUT" || fail "a member-owned PROJECTS_DIR was adopted"
+# A symlinked mirror entry inside a root-owned PROJECTS_DIR is skipped.
+cp "$PROFILE.orig" "$PROFILE"
+mv "$PROJ/app.git" "$PROJ/app.git.real"
+ln -s /root/cdir "$PROJ/app.git"
+prov
+grep -q 'symlink or not owned by root' "$OUT" || fail "a symlinked mirror was not refused"
+[[ "$(cat /root/cdir/config)" == canary ]] || fail "root wrote through a symlinked mirror"
+rm "$PROJ/app.git"; mv "$PROJ/app.git.real" "$PROJ/app.git"
+prov
+[[ $RC -eq 0 ]] || fail "sync-accounts did not recover after the placement tests (rc=$RC)"
+rm -rf /var/shared /srv/other /root/cdir
+pass "PROJECTS_DIR under a member-writable parent, a member-owned PROJECTS_DIR, and a symlinked mirror are all refused; root never writes through them"
+
 echo "==> [Container] ALL ACCOUNT TESTS PASSED"

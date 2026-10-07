@@ -1909,6 +1909,28 @@ sync_projects() {
   apt_install git acl
   case "$PROJECTS_READ" in world) MIRROR_UMASK=022 ;; *) MIRROR_UMASK=077 ;; esac
 
+  # Root writes under PROJECTS_DIR, so no other user may be able to create or
+  # swap anything on the path to it: every existing ancestor must be a real
+  # directory, root-owned, not writable by group or others. Refuse rather than
+  # adopt a PROJECTS_DIR that is a symlink or not root-owned.
+  [[ "$PROJECTS_DIR" == /* && "$PROJECTS_DIR" != *"/../"* && "$PROJECTS_DIR" != *"/.." ]] \
+    || die "PROJECTS_DIR must be an absolute path without '..' (got '$PROJECTS_DIR')"
+  local anc="$PROJECTS_DIR" ao am
+  while :; do
+    anc="$(dirname "$anc")"
+    if [[ -e "$anc" || -L "$anc" ]]; then
+      [[ -L "$anc" ]] && die "PROJECTS_DIR ancestor $anc is a symlink; refusing (another user could redirect root's writes)"
+      read -r ao am < <(stat -c '%u %a' -- "$anc")
+      [[ "$ao" == 0 ]] || die "PROJECTS_DIR ancestor $anc is not owned by root; refusing"
+      (( (8#$am & 8#022) == 0 )) || die "PROJECTS_DIR ancestor $anc is writable by group or others (mode $am); refusing"
+    fi
+    [[ "$anc" == / ]] && break
+  done
+  if [[ -L "$PROJECTS_DIR" ]]; then die "PROJECTS_DIR $PROJECTS_DIR is a symlink; refusing"; fi
+  if [[ -d "$PROJECTS_DIR" && "$(stat -c '%u' -- "$PROJECTS_DIR")" != 0 ]]; then
+    die "PROJECTS_DIR $PROJECTS_DIR exists but is not owned by root; refusing to adopt it"
+  fi
+
   local parent; parent="$(dirname "$PROJECTS_DIR")"
   if [[ ! -d "$PROJECTS_DIR" ]]; then
     if [[ $DRY_RUN -eq 0 ]]; then
@@ -1976,6 +1998,9 @@ ensure_mirror() {
   local name="$1" spec="$2" url branch repo work before after def cur first out rc=0 new=0
   url="${spec%%#*}"; branch=""; [[ "$spec" == *"#"* ]] && branch="${spec#*#}"
   repo="$PROJECTS_DIR/$name.git"
+  if [[ -L "$repo" ]] || { [[ -e "$repo" ]] && [[ "$(stat -c '%u' -- "$repo")" != 0 ]]; }; then
+    soft_fail "project $name: $repo is a symlink or not owned by root; refusing to use it"; return
+  fi
   if [[ ! -d "$repo" ]]; then
     if [[ $DRY_RUN -eq 1 ]]; then changed "project $name mirrored from $url"; return; fi
     new=1
@@ -1985,12 +2010,14 @@ ensure_mirror() {
   else
     work="$repo"
     if [[ $DRY_RUN -eq 1 ]]; then
-      write_mirror_config "$work" && changed "mirror $name: config reset to the canonical one"
       lock_mirror "$repo"
+      write_mirror_config "$work" && changed "mirror $name: config reset to the canonical one"
       note "[dry-run] fetch $name from $url"; return
     fi
-    write_mirror_config "$work" && changed "mirror $name: config reset to the canonical one"
+    # Lock FIRST: on a mirror left group-writable by an older layout, a member
+    # could swap in a config between our write and the lock.
     lock_mirror "$repo"
+    write_mirror_config "$work" && changed "mirror $name: config reset to the canonical one"
   fi
 
   # The fetch URL is the PROFILE's. The mirror's own config names no remote
