@@ -549,7 +549,9 @@ export type NotificationKind =
 	| 'run_failed'
 	| 'update'
 	| 'violation'
-	| 'invite';
+	| 'invite'
+	/** An environment problem blocking work, e.g. WSL has no network (D-19). */
+	| 'system';
 
 /**
  * `{ kind, ...params }` for the action kinds producers emit; the centre
@@ -671,6 +673,9 @@ export interface NotificationsListOptions {
 export type NotificationsChangeReason =
 	| 'created'
 	| 'coalesced'
+	/** A row's copy changed within an open episode (D-20): refresh lists,
+	 *  never toast. */
+	| 'updated'
 	| 'read'
 	| 'read_all'
 	| 'mute_changed';
@@ -678,7 +683,7 @@ export type NotificationsChangeReason =
 /** Payload of `notifications://changed`. */
 export interface NotificationsChangedEvent {
 	reason: NotificationsChangeReason;
-	/** Present for `created` / `coalesced`. */
+	/** Present for `created` / `coalesced` / `updated`. */
 	notification: NotificationRow | null;
 	/** True when the row's kind is muted — the toast bridge stays quiet. */
 	muted: boolean;

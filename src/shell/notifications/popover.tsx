@@ -51,19 +51,12 @@ export const KIND_META: Record<NotificationKind, { label: string; fg: string; bo
 	run_finished: { label: 'run finished', fg: 'var(--live)', border: 'var(--live-soft)' },
 	update: { label: 'update', fg: 'var(--info)', border: 'var(--info-soft)' },
 	invite: { label: 'invite', fg: 'var(--agent)', border: 'var(--agent-soft)' },
+	// Environment problems (D-19): a calm warning, not a danger.
+	system: { label: 'system', fg: 'var(--warning)', border: 'var(--warning-soft)' },
 };
 
-/** A row's tag. WSL network rows ride the `violation` kind (so the mute list
- *  is unchanged) but read as what they are, not as a policy violation. */
-function kindMetaFor(row: NotificationRow): { label: string; fg: string; border: string } {
-	if (row.action?.kind === 'fix.wsl_network') {
-		return { label: 'wsl network', fg: 'var(--achievement)', border: 'var(--achievement-soft)' };
-	}
-	return KIND_META[row.kind];
-}
-
 function KindTag({ row }: { row: NotificationRow }) {
-	const meta = kindMetaFor(row);
+	const meta = KIND_META[row.kind];
 	return (
 		<span
 			className="inline-flex h-4 shrink-0 items-center rounded-[var(--radius-xs)] border px-1.5 font-mono text-[10px] tracking-wide"
@@ -232,7 +225,7 @@ export function NotificationsPopoverContent({ onClose }: NotificationsPopoverCon
 					data-state="notifications-empty"
 					icon={Bell}
 					heading="Nothing yet"
-					body="Permission requests, run results, updates, violations and invites collect here."
+					body="Permission requests, run results, updates, violations, invites and system problems collect here."
 					action={{ label: 'Notification settings', onClick: openNotificationSettings }}
 				/>
 			) : (

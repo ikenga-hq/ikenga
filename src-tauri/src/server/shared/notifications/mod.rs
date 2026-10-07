@@ -45,7 +45,8 @@
 //! read time: list / unread count hide them, and the forwarded event carries
 //! `muted: true` so the toast bridge stays quiet. `permission` and `violation`
 //! cannot be muted (D-07: "Permission and violation cannot be muted; every
-//! other kind can").
+//! other kind can"). `system` (environment problems such as WSL having no
+//! network, honest-failure-states D-19) is mutable on its own.
 //!
 //! # Kinds without a producer
 //!
@@ -106,16 +107,21 @@ pub enum NotificationKind {
     /// Someone was given access, or an invite is about to expire. No producer
     /// yet (D-05 people surface does not exist).
     Invite,
+    /// The machine Ikenga runs on has a problem that blocks work and is not
+    /// Ikenga's or a pkg's doing — e.g. WSL has no network (honest-failure-
+    /// states D-19). Mutable on its own.
+    System,
 }
 
 impl NotificationKind {
-    pub const ALL: [NotificationKind; 6] = [
+    pub const ALL: [NotificationKind; 7] = [
         NotificationKind::Permission,
         NotificationKind::RunFinished,
         NotificationKind::RunFailed,
         NotificationKind::Update,
         NotificationKind::Violation,
         NotificationKind::Invite,
+        NotificationKind::System,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -126,6 +132,7 @@ impl NotificationKind {
             NotificationKind::Update => "update",
             NotificationKind::Violation => "violation",
             NotificationKind::Invite => "invite",
+            NotificationKind::System => "system",
         }
     }
 
@@ -160,7 +167,9 @@ pub enum Coalesce {
     /// One row per *episode*: while a row with the key is unresolved — read
     /// or not — a repeat with the same copy and action is dropped
     /// (`Suppressed`, no event, so no second toast), and a repeat that
-    /// changed them updates the row in place (count + 1, read state kept).
+    /// changed them updates the row in place (count + 1, read state kept)
+    /// and publishes `updated` — never `created` / `coalesced` — so lists
+    /// refresh but no second toast pops (D-20).
     /// Once the row is resolved the next repeat inserts a fresh row. For
     /// ongoing conditions that end on their own: WSL network health (D-8).
     WhileUnresolved,
@@ -205,6 +214,9 @@ pub struct Notification {
 pub enum RecordOutcome {
     Inserted(Notification),
     Coalesced(Notification),
+    /// `Coalesce::WhileUnresolved`: the open episode's row was updated in
+    /// place with changed copy. Published as `updated` (no toast, D-20).
+    Updated(Notification),
     /// `Coalesce::Once` and a row with the key already exists.
     Suppressed,
 }
@@ -212,7 +224,9 @@ pub enum RecordOutcome {
 impl RecordOutcome {
     pub fn notification(&self) -> Option<&Notification> {
         match self {
-            RecordOutcome::Inserted(n) | RecordOutcome::Coalesced(n) => Some(n),
+            RecordOutcome::Inserted(n)
+            | RecordOutcome::Coalesced(n)
+            | RecordOutcome::Updated(n) => Some(n),
             RecordOutcome::Suppressed => None,
         }
     }
@@ -253,6 +267,10 @@ pub struct ListQuery {
 pub enum ChangeReason {
     Created,
     Coalesced,
+    /// A row's copy changed in place without a new occurrence worth
+    /// announcing (`Coalesce::WhileUnresolved`, D-20). Lists refresh; the
+    /// toast bridge stays quiet.
+    Updated,
     Read,
     ReadAll,
     MuteChanged,
@@ -263,7 +281,7 @@ pub enum ChangeReason {
 #[serde(rename_all = "camelCase")]
 pub struct NotificationEvent {
     pub reason: ChangeReason,
-    /// The row, for `created` / `coalesced`.
+    /// The row, for `created` / `coalesced` / `updated`.
     pub notification: Option<Notification>,
     /// True when the row's kind is muted. Set by the forwarder (which can see
     /// settings); always false on the in-process channel.
@@ -348,7 +366,7 @@ pub async fn record(
         .await
         .map_err(|e| format!("notifications begin: {e}"))?;
 
-    let outcome_id: Option<(i64, bool)> = match (&new.dedupe_key, new.coalesce) {
+    let outcome_id: Option<(i64, Folded)> = match (&new.dedupe_key, new.coalesce) {
         (Some(key), Coalesce::Once) => {
             let exists: Option<i64> =
                 sqlx::query_scalar("SELECT id FROM shell_notifications WHERE dedupe_key = ? LIMIT 1")
@@ -389,7 +407,7 @@ pub async fn record(
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| format!("notifications coalesce: {e}"))?;
-                    Some((id, true))
+                    Some((id, Folded::Coalesced))
                 }
                 None => None,
             }
@@ -432,7 +450,7 @@ pub async fn record(
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| format!("notifications episode update: {e}"))?;
-                    Some((id, true))
+                    Some((id, Folded::Updated))
                 }
                 None => None,
             }
@@ -440,7 +458,7 @@ pub async fn record(
         _ => None,
     };
 
-    let (id, coalesced) = match outcome_id {
+    let (id, folded) = match outcome_id {
         Some(found) => found,
         None => {
             let res = sqlx::query(
@@ -459,7 +477,7 @@ pub async fn record(
             .execute(&mut *tx)
             .await
             .map_err(|e| format!("notifications insert: {e}"))?;
-            (res.last_insert_rowid(), false)
+            (res.last_insert_rowid(), Folded::Inserted)
         }
     };
 
@@ -478,13 +496,30 @@ pub async fn record(
         .await
         .map_err(|e| format!("notifications commit: {e}"))?;
 
-    if coalesced {
-        publish(ChangeReason::Coalesced, Some(stored.clone()));
-        Ok(RecordOutcome::Coalesced(stored))
-    } else {
-        publish(ChangeReason::Created, Some(stored.clone()));
-        Ok(RecordOutcome::Inserted(stored))
+    match folded {
+        Folded::Inserted => {
+            publish(ChangeReason::Created, Some(stored.clone()));
+            Ok(RecordOutcome::Inserted(stored))
+        }
+        Folded::Coalesced => {
+            publish(ChangeReason::Coalesced, Some(stored.clone()));
+            Ok(RecordOutcome::Coalesced(stored))
+        }
+        Folded::Updated => {
+            publish(ChangeReason::Updated, Some(stored.clone()));
+            Ok(RecordOutcome::Updated(stored))
+        }
     }
+}
+
+/// How [`record`] landed a row (before it is read back and published).
+#[derive(Clone, Copy)]
+enum Folded {
+    Inserted,
+    /// A new occurrence folded into an unread row: announced again.
+    Coalesced,
+    /// Copy changed within an open episode: refreshed, not announced.
+    Updated,
 }
 
 /// Best-effort wrapper for emit sites: a failed notification write must never
@@ -881,6 +916,7 @@ mod tests {
 
     #[test]
     fn permission_and_violation_are_the_only_unmutable_kinds() {
+        assert!(NotificationKind::System.is_mutable());
         let unmutable: Vec<_> = NotificationKind::ALL
             .into_iter()
             .filter(|k| !k.is_mutable())
@@ -1107,39 +1143,39 @@ mod tests {
     async fn coalesce_while_unresolved_is_one_row_per_episode() {
         let (pool, _tmp) = fresh_pool().await;
         let key = Some("wsl:network:ubuntu");
-        let a = record(&pool, note(NotificationKind::Violation, key, Coalesce::WhileUnresolved))
+        let a = record(&pool, note(NotificationKind::System, key, Coalesce::WhileUnresolved))
             .await
             .unwrap();
         let id = a.notification().unwrap().id;
         // Same copy again: dropped, even after it is read.
         assert_eq!(
-            record(&pool, note(NotificationKind::Violation, key, Coalesce::WhileUnresolved))
+            record(&pool, note(NotificationKind::System, key, Coalesce::WhileUnresolved))
                 .await
                 .unwrap(),
             RecordOutcome::Suppressed
         );
         mark_read(&pool, &[id]).await.unwrap();
         assert_eq!(
-            record(&pool, note(NotificationKind::Violation, key, Coalesce::WhileUnresolved))
+            record(&pool, note(NotificationKind::System, key, Coalesce::WhileUnresolved))
                 .await
                 .unwrap(),
             RecordOutcome::Suppressed
         );
         // Changed copy: same row, updated in place, still read.
-        let mut changed = note(NotificationKind::Violation, key, Coalesce::WhileUnresolved);
+        let mut changed = note(NotificationKind::System, key, Coalesce::WhileUnresolved);
         changed.title = "different".into();
         match record(&pool, changed).await.unwrap() {
-            RecordOutcome::Coalesced(n) => {
+            RecordOutcome::Updated(n) => {
                 assert_eq!(n.id, id);
                 assert_eq!(n.count, 2);
                 assert_eq!(n.title, "different");
                 assert!(n.read_at.is_some());
             }
-            other => panic!("expected coalesced, got {other:?}"),
+            other => panic!("expected updated, got {other:?}"),
         }
         // Resolved: the next one is a new episode.
         resolve_by_key(&pool, key.unwrap()).await.unwrap();
-        let next = record(&pool, note(NotificationKind::Violation, key, Coalesce::WhileUnresolved))
+        let next = record(&pool, note(NotificationKind::System, key, Coalesce::WhileUnresolved))
             .await
             .unwrap();
         assert!(matches!(next, RecordOutcome::Inserted(ref n) if n.id != id));
@@ -1149,7 +1185,7 @@ mod tests {
     async fn open_rows_with_key_prefix_lists_only_open_matching_rows() {
         let (pool, _tmp) = fresh_pool().await;
         for key in ["wsl:network:default", "wsl:network:ubuntu", "wsl:networkx", "other:wsl:network:"] {
-            record(&pool, note(NotificationKind::Violation, Some(key), Coalesce::WhileUnresolved))
+            record(&pool, note(NotificationKind::System, Some(key), Coalesce::WhileUnresolved))
                 .await
                 .unwrap();
         }
@@ -1157,6 +1193,63 @@ mod tests {
         let open = open_rows_with_key_prefix(&pool, "wsl:network:").await.unwrap();
         let keys: Vec<_> = open.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["wsl:network:default"]);
+    }
+
+    /// D-20: within an episode, a changed repeat refreshes lists (`updated`)
+    /// but never publishes `created` / `coalesced`, which the toast bridge
+    /// turns into a toast. A new episode is `created` again.
+    #[tokio::test]
+    async fn while_unresolved_update_publishes_updated_not_a_toast_reason() {
+        let (pool, _tmp) = fresh_pool().await;
+        // Unique key so parallel tests' events are filtered out.
+        let key = "wsl:network:d20-event-test";
+        let mine = |ev: &NotificationEvent| {
+            ev.notification
+                .as_ref()
+                .is_some_and(|n| n.dedupe_key.as_deref() == Some(key))
+        };
+        let mut rx = subscribe();
+        let drain = |rx: &mut broadcast::Receiver<NotificationEvent>| {
+            let mut out = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                if mine(&ev) {
+                    out.push(ev.reason);
+                }
+            }
+            out
+        };
+
+        record(&pool, note(NotificationKind::System, Some(key), Coalesce::WhileUnresolved))
+            .await
+            .unwrap();
+        assert_eq!(drain(&mut rx), vec![ChangeReason::Created]);
+
+        // Same copy: suppressed, no event at all.
+        record(&pool, note(NotificationKind::System, Some(key), Coalesce::WhileUnresolved))
+            .await
+            .unwrap();
+        assert!(drain(&mut rx).is_empty());
+
+        // Changed copy: updated in place, published as `updated` only.
+        let mut changed = note(NotificationKind::System, Some(key), Coalesce::WhileUnresolved);
+        changed.body = Some("WSL isn't starting".into());
+        let out = record(&pool, changed).await.unwrap();
+        assert!(matches!(out, RecordOutcome::Updated(_)));
+        assert_eq!(drain(&mut rx), vec![ChangeReason::Updated]);
+
+        // Episode over: the next problem is announced again.
+        resolve_by_key(&pool, key).await.unwrap();
+        drain(&mut rx);
+        record(&pool, note(NotificationKind::System, Some(key), Coalesce::WhileUnresolved))
+            .await
+            .unwrap();
+        assert_eq!(drain(&mut rx), vec![ChangeReason::Created]);
+    }
+
+    #[test]
+    fn updated_reason_has_its_own_wire_name() {
+        assert_eq!(serde_json::to_value(ChangeReason::Updated).unwrap(), json!("updated"));
+        assert_eq!(serde_json::to_value(ChangeReason::Coalesced).unwrap(), json!("coalesced"));
     }
 
     #[tokio::test]

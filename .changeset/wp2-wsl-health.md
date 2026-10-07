@@ -2,7 +2,7 @@
 "ikenga-desktop": minor
 ---
 
-WSL network health. Before a WSL terminal or agent launches, and when a WSL session prints a network error such as `EAI_AGAIN`, Ikenga checks whether WSL can reach the network. The check results are cached for 30 seconds, and nothing polls in the background. When the network is broken, the check names the cause, including a failed mirrored-networking setup (for example `0x8007054f`) read from the Windows event log. The affected terminal pane shows a banner, one notification is raised for each problem episode, and Settings › Engines gains a "WSL health" row. Each surface offers the fitting fix:
+WSL network health. Before a WSL terminal or agent launches, and when a WSL session prints a network error such as `EAI_AGAIN`, Ikenga checks whether WSL can reach the network. The check results are cached for 30 seconds, and nothing polls in the background. When the network is broken, the check names the cause, including a failed mirrored-networking setup (for example `0x8007054f`) read from the Windows event log. The affected terminal pane shows a banner, one notification is raised for each problem episode, and Settings › Engines gains a "WSL health" row. The notification uses a new **system** kind for environment problems, which you can mute on its own from the notification menu. If the problem changes during an episode (for example from no network to WSL not starting), the existing notification is updated in place without a second toast. Each surface offers the fitting fix:
 
 - **Repair DNS** rewrites `/etc/resolv.conf` and backs up the old file first.
 - **Restart WSL networking** opens a single administrator prompt, then shuts WSL down and restarts the Host Network Service.

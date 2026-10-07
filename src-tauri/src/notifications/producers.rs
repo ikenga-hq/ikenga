@@ -13,7 +13,7 @@
 //! | `run_finished` / `run_failed` | [`run_terminal_with_artifacts`] (in `server::shared::notifications::run`) | `server::shared::chi_exec::cache_update_done` |
 //! | `update` | [`update`] | `commands::notifications::notifications_record_update` (FE updater + pkg registry check) |
 //! | `violation` | [`violation`] | `pkg::permissions_check::record_violation` |
-//! | `violation` | [`wsl_network`] | `commands::wsl_health` (a fresh probe with a WSL-caused failure; resolved by the next `ok` probe) |
+//! | `system` | [`wsl_network`] | `commands::wsl_health` (a fresh probe with a WSL-caused failure; resolved by the next `ok` probe) |
 //! | `invite` | — | **no producer**: D-05's people surface does not exist yet |
 //!
 //! Action JSON is `{ "kind": "<action kind>", ...params }`; the UI (WP-40b)
@@ -484,8 +484,8 @@ pub fn wsl_network_key(distro: Option<&str>) -> String {
 
 /// A WSL network problem worth telling the user about (D-2, D-8), or `None`
 /// when `health` isn't WSL's fault (`ok`, `host_offline`, `not_installed`).
-/// Reuses the `violation` kind — like a denial it is something blocking work
-/// that the user must not mute away — so the mute list doesn't change.
+/// Uses the `system` kind (D-19): an environment problem, not a pkg's
+/// denial, and mutable on its own.
 pub fn wsl_network(
     health: &crate::server::shared::wsl_health::WslHealth,
 ) -> Option<NewNotification> {
@@ -498,7 +498,7 @@ pub fn wsl_network(
     };
     let distro = health.distro.as_deref();
     Some(NewNotification {
-        kind: NotificationKind::Violation,
+        kind: NotificationKind::System,
         title: truncate(
             &format!("{title} · {}", distro.unwrap_or("default distro")),
             TITLE_MAX,
@@ -659,7 +659,7 @@ mod tests {
     fn wsl_network_is_one_fix_row_per_distro() {
         use crate::server::shared::wsl_health::WslHealthState as S;
         let n = wsl_network(&wsl_health(S::NoRoute, Some("Ubuntu"))).unwrap();
-        assert_eq!(n.kind, NotificationKind::Violation);
+        assert_eq!(n.kind, NotificationKind::System);
         assert_eq!(n.title, "WSL has no network · Ubuntu");
         assert_eq!(n.dedupe_key.as_deref(), Some("wsl:network:ubuntu"));
         assert_eq!(n.coalesce, Coalesce::WhileUnresolved);

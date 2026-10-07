@@ -86,7 +86,7 @@ function row(overrides: Partial<NotificationRow>): NotificationRow {
 
 const MUTE_STATE: NotificationsMuteState = {
 	muted: ['update'],
-	mutable: ['run_finished', 'run_failed', 'update', 'invite'],
+	mutable: ['run_finished', 'run_failed', 'update', 'invite', 'system'],
 };
 
 beforeEach(() => {
@@ -157,6 +157,24 @@ describe('NotificationsPopoverContent', () => {
 		await waitFor(() => expect(mocks.notificationsMarkRead).toHaveBeenCalledWith([7]));
 	});
 
+	it('a WSL network row is tagged with its own "system" kind (D-19)', async () => {
+		mocks.notificationsList.mockResolvedValue([
+			row({
+				id: 9,
+				kind: 'system',
+				title: 'WSL has no network · Ubuntu',
+				action: { kind: 'fix.wsl_network', distro: 'Ubuntu', state: 'no_route' },
+				dedupeKey: 'wsl:network:ubuntu',
+			}),
+		]);
+		render(<NotificationsPopoverContent onClose={vi.fn()} />);
+
+		await screen.findByText('WSL has no network · Ubuntu');
+		expect(screen.getByText('system')).toBeTruthy();
+		expect(screen.queryByText('violation')).toBeNull();
+		expect(screen.queryByText('wsl network')).toBeNull();
+	});
+
 	it('the mute menu offers only mutable kinds and reflects current mute state', async () => {
 		mocks.notificationsList.mockResolvedValue([row({})]);
 		render(<NotificationsPopoverContent onClose={vi.fn()} />);
@@ -165,7 +183,7 @@ describe('NotificationsPopoverContent', () => {
 		await userEvent.click(screen.getByRole('button', { name: 'Mute a kind' }));
 
 		const menu = await screen.findByRole('menu');
-		for (const label of ['run finished', 'run failed', 'update', 'invite']) {
+		for (const label of ['run finished', 'run failed', 'update', 'invite', 'system']) {
 			expect(within(menu).getByText(label)).toBeTruthy();
 		}
 		expect(within(menu).queryByText('permission')).toBeNull();

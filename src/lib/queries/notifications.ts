@@ -66,6 +66,7 @@ export const NOTIFICATION_KINDS = [
 	'update',
 	'violation',
 	'invite',
+	'system',
 ] as const satisfies readonly NotificationKind[];
 
 /** D-07: "Permission and violation cannot be muted; every other kind can." */
@@ -74,6 +75,7 @@ export const MUTABLE_NOTIFICATION_KINDS = [
 	'run_failed',
 	'update',
 	'invite',
+	'system',
 ] as const satisfies readonly NotificationKind[];
 
 export function isNotificationKindMutable(kind: NotificationKind): boolean {

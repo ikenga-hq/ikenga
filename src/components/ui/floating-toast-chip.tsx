@@ -1,8 +1,17 @@
-import { AlertTriangle, CheckCircle2, Download, ShieldAlert, UserPlus, X, XCircle } from 'lucide-react';
+import {
+	AlertTriangle,
+	CheckCircle2,
+	Download,
+	MonitorCog,
+	ShieldAlert,
+	UserPlus,
+	X,
+	XCircle,
+} from 'lucide-react';
 import * as React from 'react';
 import { cn } from '@/components/ui/utils';
 import { useNotificationsLiveSync } from '@/lib/queries/notifications';
-import type { NotificationKind, NotificationRow } from '@/lib/tauri-cmd';
+import type { NotificationKind, NotificationRow, NotificationsChangedEvent } from '@/lib/tauri-cmd';
 
 export type FloatingToastChipVariant = 'progress' | 'error' | 'notice' | 'info';
 export type FloatingToastChipAnchor = 'viewport-top' | 'viewport-bottom-right' | 'pane-corner';
@@ -167,6 +176,8 @@ const NOTIFICATION_TOAST_VARIANT: Record<NotificationKind, FloatingToastChipVari
 	run_finished: 'info',
 	update: 'info',
 	invite: 'info',
+	// Calm, polite warning: the machine needs attention, nothing was refused.
+	system: 'notice',
 };
 
 const NOTIFICATION_TOAST_ICON: Record<NotificationKind, React.ReactNode> = {
@@ -176,7 +187,16 @@ const NOTIFICATION_TOAST_ICON: Record<NotificationKind, React.ReactNode> = {
 	run_finished: <CheckCircle2 className="h-3 w-3" />,
 	update: <Download className="h-3 w-3" />,
 	invite: <UserPlus className="h-3 w-3" />,
+	system: <MonitorCog className="h-3 w-3" />,
 };
+
+/** Only a new occurrence toasts: `created`, or `coalesced` (a repeat folded
+ *  into an unread row). `updated` — copy changed within an open episode
+ *  (D-20) — refreshes lists silently; muted kinds never toast. */
+export function isToastWorthy(event: NotificationsChangedEvent): boolean {
+	if (event.reason !== 'created' && event.reason !== 'coalesced') return false;
+	return !event.muted && event.notification !== null;
+}
 
 /** designs/system-flows.html's own toast demo: `later(i * 260, () => toast(..., { ms: 3200 }))`. */
 const NOTIFICATION_TOAST_TTL_MS = 3200;
@@ -195,10 +215,9 @@ export function NotificationToastBridge() {
 	const [queue, setQueue] = React.useState<QueuedNotificationToast[]>([]);
 
 	useNotificationsLiveSync((event) => {
-		if (event.reason !== 'created' && event.reason !== 'coalesced') return;
-		if (event.muted || !event.notification) return;
+		if (!isToastWorthy(event)) return;
 		notificationToastSeq += 1;
-		const row = event.notification;
+		const row = event.notification as NotificationRow;
 		setQueue((q) => [...q, { key: notificationToastSeq, row }]);
 	});
 
