@@ -239,6 +239,9 @@ pub(crate) fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         notifications::notifications_mute_kind,
         notifications::notifications_unmute_kind,
         notifications::notifications_record_update,
+        // ── WSL network health (honest-failure-states WP-2) ─────────────────
+        wsl_health::wsl_health_probe,
+        wsl_health::wsl_health_fix,
         // ── projects + atelier ──────────────────────────────────────────────
         // projects (phase 0 of projects-first-class plan)
         projects::project_create,

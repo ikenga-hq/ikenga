@@ -157,6 +157,13 @@ pub enum Coalesce {
     /// when every earlier one has been read or resolved. For repeating
     /// facts: violations, runs, terminal permission prompts.
     WhileUnread,
+    /// One row per *episode*: while a row with the key is unresolved — read
+    /// or not — a repeat with the same copy and action is dropped
+    /// (`Suppressed`, no event, so no second toast), and a repeat that
+    /// changed them updates the row in place (count + 1, read state kept).
+    /// Once the row is resolved the next repeat inserts a fresh row. For
+    /// ongoing conditions that end on their own: WSL network health (D-8).
+    WhileUnresolved,
 }
 
 /// What a producer hands to [`record`].
@@ -382,6 +389,49 @@ pub async fn record(
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| format!("notifications coalesce: {e}"))?;
+                    Some((id, true))
+                }
+                None => None,
+            }
+        }
+        (Some(key), Coalesce::WhileUnresolved) => {
+            let open = sqlx::query(
+                "SELECT id, title, body, action FROM shell_notifications
+                 WHERE dedupe_key = ? AND resolved_at IS NULL
+                 ORDER BY id DESC LIMIT 1",
+            )
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| format!("notifications episode lookup: {e}"))?;
+            match open {
+                Some(row) => {
+                    let id: i64 = row.get("id");
+                    let stored_action: Option<Value> = row
+                        .get::<Option<String>, _>("action")
+                        .and_then(|a| serde_json::from_str(&a).ok());
+                    let same = row.get::<String, _>("title") == new.title
+                        && row.get::<Option<String>, _>("body") == new.body
+                        && stored_action == new.action;
+                    if same {
+                        tx.rollback().await.ok();
+                        return Ok(RecordOutcome::Suppressed);
+                    }
+                    sqlx::query(
+                        "UPDATE shell_notifications
+                         SET title = ?, body = ?, action = ?, source = ?,
+                             count = count + 1, updated_at = ?
+                         WHERE id = ?",
+                    )
+                    .bind(&new.title)
+                    .bind(&new.body)
+                    .bind(&action_json)
+                    .bind(&new.source)
+                    .bind(now)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| format!("notifications episode update: {e}"))?;
                     Some((id, true))
                 }
                 None => None,
@@ -1028,6 +1078,48 @@ mod tests {
         assert!(matches!(c, RecordOutcome::Inserted(_)));
         assert_ne!(c.notification().unwrap().id, b.id);
         assert_eq!(c.notification().unwrap().count, 1);
+    }
+
+    #[tokio::test]
+    async fn coalesce_while_unresolved_is_one_row_per_episode() {
+        let (pool, _tmp) = fresh_pool().await;
+        let key = Some("wsl:network:ubuntu");
+        let a = record(&pool, note(NotificationKind::Violation, key, Coalesce::WhileUnresolved))
+            .await
+            .unwrap();
+        let id = a.notification().unwrap().id;
+        // Same copy again: dropped, even after it is read.
+        assert_eq!(
+            record(&pool, note(NotificationKind::Violation, key, Coalesce::WhileUnresolved))
+                .await
+                .unwrap(),
+            RecordOutcome::Suppressed
+        );
+        mark_read(&pool, &[id]).await.unwrap();
+        assert_eq!(
+            record(&pool, note(NotificationKind::Violation, key, Coalesce::WhileUnresolved))
+                .await
+                .unwrap(),
+            RecordOutcome::Suppressed
+        );
+        // Changed copy: same row, updated in place, still read.
+        let mut changed = note(NotificationKind::Violation, key, Coalesce::WhileUnresolved);
+        changed.title = "different".into();
+        match record(&pool, changed).await.unwrap() {
+            RecordOutcome::Coalesced(n) => {
+                assert_eq!(n.id, id);
+                assert_eq!(n.count, 2);
+                assert_eq!(n.title, "different");
+                assert!(n.read_at.is_some());
+            }
+            other => panic!("expected coalesced, got {other:?}"),
+        }
+        // Resolved: the next one is a new episode.
+        resolve_by_key(&pool, key.unwrap()).await.unwrap();
+        let next = record(&pool, note(NotificationKind::Violation, key, Coalesce::WhileUnresolved))
+            .await
+            .unwrap();
+        assert!(matches!(next, RecordOutcome::Inserted(ref n) if n.id != id));
     }
 
     #[tokio::test]

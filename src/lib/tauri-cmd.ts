@@ -740,6 +740,60 @@ export async function notificationsRecordUpdate(
 	});
 }
 
+// ─── WSL network health (honest-failure-states WP-2) ─────────────────────────
+// Rust: src-tauri/src/commands/wsl_health.rs over server/shared/wsl_health.rs.
+// Windows-only in effect; elsewhere the probe answers `not_installed` and every
+// fix `failed`.
+
+export type WslHealthState =
+	| 'ok'
+	| 'host_offline'
+	| 'no_route'
+	| 'dns_only'
+	| 'wsl_down'
+	| 'not_installed';
+
+export interface WslHealth {
+	state: WslHealthState;
+	/** The distro probed; `null` = the default distro. */
+	distro: string | null;
+	/** One short sentence naming the cause. */
+	detail: string;
+	/** Newest "falling back to networkingMode None" WSL event this boot. */
+	mirroredFailure: { at: number; errorCode: string | null } | null;
+	/** `[wsl2] networkingMode` from .wslconfig (lower-case); null = unset/unreadable. */
+	networkingMode: string | null;
+	/** Unix ms. */
+	checkedAt: number;
+}
+
+export type WslFixAction = 'repair_dns' | 'restart_networking' | 'switch_to_nat';
+
+export type WslFixOutcome =
+	| { outcome: 'done'; health: WslHealth }
+	| { outcome: 'cancelled_by_user' }
+	| { outcome: 'failed'; reason: string };
+
+/** Probe WSL networking. `distro` omitted = `engines.agentWslDistro`; results
+ *  are cached 30 s per distro unless `force`. */
+export async function wslHealthProbe(
+	args: { distro?: string | null; force?: boolean } = {},
+): Promise<WslHealth> {
+	return invoke<WslHealth>('wsl_health_probe', {
+		distro: args.distro ?? null,
+		force: args.force ?? false,
+	});
+}
+
+/** Run one WSL network fix. `restart_networking` (UAC prompt) and
+ *  `switch_to_nat` shut WSL down — confirm first, relaunch sessions after. */
+export async function wslHealthFix(
+	action: WslFixAction,
+	distro?: string | null,
+): Promise<WslFixOutcome> {
+	return invoke<WslFixOutcome>('wsl_health_fix', { action, distro: distro ?? null });
+}
+
 // ─── Secrets (Stronghold) ─────────────────────────────────────────────────────
 
 export async function secretsGet(key: string): Promise<string | null> {
