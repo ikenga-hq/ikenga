@@ -568,6 +568,11 @@ pub fn route_requirement(path: &str) -> Option<Requirement> {
         Some(Requirement::shared(&[Cap::Sessions]))
     } else if path == "/ws/fs" {
         Some(Requirement::shared(&[Cap::Files]))
+    } else if path == "/ws/events" {
+        // The attach needs no cap: each topic is then gated by its read
+        // arm's requirement (`server::events_ws`). `owner`: events are about
+        // the caller's own state, never a share's.
+        Some(Requirement::owner(&[]))
     } else if path.starts_with("/pkgs/") || path == "/pkgs" {
         Some(Requirement::shared(&[Cap::Files]))
     } else if path == crate::server::push::outbox::EVENTS_PATH {
@@ -838,6 +843,10 @@ mod tests {
         assert_eq!(
             route_requirement("/ws/fs").unwrap().caps,
             CapSet::of(&[Cap::Files])
+        );
+        assert_eq!(
+            route_requirement("/ws/events").unwrap(),
+            Requirement::owner(&[])
         );
         assert_eq!(
             route_requirement("/pkgs/x/index.html").unwrap().class,
