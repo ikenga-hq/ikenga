@@ -133,9 +133,15 @@ fn spawn_error_message(
     error: &std::io::Error,
 ) -> String {
     if let Some(dir) = cwd {
-        if !dir.is_dir() {
+        if !dir.exists() {
             return format!(
                 "{cmd}: working directory {} does not exist ({error})",
+                dir.display()
+            );
+        }
+        if !dir.is_dir() {
+            return format!(
+                "{cmd}: working directory {} is not a directory ({error})",
                 dir.display()
             );
         }
@@ -2388,6 +2394,21 @@ mod tests {
         let msg = super::spawn_error_message("git", "install it", Some(&missing), &not_found);
         assert!(msg.contains("working directory"), "{msg}");
         assert!(msg.contains("does not exist"), "{msg}");
+        assert!(!msg.contains("not found on PATH"), "{msg}");
+    }
+
+    #[test]
+    fn spawn_with_cwd_that_is_a_file_says_not_a_directory() {
+        let file = std::env::temp_dir().join(format!(
+            "ikenga-claude-store-cwd-is-file-wp5-{}",
+            std::process::id()
+        ));
+        std::fs::write(&file, b"x").unwrap();
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let msg = super::spawn_error_message("git", "install it", Some(&file), &not_found);
+        let _ = std::fs::remove_file(&file);
+        assert!(msg.contains("is not a directory"), "{msg}");
+        assert!(!msg.contains("does not exist"), "{msg}");
         assert!(!msg.contains("not found on PATH"), "{msg}");
     }
 

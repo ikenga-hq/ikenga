@@ -54,6 +54,8 @@ pub enum SecretsBackend {
     Ready,
     /// Ikenga's own vault (passphrase lock) is locked.
     VaultLocked,
+    /// The vault has no passphrase set up yet, so there is nothing to unlock.
+    VaultNotConfigured,
     /// The platform keychain is there but refused or could not be reached
     /// (locked login keychain, Secret Service not running, ...).
     KeychainUnavailable(String),
@@ -85,6 +87,7 @@ impl SecretsBackend {
             return Self::NoBackend(message);
         }
         match error.kind() {
+            StoreErrorKind::Locked if error.is_not_configured() => Self::VaultNotConfigured,
             StoreErrorKind::Locked => Self::VaultLocked,
             StoreErrorKind::Unavailable => Self::KeychainUnavailable(message),
             StoreErrorKind::Invalid | StoreErrorKind::Unknown => Self::Failed(message),
@@ -223,6 +226,10 @@ fn secrets_check(index: &Result<(), String>, backend: &SecretsBackend) -> System
         SecretsBackend::VaultLocked => warn(
             "Ikenga's secret vault is locked".into(),
             "Unlock the vault with your Ikenga passphrase in Settings › Secrets.",
+        ),
+        SecretsBackend::VaultNotConfigured => warn(
+            "Ikenga's secret vault has no passphrase set up yet".into(),
+            "Set a vault passphrase in Settings › Secrets before saving secrets.",
         ),
         SecretsBackend::KeychainUnavailable(error) => warn(
             format!("Platform keychain is locked or unreachable: {error}"),
@@ -432,6 +439,21 @@ mod tests {
         assert!(vault.message.contains("vault is locked"));
         assert!(vault.fix_hint.as_deref().unwrap().contains("passphrase"));
 
+        // No passphrase yet: don't say "locked" or tell them to unlock.
+        let unset = secrets_check(&index, &SecretsBackend::VaultNotConfigured);
+        assert!(
+            unset.message.contains("no passphrase set up"),
+            "{}",
+            unset.message
+        );
+        assert!(!unset.message.contains("locked"));
+        let unset_hint = unset.fix_hint.as_deref().unwrap();
+        assert!(
+            unset_hint.contains("Set a vault passphrase"),
+            "{unset_hint}"
+        );
+        assert!(!unset_hint.contains("Unlock"));
+
         let none = secrets_check(&index, &SecretsBackend::NoBackend("unsupported".into()));
         assert!(none.message.contains("No platform keychain backend"));
         assert!(!none.fix_hint.as_deref().unwrap().contains("Unlock"));
@@ -460,6 +482,12 @@ mod tests {
             SecretsBackend::from_probe(Err(StoreError::locked())),
             SecretsBackend::VaultLocked
         );
+        assert_eq!(
+            SecretsBackend::from_probe(Err(StoreError::from(
+                crate::secrets::unlock::UnlockError::NotConfigured
+            ))),
+            SecretsBackend::VaultNotConfigured
+        );
         assert!(matches!(
             SecretsBackend::from_probe(Err(StoreError::unavailable(
                 "platform keychain storage is unavailable or locked"
@@ -480,6 +508,17 @@ mod tests {
             SecretsBackend::from_probe(Err(StoreError::uncommitted("read mismatch"))),
             SecretsBackend::Failed(_)
         ));
+    }
+
+    #[test]
+    fn unknown_disk_free_serializes_as_null() {
+        let tmp = std::env::temp_dir().join(format!("ikenga-sysreport-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut report = build_report(tmp.clone(), SecretsBackend::Ready);
+        report.disk_free_gb = None;
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json["disk_free_gb"].is_null(), "{json}");
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]
