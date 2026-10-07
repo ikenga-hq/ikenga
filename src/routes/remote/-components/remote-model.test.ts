@@ -200,3 +200,24 @@ describe('agentCliOf', () => {
 		expect(foregroundRefusal(t, null)).toMatch(/no longer running an agent/);
 	});
 });
+
+describe('sessionRows with no foreground snapshot', () => {
+	it('falls back to the descriptor when the snapshot is null (older daemon)', () => {
+		const rows = sessionRows(
+			[
+				{
+					pty_id: 'p1',
+					label: 'claude · session 1',
+					title: '',
+					argv: ['claude'],
+					status: 'running',
+					foreground_command: { pid: 1, name: 'claude', args: ['claude'] },
+				} as never,
+			],
+			[],
+			null
+		);
+		expect(rows.map((r) => r.label)).toEqual(['claude · session 1']);
+		expect(rows[0].target).not.toBeNull();
+	});
+});

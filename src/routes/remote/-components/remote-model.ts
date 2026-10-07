@@ -145,12 +145,13 @@ export interface SessionRow {
 export function sessionRows(
 	terms: TerminalDescriptor[],
 	runs: ChiCacheRow[],
-	foreground: Record<string, ForegroundProcess> = {}
+	// `null` when an older daemon doesn't serve the snapshot.
+	foreground: Record<string, ForegroundProcess> | null = {}
 ): SessionRow[] {
 	const rows: SessionRow[] = terms
 		.filter((t) => t.status === 'running')
 		.map((t) => {
-			const fg = foreground[t.pty_id] ?? t.foreground_command;
+			const fg = foreground?.[t.pty_id] ?? t.foreground_command;
 			const label = t.label || t.title || t.argv.join(' ') || 'terminal';
 			const agent = agentCliOf(fg);
 			return {
