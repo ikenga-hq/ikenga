@@ -34,8 +34,8 @@
  *
  * `ready` lists every name the daemon publishes for this credential. A name
  * in `withheld` exists but this credential may not read it; a name in
- * neither has no daemon producer (`hooks://event`, `statusline://snapshot`,
- * `runtime://bun`, …) and will never fire in browser mode. Each such name is
+ * neither has no daemon producer (`runtime://bun`,
+ * `pkg-installed`, …) and will never fire in browser mode. Each such name is
  * noted once on the console — a dead subscription should not be mistaken for
  * "nothing happened".
  */

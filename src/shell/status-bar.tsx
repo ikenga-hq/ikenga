@@ -52,7 +52,7 @@ import {
 	useState,
 } from 'react';
 import { cn } from '@/components/ui/utils';
-import { iykeFetch } from '@/lib/iyke/client';
+import { fetchStatuslineSnapshots } from '@/lib/iyke/terminal-hooks';
 import { labelFor } from '@/lib/keymap/registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { usePkgsDerived } from '@/lib/pkgs/use-derived';
@@ -116,9 +116,8 @@ function useStatuslineSnapshots(): Record<string, StatuslineSnapshot> {
 	const [snaps, setSnaps] = useState<Record<string, StatuslineSnapshot>>({});
 	useEffect(() => {
 		let cancelled = false;
-		iykeFetch('/iyke/statusline/snapshot')
-			.then((res) => (res.ok ? res.json() : null))
-			.then((data: Record<string, StatuslineSnapshot> | null) => {
+		fetchStatuslineSnapshots<StatuslineSnapshot>()
+			.then((data) => {
 				if (!cancelled && data && typeof data === 'object') setSnaps(data);
 			})
 			.catch(() => {});

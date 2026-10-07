@@ -34,9 +34,11 @@ import {
 	permissionDecide,
 } from '@/lib/access/client';
 import { iykeFetch } from '@/lib/iyke/client';
+import { decideHookGateRemote } from '@/lib/iyke/terminal-hooks';
 import { asKnownNotificationAction } from '@/lib/notifications/action-kind';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { type NotificationRow, notificationsList } from '@/lib/tauri-cmd';
+import { isRemoteWebSession } from '@/lib/transport';
 import { notificationFix } from '@/lib/wsl-health/copy';
 import { cachedWslHealth } from '@/lib/wsl-health/query';
 import { useWslHealthUi } from '@/lib/wsl-health/store';
@@ -82,6 +84,18 @@ export async function postHookDecision(
 	requestId: string,
 	decision: 'approved' | 'denied'
 ): Promise<string | null> {
+	// A browser has no iyke bridge: a daemon terminal's gate is answered through
+	// the daemon's own arm, which is `approve`-gated (so the routing preference
+	// applies) and single-use.
+	if (isRemoteWebSession()) {
+		try {
+			return (await decideHookGateRemote(requestId, decision)) ? null : ASK_ALREADY_OVER;
+		} catch (e) {
+			const { code, message } = parseAccessError(e);
+			if (code === 'routing_refused') return (await refreshHostDecideBlock()) ?? message;
+			return message || 'The decision was refused';
+		}
+	}
 	let res: Response;
 	try {
 		res = await iykeFetch('/iyke/hooks/decision', {

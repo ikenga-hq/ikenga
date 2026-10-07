@@ -57,6 +57,10 @@ pub mod static_files;
 /// `ikenga-server supervise`: a minimal init that keeps detached runs alive
 /// across server restarts where there is no systemd (containers). Linux-only.
 pub mod supervisor;
+/// Claude terminal hooks + statusline for daemon terminals (gap audit rank
+/// 11): the per-terminal settings file, its authenticated endpoint, and the
+/// permission-gate decision.
+pub mod term_hooks;
 /// Trusted proxy and client IP resolution (IKENGA_TRUSTED_PROXIES).
 pub mod trusted_proxy;
 /// In-app server updates (WP-P9): root's update files, the admin's request.
@@ -272,6 +276,10 @@ pub struct AppState {
     /// `/ws/events` relays it to browsers. One per process — under T1, one
     /// per principal child. Share-mode clones keep the same `Arc`.
     pub(crate) events: Arc<events::EventBus>,
+    /// Daemon terminals' claude hooks and statusline (see `server::term_hooks`).
+    /// One per process — under T1, one per principal child — so a hook secret
+    /// and a parked ask are only ever known to the process that minted them.
+    pub(crate) term_hooks: Arc<term_hooks::TermHooks>,
     /// In-app updates (`server::update`): T0 with a `--data-dir` only. A
     /// principal child never has one (the T1 broker answers those routes).
     pub(crate) update: Option<Arc<update::UpdateCtl>>,
@@ -850,6 +858,7 @@ fn build_router(
         #[cfg(test)]
         UpdateSource::Given(u) => u,
     };
+    let term_hooks = term_hooks::TermHooks::new(config.data_dir.as_deref(), events.clone());
     let state = Arc::new(AppState {
         config,
         spa_service: spa_service.clone(),
@@ -866,6 +875,7 @@ fn build_router(
         secrets,
         chi: chi.unwrap_or_else(|| Arc::new(rpc_local::DaemonChi::host())),
         events,
+        term_hooks,
         update,
         shutdown_tx,
     });
@@ -920,6 +930,10 @@ fn build_router(
         state.clone(),
         auth_middleware,
     ));
+    // A terminal's claude hooks are curl, with neither cookie nor operator
+    // bearer: they authenticate with their own per-terminal secret, so they
+    // sit outside `auth_middleware` (and outside the CORS layer below).
+    let hook_routes = term_hooks::router(state.clone());
 
     // G-ACCESS §1.6: the public pairing endpoints (T0 only — a principal
     // child never pairs; the T1 broker serves its own), behind their own
@@ -938,6 +952,7 @@ fn build_router(
         .layer(cors)
         .with_state(state)
         .merge(public_access)
+        .merge(hook_routes)
         // The access state reaches `auth_middleware`, the RPC pre-hook and
         // the WS handlers through the request extensions (X-2).
         .layer(Extension(access))
@@ -1173,8 +1188,17 @@ async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> an
             push::events::spawn_bridge();
         }
     }
+    // Bound before the router is built so the router's config carries the REAL
+    // port (a principal child asks for 0): the terminals' claude hooks are
+    // curl commands that must be written with the address they will reach
+    // (`server::term_hooks`).
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
     let router = create_router_with_access(
-        config.clone(),
+        ServerConfig {
+            port: bound.port(),
+            ..config.clone()
+        },
         pty_manager.clone(),
         engine_registry,
         pa_db,
@@ -1235,10 +1259,8 @@ async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> an
         info!("token is the configured one; read it from the env file, not from this log");
     }
 
-    // Bound before the discovery files are written, so they carry the real
-    // port (a principal child binds port 0 and reports it this way, P-7).
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let bound = listener.local_addr()?;
+    // `listener` is bound above, so the discovery files carry the real port (a
+    // principal child binds port 0 and reports it this way, P-7).
 
     // Write daemon discovery metadata files. They carry the bearer token, so
     // they are owner-only and the temp copy is per user (`discovery.rs`).

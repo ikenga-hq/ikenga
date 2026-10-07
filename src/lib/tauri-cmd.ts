@@ -65,6 +65,39 @@ export async function ptySpawn(opts: PtySpawnOpts): Promise<string> {
 	return typeof res === 'string' ? res : res.pty_id;
 }
 
+// ── Claude terminal hooks on a daemon (remote-access gap audit rank 11) ──────
+//
+// A browser has no iyke bridge, so a daemon terminal's hooks, statusline and
+// permission gate go through three daemon arms (`server/term_hooks.rs`). They
+// are not Tauri commands: never call them on the desktop, which reaches the
+// same data through the bridge (`lib/iyke/terminal-hooks.ts` picks).
+
+/** Where the daemon keeps per-terminal claude hook settings, or why it can't. */
+export interface TermHooksInfo {
+	/** Directory the per-terminal `claude-hooks-<id>.json` files live in. */
+	settingsDir: string | null;
+	/** Why there is none ("Not available on this server: …"); null when there is. */
+	reason: string | null;
+}
+
+export async function termHooksInfo(): Promise<TermHooksInfo> {
+	return invoke<TermHooksInfo>('term_hooks_info');
+}
+
+/** Every terminal's latest claude statusline snapshot, keyed by terminal id. */
+export async function termHooksStatuslineSnapshot(): Promise<Record<string, unknown>> {
+	return invoke<Record<string, unknown>>('term_hooks_statusline_snapshot');
+}
+
+/** Answer a held `PreToolUse` gate. `gated: false`: nothing was waiting on it
+ *  any more (answered already, or it timed out as a deny). */
+export async function termHooksDecide(
+	requestId: string,
+	decision: 'approved' | 'denied'
+): Promise<{ recorded: boolean; gated: boolean }> {
+	return invoke('term_hooks_decide', { requestId, decision });
+}
+
 export async function ptyWrite(id: string, data: string): Promise<void> {
 	return invoke('pty_write', { id, data });
 }

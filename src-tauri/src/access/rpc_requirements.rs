@@ -40,6 +40,13 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("pty_write", req!(owner[Dispatch])),
     ("pty_resize", req!(owner[Dispatch])),
     ("pty_kill", req!(owner[Dispatch])),
+    // Claude terminal hooks (gap audit rank 11). Owner class: these are about
+    // the caller's own terminals, never a share's. The decision needs
+    // `approve`, so the routing preference (§5.1) withholds it as it does
+    // `permission_decide`.
+    ("term_hooks_info", req!(owner[Sessions])),
+    ("term_hooks_statusline_snapshot", req!(owner[Sessions])),
+    ("term_hooks_decide", req!(owner[Approve])),
     // ── fs read ──
     ("fs_exists", req!(shared[Files])),
     ("fs_read", req!(shared[Files])),

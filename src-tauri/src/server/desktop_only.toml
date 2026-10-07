@@ -140,7 +140,7 @@ reason = "Emits iyke://dom-request to the main Tauri window to introspect a rend
 
 [iyke_endpoint]
 tag = "desktop-only-forever"
-reason = "Returns the desktop-only iyke bridge's own port/token; iyke is not mounted in the daemon, so it has no daemon-side meaning."
+reason = "Returns the desktop-only iyke bridge's own port/token; iyke is not mounted in the daemon, so it has no daemon-side meaning. Never serve it: the token grants the whole bridge. What a browser needed it for (claude hook settings, statusline snapshots, the permission gate) is served by the daemon's own term_hooks_info / term_hooks_statusline_snapshot / term_hooks_decide arms."
 
 [iyke_log_push]
 tag = "desktop-only-forever"

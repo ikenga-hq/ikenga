@@ -40,52 +40,16 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde_json::json;
 
-/// Every hook event the shell's terminal surfaces consume.
-///
-/// `PreToolUse`/`PostToolUse` drive the tool-call feed and the git ledger;
-/// `UserPromptSubmit`/`SessionStart` drive context injection; `PreCompact`
-/// drives the compaction guard; `Notification`/`PermissionRequest` drive the
-/// permission inbox; `SessionEnd` closes the session out.
-///
-/// WP-40: `Stop` and `PostToolUseFailure` resolve the notification row of an
-/// in-terminal `PermissionRequest` (a denied prompt never gets `PostToolUse`;
-/// an approved tool that fails gets `PostToolUseFailure` instead). See
-/// `notifications::producers::{ends_terminal_permissions,
-/// finishes_terminal_tool}` — every event those match must be listed here.
-///
-/// No migration is needed for existing users: the settings file is rewritten
-/// from this list on every terminal spawn (`commands::pty`), so a new event
-/// reaches every terminal opened after upgrade.
-/// How long the backend parks a held `PreToolUse` response waiting for a human
-/// decision (ikenga#154). Must stay strictly below `GATE_CURL_MAX_TIME_SECS`.
-pub const GATE_HOLD_SECS: u64 = 30;
-
-/// `curl --max-time` for the gateable `PreToolUse` hook. Must outlast the hold
-/// so the decision actually reaches Claude Code, and stay below the hook
-/// timeout so curl is not killed mid-read.
-const GATE_CURL_MAX_TIME_SECS: u32 = 35;
-
-/// Explicit Claude Code hook timeout for `PreToolUse`. Claude Code defaults to
-/// 60s; we set it so the whole chain is declared in one place.
-const GATE_HOOK_TIMEOUT_SECS: u32 = 40;
-
-/// `curl --max-time` for every hook that answers immediately.
-const FAST_HOOK_MAX_TIME_SECS: u32 = 2;
-
-const HOOK_EVENTS: &[&str] = &[
-    "PreToolUse",
-    "PostToolUse",
-    "UserPromptSubmit",
-    "SessionStart",
-    "SessionEnd",
-    "PreCompact",
-    "Notification",
-    "PermissionRequest",
-    "Stop",
-    "PostToolUseFailure",
-];
+// The event list, the gate's nested timeouts and the document builder are
+// shared with the daemon's per-terminal endpoint (`server::term_hooks`): one
+// copy in `server::shared::hook_settings`, so the two cannot drift.
+pub use crate::server::shared::hook_settings::GATE_HOLD_SECS;
+use crate::server::shared::hook_settings::{self as shared, Auth, Wiring};
+#[cfg(test)]
+use crate::server::shared::hook_settings::{
+    FAST_HOOK_MAX_TIME_SECS, GATE_CURL_MAX_TIME_SECS, GATE_HOOK_TIMEOUT_SECS, HOOK_EVENTS,
+};
 
 /// `--settings` file name, written next to `control.json`.
 pub const FILE_NAME: &str = "claude-hooks-settings.json";
@@ -99,82 +63,12 @@ pub const FILE_NAME: &str = "claude-hooks-settings.json";
 /// be attributed to the Ikenga terminal that spawned the claude session, even
 /// when several terminals share the same cwd.
 pub fn build_for_terminal(port: u16, token: &str, terminal_id: Option<&str>) -> serde_json::Value {
-    // `-s` keeps curl quiet on success; `--max-time` matters because a hook
-    // that hangs stalls the session, and the shell is a local listener that
-    // either answers immediately or is gone (app quit mid-session).
-    //
-    // The budget is NOT uniform, and the ordering is load-bearing. A held
-    // `PreToolUse` gate (ikenga#154) parks the HTTP response for up to
-    // `GATE_HOLD_SECS` while a human decides in the permission inbox, so the
-    // three timeouts must nest strictly:
-    //
-    //     server hold (30s)  <  curl --max-time (35s)  <  hook timeout (40s)
-    //
-    // If curl gives up first it exits non-zero with empty stdout and Claude
-    // Code proceeds with the tool call — the gate silently does nothing. If
-    // Claude Code's own hook timeout fires first it kills curl, same outcome.
-    // Every other hook keeps the tight 2s budget: they answer immediately, and
-    // a slow one there is a stall with nothing to wait for.
-    let post_with = |path: &str, max_time: u32| {
-        let suffix = terminal_id
-            .map(|t| format!("?terminal={}", t))
-            .unwrap_or_default();
-        format!(
-            "curl -s --max-time {max_time} -X POST -H 'Authorization: Bearer {token}' \
--H 'Content-Type: application/json' --data-binary @- \
-http://127.0.0.1:{port}{path}{suffix}"
-        )
-    };
-    let post = |path: &str| post_with(path, FAST_HOOK_MAX_TIME_SECS);
-
-    let hook_cmd = post("/iyke/hooks/event");
-    let hook_block = json!([{ "type": "command", "command": hook_cmd }]);
-
-    // `PreToolUse` is the only gateable event, so it is the only one that gets
-    // the wide budget plus an explicit `timeout` (Claude Code defaults to 60s,
-    // which would outlive curl and leave the hold un-answered).
-    let gate_block = json!([{
-        "type": "command",
-        "command": post_with("/iyke/hooks/event", GATE_CURL_MAX_TIME_SECS),
-        "timeout": GATE_HOOK_TIMEOUT_SECS,
-    }]);
-
-    let mut hooks = serde_json::Map::new();
-    for event in HOOK_EVENTS {
-        // Claude Code's hook schema takes a matcher list for tool-scoped
-        // events and a bare hook list for the rest. `PreToolUse` /
-        // `PostToolUse` / `PostToolUseFailure` / `PermissionRequest` /
-        // `PreCompact` are the matcher-shaped ones. `PermissionRequest` needs
-        // its matcher or the action runner never sees a native prompt open
-        // (WP-53 N3: a PTY inject's trailing CR would answer it).
-        let value = if matches!(
-            *event,
-            "PreToolUse"
-                | "PostToolUse"
-                | "PostToolUseFailure"
-                | "PermissionRequest"
-                | "PreCompact"
-        ) {
-            let hooks = if *event == "PreToolUse" {
-                &gate_block
-            } else {
-                &hook_block
-            };
-            json!([{ "matcher": "*", "hooks": hooks }])
-        } else {
-            json!([{ "hooks": hook_block }])
-        };
-        hooks.insert((*event).to_string(), value);
-    }
-
-    json!({
-        "statusLine": {
-            "type": "command",
-            "command": post("/iyke/statusline/event"),
-            "padding": 0,
-            "refreshInterval": 300
-        },
-        "hooks": hooks
+    shared::build(&Wiring {
+        base_url: &format!("http://127.0.0.1:{port}"),
+        hook_path: "/iyke/hooks/event",
+        statusline_path: "/iyke/statusline/event",
+        auth: Auth::Bearer(token),
+        terminal_id,
     })
 }
 

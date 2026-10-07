@@ -54,6 +54,10 @@ const VALID_TAGS: &[&str] = &["WP-19", "WP-18b", "WP-20", "desktop-only-forever"
 ///   subscription to manage.
 /// * `server_open_terminals` (WP-P9) — `internal`: the T1 broker asks each
 ///   running child how many terminals an update restart would end.
+/// * `term_hooks_*` (gap audit rank 11) — a daemon terminal's claude hook
+///   settings location, statusline snapshots and permission-gate answer. The
+///   desktop reaches the same data through the iyke bridge, which a browser
+///   has no endpoint for.
 const DAEMON_ONLY_VERBS: &[&str] = &[
     "access_push_config",
     "access_push_list",
@@ -70,6 +74,9 @@ const DAEMON_ONLY_VERBS: &[&str] = &[
     "secrets_default_names",
     "server_open_terminals",
     "share_project_info",
+    "term_hooks_decide",
+    "term_hooks_info",
+    "term_hooks_statusline_snapshot",
 ];
 
 /// `tauri::generate_handler![ … ]` command names, module paths stripped —

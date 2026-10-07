@@ -246,7 +246,7 @@ mod tests {
     fn control_frames_decode_and_ignore_unproduced_names() {
         let mut subs = HashSet::new();
         assert!(handle_control(
-            r#"{"type":"subscribe","events":["settings://changed","hooks://event"]}"#,
+            r#"{"type":"subscribe","events":["settings://changed","runtime://bun"]}"#,
             &mut subs
         )
         .is_none());
