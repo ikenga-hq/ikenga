@@ -684,3 +684,315 @@ async fn an_update_source_announces_to_the_owner() {
         Some("9.9.9")
     );
 }
+
+fn sub_args(n: usize, k: &Ua, kinds: Value) -> Value {
+    json!({
+        "endpoint": format!("https://fcm.googleapis.com/fcm/send/rpc-{n}"),
+        "keys": {"p256dh": B64.encode(&k.public), "auth": B64.encode(k.auth)},
+        "kinds": kinds,
+        "label": format!("sub {n}"),
+    })
+}
+
+/// G-ACCESS §3.10 for push rows (T0, where every paired device shares the
+/// owner's principal): a credential without admin strength sees, changes,
+/// tests and removes only its own subscriptions — another credential's row
+/// reads as absent — while an admin-strength one acts on all of them.
+#[tokio::test]
+async fn a_low_tier_device_cannot_touch_another_credentials_subscription() {
+    use super::rpc::dispatch_with;
+    let store = AccessStore::memory_t0().await;
+    let h = hub(&store, Arc::new(Fake::default()));
+    let reg = Registry::new();
+    let e = env(&store, &reg);
+    let o = store.meta().owner_principal_id.unwrap().to_string();
+    let k = ua();
+    let op = operator_ctx(&store);
+    let (viewer, _) = pair(&store, Tier::View).await;
+    let view = device_ctx(&store, &viewer.device_id, Tier::View);
+    let (dispatcher, _) = pair(&store, Tier::Dispatch).await;
+    let dispatch = device_ctx(&store, &dispatcher.device_id, Tier::Dispatch);
+    let (admin_phone, _) = pair(&store, Tier::Full).await;
+    let full = device_ctx(&store, &admin_phone.device_id, Tier::Full);
+
+    let call = |ctx: &AccessCtx, cmd: &'static str, args: Value| {
+        let (h, e, ctx) = (h.clone(), &e, ctx.clone());
+        async move { dispatch_with(Some(&*h), e, &ctx, cmd, &args).await }
+    };
+    let all = json!(["permission", "pairing", "update", "run_finished"]);
+    let op_sub = call(&op, "access_push_subscribe", sub_args(1, &k, all.clone()))
+        .await
+        .unwrap()["subId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let phone_sub = call(&full, "access_push_subscribe", sub_args(2, &k, all.clone()))
+        .await
+        .unwrap()["subId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let view_sub = call(&view, "access_push_subscribe", sub_args(3, &k, all.clone()))
+        .await
+        .unwrap()["subId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // list: the view device sees its own row only.
+    let ids = |v: Value| -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["subId"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        ids(call(&view, "access_push_list", json!({})).await.unwrap()),
+        vec![view_sub.clone()]
+    );
+    assert!(ids(call(&dispatch, "access_push_list", json!({}))
+        .await
+        .unwrap())
+    .is_empty());
+
+    let before = store::list(h.pool(), &o).await.unwrap();
+    for ctx in [&view, &dispatch] {
+        for target in [&op_sub, &phone_sub] {
+            let err = call(
+                ctx,
+                "access_push_update",
+                json!({"subId": target, "kinds": ["run_finished"]}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code, Code::NotFound, "update {target}");
+            let err = call(ctx, "access_push_test", json!({"subId": target}))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, Code::NotFound, "test {target}");
+            let rm = call(ctx, "access_push_unsubscribe", json!({"subId": target}))
+                .await
+                .unwrap();
+            assert_eq!(rm["removed"], 0, "unsubscribe {target}");
+        }
+        // By endpoint too.
+        let rm = call(
+            ctx,
+            "access_push_unsubscribe",
+            json!({"endpoint": "https://fcm.googleapis.com/fcm/send/rpc-1"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rm["removed"], 0);
+    }
+    // Nothing about the operator's or the admin phone's rows changed.
+    let after = store::list(h.pool(), &o).await.unwrap();
+    for id in [&op_sub, &phone_sub] {
+        let b = before.iter().find(|s| &s.sub_id == id).unwrap();
+        let a = after.iter().find(|s| &s.sub_id == id).unwrap();
+        assert_eq!(a.kinds, b.kinds, "{id}");
+    }
+    assert!(after
+        .iter()
+        .find(|s| s.sub_id == op_sub)
+        .unwrap()
+        .kinds
+        .contains(&PushKind::Permission));
+
+    // The view device still manages its own row.
+    call(
+        &view,
+        "access_push_update",
+        json!({"subId": view_sub, "kinds": ["run_failed"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        call(&view, "access_push_test", json!({"subId": view_sub}))
+            .await
+            .unwrap()["queued"],
+        true
+    );
+
+    // Admin strength (a `full` device) sees and acts on every row.
+    assert_eq!(
+        call(&full, "access_push_list", json!({}))
+            .await
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    call(
+        &full,
+        "access_push_update",
+        json!({"subId": op_sub, "kinds": ["run_finished", "permission"]}),
+    )
+    .await
+    .unwrap();
+    let rm = call(&full, "access_push_unsubscribe", json!({"subId": view_sub}))
+        .await
+        .unwrap();
+    assert_eq!(rm["removed"], 1);
+    assert_eq!(
+        call(&view, "access_push_unsubscribe", json!({"subId": op_sub}))
+            .await
+            .unwrap()["removed"],
+        0
+    );
+    assert_eq!(store::list(h.pool(), &o).await.unwrap().len(), 2);
+}
+
+/// A non-admin credential's subscribes evict only its own rows (capped at
+/// `MAX_PER_CREDENTIAL`), never the admin devices'; once the principal is
+/// full of other credentials' rows its subscribe is refused instead.
+#[tokio::test]
+async fn a_low_tier_device_cannot_evict_other_credentials_rows() {
+    use super::rpc::dispatch_with;
+    let store = AccessStore::memory_t0().await;
+    let h = hub(&store, Arc::new(Fake::default()));
+    let reg = Registry::new();
+    let e = env(&store, &reg);
+    let o = store.meta().owner_principal_id.unwrap().to_string();
+    let host = store.meta().host_device_id.clone();
+    let k = ua();
+    let (viewer, _) = pair(&store, Tier::View).await;
+    let view = device_ctx(&store, &viewer.device_id, Tier::View);
+
+    let mut op = sub(&h, &o, SubVia::Operator, host.as_deref(), 1000, &k);
+    op.label = Some("operator".into());
+    store::upsert(h.pool(), &op).await.unwrap();
+
+    for n in 0..(store::MAX_PER_PRINCIPAL as usize + 5) {
+        dispatch_with(
+            Some(&*h),
+            &e,
+            &view,
+            "access_push_subscribe",
+            &sub_args(n, &k, json!(["run_finished"])),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let rows = store::list(h.pool(), &o).await.unwrap();
+    assert!(rows.iter().any(|r| r.label.as_deref() == Some("operator")));
+    let mine: Vec<_> = rows
+        .iter()
+        .filter(|r| r.device_id.as_deref() == Some(viewer.device_id.as_str()))
+        .collect();
+    assert_eq!(mine.len() as i64, store::MAX_PER_CREDENTIAL);
+    // The newest survive.
+    let last = store::MAX_PER_PRINCIPAL as usize + 4;
+    assert!(mine
+        .iter()
+        .any(|r| r.label.as_deref() == Some(format!("sub {last}").as_str())));
+
+    // A principal full of the operator's rows: the view device can't push
+    // any of them out.
+    sqlx::query("DELETE FROM push_subscriptions")
+        .execute(h.pool())
+        .await
+        .unwrap();
+    for n in 0..store::MAX_PER_PRINCIPAL as usize {
+        store::upsert(
+            h.pool(),
+            &sub(&h, &o, SubVia::Operator, host.as_deref(), 2000 + n, &k),
+        )
+        .await
+        .unwrap();
+    }
+    let err = dispatch_with(
+        Some(&*h),
+        &e,
+        &view,
+        "access_push_subscribe",
+        &sub_args(1, &k, json!(["run_finished"])),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, Code::Conflict);
+    let rows = store::list(h.pool(), &o).await.unwrap();
+    assert_eq!(rows.len() as i64, store::MAX_PER_PRINCIPAL);
+    assert!(rows.iter().all(|r| r.via == SubVia::Operator));
+}
+
+/// Answers 201, except endpoints containing `/slow-`, which hang for
+/// `SLOW` and then fail like an unresolvable host or a timeout.
+struct SlowFor;
+
+const SLOW: Duration = Duration::from_secs(4);
+
+impl PushTransport for SlowFor {
+    fn post<'a>(&'a self, req: &'a PushRequest) -> BoxFuture<'a, Result<PushResponse, String>> {
+        Box::pin(async move {
+            if req.endpoint.contains("/slow-") {
+                tokio::time::sleep(SLOW).await;
+                return Err("dns error".into());
+            }
+            Ok(PushResponse {
+                status: 201,
+                retry_after: None,
+            })
+        })
+    }
+}
+
+/// One principal's failing endpoints can't take over the hub's shared send
+/// pool: while its 20 slow jobs are in flight, another principal's push
+/// still goes out at once.
+#[tokio::test]
+async fn one_principals_failing_endpoints_dont_block_another() {
+    let store = AccessStore::memory_t0().await;
+    let h = PushHub::new(HubConfig {
+        store: store.clone(),
+        vapid: Some(Arc::new(
+            Vapid::generate("mailto:t@example.com".into()).unwrap(),
+        )),
+        disabled_reason: None,
+        policy: EndpointPolicy::default(),
+        transport: Arc::new(SlowFor),
+        backoff: Backoff(vec![Duration::from_secs(1); 3]),
+    });
+    let k = ua();
+    let noisy = PrincipalId::new_v7();
+    let quiet = PrincipalId::new_v7();
+    for n in 0..store::MAX_PER_PRINCIPAL as usize {
+        let mut s = sub(&h, &noisy.to_string(), SubVia::Operator, None, n, &k);
+        s.endpoint = format!("https://fcm.googleapis.com/fcm/send/slow-{n}");
+        store::upsert(h.pool(), &s).await.unwrap();
+    }
+    store::upsert(
+        h.pool(),
+        &sub(&h, &quiet.to_string(), SubVia::Operator, None, 999, &k),
+    )
+    .await
+    .unwrap();
+
+    let busy = {
+        let h = h.clone();
+        tokio::spawn(async move {
+            h.deliver(
+                &PushEvent::new(Some(noisy), PushKind::RunFinished, "run:a"),
+                None,
+            )
+            .await
+        })
+    };
+    // Let the noisy jobs take every permit they can.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let out = tokio::time::timeout(
+        Duration::from_secs(2),
+        h.deliver(
+            &PushEvent::new(Some(quiet), PushKind::RunFinished, "run:b"),
+            None,
+        ),
+    )
+    .await
+    .expect("the quiet principal's push waited behind the noisy one's");
+    assert_eq!(out.len(), 1);
+    assert!(matches!(out[0].1, super::sender::Outcome::Delivered(201)));
+    busy.abort();
+}

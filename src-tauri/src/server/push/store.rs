@@ -16,8 +16,12 @@ use crate::access::routing::Pref;
 use crate::access::store::StoreTier;
 
 /// Per-principal cap; a new subscription past it evicts the least recently
-/// updated one.
+/// updated one — any of the principal's when an admin-strength credential
+/// subscribes, only the subscriber's own otherwise ([`upsert_as`]).
 pub const MAX_PER_PRINCIPAL: i64 = 20;
+/// Per-credential cap for a credential without admin strength (its own
+/// oldest rows are evicted past it).
+pub const MAX_PER_CREDENTIAL: i64 = 5;
 /// A subscription failing this many times with no success in
 /// [`PRUNE_AFTER_MS`] is pruned.
 pub const PRUNE_FAILURES: i64 = 10;
@@ -189,11 +193,44 @@ fn row(r: &sqlx::sqlite::SqliteRow) -> Result<SubRow, sqlx::Error> {
     })
 }
 
-/// Insert, re-subscribe, or move an endpoint to this principal (upsert on
-/// `endpoint`), then hold the per-principal cap. Returns the `sub_id`: the
-/// same one on a re-subscribe by the same principal, a fresh one when the
-/// endpoint changes hands (the previous owner's handle stops working).
+/// What [`upsert_as`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Upserted {
+    Stored(String),
+    /// The principal is at [`MAX_PER_PRINCIPAL`] with other credentials'
+    /// rows a non-admin subscriber may not evict; nothing was written.
+    PrincipalFull,
+}
+
+/// [`upsert_as`] with admin strength (the cap evicts any of the
+/// principal's rows).
 pub async fn upsert(pool: &SqlitePool, new: &NewSub) -> Result<String, sqlx::Error> {
+    match upsert_as(pool, new, true).await? {
+        Upserted::Stored(id) => Ok(id),
+        Upserted::PrincipalFull => unreachable!("an admin upsert always evicts"),
+    }
+}
+
+/// The SQL selecting rows made by the same credential as `new`.
+const SAME_CREDENTIAL: &str = "principal_id = ? AND via = ? \
+     AND coalesce(device_id, '') = coalesce(?, '') \
+     AND coalesce(session_ref, '') = coalesce(?, '')";
+
+/// Insert, re-subscribe, or move an endpoint to this principal (upsert on
+/// `endpoint`), then hold the caps. Returns the `sub_id`: the same one on a
+/// re-subscribe by the same principal, a fresh one when the endpoint changes
+/// hands (the previous owner's handle stops working).
+///
+/// `admin_strength` = the subscribing credential's (G-ACCESS §3.10). With
+/// it, the per-principal cap evicts the principal's least recently updated
+/// rows. Without it, only the credential's own rows are ever evicted: past
+/// [`MAX_PER_CREDENTIAL`], and past [`MAX_PER_PRINCIPAL`] when it has an
+/// older one to give up — else the write is refused ([`Upserted::PrincipalFull`]).
+pub async fn upsert_as(
+    pool: &SqlitePool,
+    new: &NewSub,
+    admin_strength: bool,
+) -> Result<Upserted, sqlx::Error> {
     let mut conn = pool.acquire().await?;
     let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
     let now = now_ms();
@@ -244,19 +281,61 @@ pub async fn upsert(pool: &SqlitePool, new: &NewSub) -> Result<String, sqlx::Err
     .bind(now)
     .execute(&mut *tx)
     .await?;
-    // The cap: drop the least recently updated beyond it.
-    sqlx::query(
-        "DELETE FROM push_subscriptions WHERE principal_id = ? AND sub_id IN ( \
-           SELECT sub_id FROM push_subscriptions WHERE principal_id = ? \
-           ORDER BY updated_at DESC, created_at DESC LIMIT -1 OFFSET ?)",
-    )
+    if admin_strength {
+        // The cap: drop the least recently updated beyond it.
+        sqlx::query(
+            "DELETE FROM push_subscriptions WHERE principal_id = ? AND sub_id IN ( \
+               SELECT sub_id FROM push_subscriptions WHERE principal_id = ? \
+               ORDER BY updated_at DESC, created_at DESC LIMIT -1 OFFSET ?)",
+        )
+        .bind(&new.principal_id)
+        .bind(&new.principal_id)
+        .bind(MAX_PER_PRINCIPAL)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(Upserted::Stored(sub_id));
+    }
+    // Not admin strength: the credential's own rows only.
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM push_subscriptions WHERE principal_id = ?")
+            .bind(&new.principal_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let over_principal = (total - MAX_PER_PRINCIPAL).max(0);
+    let own: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM push_subscriptions WHERE {SAME_CREDENTIAL}"
+    ))
     .bind(&new.principal_id)
-    .bind(&new.principal_id)
-    .bind(MAX_PER_PRINCIPAL)
-    .execute(&mut *tx)
+    .bind(new.via.as_str())
+    .bind(&new.device_id)
+    .bind(&new.session_ref)
+    .fetch_one(&mut *tx)
     .await?;
+    let over_own = (own - MAX_PER_CREDENTIAL).max(0);
+    let evict = over_principal.max(over_own);
+    // Never the row just written.
+    if evict > own - 1 {
+        tx.rollback().await?;
+        return Ok(Upserted::PrincipalFull);
+    }
+    if evict > 0 {
+        sqlx::query(&format!(
+            "DELETE FROM push_subscriptions WHERE sub_id IN ( \
+               SELECT sub_id FROM push_subscriptions WHERE {SAME_CREDENTIAL} AND sub_id != ? \
+               ORDER BY updated_at ASC, created_at ASC LIMIT ?)"
+        ))
+        .bind(&new.principal_id)
+        .bind(new.via.as_str())
+        .bind(&new.device_id)
+        .bind(&new.session_ref)
+        .bind(&sub_id)
+        .bind(evict)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
-    Ok(sub_id)
+    Ok(Upserted::Stored(sub_id))
 }
 
 /// The principal's subscriptions, newest first.

@@ -6,13 +6,20 @@
 //! A subscription binds to the caller's own principal and credential; a
 //! broker → child token (`ChildToken` / `Relayed`) can't subscribe. Nothing
 //! here ever returns `p256dh`, `auth` or a full endpoint.
+//!
+//! **Who may touch a row** (G-ACCESS §3.10, as the device RPCs): an
+//! admin-strength credential (operator, session, a `full` device) acts on
+//! every subscription of its principal; any other credential — under T0
+//! every paired device shares the owner's principal — sees, changes, tests
+//! and removes only the rows it made itself, and its subscribes never evict
+//! another credential's rows ([`store::upsert_as`]).
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde_json::{json, Value};
 
 use super::hub::PushHub;
-use super::store::{self, NewSub, SubVia};
+use super::store::{self, NewSub, SubRow, SubVia, Upserted};
 use super::PushKind;
 use crate::access::ctx::{AccessCtx, Via};
 use crate::access::rpc::Env;
@@ -80,6 +87,51 @@ fn binding(ctx: &AccessCtx) -> Result<Binding, AccessError> {
             "push subscriptions belong to a principal's own credential",
         )),
     }
+}
+
+/// Whether the row was made by the calling credential.
+fn made_by(b: &Binding, row: &SubRow) -> bool {
+    match (b.via, row.via) {
+        (SubVia::Device, SubVia::Device) => b.device_id.is_some() && row.device_id == b.device_id,
+        (SubVia::Session, SubVia::Session) => {
+            let mine = b.session_id.as_deref().map(store::session_ref);
+            mine.is_some() && row.session_ref == mine
+        }
+        (SubVia::Operator, SubVia::Operator) => true,
+        _ => false,
+    }
+}
+
+/// Whether the caller may see or act on `row` (already its principal's):
+/// admin strength, or the credential that made it.
+fn may_touch(ctx: &AccessCtx, b: &Binding, row: &SubRow) -> bool {
+    ctx.admin_strength || made_by(b, row)
+}
+
+/// The principal's rows matching `sub_id` / `endpoint` that the caller may
+/// act on. Another credential's row reads as absent (`not_found`), never as
+/// `forbidden`, so its handle isn't confirmed to a low-tier caller.
+async fn touchable(
+    pool: &sqlx::SqlitePool,
+    ctx: &AccessCtx,
+    b: &Binding,
+    principal: &str,
+    sub_id: Option<&str>,
+    endpoint: Option<&str>,
+) -> Result<Vec<SubRow>, AccessError> {
+    Ok(store::list(pool, principal)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .filter(|s| {
+            sub_id.is_some_and(|id| s.sub_id == id) || endpoint.is_some_and(|e| s.endpoint == e)
+        })
+        .filter(|s| may_touch(ctx, b, s))
+        .collect())
+}
+
+fn no_such() -> AccessError {
+    AccessError::new(Code::NotFound, "no such subscription")
 }
 
 /// The kinds this credential may receive.
@@ -183,11 +235,12 @@ pub async fn dispatch_with(
             // `pushsubscriptionchange` (the service worker): the browser
             // rotated the endpoint; carry the old row's kinds and label over.
             let replaced = match str_arg(args, "replaces") {
-                Some(old) if old != endpoint => store::list(h.pool(), &principal)
-                    .await
-                    .map_err(internal)?
-                    .into_iter()
-                    .find(|s| s.endpoint == old),
+                Some(old) if old != endpoint => {
+                    touchable(h.pool(), ctx, &b, &principal, None, Some(old))
+                        .await?
+                        .into_iter()
+                        .next()
+                }
                 _ => None,
             };
             let kinds = match parse_kinds(args, &allowed)? {
@@ -234,7 +287,18 @@ pub async fn dispatch_with(
                     .as_deref()
                     .map(|u| u.chars().take(USER_AGENT_MAX).collect()),
             };
-            let sub_id = store::upsert(h.pool(), &new).await.map_err(internal)?;
+            let sub_id = match store::upsert_as(h.pool(), &new, ctx.admin_strength)
+                .await
+                .map_err(internal)?
+            {
+                Upserted::Stored(id) => id,
+                Upserted::PrincipalFull => {
+                    return Err(AccessError::new(
+                        Code::Conflict,
+                        "this account has too many push subscriptions; remove one first",
+                    ))
+                }
+            };
             if let Some(old) = replaced {
                 store::delete_own(h.pool(), &new.principal_id, Some(&old.sub_id), None)
                     .await
@@ -247,11 +311,17 @@ pub async fn dispatch_with(
             let sub_id = str_arg(args, "subId").ok_or_else(|| invalid("`subId` is required"))?;
             let kinds = parse_kinds(args, &entitled_kinds(env, ctx))?
                 .ok_or_else(|| invalid("`kinds` is required"))?;
+            if touchable(h.pool(), ctx, &b, &principal, Some(sub_id), None)
+                .await?
+                .is_empty()
+            {
+                return Err(no_such());
+            }
             if !store::set_kinds(h.pool(), &principal, sub_id, &kinds)
                 .await
                 .map_err(internal)?
             {
-                return Err(AccessError::new(Code::NotFound, "no such subscription"));
+                return Err(no_such());
             }
             Ok(json!({ "kinds": kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>() }))
         }
@@ -265,9 +335,12 @@ pub async fn dispatch_with(
             if sub_id.is_none() && endpoint.is_none() {
                 return Err(invalid("`subId` or `endpoint` is required"));
             }
-            let n = store::delete_own(h.pool(), &principal, sub_id, endpoint)
-                .await
-                .map_err(internal)?;
+            let mut n = 0;
+            for row in touchable(h.pool(), ctx, &b, &principal, sub_id, endpoint).await? {
+                n += store::delete_own(h.pool(), &principal, Some(&row.sub_id), None)
+                    .await
+                    .map_err(internal)?;
+            }
             Ok(json!({ "removed": n }))
         }
         "access_push_list" => {
@@ -278,6 +351,7 @@ pub async fn dispatch_with(
             let rows = store::list(h.pool(), &principal).await.map_err(internal)?;
             Ok(Value::Array(
                 rows.iter()
+                    .filter(|s| may_touch(ctx, &b, s))
                     .map(|s| {
                         let this = match s.via {
                             SubVia::Device => b.via == SubVia::Device && s.device_id == b.device_id,
@@ -292,12 +366,11 @@ pub async fn dispatch_with(
         "access_push_test" => {
             let h = hub_on(hub)?;
             let sub_id = str_arg(args, "subId").ok_or_else(|| invalid("`subId` is required"))?;
-            let owned = store::get(h.pool(), sub_id)
-                .await
-                .map_err(internal)?
-                .is_some_and(|s| s.principal_id == principal);
-            if !owned {
-                return Err(AccessError::new(Code::NotFound, "no such subscription"));
+            if touchable(h.pool(), ctx, &b, &principal, Some(sub_id), None)
+                .await?
+                .is_empty()
+            {
+                return Err(no_such());
             }
             if !h.send_test(ctx.principal_id, sub_id) {
                 return Err(AccessError::new(

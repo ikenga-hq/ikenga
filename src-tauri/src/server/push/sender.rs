@@ -10,14 +10,25 @@
 //!
 //! **Statuses.** 201/202 → success; 404/410 → the subscription is gone,
 //! delete it; 429/5xx/timeout → retry (1 s, 5 s, 30 s; `Retry-After`
-//! honoured; never past the TTL); 400/401/403/413 → count a failure. Logs
-//! carry the endpoint **host**, a `sub_id` prefix and the status only.
+//! honoured up to [`MAX_RETRY_WAIT`]; never past the TTL); 400/401/403/413
+//! → count a failure. Logs carry the endpoint **host**, a `sub_id` prefix
+//! and the status only.
+//!
+//! **Concurrency.** [`send_gated`] holds its gates (the hub's per-principal
+//! lane and global pool) for one attempt at a time and releases them
+//! before any backoff wait, so a principal whose endpoints keep failing
+//! can't park the shared pool in its retry sleeps.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
 use url::Url;
+
+/// A `Retry-After` longer than this ends the send (`Failed`) instead of
+/// keeping the job alive for hours.
+pub const MAX_RETRY_WAIT: Duration = Duration::from_secs(120);
 
 /// Push services a browser can hand us (Chrome/Edge-on-Android FCM,
 /// Firefox autopush, Safari/iOS APNs web push, Edge WNS).
@@ -235,10 +246,33 @@ pub async fn send_with_retries(
     req: &PushRequest,
     backoff: &Backoff,
 ) -> Outcome {
+    send_gated(transport, req, backoff, &[]).await
+}
+
+/// [`send_with_retries`], each attempt holding one permit of every gate (in
+/// order) and dropping them before it waits to retry.
+pub async fn send_gated(
+    transport: &dyn PushTransport,
+    req: &PushRequest,
+    backoff: &Backoff,
+    gates: &[&Semaphore],
+) -> Outcome {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(req.ttl as u64);
     let mut attempt = 0usize;
     loop {
-        let (status, retry_after) = match transport.post(req).await {
+        let posted = {
+            let mut permits = Vec::with_capacity(gates.len());
+            for g in gates {
+                match g.acquire().await {
+                    Ok(p) => permits.push(p),
+                    // A closed gate: the hub is going away.
+                    Err(_) => return Outcome::Failed(0),
+                }
+            }
+            transport.post(req).await
+            // `permits` drop here, before any wait below.
+        };
+        let (status, retry_after) = match posted {
             Ok(r) => match r.status {
                 200..=299 => return Outcome::Delivered(r.status),
                 404 | 410 => return Outcome::Gone(r.status),
@@ -251,7 +285,7 @@ pub async fn send_with_retries(
             return Outcome::Failed(status);
         };
         let wait = retry_after.map_or(*delay, |r| r.max(*delay));
-        if tokio::time::Instant::now() + wait >= deadline {
+        if wait > MAX_RETRY_WAIT || tokio::time::Instant::now() + wait >= deadline {
             return Outcome::Failed(status);
         }
         tokio::time::sleep(wait).await;
@@ -362,6 +396,54 @@ mod tests {
             Outcome::Failed(500)
         );
         assert_eq!(*t.1.lock().unwrap(), 4);
+    }
+
+    /// A long `Retry-After` (here 1 h, inside a 7-day TTL) ends the send
+    /// rather than parking it.
+    #[tokio::test]
+    async fn a_long_retry_after_is_not_waited_out() {
+        let fast = Backoff(vec![Duration::ZERO; 3]);
+        let t = Scripted(
+            Mutex::new(vec![Ok(PushResponse {
+                status: 429,
+                retry_after: Some(Duration::from_secs(3600)),
+            })]),
+            Mutex::new(0),
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            send_with_retries(&t, &req(7 * 24 * 3600), &fast).await,
+            Outcome::Failed(429)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(*t.1.lock().unwrap(), 1);
+    }
+
+    /// The gates are held for an attempt, not across the backoff wait.
+    #[tokio::test]
+    async fn gates_are_released_while_waiting_to_retry() {
+        let gate = Semaphore::new(1);
+        let t = Scripted(
+            Mutex::new(vec![Err("connect failed".into()), ok(201)]),
+            Mutex::new(0),
+        );
+        let backoff = Backoff(vec![Duration::from_millis(300)]);
+        let r = req(60);
+        let gates = [&gate];
+        let send = send_gated(&t, &r, &backoff, &gates);
+        tokio::pin!(send);
+        // Drive the first (failed) attempt into its backoff sleep.
+        let probe = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            gate.try_acquire().is_ok()
+        };
+        let free_during_wait = tokio::select! {
+            free = probe => free,
+            _ = &mut send => panic!("finished before the retry"),
+        };
+        assert!(free_during_wait, "the permit was held through the backoff");
+        assert_eq!(send.await, Outcome::Delivered(201));
+        assert_eq!(*t.1.lock().unwrap(), 2);
     }
 
     /// A retry that would land after the TTL isn't made.

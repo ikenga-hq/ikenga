@@ -1,7 +1,8 @@
 //! [`PushHub`]: one per access-store owner (the T0 daemon, the T1 broker).
 //!
 //! [`PushHub::emit`] never blocks: it queues the event (bounded) and a
-//! worker delivers it — at most [`IN_FLIGHT`] sends at once — to every
+//! worker delivers it — at most [`IN_FLIGHT`] send attempts at once, at
+//! most [`PER_PRINCIPAL_IN_FLIGHT`] of them one principal's — to every
 //! subscription of the event's principal that is **entitled right now**
 //! ([`super::store::entitled`]: device unrevoked at its current tier,
 //! routing preference, account enabled and at its session epoch, admin for
@@ -21,8 +22,11 @@ use super::{PushEvent, PushKind, PAYLOAD_LEN};
 use crate::access::store::{AccessStore, StoreTier};
 use crate::executor::PrincipalId;
 
-/// Concurrent sends.
+/// Concurrent send attempts, all principals together.
 pub const IN_FLIGHT: usize = 4;
+/// Concurrent send attempts of one principal, so its jobs (however many,
+/// however slow to fail) never hold more than this much of [`IN_FLIGHT`].
+pub const PER_PRINCIPAL_IN_FLIGHT: usize = 2;
 /// Queued events beyond this are dropped (the notification centre stays the
 /// source of truth).
 pub const QUEUE: usize = 256;
@@ -66,6 +70,7 @@ pub struct PushHub {
     backoff: Backoff,
     tx: mpsc::Sender<(PushEvent, Option<String>)>,
     sends: Arc<Semaphore>,
+    lanes: Mutex<HashMap<PrincipalId, Arc<Semaphore>>>,
     budget: Mutex<HashMap<PrincipalId, VecDeque<Instant>>>,
     tests: Mutex<HashMap<String, Instant>>,
 }
@@ -94,6 +99,7 @@ impl PushHub {
             backoff: cfg.backoff,
             tx,
             sends: Arc::new(Semaphore::new(IN_FLIGHT)),
+            lanes: Mutex::new(HashMap::new()),
             budget: Mutex::new(HashMap::new()),
             tests: Mutex::new(HashMap::new()),
         });
@@ -159,6 +165,17 @@ impl PushHub {
         let ev = PushEvent::new(Some(principal), PushKind::Test, "test");
         let _ = self.tx.try_send((ev, Some(sub_id.to_string())));
         true
+    }
+
+    /// The principal's send lane ([`PER_PRINCIPAL_IN_FLIGHT`]); idle lanes
+    /// are dropped as new ones are taken.
+    fn lane(&self, principal: PrincipalId) -> Arc<Semaphore> {
+        let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        lanes.retain(|_, s| Arc::strong_count(s) > 1);
+        lanes
+            .entry(principal)
+            .or_insert_with(|| Arc::new(Semaphore::new(PER_PRINCIPAL_IN_FLIGHT)))
+            .clone()
     }
 
     /// Spend one unit of the principal's send budget.
@@ -236,6 +253,7 @@ impl PushHub {
             }
         };
         let now_secs = store::now_ms() / 1000;
+        let lane = self.lane(principal);
         let mut jobs = Vec::new();
         for c in targets {
             let sub = c.sub;
@@ -274,10 +292,18 @@ impl PushHub {
                 topic: event.kind.topic(),
                 body,
             };
+            let lane = &lane;
             jobs.push(async move {
-                let _permit = self.sends.clone().acquire_owned().await;
-                let outcome =
-                    sender::send_with_retries(self.transport.as_ref(), &req, &self.backoff).await;
+                // Lane, then pool — per attempt, released before a retry
+                // wait (`send_gated`): one principal's failing endpoints
+                // can't hold the pool every principal shares.
+                let outcome = sender::send_gated(
+                    self.transport.as_ref(),
+                    &req,
+                    &self.backoff,
+                    &[lane.as_ref(), self.sends.as_ref()],
+                )
+                .await;
                 let id = sub.sub_id.clone();
                 let r = match outcome {
                     Outcome::Delivered(s) => store::mark_success(&self.pool, &id, s).await,
