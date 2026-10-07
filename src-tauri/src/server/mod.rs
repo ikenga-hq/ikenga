@@ -52,6 +52,8 @@ pub mod static_files;
 pub mod supervisor;
 /// Trusted proxy and client IP resolution (IKENGA_TRUSTED_PROXIES).
 pub mod trusted_proxy;
+/// In-app server updates (WP-P9): root's update files, the admin's request.
+pub mod update;
 
 /// Tauri-command ↔ daemon-RPC parity ratchet (WP-19). Test-only; reads
 /// `lib.rs` and `rpc.rs` as text so it compiles in both feature sets.
@@ -254,6 +256,9 @@ pub struct AppState {
     /// ever reachable from the process that started it. Share-mode clones of
     /// `AppState` keep the same `Arc`.
     pub(crate) chi: Arc<rpc_local::DaemonChi>,
+    /// In-app updates (`server::update`): T0 with a `--data-dir` only. A
+    /// principal child never has one (the T1 broker answers those routes).
+    pub(crate) update: Option<Arc<update::UpdateCtl>>,
     /// Channel for triggering graceful server shutdown.
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -611,7 +616,41 @@ pub(crate) fn create_router_with_access(
         crate::pkg::skill_actions::store_root(),
         access,
         None,
+        UpdateSource::Default,
     )
+}
+
+/// [`create_router_with_access`] with the update state injected, so tests
+/// point it at a temp dir instead of `/var/lib/ikenga-update`.
+#[cfg(test)]
+pub(crate) fn router_with_update(
+    config: ServerConfig,
+    access: Arc<crate::access::DaemonAccess>,
+    pty_manager: Arc<PtyManager>,
+    update: Option<Arc<update::UpdateCtl>>,
+) -> Router {
+    build_router(
+        config,
+        pty_manager,
+        Arc::new(EngineRegistry::new()),
+        None,
+        None,
+        None,
+        rpc_shell::PathGuard::allowlist(),
+        None,
+        access,
+        None,
+        UpdateSource::Given(update),
+    )
+}
+
+/// Where a router's [`update::UpdateCtl`] comes from.
+enum UpdateSource {
+    /// T0 with a `--data-dir`: root's state dir and `<data>/update-request.json`.
+    Default,
+    /// Tests.
+    #[cfg(test)]
+    Given(Option<Arc<update::UpdateCtl>>),
 }
 
 /// [`router_with_home`] with the path allowlist made explicit too, so tests
@@ -638,6 +677,7 @@ pub(crate) fn router_with(
         crate::pkg::skill_actions::store_root(),
         crate::access::DaemonAccess::unavailable(),
         None,
+        UpdateSource::Default,
     )
 }
 
@@ -665,6 +705,7 @@ pub(crate) fn router_with_store(
         store,
         crate::access::DaemonAccess::unavailable(),
         None,
+        UpdateSource::Default,
     )
 }
 
@@ -688,6 +729,7 @@ pub(crate) fn router_with_chi(
         crate::pkg::skill_actions::store_root(),
         crate::access::DaemonAccess::unavailable(),
         Some(chi),
+        UpdateSource::Default,
     )
 }
 
@@ -703,6 +745,7 @@ fn build_router(
     store: Option<PathBuf>,
     access: Arc<crate::access::DaemonAccess>,
     chi: Option<Arc<rpc_local::DaemonChi>>,
+    update: UpdateSource,
 ) -> Router {
     // Whatever the allowlist covers, no caller path reaches this daemon's own
     // state: its `--data-dir` (fs_roots.json, ikenga.db, supabase.json,
@@ -745,6 +788,17 @@ fn build_router(
         config.data_dir.as_deref(),
         config.executor_tier,
     ));
+    let update = match update {
+        UpdateSource::Default => match (&access.mode, &config.data_dir) {
+            (crate::access::DaemonMode::T0, Some(dir)) => Some(Arc::new(update::UpdateCtl::new(
+                update::state_dir(),
+                dir.join(update::REQUEST_FILE),
+            ))),
+            _ => None,
+        },
+        #[cfg(test)]
+        UpdateSource::Given(u) => u,
+    };
     let state = Arc::new(AppState {
         config,
         spa_service: spa_service.clone(),
@@ -760,6 +814,7 @@ fn build_router(
         store,
         secrets,
         chi: chi.unwrap_or_else(|| Arc::new(rpc_local::DaemonChi::host())),
+        update,
         shutdown_tx,
     });
 
@@ -782,6 +837,9 @@ fn build_router(
             post(rpc::rpc_handler).layer(axum::extract::DefaultBodyLimit::max(RPC_BODY_LIMIT)),
         )
         .route("/api/shutdown", post(shutdown_handler))
+        // In-app updates (WP-P9): operator only (`access::route_requirement`).
+        .route("/api/server/update", get(update::t0_status))
+        .route("/api/server/update/apply", post(update::t0_apply))
         .route("/ws/pty/:id", get(pty_ws::pty_ws_handler))
         .route("/ws/chat/:id", get(chat_ws::chat_ws_handler))
         .route("/ws/fs", get(fs_ws::fs_ws_handler))

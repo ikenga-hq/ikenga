@@ -4,7 +4,7 @@
 // session `checkForUpdate()` always answers null, so the old "Ikenga is up to
 // date. Last checked just now" line was claiming a check that never ran
 // (audit 2026-10-06 rank 17). A browser session says who updates the server
-// instead.
+// instead — and, for an admin who can (WP-P9), where.
 
 import { CheckCircle2, Info } from 'lucide-react';
 
@@ -13,9 +13,13 @@ export function UpdateStatus({
 	available,
 	checking,
 	lastCheckedAt,
+	serverUpdates = false,
 }: {
 	/** True when the in-app updater can run (`isTauri()`). */
 	desktop: boolean;
+	/** Browser only: this viewer may update the server (the Server updates
+	 *  panel is on the page). */
+	serverUpdates?: boolean;
 	available: boolean;
 	checking: boolean;
 	lastCheckedAt: number | null;
@@ -28,8 +32,10 @@ export function UpdateStatus({
 			>
 				<Info className="size-4 shrink-0 text-muted-foreground" />
 				<span className="text-muted-foreground">
-					This browser session can't check for or install Ikenga updates — the in-app updater runs
-					only in the desktop app. The server is updated by whoever runs it.
+					This browser session can't install app updates.{' '}
+					{serverUpdates
+						? 'To update the server itself, see Server updates below.'
+						: 'The server is updated by its administrator.'}
 				</span>
 			</div>
 		);

@@ -8,6 +8,7 @@
 //!                      ├─ /access/pair/*, /access/invite/*    (extension point, R16 §14.1)
 //!                      └─ require_principal ─▶ PrincipalCtx
 //!                          ├─ /auth/{logout,me,password}
+//!                          ├─ /api/server/update{,/apply}   (answered here, admins only; never proxied)
 //!                          ├─ /api/rpc ─ R-3 authorize / access_* ─▶ 127.0.0.1:<port> /api/rpc
 //!                          ├─ /pkgs/*  ──────────────────────────▶ 127.0.0.1:<port> /pkgs/*
 //!                          └─ /ws/*    ─ ws_registry ───────────▶ 127.0.0.1:<port> /ws/*
@@ -103,6 +104,12 @@ pub struct BrokerState {
     pub ws: Arc<WsRegistry>,
     pub http: reqwest::Client,
     pub hooks: BrokerHooks,
+    /// In-app updates (WP-P9; `server::update`). `None` in unit tests that
+    /// don't set it, which answers `unsupported`.
+    pub update: Option<Arc<crate::server::update::UpdateCtl>>,
+    /// The access layer, for the update routes' admin-strength check and
+    /// audit row. `None` in unit tests: then only a password session counts.
+    pub access_t1: Option<Arc<crate::access::t1::T1Access>>,
 }
 
 impl BrokerState {
@@ -124,6 +131,8 @@ impl BrokerState {
             children: Arc::new(Children::new(launcher)),
             ws: WsRegistry::new(),
             http,
+            update: None,
+            access_t1: None,
         })
     }
 }
@@ -183,6 +192,16 @@ pub fn router(
         .route("/auth/logout", post(auth_mod::routes::logout))
         .route("/auth/me", get(auth_mod::routes::me))
         .route("/auth/password", post(auth_mod::routes::change_password))
+        // In-app updates (WP-P9): the broker answers these itself, after a
+        // fresh admin check; they never reach a principal's child.
+        .route(
+            "/api/server/update",
+            get(crate::server::update::broker_status),
+        )
+        .route(
+            "/api/server/update/apply",
+            post(crate::server::update::broker_apply),
+        )
         // `/api/shutdown` and anything else under /api: no such route here,
         // and an unauthenticated caller can't even learn that.
         .route("/api/*rest", any(api_not_found))
@@ -360,6 +379,14 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
     // the two-epoch socket check.
     let installed = crate::access::t1::install(&access_t1, broker_state.ws.clone());
     broker_state.hooks = BrokerHooks::access(&installed);
+    // WP-P9: root's update files, and the request path under operator/
+    // (root 0700: no principal can see or write it).
+    broker_state.update = Some(Arc::new(crate::server::update::UpdateCtl::new(
+        crate::server::update::state_dir(),
+        root.operator_dir()
+            .join(crate::server::update::REQUEST_FILE),
+    )));
+    broker_state.access_t1 = Some(access_t1.clone());
     let state = Arc::new(broker_state);
     if let Some(hub) = push_hub {
         crate::server::push::install_hub(hub);

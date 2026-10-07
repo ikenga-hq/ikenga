@@ -35,8 +35,18 @@ import {
 import { IconButton } from '@/components/ui/icon-button';
 import { useEffectiveModel } from '@/lib/actions/store';
 import { isMac } from '@/lib/platform';
-import { isTauri } from '@/lib/transport';
-import { activateActionId, cascadeKeyLabel, goto, MENU_TREE, resolveMenuTree, type PredefinedKind } from './tree';
+import { toast } from '@/lib/toast';
+import { isBrowserHost, isTauri } from '@/lib/transport';
+import {
+	activateActionId,
+	cascadeKeyLabel,
+	goto,
+	MENU_TREE,
+	type MenuDef,
+	type ResolvedMenuEntry,
+	resolveMenuTree,
+	type PredefinedKind,
+} from './tree';
 
 const EXEC_COMMAND: Partial<Record<PredefinedKind, string>> = {
 	undo: 'undo',
@@ -47,9 +57,61 @@ const EXEC_COMMAND: Partial<Record<PredefinedKind, string>> = {
 	selectAll: 'selectAll',
 };
 
+/** Predefined items that only mean something in a native window. A browser tab
+ *  cannot minimize, maximize or quit itself, so on a browser session these are
+ *  hidden rather than left as items that do nothing. */
+const BROWSER_HIDDEN: ReadonlySet<PredefinedKind> = new Set(['minimize', 'maximize', 'quit']);
+
+/** One menu's leaves with the entries this host cannot honour removed (macOnly
+ *  everywhere; window/app lifecycle in a browser) and any separators they leave
+ *  doubled or dangling collapsed. */
+export function visibleMenuEntries(
+	entries: ResolvedMenuEntry[],
+	opts: { browser: boolean }
+): ResolvedMenuEntry[] {
+	const out: ResolvedMenuEntry[] = [];
+	for (const e of entries) {
+		if (e.kind !== 'separator' && e.source === 'role') {
+			if (e.macOnly) continue;
+			if (opts.browser && BROWSER_HIDDEN.has(e.predefined)) continue;
+		}
+		if (e.kind === 'separator' && (out.length === 0 || out[out.length - 1].kind === 'separator'))
+			continue;
+		out.push(e);
+	}
+	while (out.length > 0 && out[out.length - 1].kind === 'separator') out.pop();
+	return out;
+}
+
+const resolveVisible = (menu: MenuDef) =>
+	visibleMenuEntries(resolveMenuTree(menu), { browser: isBrowserHost() });
+
+/** Browser Fullscreen: the Fullscreen API on the page, toggled. */
+async function toggleBrowserFullscreen(): Promise<void> {
+	try {
+		if (document.fullscreenElement) await document.exitFullscreen();
+		else await document.documentElement.requestFullscreen();
+	} catch {
+		toast({ label: 'Fullscreen is not available in this browser.', variant: 'error' });
+	}
+}
+
 /** Best-effort action for a `predefined` leaf that has no `action` of its
  *  own — see the file header for why each branch is what it is. */
-async function runPredefined(kind: PredefinedKind): Promise<void> {
+export async function runPredefined(kind: PredefinedKind): Promise<void> {
+	if (isBrowserHost()) {
+		if (kind === 'fullscreen') return toggleBrowserFullscreen();
+		if (kind === 'paste') {
+			// `execCommand('paste')` is always refused outside a browser extension,
+			// and reading the clipboard from a menu click prompts or fails; the
+			// keyboard shortcut is the one thing that works.
+			toast({
+				label: `Use ${isMac ? '⌘V' : 'Ctrl+V'} to paste — browsers do not allow pasting from a menu.`,
+				variant: 'info',
+			});
+			return;
+		}
+	}
 	const execCmd = EXEC_COMMAND[kind];
 	if (execCmd) {
 		// Deprecated but still the pragmatic fallback for a custom in-app menu
@@ -117,13 +179,12 @@ export function NativeMenuCascade({ mac }: { mac?: boolean } = {}) {
 						<DropdownMenuSub key={menu.id}>
 							<DropdownMenuSubTrigger>{menu.label}</DropdownMenuSubTrigger>
 							<DropdownMenuSubContent className="w-64">
-								{resolveMenuTree(menu).map((entry, idx) => {
+								{resolveVisible(menu).map((entry, idx) => {
 									if (entry.kind === 'separator') {
 										// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers, stable per menu
 										return <DropdownMenuSeparator key={`sep-${idx}`} />;
 									}
 									if (entry.source === 'role') {
-										if (entry.macOnly) return null;
 										return (
 											<DropdownMenuItem key={entry.id} onSelect={() => void runPredefined(entry.predefined)}>
 												{entry.label}

@@ -232,6 +232,28 @@ impl Children {
         Some(l.endpoint.clone())
     }
 
+    /// The endpoints of the children running right now, without waiting:
+    /// a slot that is busy (a launch in progress) is skipped and makes the
+    /// result `partial`. Never launches anything, unlike
+    /// [`endpoint`](Self::endpoint). For the update routes' terminal count.
+    pub fn running_endpoints(&self) -> (Vec<(PrincipalId, ChildEndpoint)>, bool) {
+        let mut out = Vec::new();
+        let mut partial = false;
+        for (id, slot) in self.all_slots() {
+            match slot.try_lock() {
+                Ok(mut live) => {
+                    if let Some(l) = live.as_mut() {
+                        if !l.process.has_exited() {
+                            out.push((id, l.endpoint.clone()));
+                        }
+                    }
+                }
+                Err(_) => partial = true,
+            }
+        }
+        (out, partial)
+    }
+
     /// Principals with a live (not exited) child.
     pub async fn running(&self) -> Vec<PrincipalId> {
         let mut out = Vec::new();

@@ -3,6 +3,7 @@ import { Package } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import type { NgwaItem } from '@ikenga/contract';
 import { ListRow } from '@/components/ui/list-row';
+import { toast } from '@/lib/toast';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import {
 	pkgKernelStatus,
@@ -20,6 +21,14 @@ import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import type { ExplorerSectionContext } from '../section-registry';
 
 const FALLBACK_QUERY_KEY_PREFIX = 'explorer-ngwa-project-fallback';
+
+/** Disable / Uninstall run an RPC that can be refused (a browser session that
+ *  is not allowed to, a pkg that is busy, a daemon error). Tell the user — a
+ *  swallowed rejection looks like a click that did nothing. */
+export function reportPkgFailure(verb: 'disable' | 'uninstall', id: string, err: unknown): void {
+	const reason = err instanceof Error ? err.message : String(err);
+	toast({ label: `Could not ${verb} ${id}: ${reason}`, variant: 'error' });
+}
 
 /** The kernel pkg rows this section showed before DEC-74, kept as the
  *  loading-state fallback: the shared Ngwa snapshot (`use-ngwa-snapshot.ts`)
@@ -112,9 +121,11 @@ export function NgwaProjectSection({ projectId }: ExplorerSectionContext) {
 						handlers={{
 							'open-detail': () => openDetail(pkg.id),
 							disable: () => {
-								void pkgSetEnabled(pkg.id, false).then(() =>
-									qc.invalidateQueries({ queryKey: [FALLBACK_QUERY_KEY_PREFIX, projectId] })
-								);
+								void pkgSetEnabled(pkg.id, false)
+									.then(() =>
+										qc.invalidateQueries({ queryKey: [FALLBACK_QUERY_KEY_PREFIX, projectId] })
+									)
+									.catch((e) => reportPkgFailure('disable', pkg.id, e));
 							},
 							uninstall: () => {
 								void (async () => {
@@ -125,7 +136,7 @@ export function NgwaProjectSection({ projectId }: ExplorerSectionContext) {
 									if (!ok) return;
 									await pkgUninstall(pkg.id);
 									await qc.invalidateQueries({ queryKey: [FALLBACK_QUERY_KEY_PREFIX, projectId] });
-								})().catch(() => {});
+								})().catch((e) => reportPkgFailure('uninstall', pkg.id, e));
 							},
 						}}
 					>
@@ -180,9 +191,9 @@ export function NgwaProjectSection({ projectId }: ExplorerSectionContext) {
 						handlers={{
 							'open-detail': () => openDetail(item.id),
 							disable: () => {
-								void pkgSetEnabled(item.id, false).then(() =>
-									qc.invalidateQueries({ queryKey: ngwaSnapshotQueryKey })
-								);
+								void pkgSetEnabled(item.id, false)
+									.then(() => qc.invalidateQueries({ queryKey: ngwaSnapshotQueryKey }))
+									.catch((e) => reportPkgFailure('disable', item.id, e));
 							},
 							uninstall: () => {
 								void (async () => {
@@ -193,7 +204,7 @@ export function NgwaProjectSection({ projectId }: ExplorerSectionContext) {
 									if (!ok) return;
 									await pkgUninstall(item.id);
 									await qc.invalidateQueries({ queryKey: ngwaSnapshotQueryKey });
-								})().catch(() => {});
+								})().catch((e) => reportPkgFailure('uninstall', item.id, e));
 							},
 						}}
 					>

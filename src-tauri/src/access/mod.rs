@@ -555,7 +555,12 @@ pub fn authorize(ctx: &AccessCtx, cmd: &str) -> Result<(), AccessError> {
 /// The requirement of a non-RPC protected route (§1.6 "Non-RPC routes");
 /// `None` for `/api/rpc`, which is checked per command.
 pub fn route_requirement(path: &str) -> Option<Requirement> {
-    if path == "/api/shutdown" {
+    // In-app updates (WP-P9) restart the daemon: the same class as
+    // `/api/shutdown`. A paired device of any tier is refused.
+    if matches!(
+        path,
+        "/api/shutdown" | "/api/server/update" | "/api/server/update/apply"
+    ) {
         Some(Requirement::operator())
     } else if path.starts_with("/ws/pty/") {
         Some(Requirement::owner(&[Cap::Sessions]))
@@ -688,6 +693,13 @@ mod tests {
             authorize(&op, "share_project_info").unwrap_err().message,
             "class=internal"
         );
+        // WP-P9: only the broker's own internal call may count terminals.
+        for c in [&op, &device(Tier::Full)] {
+            assert_eq!(
+                authorize(c, "server_open_terminals").unwrap_err().message,
+                "class=internal"
+            );
+        }
 
         let phone = device(Tier::Dispatch);
         assert!(authorize(&phone, "pty_write").is_ok());
@@ -730,6 +742,7 @@ mod tests {
         let plain = child.child_ctx(&broker, RequestMeta::default());
         assert_eq!(plain.via, Via::ChildToken);
         assert!(authorize(&plain, "share_project_info").is_ok());
+        assert!(authorize(&plain, "server_open_terminals").is_ok());
         for name in ["x-ikenga-share-principal", "x-ikenga-share-role"] {
             let mut h = broker.clone();
             h.insert(name, "x".parse().unwrap());
@@ -767,7 +780,11 @@ mod tests {
             }
             let c = child.child_ctx(&h, RequestMeta::default());
             assert_eq!(c.via, Via::Relayed, "{headers:?}");
-            for cmd in ["share_project_info", "notifications_record_access"] {
+            for cmd in [
+                "share_project_info",
+                "notifications_record_access",
+                "server_open_terminals",
+            ] {
                 assert_eq!(
                     authorize(&c, cmd).unwrap_err().message,
                     "class=internal",
@@ -803,10 +820,17 @@ mod tests {
 
     #[test]
     fn route_requirements_cover_the_protected_routes() {
-        assert_eq!(
-            route_requirement("/api/shutdown").unwrap().class,
-            ArmClass::Operator
-        );
+        for p in [
+            "/api/shutdown",
+            "/api/server/update",
+            "/api/server/update/apply",
+        ] {
+            assert_eq!(
+                route_requirement(p).unwrap().class,
+                ArmClass::Operator,
+                "{p}"
+            );
+        }
         assert_eq!(
             route_requirement("/ws/pty/abc").unwrap().caps,
             CapSet::of(&[Cap::Sessions])

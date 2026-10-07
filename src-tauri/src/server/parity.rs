@@ -52,6 +52,8 @@ const VALID_TAGS: &[&str] = &["WP-19", "WP-18b", "WP-20", "desktop-only-forever"
 /// * plans/pwa S2: the six `access_push_*` arms are browser-only; the
 ///   desktop never registers a service worker, so it has no push
 ///   subscription to manage.
+/// * `server_open_terminals` (WP-P9) — `internal`: the T1 broker asks each
+///   running child how many terminals an update restart would end.
 const DAEMON_ONLY_VERBS: &[&str] = &[
     "access_push_config",
     "access_push_list",
@@ -66,6 +68,7 @@ const DAEMON_ONLY_VERBS: &[&str] = &[
     "permission_relay_take",
     "pty_list",
     "secrets_default_names",
+    "server_open_terminals",
     "share_project_info",
 ];
 

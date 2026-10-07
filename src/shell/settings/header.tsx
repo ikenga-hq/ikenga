@@ -24,6 +24,7 @@ import {
 	settingsSection,
 } from '@/shell/settings/nav';
 import { SettingsScopeSwitch } from '@/shell/settings/scope-switch';
+import { copyText } from '@/lib/clipboard';
 
 const PERSONAL_ONLY_FIELD_SET = new Set<string>(PERSONAL_ONLY_FIELDS);
 
@@ -78,11 +79,10 @@ export function SettingsSectionHeader({ sectionId, searchActive }: SettingsSecti
 	);
 
 	async function handleCopy() {
-		try {
-			await navigator.clipboard.writeText(iykeLine);
+		if (await copyText(iykeLine)) {
 			setCopied(true);
 			setTimeout(() => setCopied(false), 1200);
-		} catch {
+		} else {
 			setCopied(false);
 		}
 	}
