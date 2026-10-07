@@ -186,20 +186,28 @@ SECRETS_FILE=/root/provision/secrets.scoped
 
 An account named in the profile that has no Unix user yet is reported as pending and skipped.
 
-### Shared project clones
+### Shared projects: a read-only mirror, one clone per account
 
-One bare clone per project in `PROJECTS_DIR` (default `/srv/ikenga/projects`, `root:ikenga-projects`, mode `2775` setgid, `core.sharedRepository=group`). Every member (`PROJECTS_MEMBERS`, default all managed accounts) gets its own worktree at `~/projects/<project>` on branch `<account>/main` (`PROJECTS_BRANCH_PREFIX` prepends to that), created as that user from `origin/<default branch>`.
+One download per project, everyone on their own branch, and nobody able to affect anyone else:
+
+- **The mirror.** One bare repo per project in `PROJECTS_DIR` (default `/srv/ikenga/projects/<name>.git`). It is `root:root`, directories `0755` and files `0644` (or `0750`/`0640` plus read-only ACLs, below), with no group, no ACL and no file a member can write. Only the provisioner updates it. It is never gc'd or pruned (the clones depend on its objects).
+- **Each account's own clone.** `~/projects/<project>`, created once as that user with `git clone --no-local --reference <mirror> <mirror>` and checked out on `<account>/main` (`PROJECTS_BRANCH_PREFIX` prepends to it) from the mirror's default branch. `origin` is the mirror path and `objects/info/alternates` points at the mirror, so the project is stored once. Its hooks, config, refs and index belong to the account. Account A can neither run code as account B through a git hook or config key, nor rewrite B's branches, nor read B's index. An existing clone is never touched; to refresh it the account runs `git fetch origin` itself, which only reads the mirror.
 
 | Key | Default | |
 |-----|---------|--|
 | `PROJECTS` | none | `name=git-url[#branch]`. No `#branch` = the remote's default branch. A URL with credentials in it is refused. |
-| `PROJECTS_DIR`, `PROJECTS_GROUP`, `PROJECTS_MODE` | `/srv/ikenga/projects`, `ikenga-projects`, `2775` | `2770` hides the clones from accounts that are not members, which you want for private repos. |
-| `PROJECTS_MEMBERS` | all managed accounts | Narrowing it removes the group membership and ACL; the worktree is left where it is (and stops working). |
-| `PROJECTS_TOKEN_SECRET` | none | Name of a secret in `SECRETS_FILE` (scope it `root`): an https deploy token for private repos. It reaches `git` through `GIT_ASKPASS` in that one process's environment. Never in argv, the URL, or the repo config. |
+| `PROJECTS_DIR` | `/srv/ikenga/projects` | |
+| `PROJECTS_READ` | `members` | `members`: the managed accounts get a **read-only** ACL entry on each mirror and nobody else can read it (right for private repos). `world`: any user on the box can read the mirrors. |
+| `PROJECTS_MEMBERS` | all managed accounts | Who gets a clone and (with `PROJECTS_READ=members`) read access. Narrowing it removes the ACL entry; the account's clone is left where it is. |
+| `PROJECTS_TOKEN_SECRET` | none | Name of a secret in `SECRETS_FILE` (scope it `root`): an https deploy token for private repos. |
 
-A clone is only ever fetched into: no reset, no prune, no rewrite, and an existing worktree is never touched. A run with nothing new reports `no changes`. Only the provisioner holds the deploy token, so shared clones refresh when `sync-accounts` runs (from a timer if you want it regular); accounts cannot fetch upstream themselves. `safe.directory` is written to `/etc/gitconfig`, as an `# ikenga:` block listing exactly the shared repos.
+**How the provisioner updates the mirror without trusting anything.** Root's `git fetch` runs with an empty environment (`env -i`), `HOME` in a root-only scratch directory, system and global config disabled, its working directory in that scratch directory, `core.hooksPath=/dev/null`, `core.fsmonitor=false`, no credential helper, no redirects, gc and maintenance off, and `GIT_ALLOW_PROTOCOL` narrowed to the one transport the profile URL uses. It fetches the profile's URL explicitly, so no `remote.*` or `url.*.insteadOf` in the repo is ever consulted, and it rewrites the mirror's `config` to a fixed canonical one on every run, empties `hooks/`, and removes symlinks and `alternates` files. The deploy token reaches `git` through `GIT_ASKPASS` (a script reading a `0600` file in the scratch directory) for http(s) URLs only: never argv, the URL or a repo config. Errors are captured in a variable, not written to a file. Root writes nothing into an account's home or any other directory an account can write. `sync-accounts` converges an older group-writable layout back to this one.
 
-**Why there is an ACL as well as the group.** The daemon starts every account's sessions with **no supplementary groups** (`src-tauri/src/executor/t1.rs`, `verify_dropped()` refuses a spawn that has any). Group membership therefore helps an SSH login but not a terminal or Chi run. Each member also gets a POSIX ACL entry on the folder and the clones, which is matched on the uid and survives the drop. The filesystem under `PROJECTS_DIR` must support ACLs (ext4 and xfs do by default); if `setfacl` fails the run warns and exits non-zero.
+**Why `PROJECTS_READ=members` uses ACLs, not a group.** The daemon starts every account's sessions with **no supplementary groups** (`src-tauri/src/executor/t1.rs`, `verify_dropped()` refuses a spawn that has any), so group membership would help an SSH login but not a terminal or Chi run. A named-user ACL entry is matched on the uid and survives the drop. The entries are read-only (`r-x` on directories, `r--` on files); nothing grants write. The filesystem must support ACLs (ext4 and xfs do by default); if `setfacl` fails the run warns and exits non-zero.
+
+**`safe.directory`.** Git refuses to fetch or clone from a repository owned by another uid. `/etc/gitconfig` (root-only) therefore carries an `# ikenga:` block that lists exactly the mirror paths. It is regenerated from `PROJECTS` on every run, so a project removed from the profile loses its entry (its mirror and the accounts' clones stay on disk). Each change to `/etc/gitconfig` or `/etc/bash.bashrc` leaves a `.bak-<time>` beside it; the last five are kept.
+
+Mirrors refresh only when `sync-accounts` runs (put it on a timer if you want them regular); accounts have no upstream credential. A run with nothing new reports `no changes`.
 
 ### Scoped secrets
 

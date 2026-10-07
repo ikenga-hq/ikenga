@@ -1,9 +1,13 @@
 #!/bin/bash
-# provision.sh sync-accounts: shared project clones (D-B2) and scoped secrets
-# (D-B3), run as root inside an ubuntu:24.04 container
+# provision.sh sync-accounts: shared project mirrors + per-account clones (D-B2)
+# and scoped secrets (D-B3), run as root inside an ubuntu:24.04 container
 # (test-accounts-container.sh). Four accounts (ada, grace = people; rex, ruby =
 # agents) plus one unmanaged ik-eve, a local bare repo as the project, a
-# loopback HTTP server for the private-repo path, and a fake secrets file.
+# loopback HTTP server for the private-repo path, an "attacker" listener that
+# records any request (and any token) sent to it, and a fake secrets file.
+#
+# Every attack below runs as an account via `as`, which is setpriv with
+# --clear-groups: exactly the daemon's sessions (no supplementary groups).
 #
 # Every secret value below starts with FAKE- (or is the one deliberately odd
 # "everyone" value). The suite asserts none of them ever reaches the output.
@@ -111,8 +115,32 @@ HTTPServer(('127.0.0.1', 8099), H).serve_forever()
 PY
 FIXTURE_TOKEN=FAKE-deploy-token-444 python3 "$T/githttp.py" /fixtures/http >/dev/null 2>&1 &
 HTTP_PID=$!
-trap 'kill "$HTTP_PID" 2>/dev/null || true; rm -rf "$T"' EXIT
-for _ in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8099) 2>/dev/null && break; sleep 0.1; done
+# An attacker's listener: records the request line and whether it carried an
+# Authorization header, and answers 401 so a client with a credential sends it.
+cat > "$T/attacker.py" <<'PY'
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+LOG = sys.argv[1]
+class H(BaseHTTPRequestHandler):
+    def go(self):
+        with open(LOG, 'a') as f:
+            f.write('%s %s auth=%s\n' % (self.command, self.path, self.headers.get('Authorization', '-')))
+        self.send_response(401)
+        self.send_header('WWW-Authenticate', 'Basic realm="x"')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+    do_GET = go
+    do_POST = go
+    def log_message(self, *a):
+        pass
+HTTPServer(('127.0.0.1', 8098), H).serve_forever()
+PY
+ATTLOG="$T/attacker.log"; : > "$ATTLOG"
+python3 "$T/attacker.py" "$ATTLOG" >/dev/null 2>&1 &
+ATT_PID=$!
+trap 'kill "$HTTP_PID" "$ATT_PID" 2>/dev/null || true; rm -rf "$T"' EXIT
+for _ in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/8099) 2>/dev/null && (exec 3<>/dev/tcp/127.0.0.1/8098) 2>/dev/null && break; sleep 0.1; done
+: > "$ATTLOG"
 git ls-remote http://127.0.0.1:8099/private.git >/dev/null 2>&1 && fail "fixture: private repo answered without a token"
 pass "fixture: private repo refuses an anonymous clone"
 
@@ -147,12 +175,12 @@ keys_of() { sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$1" | sort | tr '\n'
 
 prov --dry-run
 [[ $RC -eq 0 ]] || fail "dry run exited $RC"
-grep -q 'would: worktree ik-rex:app' "$OUT" || fail "dry run did not plan rex's worktree"
+grep -q 'would: clone ik-rex:app' "$OUT" || fail "dry run did not plan rex's clone"
 grep -q 'would: secrets ik-rex: +AGENT_KEY +REX_ONLY +SHARED_NOTE' "$OUT" || fail "dry run did not plan rex's secrets by name"
-! getent group ikenga-projects >/dev/null || fail "dry run created the group"
+! getent group ikenga-projects >/dev/null || fail "dry run created a group"
 [[ ! -e $PROJ && ! -e $SDIR ]] || fail "dry run created directories"
 grep -q 'FAKE-' "$OUT" && fail "dry run printed a secret value"
-pass "dry run plans group, worktrees and per-account secret names, and changes nothing"
+pass "dry run plans mirrors, per-account clones and secret names, and changes nothing"
 
 # --------------------------------------------- 2. first run (with a sampler)
 
@@ -173,66 +201,82 @@ kill "$SAMPLER" 2>/dev/null || true; wait "$SAMPLER" 2>/dev/null || true
 [[ ! -s "$T/argv-hits" ]] || fail "the deploy token appeared in a process argv"
 pass "first run succeeded; deploy token never appeared in any argv"
 
-# ------------------------------------------------- 3. group, folder, clones
+# ------------------------------------------- 3. the mirrors: root-owned, read-only
 
-getent group ikenga-projects >/dev/null || fail "group missing"
-members=",$(getent group ikenga-projects | cut -d: -f4),"
-for a in ada grace rex ruby; do [[ "$members" == *",ik-$a,"* ]] || fail "ik-$a not in the group"; done
-[[ "$members" != *",ik-eve,"* && "$members" != *",ops,"* ]] || fail "an unmanaged user joined the group"
-[[ "$(stat -c '%U %G %a' $PROJ)" == "root ikenga-projects 2775" ]] || fail "projects dir is $(stat -c '%U %G %a' $PROJ)"
+[[ "$(stat -c '%U %G %a' $PROJ)" == "root root 755" ]] || fail "projects dir is $(stat -c '%U %G %a' $PROJ)"
+! getent group ikenga-projects >/dev/null || fail "a shared group was created (the group-writable model is gone)"
 for p in app private; do
-  [[ -d $PROJ/$p.git ]] || fail "no shared clone $p"
-  [[ "$(git -C $PROJ/$p.git config core.sharedRepository)" =~ ^(1|group|true)$ ]] || fail "$p: core.sharedRepository not group"
-  [[ "$(stat -c %G $PROJ/$p.git)" == ikenga-projects ]] || fail "$p.git is not group-owned"
+  M=$PROJ/$p.git
+  [[ -d $M ]] || fail "no mirror $p"
+  [[ -z "$(find $M \( ! -user root -o ! -group root -o -type l -o -perm /6027 \) -print -quit)" ]] || fail "$p: something in the mirror is not root-owned, or is group/other-writable, setgid or a symlink: $(find $M \( ! -user root -o ! -group root -o -type l -o -perm /6027 \) -print -quit)"
+  ! getfacl -R -cp $M 2>/dev/null | grep -Eq '^(default:)?user:[^:]+:.*w' || fail "$p: a named-user ACL grants write"
+  ! getfacl -R -cp $M 2>/dev/null | grep -q '^default:' || fail "$p: default ACLs present"
+  [[ ! -e $M/hooks ]] || fail "$p: the mirror has a hooks directory"
+  [[ ! -e $M/objects/info/alternates ]] || fail "$p: the mirror has alternates"
+  [[ "$(git config --file $M/config --get-regexp '.' | cut -d' ' -f1 | sort | tr '\n' ' ')" == "core.bare core.filemode core.repositoryformatversion gc.auto ikenga.mirror " ]] \
+    || fail "$p: mirror config has keys beyond the canonical ones: $(git config --file $M/config --list | cut -d= -f1 | tr '\n' ' ')"
+  [[ "$(git config --file $M/config gc.auto)" == 0 ]] || fail "$p: gc.auto is not 0"
+  for a in ada grace rex ruby; do
+    getfacl -cp $M | grep -q "^user:ik-$a:r-x" || fail "$p: ik-$a has no read-only ACL entry"
+  done
+  ! getfacl -cp $M | grep -q '^user:ik-eve' || fail "$p: unmanaged ik-eve has an ACL"
 done
-[[ "$(git -C $PROJ/private.git config remote.origin.url)" == "http://127.0.0.1:8099/private.git" ]] || fail "private remote URL carries something it should not"
-! grep -rqa 'FAKE-deploy-token' $PROJ || fail "the deploy token was written into a shared clone"
+[[ "$(git -C $PROJ/private.git rev-parse refs/heads/main)" == "$(git -C /fixtures/work rev-parse HEAD)" ]] || fail "private mirror did not fetch main"
+[[ "$(git --git-dir $PROJ/app.git symbolic-ref HEAD)" == refs/heads/main ]] || fail "app mirror HEAD is not main"
+! git config --file $PROJ/private.git/config --get-regexp 'remote|url' | grep -q . || fail "the private mirror's config names a remote or url"
+! grep -rqa 'FAKE-deploy-token' $PROJ || fail "the deploy token was written into a mirror"
 ! grep -rqa 'FAKE-deploy-token' /etc/gitconfig 2>/dev/null || fail "the deploy token is in /etc/gitconfig"
 grep -q 'directory = /srv/ikenga/projects/app.git' /etc/gitconfig || fail "safe.directory for app missing"
 ! grep -Eq 'directory *= *\*' /etc/gitconfig || fail "safe.directory is a wildcard"
-pass "group, setgid 2775 folder, bare shared clones (public and token-authenticated), scoped safe.directory"
+# Read access: members only (PROJECTS_READ=members is the default).
+as ada git --git-dir $PROJ/app.git rev-parse refs/heads/main >/dev/null || fail "ada cannot read the mirror with no supplementary groups"
+! as eve cat $PROJ/app.git/HEAD >/dev/null 2>&1 || fail "unmanaged ik-eve can read a members-only mirror"
+! as ops cat $PROJ/app.git/HEAD >/dev/null 2>&1 || fail "an unrelated user can read a members-only mirror"
+pass "root:root 0755 folder, no group; mirrors root-owned, no group/other write, no hooks, canonical config, read-only member ACLs; others cannot read"
 
-# ------------------------------------------------------------- 4. worktrees
+# ----------------------------------------------- 4. each account's own clone
 
+M_APP=$PROJ/app.git
 for a in ada grace rex ruby; do
   u="$(id -u ik-$a)"
   for p in app private; do
     wt="$PRINC/$u/home/projects/$p"
     [[ -f "$wt/README.md" ]] || fail "ik-$a: no checkout of $p"
-    [[ "$(stat -c %u "$wt")" == "$u" ]] || fail "ik-$a: worktree $p is not owned by the account"
+    [[ "$(stat -c %u "$wt")" == "$u" && "$(stat -c %u "$wt/.git")" == "$u" && "$(stat -c %u "$wt/.git/config")" == "$u" ]] || fail "ik-$a: clone $p is not owned by the account"
+    [[ -d "$wt/.git" && ! -f "$wt/.git" ]] || fail "ik-$a:$p is a linked worktree, not a clone"
     [[ "$(as "$a" git -C "$wt" branch --show-current)" == "$a/main" ]] || fail "ik-$a:$p is on '$(as "$a" git -C "$wt" branch --show-current)'"
+    [[ "$(as "$a" git -C "$wt" config remote.origin.url)" == "$PROJ/$p.git" ]] || fail "ik-$a:$p origin is not the mirror"
+    [[ "$(cat "$wt/.git/objects/info/alternates")" == "$PROJ/$p.git/objects" ]] || fail "ik-$a:$p does not borrow the mirror's objects"
+    [[ "$(as "$a" git -C "$wt" count-objects -v | awk '/^(count|in-pack):/{n+=$2} END{print n+0}')" -le 5 ]] || fail "ik-$a:$p stored its own copy of the objects: $(as "$a" git -C "$wt" count-objects -v | tr '\n' ' ')"
   done
 done
-[[ ! -e "$(getent passwd ik-eve | cut -d: -f6)/projects" ]] || fail "unmanaged ik-eve got a worktree"
-pass "each of 4 accounts has its own worktree of both projects on <account>/main; unmanaged ik-eve none"
+[[ ! -e "$(getent passwd ik-eve | cut -d: -f6)/projects" ]] || fail "unmanaged ik-eve got a clone"
+pass "each of 4 accounts has its OWN clone (not a worktree) of both projects on <account>/main, origin = the mirror, objects borrowed (stored once); unmanaged ik-eve none"
 
-# ------------------------------- 5. daemon-style sessions can use the clone
+# ------------------------- 5. daemon-style sessions use their clone and the mirror
 
-# Sessions have no supplementary groups: only the ACL lets them in. Prove
-# every account can commit, and read the others' commits.
 for a in ada grace rex ruby; do
   wt="$PRINC/$(id -u ik-$a)/home/projects/app"
   as "$a" git -C "$wt" -c user.name="$a" -c user.email="$a@example.invalid" commit -q --allow-empty -m "work by $a" \
-    || fail "ik-$a cannot commit through the shared clone with no supplementary groups"
+    || fail "ik-$a cannot commit in its own clone"
 done
 rexwt="$PRINC/$(id -u ik-rex)/home/projects/app"
-as rex git -C "$rexwt" log --oneline -1 ada/main | grep -q 'work by ada' || fail "rex cannot read ada's commit"
-as ada git -C "$PRINC/$(id -u ik-ada)/home/projects/app" log --oneline -1 grace/main | grep -q 'work by grace' || fail "ada cannot read grace's commit"
-as ruby git -C "$PRINC/$(id -u ik-ruby)/home/projects/app" worktree list | grep -q "/rex/\|$(id -u ik-rex)" || fail "ruby cannot list the shared worktrees"
-pass "all accounts commit via the shared clone and read each other's branches (no supplementary groups)"
+adawt="$PRINC/$(id -u ik-ada)/home/projects/app"
+! as rex git -C "$rexwt" rev-parse --verify -q refs/remotes/origin/ada/main >/dev/null && ! as rex git -C "$rexwt" branch -a | grep -q 'ada/main' || fail "rex's clone can see ada's branch (clones are not isolated)"
+as rex git -C "$rexwt" fetch -q origin || fail "rex cannot fetch from the mirror with no supplementary groups"
+pass "all accounts commit in their own clone and fetch from the mirror read-only (no supplementary groups); branches are private to each clone"
 
-# Negative control: the group alone is not enough. Strip the ACLs, show the
-# commit fail, converge, show it work.
-setfacl -R -b $PROJ/app.git
-if as grace git -C "$PRINC/$(id -u ik-grace)/home/projects/app" -c user.name=g -c user.email=g@example.invalid commit -q --allow-empty -m "no acl" 2>/dev/null; then
-  fail "negative control: commit worked without the ACL (the test proves nothing)"
+# Negative control: the mirror is readable through the ACL. Remove one
+# member's entry, show the fetch fail, converge, show it work.
+setfacl -R -x u:ik-grace $M_APP
+if as grace git -C "$PRINC/$(id -u ik-grace)/home/projects/app" fetch -q origin 2>/dev/null; then
+  fail "negative control: fetch worked without the ACL (the test proves nothing)"
 fi
 prov
 [[ $RC -eq 0 ]] || fail "converge after ACL loss exited $RC"
-grep -q 'ACL for ik-grace on /srv/ikenga/projects/app.git' "$OUT" || fail "the ACL was not restored by the run"
-as grace git -C "$PRINC/$(id -u ik-grace)/home/projects/app" -c user.name=g -c user.email=g@example.invalid commit -q --allow-empty -m "acl back" \
-  || fail "commit still fails after the ACL was restored"
-pass "negative control: without ACLs the group alone cannot write (no supplementary groups); a rerun restores them"
+grep -q "mirror $M_APP locked down" "$OUT" || fail "the lost ACL was not repaired by the run"
+as grace git -C "$PRINC/$(id -u ik-grace)/home/projects/app" fetch -q origin || fail "fetch still fails after the ACL was restored"
+pass "negative control: without its read ACL an account cannot read the mirror (no supplementary groups); a rerun restores it"
 
 # ------------------------------------------------------------------ secrets
 
@@ -296,10 +340,182 @@ UPSTREAM="$(git -C /fixtures/work rev-parse HEAD)"
 prov
 [[ $RC -eq 0 ]] || fail "run after an upstream commit exited $RC"
 grep -q 'project app fetched new commits' "$OUT" || fail "new upstream commit not reported"
-[[ "$(git -C $PROJ/app.git rev-parse refs/remotes/origin/main)" == "$UPSTREAM" ]] || fail "shared clone did not fetch"
-[[ "$(as rex git -C $rexwt rev-parse HEAD)" == "$HEAD1" ]] || fail "a fetch moved rex's worktree"
+[[ "$(git -C $PROJ/app.git rev-parse refs/heads/main)" == "$UPSTREAM" ]] || fail "mirror did not fetch"
+[[ "$(as rex git -C $rexwt rev-parse HEAD)" == "$HEAD1" ]] || fail "a fetch moved rex's clone"
+as rex git -C $rexwt fetch -q origin && [[ "$(as rex git -C $rexwt rev-parse refs/remotes/origin/main)" == "$UPSTREAM" ]] || fail "rex cannot pull the new commit from the mirror itself"
 prov; grep -q 'no changes' "$OUT" || fail "second run after the fetch reported changes"
-pass "an upstream commit is fetched into the shared clone only; worktrees stay where they are; next run is clean"
+pass "an upstream commit is fetched into the mirror only; clones stay where they are until the account fetches; next run is clean"
+
+# ---------------------------------------------------------------------------
+# 6. REGRESSION: the five attacks that blocked the group-writable design.
+#    Each runs as an account with no supplementary groups and must now have
+#    no effect. Every refusal is checked for the right reason by also trying
+#    the plain file operation (not only a git command).
+# ---------------------------------------------------------------------------
+
+ADA_U="$(id -u ik-ada)"; REX_U="$(id -u ik-rex)"
+ADA_HOME="$PRINC/$ADA_U/home"; REX_HOME="$PRINC/$REX_U/home"
+echo "precious" > /root/canary; chmod 0600 /root/canary
+root_tmp() { { find /tmp /var/tmp -mindepth 1 -maxdepth 1 -user root 2>/dev/null || true; } | { grep -v "^$T\$" || true; } | sort | tr '\n' ' '; }
+MARK=/tmp/ik-attack-marker
+rm -f $MARK.*
+
+# ---- attack 1: root code exec through the shared repo's config/hooks
+M=$PROJ/app.git
+! as ada sh -c "mkdir $M/hooks" 2>/dev/null || fail "A1: ada created hooks/ in the mirror"
+! as ada sh -c "printf '#!/bin/sh\nid -u > $MARK.hook\n' > $M/hooks/reference-transaction" 2>/dev/null || fail "A1: ada planted a hook in the mirror"
+! as ada sh -c "echo '[remote \"origin\"]' >> $M/config" 2>/dev/null || fail "A1: ada appended to the mirror config"
+! as ada git config --file $M/config remote.origin.uploadpack "sh -c 'id -u > $MARK.uploadpack'" 2>/dev/null || fail "A1: ada set uploadpack in the mirror config"
+! as ada git config --file $M/config core.fsmonitor "id -u > $MARK.fsm" 2>/dev/null || fail "A1: ada set fsmonitor in the mirror config"
+! as ada sh -c "touch $M/planted $M/objects/planted $M/refs/heads/planted" 2>/dev/null || fail "A1: ada wrote a file into the mirror"
+! as ada sh -c "touch $PROJ/planted" 2>/dev/null || fail "A1: ada wrote into the projects folder"
+# Hooks and config planted in the account's OWN clone (she can: it is hers).
+for h in reference-transaction post-checkout post-merge post-commit pre-auto-gc post-rewrite pre-push; do
+  as ada sh -c "printf '#!/bin/sh\nid -u >> $MARK.ownhook\n' > $adawt/.git/hooks/$h && chmod +x $adawt/.git/hooks/$h" || fail "A1: could not plant a hook in ada's own clone (test setup)"
+done
+as ada git -C $adawt config core.fsmonitor "sh -c 'id -u >> $MARK.ownfsm; echo 0'" || true
+as ada git -C $adawt config core.hooksPath "$adawt/.git/hooks"
+as ada git -C $adawt config remote.origin.uploadpack "sh -c 'id -u >> $MARK.ownup'"
+# Control: the planted hook IS live for ada herself.
+as ada git -C $adawt -c user.name=a -c user.email=a@example.invalid commit -q --allow-empty -m "control" 2>/dev/null || true
+[[ -s $MARK.ownhook && "$(sort -u $MARK.ownhook)" == "$ADA_U" ]] || fail "A1 control: the planted hook in ada's own clone does not run for ada (the test proves nothing)"
+rm -f $MARK.*
+echo again >> /fixtures/work/README.md
+git -C /fixtures/work commit -q -am "third" && git -C /fixtures/work push -q /fixtures/app.git main
+UPSTREAM="$(git -C /fixtures/work rev-parse HEAD)"
+prov
+[[ $RC -eq 0 ]] || fail "A1: sync-accounts exited $RC"
+[[ "$(git -C $M rev-parse refs/heads/main)" == "$UPSTREAM" ]] || fail "A1: the mirror did not fetch (the run proves nothing)"
+ls $MARK.* >/dev/null 2>&1 && fail "A1: code planted by ada ran during sync-accounts: $(cat $MARK.* | tr '\n' ' ')"
+[[ ! -e $M/hooks ]] || fail "A1: the mirror has hooks/"
+as ada git -C $adawt config --unset remote.origin.uploadpack     # ada's own booby traps off again,
+as ada git -C $adawt config --unset core.fsmonitor               # so later failures are about permissions
+rm -f $adawt/.git/hooks/{reference-transaction,post-checkout,post-merge,post-commit,pre-auto-gc,post-rewrite,pre-push}
+pass "A1: ada cannot plant a hook or config in the mirror; hooks/config/fsmonitor/uploadpack planted in her OWN clone never run as root during sync-accounts (control: they do run for her)"
+
+# ---- attack 2: deploy token theft through the remote URL
+P=$PROJ/private.git
+! as ada git config --file $P/config remote.origin.url http://127.0.0.1:8098/x.git 2>/dev/null || fail "A2: ada changed the mirror's remote URL"
+! as ada git config --file $P/config 'url.http://127.0.0.1:8098/.insteadOf' http://127.0.0.1:8099/ 2>/dev/null || fail "A2: ada set url.insteadOf in the mirror"
+! as ada git config --file $P/config http.proxy http://127.0.0.1:8098 2>/dev/null || fail "A2: ada set http.proxy in the mirror"
+! as ada sh -c "echo x >> $P/config" 2>/dev/null || fail "A2: ada can write the mirror config"
+# A stale config that DIFFERS from the profile (what the old layout let a
+# member leave behind), planted by root here: the run must ignore every key.
+git config --file $P/config remote.origin.url http://127.0.0.1:8098/steal.git
+git config --file $P/config 'url.http://127.0.0.1:8098/.insteadOf' http://127.0.0.1:8099/
+git config --file $P/config http.proxy http://127.0.0.1:8098
+git config --file $P/config remote.origin.uploadpack "sh -c 'id -u > $MARK.uploadpack'"
+git config --file $P/config core.fsmonitor "sh -c 'id -u > $MARK.fsm; echo 0'"
+git config --file $P/config core.hooksPath "$P/evilhooks"
+git config --file $P/config core.sshCommand "sh -c 'id -u > $MARK.ssh'"
+mkdir -p $P/hooks $P/evilhooks
+for h in reference-transaction post-update; do printf '#!/bin/sh\nid -u > %s.hook\n' "$MARK" > $P/hooks/$h; cp $P/hooks/$h $P/evilhooks/$h; chmod +x $P/hooks/$h $P/evilhooks/$h; done
+git -C /fixtures/work commit -q --allow-empty -m "private moves" && git -C /fixtures/work push -q /fixtures/http/private.git main
+UPSTREAM2="$(git -C /fixtures/work rev-parse HEAD)"
+: > "$ATTLOG"; rm -f $MARK.*
+prov
+[[ $RC -eq 0 ]] || fail "A2: sync-accounts exited $RC"
+[[ "$(git -C $P rev-parse refs/heads/main)" == "$UPSTREAM2" ]] || fail "A2: root's fetch did not use the profile URL (private mirror did not advance)"
+[[ ! -s "$ATTLOG" ]] || fail "A2: the attacker's listener received a request: $(cut -c1-60 "$ATTLOG" | head -3)"
+! grep -q 'FAKE-deploy-token\|Basic' "$ATTLOG" || fail "A2: the deploy token reached the attacker"
+ls $MARK.* >/dev/null 2>&1 && fail "A2: planted stale config/hooks ran as root: $(cat $MARK.* | tr '\n' ' ')"
+[[ -z "$(git config --file $P/config --get-regexp 'remote|url|http|core.fsmonitor|core.hookspath|core.sshcommand')" ]] || fail "A2: the stale config keys survived"
+[[ ! -e $P/hooks && ! -e $P/evilhooks/x ]] || fail "A2: planted hooks/ survived"
+grep -q 'config reset to the canonical one' "$OUT" || fail "A2: the run did not report resetting the stale config"
+pass "A2: nobody can change the mirror's URL/insteadOf/proxy; with a stale differing config planted (as the old layout allowed), root's fetch used the profile URL, the attacker's listener got nothing, no token left the box, the config was reset"
+
+# ---- attack 3: root writes through a member's symlink
+M=$PROJ/app.git
+! as ada ln -s /root/canary $M/.fetch.err 2>/dev/null || fail "A3: ada made a symlink in the mirror"
+! as ada ln -s /root/canary $PROJ/.fetch.err 2>/dev/null || fail "A3: ada made a symlink in the projects folder"
+! as ada ln -s /root/canary "$PROJ/.new-app.AAAAAA" 2>/dev/null || fail "A3: ada made a symlink named like the provisioner's temp dir"
+# A legacy layout (symlink + alternates + loose perms), planted by root.
+ln -s /root/canary $M/.fetch.err
+mkdir -p $M/objects/info; echo /tmp/evil-objects > $M/objects/info/alternates
+chmod -R g+w $M; chmod g+s $M
+# And every directory ada CAN write: her home, ~/projects, her clone.
+as ada ln -s /root/canary "$ADA_HOME/.fetch.err"
+as ada ln -s /root/canary "$ADA_HOME/projects/.fetch.err"
+as ada ln -s /root/canary "$ADA_HOME/projects/app.git"
+as ada ln -s /root/canary "$ADA_HOME/projects/app.fetch.err"
+as ada ln -s /root/canary "$adawt/.fetch.err"
+BEFORE_TMP="$(root_tmp)"
+echo yet-again >> /fixtures/work/README.md
+git -C /fixtures/work commit -q -am "fourth" && git -C /fixtures/work push -q /fixtures/app.git main
+prov
+[[ $RC -eq 0 ]] || fail "A3: sync-accounts exited $RC"
+[[ "$(cat /root/canary)" == precious ]] || fail "A3: root's file was truncated or changed through a symlink"
+[[ -z "$(find "$PRINC"/*/home -user root -print -quit)" ]] || fail "A3: root wrote into a member-owned directory: $(find "$PRINC"/*/home -user root | head -3)"
+[[ "$(root_tmp)" == "$BEFORE_TMP" ]] || fail "A3: the run left root-owned files in /tmp: $(root_tmp)"
+[[ ! -e $M/.fetch.err && ! -L $M/.fetch.err ]] || fail "A3: the planted symlink was left in the mirror"
+[[ ! -e $M/objects/info/alternates ]] || fail "A3: the planted alternates survived"
+[[ -z "$(find $M \( ! -user root -o -type l -o -perm /6027 \) -print -quit)" ]] || fail "A3: the legacy loose perms were not repaired: $(find $M \( ! -user root -o -type l -o -perm /6027 \) -exec stat -c '%n %U %a' {} + | head -3)"
+pass "A3: no member can create a symlink where root writes; with symlinks in every dir a member CAN write plus a legacy layout planted, the root-only canary is untouched, root wrote nothing into any account's home or /tmp, and the legacy layout was repaired"
+
+# ---- attack 4: account A runs code as / changes account B
+! as ada sh -c "ls $REX_HOME" >/dev/null 2>&1 || fail "A4: ada can list rex's home"
+! as ada sh -c "echo '[core]' >> $rexwt/.git/config" 2>/dev/null || fail "A4: ada wrote rex's clone config"
+! as ada sh -c "printf '#!/bin/sh\nid -u > $MARK.crosshook\n' > $rexwt/.git/hooks/post-commit" 2>/dev/null || fail "A4: ada planted a hook in rex's clone"
+! as ada git -C $rexwt config core.fsmonitor "id -u > $MARK.crossfsm" 2>/dev/null || fail "A4: ada set fsmonitor in rex's clone"
+! as ada cat $rexwt/.git/index >/dev/null 2>&1 || fail "A4: ada read rex's index"
+# Ada's hooks/config are ada's alone: rex's commit in rex's own clone, and a
+# commit/checkout/status in the mirror's neighbourhood, never run them.
+as ada sh -c "printf '#!/bin/sh\nid -u >> $MARK.crosshook\n' > $adawt/.git/hooks/post-commit && chmod +x $adawt/.git/hooks/post-commit"
+as ada git -C $adawt config core.fsmonitor "sh -c 'id -u >> $MARK.crossfsm; echo 0'"
+as rex git -C $rexwt -c user.name=r -c user.email=r@example.invalid commit -q --allow-empty -m "rex after ada's hooks" || fail "A4: rex's commit failed"
+as rex git -C $rexwt status --short >/dev/null || fail "A4: rex's status failed"
+as rex git -C $rexwt fetch -q origin
+ls $MARK.crosshook $MARK.crossfsm >/dev/null 2>&1 && fail "A4: ada's hook/fsmonitor ran for rex: $(cat $MARK.cross* | tr '\n' ' ')"
+# Control: they do run for ada.
+as ada git -C $adawt -c user.name=a -c user.email=a@example.invalid commit -q --allow-empty -m "ada commits"
+[[ -s $MARK.crosshook && "$(sort -u $MARK.crosshook)" == "$ADA_U" ]] || fail "A4 control: ada's own hook did not run for ada"
+rm -f $MARK.*
+[[ "$(stat -c %a "$REX_HOME")" == 700 ]] || fail "A4: rex's home is not 0700"
+pass "A4: ada cannot read or write rex's clone (hooks, config, index); a hook and fsmonitor in ada's clone run for ada only, never for rex (control: they do run for ada)"
+
+# ---- attack 5: rewrite refs, delete refs, corrupt objects, read other clones
+M=$PROJ/app.git
+MAIN_BEFORE="$(git -C $M rev-parse refs/heads/main)"; REFS_BEFORE="$(git -C $M for-each-ref | sha256sum)"
+OBJ_BEFORE="$(find $M/objects -type f | sort | sha256sum)"
+EVIL="$(git -C $M rev-parse refs/heads/main~1)"
+! as ada sh -c "echo $EVIL > $M/refs/heads/main" 2>/dev/null || fail "A5: ada wrote a ref file in the mirror"
+! as ada git --git-dir $M update-ref refs/heads/rex/main "$EVIL" 2>/dev/null || fail "A5: ada created refs/heads/rex/main in the mirror"
+! as ada git --git-dir $M update-ref -d refs/heads/main 2>/dev/null || fail "A5: ada deleted a shared ref"
+! as ada git --git-dir $M update-ref refs/heads/main "$EVIL" 2>/dev/null || fail "A5: ada rewrote the shared main"
+! as ada sh -c "echo junk | git --git-dir $M hash-object -w --stdin" >/dev/null 2>&1 || fail "A5: ada wrote an object into the mirror"
+! as ada sh -c "touch $M/objects/aa; mkdir $M/objects/ab; rm -rf $M/objects/pack" 2>/dev/null || fail "A5: ada altered the mirror's object store"
+! as ada git -C $adawt push -q origin HEAD:refs/heads/evil 2>/dev/null || fail "A5: ada pushed to the mirror"
+! as ada git -C $adawt push -q origin --delete main 2>/dev/null || fail "A5: ada deleted main through the mirror"
+! as ada git -C $rexwt update-ref refs/heads/rex/main "$EVIL" 2>/dev/null || fail "A5: ada rewrote rex's branch in rex's clone"
+! as ada git -C $rexwt update-ref -d refs/heads/rex/main 2>/dev/null || fail "A5: ada deleted rex's branch"
+! as ada sh -c "ls $rexwt/.git/objects" >/dev/null 2>&1 || fail "A5: ada listed rex's object store"
+[[ "$(git -C $M rev-parse refs/heads/main)" == "$MAIN_BEFORE" && "$(git -C $M for-each-ref | sha256sum)" == "$REFS_BEFORE" ]] || fail "A5: the mirror's refs changed"
+[[ "$(find $M/objects -type f | sort | sha256sum)" == "$OBJ_BEFORE" ]] || fail "A5: the mirror's object store changed"
+git -C $M fsck --no-dangling >/dev/null 2>&1 || fail "A5: the mirror no longer passes fsck"
+[[ "$(as rex git -C $rexwt rev-parse refs/heads/rex/main)" == "$(as rex git -C $rexwt rev-parse HEAD)" ]] || fail "A5: rex's branch moved"
+prov; [[ $RC -eq 0 ]] || fail "A5: run after the attacks exited $RC"
+pass "A5: ada cannot update, create or delete refs, write or corrupt objects, or push to the mirror or into rex's clone, nor list rex's objects; refs, objects and fsck are unchanged"
+
+# --- the mirror is still usable by everyone after all of that
+for a in ada grace rex ruby; do as "$a" git -C "$PRINC/$(id -u ik-$a)/home/projects/app" fetch -q origin || fail "ik-$a can no longer fetch from the mirror"; done
+rm -f /root/canary
+pass "after the five attacks every account still fetches from the mirror"
+
+# --------------------------------------------- read access: world vs members
+
+sed -i '/^PROJECTS_READ=/d' "$PROFILE"; echo 'PROJECTS_READ=world' >> "$PROFILE"
+prov
+[[ $RC -eq 0 ]] || fail "PROJECTS_READ=world run exited $RC"
+as eve git --git-dir $PROJ/app.git rev-parse refs/heads/main >/dev/null || fail "world mode: unmanaged ik-eve cannot read the mirror"
+[[ -z "$(getfacl -cp $PROJ/app.git | grep '^user:ik-')" ]] || fail "world mode left per-member ACL entries"
+[[ -z "$(find $PROJ/app.git \( ! -user root -o -perm /6022 -o ! -perm -004 \) -print -quit)" ]] || fail "world mode: modes are wrong"
+! as eve sh -c "touch $PROJ/app.git/x" 2>/dev/null || fail "world mode: other can write"
+sed -i '/^PROJECTS_READ=/d' "$PROFILE"
+prov
+[[ $RC -eq 0 ]] || fail "back to members run exited $RC"
+! as eve cat $PROJ/app.git/HEAD >/dev/null 2>&1 || fail "members mode did not close the mirror to ik-eve again"
+as ada git --git-dir $PROJ/app.git rev-parse refs/heads/main >/dev/null || fail "members mode: ada lost access"
+pass "PROJECTS_READ=world opens the mirrors read-only to every user and drops the ACLs; switching back to members closes them again"
 
 # ----------------------------------------------- scope narrowing, rotation
 
@@ -375,15 +591,29 @@ sed -i 's/^ACCOUNTS=.*/ACCOUNTS=()/' "$PROFILE"           # discover ik-* users 
 prov --dry-run
 [[ $RC -eq 0 ]] || fail "discovery dry run exited $RC"
 grep -q 'managed accounts: .*eve' "$OUT" || fail "auto-discovery did not find ik-eve"
-grep -q 'would: worktree ik-eve:app' "$OUT" || fail "discovered eve was not planned a worktree"
+grep -q 'would: clone ik-eve:app' "$OUT" || fail "discovered eve was not planned a clone"
 sed -i -e 's/^ACCOUNTS=.*/ACCOUNTS=(ada grace rex)/' -e 's/^AGENT_ACCOUNTS=.*/AGENT_ACCOUNTS=(rex)/' "$PROFILE"   # ruby leaves
 sed -i '/RUBY_ONLY/d' "$SECRETS"
 prov
 [[ $RC -eq 0 ]] || fail "removal run exited $RC"
-[[ "$(getent group ikenga-projects | cut -d: -f4)" != *ik-ruby* ]] || fail "ruby is still in the group"
 [[ ! -e $SDIR/ik-ruby.env ]] || fail "ruby's secrets file survived her removal from the profile"
-! getfacl -cp $PROJ/app.git | grep -q 'user:ik-ruby' || fail "ruby's ACL survived"
-[[ -d "$PRINC/$(id -u ik-ruby)/home/projects/app" ]] || fail "ruby's worktree was deleted (it must be left alone)"
-pass "dropping an account from the profile removes its group membership, ACL and secrets file; its worktree is left alone"
+! getfacl -R -cp $PROJ/app.git | grep -q 'user:ik-ruby' || fail "ruby's ACL survived"
+! as ruby cat $PROJ/app.git/HEAD >/dev/null 2>&1 || fail "ruby can still read the members-only mirror"
+[[ -d "$PRINC/$(id -u ik-ruby)/home/projects/app/.git" ]] || fail "ruby's clone was deleted (it must be left alone)"
+pass "dropping an account from the profile removes its read ACL and secrets file; its own clone is left alone"
+
+# A project removed from the profile loses its safe.directory entry; the
+# mirror and the clones stay on disk. Change a managed block repeatedly: only
+# the last five backups of /etc/gitconfig are kept.
+for i in 1 2 3 4 5 6 7 8; do : > /etc/gitconfig.bak-2020010100000$i; done
+sed -i 's/^PROJECTS=.*/PROJECTS=("app=file:\/\/\/fixtures\/app.git")/' "$PROFILE"
+prov
+[[ $RC -eq 0 ]] || fail "project removal run exited $RC"
+! grep -q 'private.git' /etc/gitconfig || fail "a removed project's safe.directory entry survived"
+grep -q 'app.git' /etc/gitconfig || fail "the remaining project's safe.directory entry vanished"
+[[ -d $PROJ/private.git && -d "$PRINC/$(id -u ik-ada)/home/projects/private/.git" ]] || fail "removing a project deleted data"
+[[ "$(ls /etc/gitconfig.bak-* | wc -l)" -le 5 ]] || fail "gitconfig backups were not pruned: $(ls /etc/gitconfig.bak-* | wc -l)"
+ls /etc/gitconfig.bak-2020* >/dev/null 2>&1 && [[ ! -e /etc/gitconfig.bak-20200101000001 ]] || fail "the oldest backups were kept instead of the newest"
+pass "a removed project loses its safe.directory entry (data stays); /etc/gitconfig backups are pruned to the last five"
 
 echo "==> [Container] ALL ACCOUNT TESTS PASSED"

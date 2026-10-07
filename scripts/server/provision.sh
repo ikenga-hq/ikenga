@@ -93,7 +93,7 @@ while [[ $# -gt 0 ]]; do
         printf '  check-update          read the release manifest and write %s/available.json (installs nothing)\n' "$STATE_DIR"
         printf '  apply-request         claim and apply an admin update request (run by ikenga-update.service)\n'
         printf '  install-update-units  install %s and the update timer, path and service units\n' "$STABLE_COPY"
-        printf '  sync-accounts         converge shared project clones, per-account worktrees and scoped secrets\n'
+        printf '  sync-accounts         converge shared project mirrors, per-account clones and scoped secrets\n'
         printf '                        (run it after creating or removing accounts; the full provision run does it too)\n'
         exit 0
       fi
@@ -167,11 +167,10 @@ ACCOUNTS=()            # login names (unix user = ik-<name>); empty = every ik-*
 AGENT_ACCOUNTS=()      # the accounts a secret scoped `agents` goes to (also managed)
 UID_RANGE="20000-29999"
 PROJECTS_DIR="/srv/ikenga/projects"
-PROJECTS_GROUP="ikenga-projects"
-PROJECTS_MODE="2775"
+PROJECTS_READ="members"     # who can read the root-owned mirrors: members (read-only ACLs) | world
 PROJECTS_MEMBERS=()    # empty = every managed account
 PROJECTS=()            # name=git-url[#branch]
-PROJECTS_BRANCH_PREFIX=""   # worktree branch = <prefix><account>/main
+PROJECTS_BRANCH_PREFIX=""   # each account's branch = <prefix><account>/main
 PROJECTS_TOKEN_SECRET=""    # NAME of a SECRETS_FILE entry: https deploy token for private repos
 SECRETS_FILE=""             # root-only scoped secrets (format in README)
 
@@ -1637,19 +1636,21 @@ ProtectHome=read-only
 # created by `ikenga-server accounts create`, never by this script. Two things
 # are shared between them and converged here (founder decisions D-B2, D-B3):
 #
-#   * ONE clone per project in PROJECTS_DIR (a bare repo, group-owned); every
-#     account works in its OWN git worktree on its OWN branch.
+#   * ONE download per project: a root-owned, read-only bare mirror in
+#     PROJECTS_DIR. Every account has its OWN clone of it (objects shared
+#     through git alternates), on its OWN branch. Nobody but root can write
+#     the mirror, and no account can touch another's clone, hooks or config.
 #   * Scoped secrets: one root-only SECRETS_FILE, each secret tagged for
 #     `everyone`, `agents`, or named accounts; each account gets only its own.
 #
 # A daemon session runs as the account's uid with NO supplementary groups
 # (src-tauri/src/executor/t1.rs:3-4 and verify_dropped(), which fails the spawn
-# if getgroups() is non-empty). So a group alone would give SSH logins access
-# to the shared clone but not the terminals and Chi runs the daemon starts.
-# Each member therefore also gets a POSIX ACL entry (matched on the uid, which
-# survives the group drop), and every command run on an account's behalf below
-# is run with `setpriv --clear-groups` so it sees exactly what the daemon's
-# sessions see.
+# if getgroups() is non-empty). So a group cannot grant a terminal or Chi run
+# anything. Read access to a non-world-readable mirror is therefore a READ-ONLY
+# POSIX ACL entry per member (matched on the uid, which survives the group
+# drop). There is no group and no ACL that grants write anywhere. Every command
+# run on an account's behalf below goes through `setpriv --clear-groups`, so it
+# sees exactly what the daemon's sessions see.
 #
 # The summary lists secret NAMES only. Values live in shell variables and are
 # written with the printf builtin: never argv, never the log, never `eval`.
@@ -1660,6 +1661,7 @@ SECRETS_LOADER="/etc/profile.d/ikenga-secrets.sh"
 GITCONFIG_SYSTEM="/etc/gitconfig"
 BASH_BASHRC="/etc/bash.bashrc"
 FAILED=0
+GIT_HOME=""; ASKPASS_FILE=""; MIRROR_UMASK=077     # git_root's scratch dir, askpass, umask (see sync_projects)
 soft_fail() { printf 'warning: %s\n' "$*" >&2; FAILED=1; }
 
 declare -A ACCT_UID=() ACCT_GID=() ACCT_HOME=()
@@ -1686,8 +1688,7 @@ validate_accounts_profile() {
   done
   [[ "$UID_RANGE" =~ ^[0-9]+-[0-9]+$ ]] || die "UID_RANGE must look like 20000-29999 (got '$UID_RANGE')"
   [[ "$PROJECTS_DIR" =~ ^/[A-Za-z0-9._/-]*[A-Za-z0-9._-]$ && "$PROJECTS_DIR" != *..* ]] || die "PROJECTS_DIR must be an absolute path without spaces or '..' (got '$PROJECTS_DIR')"
-  [[ "$PROJECTS_GROUP" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "PROJECTS_GROUP '$PROJECTS_GROUP' is not a valid group name"
-  [[ "$PROJECTS_MODE" =~ ^2[0-7]{3}$ ]] || die "PROJECTS_MODE must be a setgid mode such as 2775 or 2770 (got '$PROJECTS_MODE')"
+  [[ "$PROJECTS_READ" == members || "$PROJECTS_READ" == world ]] || die "PROJECTS_READ must be 'members' or 'world' (got '$PROJECTS_READ')"
   [[ "$PROJECTS_BRANCH_PREFIX" =~ ^[A-Za-z0-9._/-]*$ ]] || die "PROJECTS_BRANCH_PREFIX has characters git branch names should not"
   local seen=" "
   for e in "${PROJECTS[@]}"; do
@@ -1696,8 +1697,14 @@ validate_accounts_profile() {
     [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && "$name" != *.git ]] || die "PROJECTS name '$name' is not a plain directory name"
     [[ "$seen" != *" $name "* ]] || die "PROJECTS names '$name' twice"
     seen+="$name "
-    # A credential in the URL would be written into the repo's config and show
-    # in argv. Private repos use PROJECTS_TOKEN_SECRET instead.
+    # The URL becomes git's argument: no option look-alikes, and only the
+    # transports git_root knows how to restrict. A credential in it would show
+    # in argv; private repos use PROJECTS_TOKEN_SECRET instead.
+    [[ "${rest%%#*}" =~ ^(https?://|ssh://|file://|/|[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:) ]] \
+      || die "PROJECTS '$name': the URL must be https://, http://, ssh://, file://, an absolute path, or user@host:path"
+    if [[ "$rest" == *"#"* ]]; then
+      [[ "${rest#*#}" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die "PROJECTS '$name': the #branch '${rest#*#}' is not a plain branch name"
+    fi
     if [[ "${rest%%#*}" =~ ^https?://[^/]*@ ]]; then
       die "PROJECTS '$name': the URL carries credentials; remove them and set PROJECTS_TOKEN_SECRET (a secret in SECRETS_FILE)"
     fi
@@ -1760,8 +1767,8 @@ as_account() {
 
 # managed_block <file> <tag> <top|bottom> <content>
 # Keeps one `# ikenga: <tag> begin|end` block in <file>; empty content removes
-# it. Returns 0 when it changed the file, 1 when nothing differed. The first
-# change to an existing file leaves a .bak-<time> beside it.
+# it. Returns 0 when it changed the file, 1 when nothing differed. Every change
+# to an existing file leaves a .bak-<time> beside it; the last five are kept.
 managed_block() {
   local f="$1" tag="$2" pos="$3" content="$4"
   local b="# ikenga: $tag begin" e="# ikenga: $tag end" have=0 cur=""
@@ -1781,6 +1788,8 @@ managed_block() {
   } > "$tmp"
   if [[ -f "$f" ]]; then
     cp -a "$f" "$f.bak-$(date +%Y%m%d-%H%M%S)"
+    # Keep the last five backups (their names sort by time).
+    find "$(dirname -- "$f")" -maxdepth 1 -name "$(basename -- "$f").bak-*" | sort | head -n -5 | xargs -r rm -f --
     cat "$tmp" > "$f"                      # keeps the file's owner and mode
   else
     install -m 0644 -o root -g root "$tmp" "$f"
@@ -1789,92 +1798,138 @@ managed_block() {
   return 0
 }
 
-# ---- shared project clones (D-B2)
+# ---- shared project mirrors (D-B2)
+#
+# One read-only bare MIRROR per project, owned by root, that nobody but root
+# can write: no group write, no ACL write, nothing a member could plant in it
+# (config, hooks/, refs, objects). Each account has its OWN ordinary clone at
+# ~/projects/<name>, made as that user with `git clone --reference <mirror>`
+# (objects/info/alternates -> the mirror), origin = the mirror path. Its hooks,
+# config, refs and index are its own, so one account can never run code as, or
+# change the work of, another. Mirrors are never gc'd or pruned: the accounts'
+# alternates depend on their objects staying put.
+#
+# Root's own git never trusts a repo's config or a member's environment: see
+# git_root. Nothing root writes lands in a member-writable directory.
 
-# git against a remote, with the deploy token (if any) delivered through
-# GIT_ASKPASS: the token is in the environment of this one git process only.
-# It is never in argv, the repo config or the URL.
-git_net() {
+# git_root <url|none> <git args...>: git run as root with nothing inherited.
+#  - env -i, HOME in a root-only scratch dir, system + global config off, cwd
+#    in that scratch dir (never a directory a member can write);
+#  - hooks, fsmonitor, credential helpers, redirects, gc and maintenance off;
+#  - only the protocol the profile's URL uses is allowed;
+#  - the deploy token, for an http(s) URL only, reaches git through GIT_ASKPASS
+#    (an askpass script reading a 0600 file in the scratch dir): never argv,
+#    never a repo config.
+git_root() {
   local url="$1"; shift
-  if [[ -n "${PROJ_TOKEN:-}" && "$url" =~ ^https?:// ]]; then
-    ( umask 0002; export GIT_ASKPASS="$ASKPASS_FILE" GIT_TERMINAL_PROMPT=0 IKENGA_GIT_TOKEN="$PROJ_TOKEN"; git -c credential.helper= "$@" )
-  else
-    ( umask 0002; export GIT_TERMINAL_PROMPT=0; git "$@" )
+  local proto=none
+  case "$url" in
+    https://*) proto=https ;;
+    http://*) proto=http ;;
+    ssh://*|[A-Za-z0-9._-]*@*:*) proto=ssh ;;
+    file://*|/*) proto=file ;;
+  esac
+  local -a e=(PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 HOME="$GIT_HOME"
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
+    GIT_ALLOW_PROTOCOL="$proto" GIT_SSH_COMMAND="ssh -o BatchMode=yes")
+  if [[ -n "$ASKPASS_FILE" && ( "$proto" == https || "$proto" == http ) ]]; then
+    e+=(GIT_ASKPASS="$ASKPASS_FILE" IKENGA_TOKEN_FILE="$GIT_HOME/token")
   fi
+  ( umask "$MIRROR_UMASK"; cd "$GIT_HOME" && exec env -i "${e[@]}" git \
+      -c core.hooksPath=/dev/null -c core.fsmonitor=false -c credential.helper= \
+      -c http.followRedirects=false -c gc.auto=0 -c maintenance.auto=false "$@" )
 }
 
-# ACL entries survive the supplementary-group drop; see the header comment.
-acl_has() { getfacl -cp -- "$1" 2>/dev/null | grep -q "^${3:+default:}user:$2:rwx"; }
+# Named-user ACL entries (on the directory itself) as "ik-ada ik-grace".
 acl_users() { getfacl -cp -- "$1" 2>/dev/null | sed -n 's/^user:\(ik-[^:]*\):.*/\1/p'; }
+acl_has_r() { getfacl -cp -- "$1" 2>/dev/null | grep -q "^user:$2:r-x"; }
 
-sync_acls() {
-  local path="$1" recursive="$2" a u want="" have
-  for a in "${MEMBERS[@]}"; do has_account "$a" && want+=" ik-$a"; done
-  for u in $want; do
-    if ! acl_has "$path" "$u" || ! acl_has "$path" "$u" default; then
-      if [[ $DRY_RUN -eq 1 ]]; then changed "ACL for $u on $path"
-      elif setfacl ${recursive:+-R} -m "u:$u:rwX,d:u:$u:rwX" -- "$path"; then changed "ACL for $u on $path"
-      else soft_fail "setfacl failed on $path: this filesystem may not support ACLs, so daemon sessions (no supplementary groups) cannot write the shared clones"; return 0
-      fi
+# Make a mirror (or PROJECTS_DIR) exactly: root-owned, nobody can write,
+# nothing setuid/setgid, no symlinks, no hooks, no foreign alternates. Read
+# access: world (PROJECTS_READ=world) or per-member READ-ONLY ACL entries
+# (PROJECTS_READ=members; matched on the uid, so they hold for daemon sessions
+# that run with no supplementary groups). Reports a change only when it
+# actually had to repair something (and not at all with a second argument).
+lock_mirror() {
+  local repo="$1" quiet="${2:-}" a u want="" fixed=0 bad
+  # Debris an older (group-writable) layout, or a member, could have left.
+  if [[ -e "$repo/hooks" || -e "$repo/worktrees" || -e "$repo/.fetch.err" \
+        || -e "$repo/objects/info/alternates" || -e "$repo/objects/info/http-alternates" ]]; then
+    fixed=1
+    [[ $DRY_RUN -eq 1 ]] || rm -rf -- "$repo/hooks" "$repo/worktrees" "$repo/.fetch.err" \
+      "$repo/objects/info/alternates" "$repo/objects/info/http-alternates"
+  fi
+  if [[ "$PROJECTS_READ" == world ]]; then
+    bad="$(find "$repo" \( ! -user root -o ! -group root -o -type l -o -perm /6022 -o ! -perm -004 -o \( -type d ! -perm -005 \) \) -print -quit 2>/dev/null)"
+  else
+    bad="$(find "$repo" \( ! -user root -o ! -group root -o -type l -o -perm /6027 -o \( -type d ! -perm -050 \) \) -print -quit 2>/dev/null)"
+  fi
+  [[ -z "$bad" ]] || fixed=1
+  if [[ $DRY_RUN -eq 0 ]]; then
+    find "$repo" -type l -delete
+    chown -R root:root -- "$repo"
+    if [[ "$PROJECTS_READ" == world ]]; then chmod -R u=rwX,go=rX,u-s,g-s -- "$repo"
+    else chmod -R u=rwX,g=rX,o=,u-s,g-s -- "$repo"; fi
+  fi
+  if [[ "$PROJECTS_READ" == world ]]; then
+    if [[ -n "$(acl_users "$repo")" ]]; then
+      fixed=1; [[ $DRY_RUN -eq 1 ]] || setfacl -R -b -- "$repo"
     fi
-  done
-  have="$(acl_users "$path")"
-  for u in $have; do
-    [[ " $want " == *" $u "* ]] && continue
-    if [[ $DRY_RUN -eq 1 ]]; then changed "ACL for $u removed from $path"
-    else setfacl ${recursive:+-R} -x "u:$u,d:u:$u" -- "$path" && changed "ACL for $u removed from $path"
-    fi
-  done
+  else
+    for a in "${MEMBERS[@]}"; do has_account "$a" && want+=" ik-$a"; done
+    for u in $want; do
+      acl_has_r "$repo" "$u" || fixed=1
+      [[ $DRY_RUN -eq 1 ]] || setfacl -R -m "u:$u:rX" -- "$repo" \
+        || soft_fail "setfacl failed on $repo: this filesystem may not support ACLs, so daemon sessions (no supplementary groups) cannot read the mirror"
+    done
+    for u in $(acl_users "$repo"); do
+      [[ " $want " == *" $u "* ]] && continue
+      fixed=1; [[ $DRY_RUN -eq 1 ]] || setfacl -R -x "u:$u" -- "$repo"
+    done
+  fi
+  [[ $fixed -eq 0 || -n "$quiet" ]] || changed "mirror $repo locked down (root-owned, read-only for everyone else)"
 }
 
-sync_group() {
-  local g="$PROJECTS_GROUP" members a u cur
-  if ! getent group "$g" >/dev/null; then
-    run groupadd --system "$g"; changed "group $g created"
+# The only config a mirror ever has, written by root. Anything else in an
+# existing mirror's config (a legacy shared-group setting, a remote, a planted
+# key) is replaced.
+write_mirror_config() {
+  local repo="$1" tmp="$GIT_HOME/mirror.config"
+  printf '%s\n' '[core]' '	repositoryformatversion = 0' '	filemode = true' '	bare = true' \
+    '[gc]' '	auto = 0' '[ikenga]' '	mirror = true' > "$tmp"
+  if ! cmp -s "$tmp" "$repo/config" 2>/dev/null; then
+    [[ $DRY_RUN -eq 1 ]] || install -m 0644 -o root -g root "$tmp" "$repo/config"
+    return 0
   fi
-  cur=",$(getent group "$g" | cut -d: -f4 || true),"
-  for a in "${MEMBERS[@]}"; do
-    has_account "$a" || continue
-    [[ "$cur" == *",ik-$a,"* ]] && continue
-    run usermod -aG "$g" "ik-$a"; changed "ik-$a added to group $g"
-  done
-  # Only ik-* members are ours to remove; the admin user and anyone added by
-  # hand stay.
-  members="$(getent group "$g" | cut -d: -f4 || true)"
-  for u in ${members//,/ }; do
-    [[ "$u" == ik-* ]] || continue
-    for a in "${MEMBERS[@]}"; do [[ "$u" == "ik-$a" ]] && continue 2; done
-    run gpasswd -d "$u" "$g" >/dev/null; changed "$u removed from group $g"
-  done
+  return 1
 }
 
 sync_projects() {
-  log "Shared project clones ($PROJECTS_DIR, group $PROJECTS_GROUP)"
+  log "Shared project mirrors ($PROJECTS_DIR, read: $PROJECTS_READ)"
   apt_install git acl
-  sync_group
+  case "$PROJECTS_READ" in world) MIRROR_UMASK=022 ;; *) MIRROR_UMASK=077 ;; esac
 
   local parent; parent="$(dirname "$PROJECTS_DIR")"
   if [[ ! -d "$PROJECTS_DIR" ]]; then
-    if [[ $DRY_RUN -eq 1 ]]; then note "[dry-run] create $PROJECTS_DIR (root:$PROJECTS_GROUP $PROJECTS_MODE)"
-    else
+    if [[ $DRY_RUN -eq 0 ]]; then
       [[ -d "$parent" ]] || install -d -m 0755 -o root -g root "$parent"
-      install -d -m "$PROJECTS_MODE" -o root -g "$PROJECTS_GROUP" "$PROJECTS_DIR"
+      install -d -m 0755 -o root -g root "$PROJECTS_DIR"
     fi
-    changed "$PROJECTS_DIR created (root:$PROJECTS_GROUP $PROJECTS_MODE)"
+    changed "$PROJECTS_DIR created (root:root 0755: nobody else can add or change a mirror)"
   else
     local o g m; read -r o g m < <(stat -c '%U %G %a' -- "$PROJECTS_DIR")
-    if [[ "$o" != root || "$g" != "$PROJECTS_GROUP" ]]; then
-      run chown "root:$PROJECTS_GROUP" "$PROJECTS_DIR"; changed "$PROJECTS_DIR owner -> root:$PROJECTS_GROUP"
+    if [[ "$o" != root || "$g" != root || "$m" != 755 ]] || getfacl -cp -- "$PROJECTS_DIR" 2>/dev/null | grep -q '^\(default:\)\?user:[^:]'; then
+      if [[ $DRY_RUN -eq 0 ]]; then
+        chown root:root "$PROJECTS_DIR"; chmod 0755 "$PROJECTS_DIR"; setfacl -b -- "$PROJECTS_DIR"
+      fi
+      changed "$PROJECTS_DIR reset to root:root 0755 (was $o:$g $m)"
     fi
-    if [[ "$m" != "$PROJECTS_MODE" ]]; then
-      run chmod "$PROJECTS_MODE" "$PROJECTS_DIR"; changed "$PROJECTS_DIR mode $m -> $PROJECTS_MODE"
-    fi
+    [[ $DRY_RUN -eq 1 ]] || rm -rf -- "$PROJECTS_DIR"/.new-*      # an interrupted earlier run
   fi
-  [[ $DRY_RUN -eq 1 && ! -d "$PROJECTS_DIR" ]] || sync_acls "$PROJECTS_DIR" ""
 
-  # safe.directory for exactly the shared repos (the account's git refuses a
-  # repo owned by another uid otherwise). Not '*', and not a wildcard: git
-  # before 2.46 only understands a lone '*'.
+  # safe.directory for exactly the mirrors: git refuses to fetch or clone from
+  # a repo owned by another uid otherwise. Not '*', and not a wildcard: git
+  # before 2.46 only understands a lone '*'. (/etc/gitconfig is root-only.)
   local e name block=""
   for e in "${PROJECTS[@]}"; do
     name="${e%%=*}"
@@ -1883,11 +1938,14 @@ sync_projects() {
 "
   done
   if managed_block "$GITCONFIG_SYSTEM" "projects safe.directory" bottom "${block%$'\n'}"; then
-    changed "safe.directory for the shared clones in $GITCONFIG_SYSTEM"
+    changed "safe.directory for the shared mirrors in $GITCONFIG_SYSTEM"
   fi
 
-  # Private repos: https token from SECRETS_FILE through GIT_ASKPASS.
-  PROJ_TOKEN=""; ASKPASS_FILE=""; ASKPASS_DIR=""
+  # Root-only scratch dir: git's HOME and cwd, and the deploy token's askpass.
+  ASKPASS_FILE=""
+  GIT_HOME="$(mktemp -d)"; chmod 0700 "$GIT_HOME"
+  trap 'rm -rf -- "${GIT_HOME:-/nonexistent}"' EXIT
+  local PROJ_TOKEN=""
   if [[ -n "$PROJECTS_TOKEN_SECRET" ]]; then
     [[ "${ROOT_COUNT[$PROJECTS_TOKEN_SECRET]:-0}" -eq 1 ]] \
       || { [[ $SECRETS_UNREADABLE -eq 1 ]] || die "PROJECTS_TOKEN_SECRET '$PROJECTS_TOKEN_SECRET' must appear exactly once in SECRETS_FILE (found ${ROOT_COUNT[$PROJECTS_TOKEN_SECRET]:-0})"; }
@@ -1896,93 +1954,119 @@ sync_projects() {
       note "WARNING: $PROJECTS_TOKEN_SECRET is the deploy token and is scoped '${ROOT_SCOPE[$PROJECTS_TOKEN_SECRET]}', so those accounts get it too. Scope it 'root' to keep it provisioner-only."
     fi
     if [[ -n "$PROJ_TOKEN" && $DRY_RUN -eq 0 ]]; then
-      ASKPASS_DIR="$(mktemp -d)"
-      ASKPASS_FILE="$ASKPASS_DIR/askpass"
-      printf '%s\n' '#!/bin/sh' 'case "$1" in *sername*) echo x-access-token ;; *) printf "%s\n" "$IKENGA_GIT_TOKEN" ;; esac' > "$ASKPASS_FILE"
-      chmod 0700 "$ASKPASS_FILE"
+      ( umask 077
+        printf '%s\n' "$PROJ_TOKEN" > "$GIT_HOME/token"
+        printf '%s\n' '#!/bin/sh' 'case "$1" in *sername*) echo x-access-token ;; *) cat "$IKENGA_TOKEN_FILE" ;; esac' > "$GIT_HOME/askpass"
+        chmod 0700 "$GIT_HOME/askpass" )
+      ASKPASS_FILE="$GIT_HOME/askpass"
     fi
   fi
+  PROJ_TOKEN=""
 
-  for e in "${PROJECTS[@]}"; do ensure_clone "${e%%=*}" "${e#*=}"; done
-  [[ -z "$ASKPASS_DIR" ]] || { rm -rf -- "$ASKPASS_DIR"; ASKPASS_FILE=""; PROJ_TOKEN=""; }
+  for e in "${PROJECTS[@]}"; do ensure_mirror "${e%%=*}" "${e#*=}"; done
   local a
-  # A member added after a clone exists gets its ACL on the clone here; a new
-  # clone inherited the directory's defaults already, so this is then a no-op.
-  for e in "${PROJECTS[@]}"; do [[ -d "$PROJECTS_DIR/${e%%=*}.git" ]] && sync_acls "$PROJECTS_DIR/${e%%=*}.git" recursive; done
   for a in "${MEMBERS[@]}"; do
     has_account "$a" || continue
-    for e in "${PROJECTS[@]}"; do ensure_worktree "$a" "${e%%=*}"; done
+    for e in "${PROJECTS[@]}"; do ensure_account_clone "$a" "${e%%=*}"; done
   done
+  rm -rf -- "$GIT_HOME"; GIT_HOME=""; ASKPASS_FILE=""
 }
 
-ensure_clone() {
-  local name="$1" spec="$2" url branch repo before after def
+ensure_mirror() {
+  local name="$1" spec="$2" url branch repo work before after def cur first out rc=0 new=0
   url="${spec%%#*}"; branch=""; [[ "$spec" == *"#"* ]] && branch="${spec#*#}"
   repo="$PROJECTS_DIR/$name.git"
-
   if [[ ! -d "$repo" ]]; then
-    if [[ $DRY_RUN -eq 1 ]]; then changed "project $name cloned from $url"; return; fi
-    ( umask 0002; git init --bare --shared=group -q "$repo" ) || { soft_fail "project $name: git init failed"; return; }
-    git -C "$repo" remote add origin "$url"
-    git -C "$repo" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
-    if ! git_net "$url" -C "$repo" fetch --quiet origin 2>"$repo/.fetch.err"; then
-      soft_fail "project $name: cannot fetch $url: $(tr '\n' ' ' < "$repo/.fetch.err" | cut -c1-200)"
-      rm -rf -- "$repo"; return
+    if [[ $DRY_RUN -eq 1 ]]; then changed "project $name mirrored from $url"; return; fi
+    new=1
+    work="$(mktemp -d "$PROJECTS_DIR/.new-$name.XXXXXX")"
+    git_root none init --bare -q --template= -- "$work" || { soft_fail "project $name: git init failed"; rm -rf -- "$work"; return; }
+    write_mirror_config "$work" || true
+  else
+    work="$repo"
+    if [[ $DRY_RUN -eq 1 ]]; then
+      write_mirror_config "$work" && changed "mirror $name: config reset to the canonical one"
+      lock_mirror "$repo"
+      note "[dry-run] fetch $name from $url"; return
     fi
-    rm -f "$repo/.fetch.err"
-    def="$branch"
-    if [[ -z "$def" ]]; then
-      def="$(git_net "$url" ls-remote --symref "$url" HEAD 2>/dev/null | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}')"
+    write_mirror_config "$work" && changed "mirror $name: config reset to the canonical one"
+    lock_mirror "$repo"
+  fi
+
+  # The fetch URL is the PROFILE's. The mirror's own config names no remote
+  # and is not consulted; the refspecs make it an exact copy of the remote's
+  # branches and tags. --prune drops refs only; no object is ever deleted.
+  digest() { git_root none --git-dir "$work" for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags | sha256sum; }
+  before="$(digest)"
+  out="$(git_root "$url" --git-dir "$work" fetch --quiet --prune --no-write-fetch-head -- "$url" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*' 2>&1)" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    if [[ $new -eq 1 ]]; then
+      soft_fail "project $name: cannot fetch $url: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"
+      rm -rf -- "$work"; return
     fi
-    [[ -n "$def" ]] || def="$(git -C "$repo" for-each-ref --format='%(refname:strip=3)' refs/remotes/origin | head -1)"
-    if [[ -n "$def" ]]; then
-      git -C "$repo" config ikenga.defaultBranch "$def"
-      git -C "$repo" symbolic-ref HEAD "refs/heads/$def"
+    soft_fail "project $name: fetch from $url failed (mirror left as it was): $(tr '\n' ' ' <<<"$out" | cut -c1-200)"
+  fi
+  after="$(digest)"
+
+  # Default branch: the profile's #branch, else keep the mirror's HEAD while it
+  # resolves, else ask the remote. The name is checked before it is used.
+  def="$branch"
+  if [[ -z "$def" ]]; then
+    cur="$(git_root none --git-dir "$work" symbolic-ref -q --short HEAD || true)"
+    if [[ -n "$cur" ]] && git_root none --git-dir "$work" show-ref --verify --quiet "refs/heads/$cur"; then def="$cur"
+    else
+      def="$(git_root "$url" ls-remote --symref -- "$url" HEAD 2>/dev/null | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}')"
+      if [[ -z "$def" ]]; then
+        first="$(git_root none --git-dir "$work" for-each-ref --format='%(refname:strip=2)' refs/heads | head -1)"
+        def="$first"
+      fi
     fi
-    changed "project $name cloned from $url (default branch ${def:-none yet})"
+  fi
+  if [[ -n "$def" ]] && git_root none check-ref-format --branch "$def" >/dev/null 2>&1; then
+    cur="$(git_root none --git-dir "$work" symbolic-ref -q HEAD || true)"
+    [[ "$cur" == "refs/heads/$def" ]] || git_root none --git-dir "$work" symbolic-ref HEAD "refs/heads/$def"
+  else
+    def=""
+  fi
+
+  if [[ $new -eq 1 ]]; then
+    mv -T -- "$work" "$repo" || { soft_fail "project $name: cannot move the new mirror into place"; rm -rf -- "$work"; return; }
+    lock_mirror "$repo" quiet
+    changed "project $name mirrored from $url (default branch ${def:-none yet})"
     return
   fi
-
-  # An existing clone is only ever fetched into: no reset, no prune, no
-  # rewrite of anything a worktree may be standing on.
-  digest() { git -C "$repo" for-each-ref --format='%(objectname) %(refname)' refs/remotes refs/tags | sha256sum; }
-  if [[ $DRY_RUN -eq 1 ]]; then note "[dry-run] fetch $name from its remote"; return; fi
-  before="$(digest)"
-  if git_net "$url" -C "$repo" fetch --quiet origin 2>"$repo/.fetch.err"; then
-    rm -f "$repo/.fetch.err"
-    after="$(digest)"
-    [[ "$before" == "$after" ]] || changed "project $name fetched new commits"
-  else
-    soft_fail "project $name: fetch from $url failed (clone left as it was): $(tr '\n' ' ' < "$repo/.fetch.err" | cut -c1-200)"
-    rm -f "$repo/.fetch.err"
-  fi
+  lock_mirror "$repo" quiet            # what the fetch just wrote gets the same modes
+  [[ "$before" == "$after" ]] || changed "project $name fetched new commits"
 }
 
-ensure_worktree() {
-  local a="$1" name="$2" repo wt branch def home
+# An account's own clone: created once, as the account, and then never touched.
+ensure_account_clone() {
+  local a="$1" name="$2" repo wt branch def home out
   repo="$PROJECTS_DIR/$name.git"; home="${ACCT_HOME[$a]}"; wt="$home/projects/$name"
   branch="${PROJECTS_BRANCH_PREFIX}${a}/main"
-  [[ ! -e "$wt" ]] || return 0                         # never touch an existing worktree
+  [[ ! -e "$wt" && ! -L "$wt" ]] || return 0           # never touch an existing clone
   if [[ $DRY_RUN -eq 1 ]]; then
-    [[ -d "$repo" ]] && changed "worktree ik-$a:$name on $branch" || changed "worktree ik-$a:$name on $branch (after the clone)"
+    [[ -d "$repo" ]] && changed "clone ik-$a:$name on $branch" || changed "clone ik-$a:$name on $branch (after the mirror)"
     return
   fi
   [[ -d "$repo" ]] || return 0
-  def="$(git -C "$repo" config ikenga.defaultBranch || true)"
-  if [[ -z "$def" ]] || ! git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$def"; then
-    note "ik-$a:$name: the shared clone has no commits on '${def:-?}' yet; no worktree"
+  def="$(git_root none --git-dir "$repo" symbolic-ref -q --short HEAD || true)"
+  if [[ -z "$def" ]] || ! git_root none --git-dir "$repo" show-ref --verify --quiet "refs/heads/$def"; then
+    note "ik-$a:$name: the mirror has no commits on '${def:-?}' yet; no clone"
     return
   fi
-  [[ "$(stat -c %u -- "$home" 2>/dev/null)" == "${ACCT_UID[$a]}" ]] || { soft_fail "ik-$a: home $home is not owned by the account; no worktree"; return; }
+  [[ "$(stat -c %u -- "$home" 2>/dev/null)" == "${ACCT_UID[$a]}" ]] || { soft_fail "ik-$a: home $home is not owned by the account; no clone"; return; }
   as_account "$a" mkdir -p -- "$home/projects" || { soft_fail "ik-$a: cannot create $home/projects"; return; }
-  local rc=0
-  if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
-    as_account "$a" git -C "$repo" worktree add --quiet -- "$wt" "$branch" >/dev/null 2>&1 || rc=$?
-  else
-    as_account "$a" git -C "$repo" worktree add --quiet --no-track -b "$branch" -- "$wt" "refs/remotes/origin/$def" >/dev/null 2>&1 || rc=$?
+  # --no-local: transfer through upload-pack, never hard-link or copy from the
+  # root-owned mirror. --reference: the account's objects/info/alternates point
+  # at the mirror, so the project is stored once.
+  if ! out="$(as_account "$a" git clone --quiet --no-local --no-checkout --reference "$repo" -- "$repo" "$wt" 2>&1)"; then
+    soft_fail "ik-$a:$name: git clone failed: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"; return
   fi
-  if [[ $rc -ne 0 ]]; then soft_fail "ik-$a:$name: git worktree add failed (exit $rc)"; return; fi
-  changed "worktree ik-$a:$name on $branch"
+  if ! out="$(as_account "$a" git -C "$wt" checkout --quiet --no-track -b "$branch" "refs/remotes/origin/$def" 2>&1)"; then
+    soft_fail "ik-$a:$name: cannot create $branch: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"; return
+  fi
+  changed "clone ik-$a:$name on $branch"
 }
 
 # ---- scoped secrets (D-B3)
