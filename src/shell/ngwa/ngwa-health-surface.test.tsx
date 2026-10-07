@@ -424,3 +424,40 @@ describe('D-02 layout', () => {
 		expect(block('.view-ngwa .hscroll')).toMatch(/overflow-y: auto/);
 	});
 });
+
+describe('engine probe when WSL could not be asked (D-10)', () => {
+	it('says "WSL unavailable — <reason>", not "CLI not found"', async () => {
+		const caps = { streaming: true, tool_use: true, thinking: false, artifacts: false, mcp: false, session_resume: false };
+		vi.mocked(cmd.detectAgent).mockImplementation(async (id: string) =>
+			id === 'claude-code'
+				? {
+						id,
+						display: 'Claude Code',
+						executable_path: 'claude (WSL)',
+						version: null,
+						authed: null,
+						auth_hint: null,
+						capabilities: caps,
+						unavailable: { kind: 'wsl', reason: 'Wsl/Service/CreateInstance/E_FAIL' },
+					}
+				: null
+		);
+		const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const items = engineItems(['claude']);
+		const { container } = render(
+			<QueryClientProvider client={qc}>
+				<NgwaHealthSurface items={items} snapshot={mkSnapshot(items)} onOpenBackup={() => {}} onOpenStore={() => {}} />
+			</QueryClientProvider>
+		);
+		await waitFor(() =>
+			expect(container.querySelector('[data-engine="claude"] [data-engine-probe]')?.textContent).toBe(
+				"Couldn't check the CLI: WSL unavailable — Wsl/Service/CreateInstance/E_FAIL"
+			)
+		);
+		await waitFor(() =>
+			expect(container.querySelector('[data-engine="codex"] [data-engine-probe]')?.textContent).toBe(
+				'CLI not found by the probe'
+			)
+		);
+	});
+});

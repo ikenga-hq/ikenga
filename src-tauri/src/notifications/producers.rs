@@ -13,6 +13,7 @@
 //! | `run_finished` / `run_failed` | [`run_terminal_with_artifacts`] (in `server::shared::notifications::run`) | `server::shared::chi_exec::cache_update_done` |
 //! | `update` | [`update`] | `commands::notifications::notifications_record_update` (FE updater + pkg registry check) |
 //! | `violation` | [`violation`] | `pkg::permissions_check::record_violation` |
+//! | `system` | [`wsl_network`] (in `server::shared::notifications::wsl`) | `commands::wsl_health` and the Chi pre-run probe (`server::shared::chi_exec`), through `wsl::report_with_db` (a fresh probe with a WSL-caused failure; resolved by the next `ok` probe) |
 //! | `invite` | — | **no producer**: D-05's people surface does not exist yet |
 //!
 //! Action JSON is `{ "kind": "<action kind>", ...params }`; the UI (WP-40b)
@@ -34,6 +35,9 @@
 //!   `SessionEnd`.
 //! * `open.chi_run`, `open.release_notes`, `open.pkg_updates`,
 //!   `open.violations`.
+//! * `fix.wsl_network` — `{ kind, distro, state }`: WSL in `distro` (`null`
+//!   = the default distro) has no working network; the UI offers the fixes
+//!   for `state` (`wsl_health_fix`). Resolves when a probe returns `ok`.
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -48,6 +52,13 @@ pub use crate::server::shared::notifications::run::{
     run_terminal, run_terminal_with_artifacts, SOURCE_CHI,
 };
 pub const SOURCE_UPDATER: &str = "updater";
+// The `fix.wsl_network` builder moved to the ungated
+// `server::shared::notifications::wsl` (WP-7, D-21: the Chi pre-run probe
+// raises it from the shared run path too).
+pub use crate::server::shared::notifications::wsl::{
+    wsl_network, wsl_network_key, wsl_network_keys_to_resolve, SOURCE_WSL_HEALTH,
+    WSL_NETWORK_KEY_PREFIX,
+};
 
 // The text helpers are shared with the run producer, which moved to the
 // ungated `server::shared::notifications::run` (WP-P10).

@@ -29,11 +29,13 @@ pub async fn detect_system(app: tauri::AppHandle) -> Result<SystemReport, String
         .path()
         .app_data_dir()
         .map_err(|e| format!("app_data_dir: {e}"))?;
-    let backend_ready = app
-        .try_state::<crate::commands::secrets::SecretsLock>()
-        .map(|lock| lock.probe(&app).is_ok())
-        .unwrap_or(false);
-    Ok(system::build_report(dir, backend_ready))
+    let backend = match app.try_state::<crate::commands::secrets::SecretsLock>() {
+        Some(lock) => system::SecretsBackend::from_probe(lock.probe(&app)),
+        None => system::SecretsBackend::NoBackend(
+            "the secrets service is not running in this process".into(),
+        ),
+    };
+    Ok(system::build_report(dir, backend))
 }
 
 #[tauri::command]

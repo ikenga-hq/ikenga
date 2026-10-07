@@ -53,6 +53,7 @@ use super::events::{EventBus, Topic};
 use super::rpc::RpcResponse;
 use super::rpc_local::chi_env;
 use super::rpc_shell::targ;
+use super::shared::agents::WslLookup;
 use super::shared::chi_exec::{self, ChiEnv, ChiRunOpts, NoInProcessEngines};
 use super::shared::seats::{
     active_project, clear_core, create_core, drain_one, engines_info, fill_locked, list_core,
@@ -132,15 +133,27 @@ fn seat_id(args: &Value) -> Result<String, String> {
 /// no openrouter adapter, and every engine's install state (a handful of
 /// PATH lookups, so it is probed whole on every call and is the same world
 /// for any seat — no re-derive after a bind is needed).
-fn daemon_world(state: &AppState) -> WorldSnapshot {
+async fn daemon_world(state: &AppState) -> WorldSnapshot {
     let resolver = &state.chi.resolver;
-    let unavailable_engines = ENGINE_CAPS
-        .iter()
-        .filter_map(|cap| {
-            let binary = cap.binary?;
-            let found = resolver.native(binary).is_some() || resolver.in_wsl(binary);
+    let distro = resolver.wsl_distro();
+    // A WSL that couldn't be asked counts as installed (D-11): only a
+    // definite miss on both sides makes an engine unavailable.
+    let probes = ENGINE_CAPS.iter().filter_map(|cap| {
+        let binary = cap.binary?;
+        let distro = distro.clone();
+        Some(async move {
+            let found = resolver.native(binary).is_some()
+                || !matches!(
+                    resolver.in_wsl(binary, distro.as_deref()).await,
+                    WslLookup::NotFound
+                );
             (!found).then(|| cap.engine_id.to_string())
         })
+    });
+    let unavailable_engines = futures_util::future::join_all(probes)
+        .await
+        .into_iter()
+        .flatten()
         .collect();
     WorldSnapshot {
         unavailable_engines,
@@ -193,7 +206,7 @@ pub(super) async fn seats_list(state: &AppState, args: &Value) -> RpcResponse {
             None => active_project(&pool).await?,
         };
         let rows = list_rows(&pool, &project).await?;
-        Ok(list_core(&pool, &daemon_world(state), rows).await?)
+        Ok(list_core(&pool, &daemon_world(state).await, rows).await?)
     }
     .await;
     reply("seats_list", r)
@@ -205,7 +218,7 @@ pub(super) async fn seats_get(state: &AppState, args: &Value) -> RpcResponse {
         let seat: SeatAddress = targ(args, &["seat"])?;
         let pool = pool(state).await?;
         let row = resolve_address(&pool, &seat).await?;
-        Ok(view_of(&pool, &daemon_world(state), row).await?)
+        Ok(view_of(&pool, &daemon_world(state).await, row).await?)
     }
     .await;
     reply("seats_get", r)
@@ -216,7 +229,7 @@ pub(super) async fn seats_get(state: &AppState, args: &Value) -> RpcResponse {
 pub(super) async fn seats_engines(state: &AppState) -> RpcResponse {
     reply(
         "seats_engines",
-        Ok::<_, Fail>(engines_info(&daemon_world(state))),
+        Ok::<_, Fail>(engines_info(&daemon_world(state).await)),
     )
 }
 
@@ -232,7 +245,7 @@ pub(super) async fn seats_resolve(state: &AppState, args: &Value) -> RpcResponse
         let pool = pool(state).await?;
         let row = resolve_address(&pool, &seat).await?;
         let claim_resume = opts.map(|o| o.claim_resume).unwrap_or(false);
-        let world = daemon_world(state);
+        let world = daemon_world(state).await;
         let (route, effects) = resolve_core(&pool, &world, &row.id, &actor, claim_resume).await?;
         publish_effects(state, &effects);
         Ok(route)
@@ -254,7 +267,7 @@ pub(super) async fn seats_create(state: &AppState, args: &Value) -> RpcResponse 
             );
         }
         let pool = pool(state).await?;
-        let (result, effects) = create_core(&pool, &daemon_world(state), req, &actor).await?;
+        let (result, effects) = create_core(&pool, &daemon_world(state).await, req, &actor).await?;
         publish_effects(state, &effects);
         Ok(result)
     }
@@ -271,7 +284,7 @@ pub(super) async fn seats_move(state: &AppState, args: &Value) -> RpcResponse {
         let opts: Option<MoveOpts> = targ(args, &["opts"])?;
         let pool = pool(state).await?;
         let claim = opts.and_then(|o| o.claim);
-        let world = daemon_world(state);
+        let world = daemon_world(state).await;
         let (result, effects) = move_core(
             &pool,
             &world,
@@ -300,7 +313,7 @@ pub(super) async fn seats_resume(state: &AppState, args: &Value) -> RpcResponse 
         let env = chi_env(state)?;
         // The seat's mutex first, as the desktop command takes it (§4.1).
         let _guard = store().lock_one(&seat_id).await;
-        let world = daemon_world(state);
+        let world = daemon_world(state).await;
         let env = &env;
         let (result, effects) = resume_locked(
             &pool,
@@ -330,7 +343,7 @@ pub(super) async fn seats_fill(state: &AppState, args: &Value) -> RpcResponse {
         let pool = pool(state).await?;
         let env = chi_env(state)?;
         let _guard = store().lock_one(&seat_id).await;
-        let world = daemon_world(state);
+        let world = daemon_world(state).await;
         let persistent = opts.map(|o| o.persistent).unwrap_or(false);
         let env = &env;
         let (result, effects) = fill_locked(
@@ -361,7 +374,7 @@ pub(super) async fn seats_queue(state: &AppState, args: &Value) -> RpcResponse {
         // Built first: a queue the poller could never send is refused here.
         let env = Arc::new(chi_env(state)?);
         let (seat, effects) =
-            queue_core(&pool, &daemon_world(state), &seat_id, prompt, &actor).await?;
+            queue_core(&pool, &daemon_world(state).await, &seat_id, prompt, &actor).await?;
         publish_effects(state, &effects);
         watch_queue(seat_id, env, state.events.clone());
         Ok(seat)
@@ -376,7 +389,7 @@ pub(super) async fn seats_clear(state: &AppState, args: &Value) -> RpcResponse {
         let seat_id = seat_id(args)?;
         let actor = actor(args)?;
         let pool = pool(state).await?;
-        let (seat, effects) = clear_core(&pool, &daemon_world(state), &seat_id, &actor).await?;
+        let (seat, effects) = clear_core(&pool, &daemon_world(state).await, &seat_id, &actor).await?;
         publish_effects(state, &effects);
         Ok(seat)
     }
@@ -390,7 +403,7 @@ pub(super) async fn seats_rename(state: &AppState, args: &Value) -> RpcResponse 
         let name: String = targ(args, &["name"])?;
         let actor = actor(args)?;
         let pool = pool(state).await?;
-        let world = daemon_world(state);
+        let world = daemon_world(state).await;
         let (seat, effects) = rename_core(&pool, &world, &seat_id, &name, &actor).await?;
         publish_effects(state, &effects);
         Ok(seat)
@@ -418,7 +431,7 @@ pub(super) async fn seats_release(state: &AppState, args: &Value) -> RpcResponse
         let seat_id = seat_id(args)?;
         let actor = actor(args)?;
         let pool = pool(state).await?;
-        let (seat, effects) = release_core(&pool, &daemon_world(state), &seat_id, &actor).await?;
+        let (seat, effects) = release_core(&pool, &daemon_world(state).await, &seat_id, &actor).await?;
         publish_effects(state, &effects);
         Ok(seat)
     }

@@ -64,6 +64,7 @@ import {
 	type PkgHealthRemoveResult,
 	type PkgKernelStatus,
 } from '@/lib/tauri-cmd';
+import { agentUnavailableText } from '@/lib/agent-unavailable';
 import { handToChi } from '@/shell/companion/companion-store';
 import { desktopOnlyReason } from '@/lib/desktop-only';
 import { NOT_AVAILABLE_ON_SERVER_LABEL } from '@/lib/transport/unavailable';
@@ -1304,7 +1305,9 @@ export function NgwaHealthSurface({
 											? 'Probing the CLI…'
 											: probe?.error
 												? `CLI probe failed: ${errText(probe.error)}`
-												: agent
+												: agentUnavailableText(agent)
+													? `Couldn't check the CLI: ${agentUnavailableText(agent)}`
+													: agent
 													? `CLI at ${agent.executable_path} · auth ${
 															agent.authed === null ? 'unknown' : agent.authed ? 'ok' : 'not signed in'
 														}`

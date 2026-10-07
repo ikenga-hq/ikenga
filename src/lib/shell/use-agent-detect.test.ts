@@ -51,6 +51,25 @@ describe('entryFromProbe', () => {
 		expect(entry.error).toBeUndefined();
 	});
 
+	it('returns unavailable (not missing, not detected) when WSL could not be asked', () => {
+		const agent = {
+			...makeAgent('claude-code'),
+			executable_path: 'claude (WSL)',
+			version: null,
+			authed: null,
+			unavailable: { kind: 'wsl', reason: 'Wsl/Service/CreateInstance/E_FAIL' },
+		};
+		const entry = entryFromProbe(agent);
+		expect(entry.status).toBe('unavailable');
+		expect(entry.agent?.id).toBe('claude-code');
+		expect(entry.error).toBe('WSL unavailable — Wsl/Service/CreateInstance/E_FAIL');
+	});
+
+	it('treats an explicit null unavailable (older/other daemons) as detected', () => {
+		const entry = entryFromProbe({ ...makeAgent('codex'), unavailable: null });
+		expect(entry.status).toBe('detected');
+	});
+
 	it('returns unknown with the error message when the probe rejects', () => {
 		const entry = entryFromProbe(null, new Error('boom'));
 		expect(entry.status).toBe('unknown');
@@ -122,6 +141,15 @@ describe('computeAllMissing', () => {
 	it('returns false when any engine is pending', () => {
 		const results = {
 			'claude-code': { status: 'pending' as const },
+			codex: { status: 'missing' as const },
+			gemini: { status: 'missing' as const },
+		};
+		expect(computeAllMissing(results, ids)).toBe(false);
+	});
+
+	it('returns false when an engine could not be checked (WSL unavailable)', () => {
+		const results = {
+			'claude-code': { status: 'unavailable' as const, error: 'WSL unavailable — no distro' },
 			codex: { status: 'missing' as const },
 			gemini: { status: 'missing' as const },
 		};

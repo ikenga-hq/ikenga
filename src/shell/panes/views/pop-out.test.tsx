@@ -44,6 +44,7 @@ vi.mock('@/terminal/single-terminal', () => ({
 	SingleTerminal: () => <div data-testid="xterm" />,
 }));
 vi.mock('@/terminal/cost-hud', () => ({ CostHud: () => null }));
+vi.mock('@/shell/wsl-health/wsl-health-banner', () => ({ WslHealthBanner: () => null }));
 vi.mock('@/terminal/git-ledger', () => ({ GitLedger: () => null }));
 vi.mock('@/terminal/permission-inbox', () => ({ PermissionInbox: () => null }));
 vi.mock('@/terminal/tool-call-feed', () => ({ ToolCallFeed: () => null }));

@@ -162,11 +162,14 @@ async fn tauri_world(
     if all_engines {
         engines.extend(ENGINE_CAPS.iter().map(|c| c.engine_id.to_string()));
     }
-    for engine in &engines {
-        if let Some(binary) = engine_cap(engine).and_then(|c| c.binary) {
-            if !binary_available(binary) {
-                world.unavailable_engines.push(engine.clone());
-            }
+    // Probed concurrently: each may wait on a cold WSL start.
+    let probes = engines.iter().filter_map(|engine| {
+        let binary = engine_cap(engine).and_then(|c| c.binary)?;
+        Some(async move { (engine.clone(), binary_available(binary).await) })
+    });
+    for (engine, available) in futures_util::future::join_all(probes).await {
+        if !available {
+            world.unavailable_engines.push(engine);
         }
     }
 

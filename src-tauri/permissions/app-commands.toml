@@ -362,6 +362,8 @@ commands.allow = [
   "window_list",
   "window_remove_surface",
   "window_spawn",
+  "wsl_health_fix",
+  "wsl_health_probe",
 ]
 
 [[permission]]

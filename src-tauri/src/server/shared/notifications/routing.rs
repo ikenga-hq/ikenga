@@ -418,7 +418,7 @@ pub async fn record_ask(
     }
     new.action = Some(action);
     let stored = match super::record(pool, new).await? {
-        RecordOutcome::Inserted(n) | RecordOutcome::Coalesced(n) => n,
+        RecordOutcome::Inserted(n) | RecordOutcome::Coalesced(n) | RecordOutcome::Updated(n) => n,
         RecordOutcome::Suppressed => return Ok(None),
     };
     sqlx::query(

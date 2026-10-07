@@ -14,12 +14,12 @@ import { useMemo } from 'react';
 import { createFileRoute, useNavigate, useParams } from '@tanstack/react-router';
 import { useQuery } from '@tanstack/react-query';
 import { ArrowLeft, FileText, Star } from 'lucide-react';
-import * as Icons from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { projectArtifactsQueryOptions } from '@/lib/queries/project-artifacts';
 import { useShellStore } from '@/lib/shell/shell-store';
+import { ArchetypeGlyph } from '@/shell/artifact-wizard/archetype-glyph';
 import { type Archetype, findArchetype } from '@/shell/artifact-wizard/archetypes';
 import type { ArtifactRow } from '@/lib/tauri-cmd';
 
@@ -58,14 +58,14 @@ function ByKindPage() {
 	}
 
 	const label = archetype?.label ?? kind;
-	const Glyph = archetype ? resolveGlyph(archetype.glyphName) : Icons.Square;
+	const glyphName = archetype?.glyphName ?? 'Square';
 
 	return (
 		<div className="flex h-full flex-col overflow-y-auto">
 			<HeaderBar
 				label={label}
 				kind={kind}
-				Glyph={Glyph}
+				glyphName={glyphName}
 				totalForKind={rows.length}
 				totalAll={catalogQuery.data?.counts.all}
 				onBack={goHome}
@@ -94,7 +94,7 @@ function ByKindPage() {
 function HeaderBar({
 	label,
 	kind,
-	Glyph,
+	glyphName,
 	totalForKind,
 	totalAll,
 	onBack,
@@ -102,7 +102,7 @@ function HeaderBar({
 }: {
 	label: string;
 	kind: string;
-	Glyph: (typeof Icons)['Square'];
+	glyphName: string;
 	totalForKind: number;
 	totalAll: number | undefined;
 	onBack: () => void;
@@ -113,7 +113,7 @@ function HeaderBar({
 			<Button variant="ghost" size="sm" onClick={onBack} aria-label="Back to home">
 				<ArrowLeft className="h-4 w-4" />
 			</Button>
-			<Glyph className="h-4 w-4 text-muted-foreground" />
+			<ArchetypeGlyph name={glyphName} className="h-4 w-4 text-muted-foreground" />
 			<div className="flex flex-col min-w-0">
 				<span className="text-sm font-semibold text-foreground">{label}</span>
 				<span className="font-mono text-[10px] text-muted-foreground">
@@ -211,11 +211,4 @@ function relativeAt(ms: number): string {
 	if (wk < 5) return `${wk}w`;
 	const mo = Math.round(day / 30);
 	return `${mo}mo`;
-}
-
-type LucideIcon = (typeof Icons)['Square'];
-
-function resolveGlyph(name: string): LucideIcon {
-	const map = Icons as unknown as Record<string, LucideIcon>;
-	return map[name] ?? Icons.Square;
 }
