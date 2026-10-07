@@ -36,6 +36,7 @@ pub mod comments;
 pub mod confined_fs;
 pub mod data_health;
 pub mod engine_layout;
+pub mod failure_class;
 pub mod fs;
 pub mod git;
 pub mod identity;
