@@ -173,6 +173,63 @@ Everything lives under `/opt/ikenga/data`. In multi-user mode that is the operat
 
 **Turning it off.** `sudo systemctl disable --now ikenga-update.path` stops in-app updates. `sudo systemctl disable --now ikenga-update-check.timer` stops the daily check, and the app then shows no update at all.
 
+## Shared projects and scoped secrets
+
+Two things every account on a multi-user host needs, and neither belongs in the `IKENGA_SECRET_*` environment (which every account inherits) or in each account's home. `provision.sh` converges both from the profile. Accounts are still created by `ikenga-server accounts create`; the provisioner only names them, so run `sudo ikenga-provision sync-accounts` (or re-run the full provision) after creating or removing one. `--dry-run` prints the plan (`would: ...`) and changes nothing.
+
+```bash
+ACCOUNTS=(ada grace rex ruby)       # login names; the Unix user is ik-<name>. Empty = every ik-* user in UID_RANGE
+AGENT_ACCOUNTS=(rex ruby)           # who a secret scoped `agents` goes to
+PROJECTS=("app=https://github.com/org/app.git#main" "site=git@github.com:org/site.git")
+SECRETS_FILE=/root/provision/secrets.scoped
+```
+
+An account named in the profile that has no Unix user yet is reported as pending and skipped.
+
+### Shared project clones
+
+One bare clone per project in `PROJECTS_DIR` (default `/srv/ikenga/projects`, `root:ikenga-projects`, mode `2775` setgid, `core.sharedRepository=group`). Every member (`PROJECTS_MEMBERS`, default all managed accounts) gets its own worktree at `~/projects/<project>` on branch `<account>/main` (`PROJECTS_BRANCH_PREFIX` prepends to that), created as that user from `origin/<default branch>`.
+
+| Key | Default | |
+|-----|---------|--|
+| `PROJECTS` | none | `name=git-url[#branch]`. No `#branch` = the remote's default branch. A URL with credentials in it is refused. |
+| `PROJECTS_DIR`, `PROJECTS_GROUP`, `PROJECTS_MODE` | `/srv/ikenga/projects`, `ikenga-projects`, `2775` | `2770` hides the clones from accounts that are not members, which you want for private repos. |
+| `PROJECTS_MEMBERS` | all managed accounts | Narrowing it removes the group membership and ACL; the worktree is left where it is (and stops working). |
+| `PROJECTS_TOKEN_SECRET` | none | Name of a secret in `SECRETS_FILE` (scope it `root`): an https deploy token for private repos. It reaches `git` through `GIT_ASKPASS` in that one process's environment. Never in argv, the URL, or the repo config. |
+
+A clone is only ever fetched into: no reset, no prune, no rewrite, and an existing worktree is never touched. A run with nothing new reports `no changes`. Only the provisioner holds the deploy token, so shared clones refresh when `sync-accounts` runs (from a timer if you want it regular); accounts cannot fetch upstream themselves. `safe.directory` is written to `/etc/gitconfig`, as an `# ikenga:` block listing exactly the shared repos.
+
+**Why there is an ACL as well as the group.** The daemon starts every account's sessions with **no supplementary groups** (`src-tauri/src/executor/t1.rs`, `verify_dropped()` refuses a spawn that has any). Group membership therefore helps an SSH login but not a terminal or Chi run. Each member also gets a POSIX ACL entry on the folder and the clones, which is matched on the uid and survives the drop. The filesystem under `PROJECTS_DIR` must support ACLs (ext4 and xfs do by default); if `setfacl` fails the run warns and exits non-zero.
+
+### Scoped secrets
+
+`SECRETS_FILE` must be a regular file, owned by root, mode `0600`, in a directory only root can write. A looser one is refused, and nothing is read. One secret per line, the scope in front, so the value is everything after the first `=` and is never interpreted:
+
+```
+# comments and blank lines are skipped
+[everyone]     SHARED_NOTE=anything, including = # and spaces
+[agents]       ANTHROPIC_API_KEY=...          # AGENT_ACCOUNTS
+[rex]          MM_BOT_TOKEN=...               # one account (login name)
+[ada,grace]    SOME_KEY=...                   # several
+[root]         GIT_DEPLOY_TOKEN=...           # provisioner only, delivered to nobody
+```
+
+There is no default scope: a line without one is an error, as is a scope naming an account that is not managed (a typo), an empty or multi-line value, a name that would change how a shell or git behaves (`PATH`, `LD_*`, `BASH_*`, `IKENGA_*`, `GIT_ASKPASS`, ...), or the same name reaching one account from two lines. Values are single-line and kept byte for byte.
+
+Each account gets `/etc/ikenga/secrets/ik-<name>.env`, owned `root:<its private group>`, mode `0640`: it can read the file, not change it, and no other account can open it. The summary lists secret **names** per account (`+` added, `~` value changed, `-` removed), never values. Removing a line or narrowing its scope removes the secret from that account on the next run; an account dropped from the profile loses its file. Every replaced or removed file is first copied to `/etc/ikenga/secrets-backup/` (root-only, `0700`; the last five per account). The backups are deliberately not in the account-readable directory, which would undo a narrowing.
+
+`SECRETS_FROM` (secrets copied into `/opt/ikenga/.env` as `IKENGA_SECRET_*`) still works and is still box-wide. Use `SECRETS_FILE` for anything that should not reach every account.
+
+### Where the secrets reach, and where they do not
+
+The daemon has no way for the root side to inject a per-account environment: a principal's child gets only a fixed floor plus the box-wide `IKENGA_SECRET_*` (`src-tauri/src/server/broker/children.rs`, `host_env()`; `src-tauri/src/executor/t1.rs`, `environment()`), and `IKENGA_SECRET_*` is stripped from PTYs and Chi runs on purpose (`pty/mod.rs`, `is_host_only_env`). Its per-account secret store is sealed and written only through the account's own RPC. So delivery is by the shell:
+
+- `/etc/profile.d/ikenga-secrets.sh` exports the account's file (read line by line, `export "NAME=value"`, never evaluated), and a managed block at the top of `/etc/bash.bashrc` loads it for interactive bash.
+- **Reached:** SSH logins, and any terminal whose shell is a login shell or interactive bash, and everything started from it (an agent CLI you launch at that prompt inherits them).
+- **Not reached:** a process the daemon execs directly, with no shell in front: an engine CLI started as the terminal's own command, a Chi run, a pkg sidecar, and a non-login `sh` (the default account shell is `/bin/sh`, dash).
+
+The fix for the second group belongs in the daemon: `T1Launcher::host_env()` reading the root-owned `/etc/ikenga/secrets/<unix_name>.env` and adding its entries to the child's environment, under names the PTY denylist does not match, would carry them into every PTY and Chi run. The file format is a plain `NAME=value` list so that change needs nothing new from the provisioner. Until then, treat agent-account secrets delivered this way as available to shell-launched work only.
+
 ## T0 → T1: `accounts adopt-t0`
 
 ```
