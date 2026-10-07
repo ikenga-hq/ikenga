@@ -12,6 +12,7 @@ import { createOscObserver, fireOscNotification } from '@/lib/terminal/osc-notif
 import { copyText } from '@/lib/clipboard';
 import { readClipboardText } from '@/lib/transport/shims';
 import { handleOsc52, handleTerminalCopyKey, openTerminalUrl } from './clipboard-actions';
+import { explainEmptyPaste, onTerminalPasteEvent } from './paste-image';
 import { useDismissMenu } from './use-dismiss-menu';
 import { menuPasteBlockedHint, pasteKeyIsNative } from './paste-policy';
 import { FloatingToastChip } from '@/components/ui/floating-toast-chip';
@@ -897,6 +898,7 @@ export function XTermHost({
 				readClipboardText()
 					.then((t) => {
 						if (t) term.paste(t);
+						else void explainEmptyPaste();
 					})
 					.catch(() => {});
 			};
@@ -1214,6 +1216,16 @@ export function XTermHost({
 		return () => el.removeEventListener(OS_FILE_DROP_EVENT, onPaths);
 	}, []);
 
+	// An image pasted with no text does nothing in a browser (the terminal only
+	// takes text, and there is no upload yet): say so instead of staying silent.
+	// Capture phase so it runs before xterm's own textarea paste handler.
+	useEffect(() => {
+		const el = wrapperRef.current;
+		if (!el) return;
+		el.addEventListener('paste', onTerminalPasteEvent, true);
+		return () => el.removeEventListener('paste', onTerminalPasteEvent, true);
+	}, []);
+
 	const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
 	// Shown when a browser refuses a menu-driven clipboard read.
 	const [pasteHint, setPasteHint] = useState<string | null>(null);
@@ -1307,6 +1319,7 @@ export function XTermHost({
 							readClipboardText()
 								.then((t) => {
 									if (t) termRef.current?.paste(t);
+									else void explainEmptyPaste();
 									termRef.current?.focus();
 								})
 								.catch(() => {

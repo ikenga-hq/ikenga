@@ -9,7 +9,8 @@
 
 import { CloudOff } from 'lucide-react';
 import { OfflineState } from '@/components/states';
-import { openExternalUrl } from '@/lib/transport';
+import { toast } from '@/lib/toast';
+import { isBrowserHost, openLocalPath } from '@/lib/transport';
 
 interface ArtifactStoppedPlateProps {
 	path: string;
@@ -29,12 +30,18 @@ export function ArtifactStoppedPlate({ path, onRestart }: ArtifactStoppedPlatePr
 			<button
 				type="button"
 				className="text-xs text-muted-foreground underline-offset-2 hover:underline"
-				// Matches `unknown-view.tsx`'s own "Open in default app" — the
-				// shell plugin's `open()` takes the raw path directly, same as a
-				// URL (it shells out to xdg-open / `open` / explorer.exe).
-				onClick={() => void openExternalUrl(path)}
+				// Matches `unknown-view.tsx`'s own "Open in default app". The OS
+				// opens the path on desktop; a browser session downloads the file.
+				onClick={() =>
+					void openLocalPath(path, { kind: 'file' }).catch((e) =>
+						toast({
+							label: `Could not open the file: ${e instanceof Error ? e.message : String(e)}`,
+							variant: 'error',
+						})
+					)
+				}
 			>
-				Open in default app
+				{isBrowserHost() ? 'Download file' : 'Open in default app'}
 			</button>
 		</div>
 	);
