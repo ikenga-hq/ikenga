@@ -74,36 +74,72 @@ describe('getAuthToken', () => {
 });
 
 describe('WebRemoteTransport.listen', () => {
-	it('warns once per event name that nothing will fire', async () => {
+	/** A WebSocket stand-in that records what was opened and sent. */
+	function fakeSockets() {
+		const opened: Array<{ sent: string[]; open(): void; frame(v: unknown): void }> = [];
+		const open = () => {
+			const s = {
+				onopen: null as null | (() => void),
+				onmessage: null as null | ((e: { data: unknown }) => void),
+				onclose: null as null | (() => void),
+				onerror: null as null | ((e: unknown) => void),
+				sent: [] as string[],
+				send(raw: string) {
+					this.sent.push(raw);
+				},
+				close() {},
+				open() {
+					this.onopen?.();
+				},
+				frame(v: unknown) {
+					this.onmessage?.({ data: JSON.stringify(v) });
+				},
+			};
+			opened.push(s);
+			return s as unknown as WebSocket;
+		};
+		return { opened, open };
+	}
+
+	it('subscribes over the events socket and delivers its frames', async () => {
 		const { WebRemoteTransport } = await freshModule();
-		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-		const t = new WebRemoteTransport();
-
-		await t.listen('fs://1', () => {});
-		await t.listen('fs://1', () => {});
-		await t.listen('projects:active-changed', () => {});
-
-		expect(warn).toHaveBeenCalledTimes(2);
-		expect(warn.mock.calls[0]?.[0]).toContain("listen('fs://1')");
-		warn.mockRestore();
-	});
-
-	it('fans out through dispatch once a producer exists', async () => {
-		const { WebRemoteTransport } = await freshModule();
-		vi.spyOn(console, 'warn').mockImplementation(() => {});
-		const t = new WebRemoteTransport();
+		const { opened, open } = fakeSockets();
+		const t = new WebRemoteTransport({ openEventsSocket: open });
 
 		const seen: unknown[] = [];
 		const off = await t.listen<{ id: string }>('projects:active-changed', (e) =>
 			seen.push(e.payload)
 		);
+		expect(opened).toHaveLength(1);
+		opened[0].open();
+		expect(opened[0].sent.map((s) => JSON.parse(s))).toEqual([
+			{ type: 'subscribe', events: ['projects:active-changed'] },
+		]);
 
-		t.dispatch('projects:active-changed', { id: 'p1' });
+		opened[0].frame({ type: 'event', event: 'projects:active-changed', payload: { id: 'p1' } });
 		expect(seen).toEqual([{ id: 'p1' }]);
 
 		off();
-		t.dispatch('projects:active-changed', { id: 'p2' });
+		opened[0].frame({ type: 'event', event: 'projects:active-changed', payload: { id: 'p2' } });
 		expect(seen).toEqual([{ id: 'p1' }]);
+	});
+
+	it('no longer warns that a subscription will never fire', async () => {
+		const { WebRemoteTransport } = await freshModule();
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const t = new WebRemoteTransport({ openEventsSocket: fakeSockets().open });
+		await t.listen('settings://changed', () => {});
+		expect(warn).not.toHaveBeenCalled();
+		warn.mockRestore();
+	});
+
+	it('fans out through dispatch to local listeners', async () => {
+		const { WebRemoteTransport } = await freshModule();
+		const t = new WebRemoteTransport({ openEventsSocket: fakeSockets().open });
+		const seen: unknown[] = [];
+		await t.listen('pa-action-paused', (e) => seen.push(e.payload));
+		t.dispatch('pa-action-paused', { batchId: 'b', count: 1 });
+		expect(seen).toEqual([{ batchId: 'b', count: 1 }]);
 	});
 });
 
