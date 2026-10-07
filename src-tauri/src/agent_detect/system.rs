@@ -404,7 +404,11 @@ mod tests {
         let report = build_report(tmp.clone(), SecretsBackend::Failed("parse".into()));
         let row = secrets_row(&report);
         assert_eq!(row.level, CheckLevel::Warn);
-        assert!(row.message.contains("Secret index is unreadable"), "{}", row.message);
+        assert!(
+            row.message.contains("Secret index is unreadable"),
+            "{}",
+            row.message
+        );
         let hint = row.fix_hint.as_deref().unwrap();
         assert!(!hint.starts_with("Unlock"), "{hint}");
         let _ = std::fs::remove_dir_all(tmp);
@@ -418,7 +422,11 @@ mod tests {
             &SecretsBackend::KeychainUnavailable("storage locked".into()),
         );
         assert!(locked.message.contains("keychain is locked or unreachable"));
-        assert!(locked.fix_hint.as_deref().unwrap().contains("Unlock the platform keychain"));
+        assert!(locked
+            .fix_hint
+            .as_deref()
+            .unwrap()
+            .contains("Unlock the platform keychain"));
 
         let vault = secrets_check(&index, &SecretsBackend::VaultLocked);
         assert!(vault.message.contains("vault is locked"));
@@ -429,11 +437,15 @@ mod tests {
         assert!(!none.fix_hint.as_deref().unwrap().contains("Unlock"));
 
         let disabled = secrets_check(&index, &SecretsBackend::StoreDisabled("migration".into()));
-        assert!(disabled.message.contains("disabled the secret store at startup: migration"));
+        assert!(disabled
+            .message
+            .contains("disabled the secret store at startup: migration"));
         assert!(!disabled.fix_hint.as_deref().unwrap().contains("Unlock"));
 
         let failed = secrets_check(&index, &SecretsBackend::Failed("boom".into()));
-        assert!(failed.message.contains("Couldn't verify the secret store: boom"));
+        assert!(failed
+            .message
+            .contains("Couldn't verify the secret store: boom"));
         assert!(!failed.fix_hint.as_deref().unwrap().contains("Unlock"));
 
         let ready = secrets_check(&index, &SecretsBackend::Ready);
@@ -479,7 +491,11 @@ mod tests {
 
         let row = disk_free_check(None, target);
         assert_eq!(row.level, CheckLevel::Warn);
-        assert!(row.message.contains("Couldn't determine free space"), "{}", row.message);
+        assert!(
+            row.message.contains("Couldn't determine free space"),
+            "{}",
+            row.message
+        );
         assert!(!row.message.contains("0 GB"));
     }
 
