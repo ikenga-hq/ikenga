@@ -19,7 +19,7 @@ interface NewTabMenuProps {
 export function NewTabMenu({ leaf, open, onClose, anchor }: NewTabMenuProps) {
 	const addTab = usePaneStore((s) => s.addTab);
 	const focusPane = usePaneStore((s) => s.focusPane);
-	const { profiles, selectedProfile } = useDefaultShellProfile();
+	const { profiles, selectedProfile, readError } = useDefaultShellProfile();
 
 	// Click outside to close. Defer one tick so the click that opened the
 	// menu isn't itself caught here.
@@ -73,6 +73,18 @@ export function NewTabMenu({ leaf, open, onClose, anchor }: NewTabMenuProps) {
 						heading="Terminals & Shells"
 						className="text-[10px] uppercase tracking-wider text-muted-foreground"
 					>
+						{readError && (
+							// Couldn't read the saved default / custom shells: say the
+							// terminal below is a fallback instead of opening it silently.
+							<div
+								role="alert"
+								data-testid="new-tab-shell-read-error"
+								className="px-2 py-1.5 text-[11px] normal-case tracking-normal"
+								style={{ color: 'var(--danger)' }}
+							>
+								{readError}
+							</div>
+						)}
 						<MenuItem
 							onSelect={() =>
 								commit({

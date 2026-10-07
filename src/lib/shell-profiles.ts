@@ -127,20 +127,46 @@ export function useShellProfiles() {
 	});
 }
 
+function reasonOf(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Why the default shell couldn't be resolved as saved, or `null` when it
+ * was. Exported for tests. A failed read is "couldn't tell", not "no saved
+ * default" — callers must say a fallback is a fallback, not open it silently.
+ */
+export function defaultShellReadError(opts: {
+	settingError: unknown;
+	customError: unknown;
+	savedId: string | null | undefined;
+	resolved: boolean;
+	fallbackLabel: string;
+}): string | null {
+	const { settingError, customError, savedId, resolved, fallbackLabel } = opts;
+	if (settingError) {
+		return `Couldn't read your default shell setting (${reasonOf(settingError)}). Using ${fallbackLabel} for now.`;
+	}
+	if (customError) {
+		// Saved default is a custom shell we couldn't load → wrong shell would open.
+		if (savedId && !resolved) {
+			return `Couldn't read your saved custom shells (${reasonOf(customError)}), so your default shell isn't available. Using ${fallbackLabel} for now.`;
+		}
+		return `Couldn't read your saved custom shells (${reasonOf(customError)}). They're missing from this list until it loads.`;
+	}
+	return null;
+}
+
 export function useDefaultShellProfile() {
 	const queryClient = useQueryClient();
 	const { data: profiles = [getFallbackProfile()], isLoading: isProfilesLoading } =
 		useShellProfiles();
+	const { error: customError, refetch: refetchCustom } = useCustomShellProfiles();
 
+	// A failed read surfaces as a query error — never as "no saved default".
 	const settingQuery = useQuery<string | null>({
 		queryKey: ['settings', DEFAULT_SHELL_KEY],
-		queryFn: async () => {
-			try {
-				return await settingsGet(DEFAULT_SHELL_KEY);
-			} catch {
-				return null;
-			}
-		},
+		queryFn: () => settingsGet(DEFAULT_SHELL_KEY),
 		staleTime: 60_000,
 	});
 
@@ -154,16 +180,29 @@ export function useDefaultShellProfile() {
 	});
 
 	const savedId = settingQuery.data;
+	const saved = savedId ? profiles.find((p) => p.id === savedId) : undefined;
 	const selected =
-		profiles.find((p) => p.id === savedId) ??
-		profiles.find((p) => p.isDefault) ??
-		profiles[0] ??
-		getFallbackProfile();
+		saved ?? profiles.find((p) => p.isDefault) ?? profiles[0] ?? getFallbackProfile();
+
+	const readError = defaultShellReadError({
+		settingError: settingQuery.error,
+		customError,
+		savedId,
+		resolved: saved !== undefined,
+		fallbackLabel: selected.label,
+	});
 
 	return {
 		profiles,
 		selectedProfile: selected,
 		setDefaultProfileId: mutation.mutate,
 		isLoading: isProfilesLoading || settingQuery.isLoading,
+		/** Set when the saved default or custom shells couldn't be read; the
+		 *  selection above is then a fallback and the UI must say so. */
+		readError,
+		retryRead: () => {
+			void settingQuery.refetch();
+			void refetchCustom();
+		},
 	};
 }

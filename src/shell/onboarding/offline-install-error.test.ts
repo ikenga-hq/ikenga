@@ -6,6 +6,9 @@ describe('offlineInstallErrorMessage', () => {
 		expect(offlineInstallErrorMessage(new TypeError('Failed to fetch'))).toMatch(
 			/Couldn't reach the package registry/
 		);
+		expect(
+			offlineInstallErrorMessage(new TypeError('NetworkError when attempting to fetch resource.'))
+		).toMatch(/Couldn't reach the package registry/);
 		expect(offlineInstallErrorMessage(new Error('npm error code EAI_AGAIN'))).toMatch(
 			/Couldn't reach the package registry/
 		);
@@ -17,6 +20,8 @@ describe('offlineInstallErrorMessage', () => {
 			'backup existing install: Access is denied. (os error 5)',
 			'tarball SHA-512 integrity mismatch — refusing to install',
 			'manifest id mismatch: tarball declares `a`, registry said `b`',
+			// Not a bare webview fetch rejection — must not be read as network.
+			'registry detail: failed to fetch manifest: certificate verify failed',
 		]) {
 			const msg = offlineInstallErrorMessage(new Error(raw));
 			expect(msg).not.toMatch(/reach/i);

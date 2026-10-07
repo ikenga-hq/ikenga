@@ -17,7 +17,14 @@ vi.mock('@/lib/tauri-cmd', async (orig) => ({
 	terminalDetectShells: vi.fn().mockResolvedValue([]),
 }));
 
-import { CUSTOM_SHELL_KEY, parseCustomShellProfiles, useCustomShellProfiles } from './shell-profiles';
+import {
+	CUSTOM_SHELL_KEY,
+	DEFAULT_SHELL_KEY,
+	defaultShellReadError,
+	parseCustomShellProfiles,
+	useCustomShellProfiles,
+	useDefaultShellProfile,
+} from './shell-profiles';
 
 const SAVED = [
 	{ id: 'custom-1', label: 'MSYS2', icon: 'terminal', cmd: ['bash.exe'], isDefault: false, kind: 'custom', distro: null },
@@ -85,5 +92,63 @@ describe('useCustomShellProfiles', () => {
 		const written = JSON.parse(value as string) as { id: string }[];
 		expect(written.map((p) => p.id)[0]).toBe('custom-1');
 		expect(written).toHaveLength(2);
+	});
+});
+
+describe('defaultShellReadError', () => {
+	const base = { settingError: null, customError: null, savedId: 'custom-1', resolved: true, fallbackLabel: 'pwsh' };
+
+	it('is null when everything was read', () => {
+		expect(defaultShellReadError(base)).toBeNull();
+	});
+
+	it('names a failed default-shell read and the fallback in use', () => {
+		const msg = defaultShellReadError({ ...base, settingError: new Error('ipc timeout'), savedId: undefined, resolved: false });
+		expect(msg).toMatch(/default shell setting \(ipc timeout\)/);
+		expect(msg).toMatch(/Using pwsh/);
+	});
+
+	it('says the saved custom default is unavailable when custom shells could not be read', () => {
+		const msg = defaultShellReadError({ ...base, customError: new Error('bad json'), resolved: false });
+		expect(msg).toMatch(/default shell isn't available/);
+		expect(msg).toMatch(/Using pwsh/);
+	});
+});
+
+describe('useDefaultShellProfile', () => {
+	beforeEach(() => {
+		settingsGetMock.mockReset();
+	});
+
+	it('a failed custom-shells read with a custom saved default reports the fallback instead of hiding it', async () => {
+		settingsGetMock.mockImplementation(async (key: string) => {
+			if (key === CUSTOM_SHELL_KEY) throw new Error('ipc timeout');
+			if (key === DEFAULT_SHELL_KEY) return 'custom-1';
+			return null;
+		});
+		const { result } = renderHook(() => useDefaultShellProfile(), { wrapper: wrapper() });
+		await waitFor(() => expect(result.current.readError).toMatch(/custom shells \(ipc timeout\)/));
+		expect(result.current.selectedProfile.id).not.toBe('custom-1');
+		expect(result.current.readError).toMatch(/default shell isn't available/);
+	});
+
+	it('a failed default-shell read is an error, not "no saved default"', async () => {
+		settingsGetMock.mockImplementation(async (key: string) => {
+			if (key === DEFAULT_SHELL_KEY) throw new Error('db locked');
+			return null;
+		});
+		const { result } = renderHook(() => useDefaultShellProfile(), { wrapper: wrapper() });
+		await waitFor(() => expect(result.current.readError).toMatch(/db locked/));
+	});
+
+	it('a clean read reports no error and selects the saved custom default', async () => {
+		settingsGetMock.mockImplementation(async (key: string) => {
+			if (key === CUSTOM_SHELL_KEY) return JSON.stringify(SAVED);
+			if (key === DEFAULT_SHELL_KEY) return 'custom-1';
+			return null;
+		});
+		const { result } = renderHook(() => useDefaultShellProfile(), { wrapper: wrapper() });
+		await waitFor(() => expect(result.current.selectedProfile.id).toBe('custom-1'));
+		expect(result.current.readError).toBeNull();
 	});
 });

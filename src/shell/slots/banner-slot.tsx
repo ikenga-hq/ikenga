@@ -12,7 +12,8 @@
 // Priority order now (tier, then original mount order within a tier):
 //   violation — ConnectionBanner (a blocking condition: the host is gone),
 //               TrustReviewBanner (capability review — P10 folds trust into
-//               violations)
+//               violations), TerminalRestoreBanner (saved terminal list
+//               unreadable; saving is paused until the user resumes it)
 //   update    — UpdaterBanner (app binary), PkgAutoUpdater (pkg progress /
 //               failure / success strip)
 //   info      — ConnectorBanner
@@ -31,6 +32,7 @@ import type { ComponentType } from 'react';
 import { ConnectionBanner } from '@/shell/connection-banner';
 import { ConnectorBanner } from '@/shell/connector-banner';
 import { PkgAutoUpdater } from '@/shell/pkg-auto-updater';
+import { TerminalRestoreBanner } from '@/shell/terminal-restore-banner';
 import { TrustReviewBanner } from '@/shell/trust-review-banner';
 // WP-41: moved into src/shell/updater/ (absorbed folder) — see that folder's
 // update-sheet.tsx / status-bar-slot.tsx / post-restart-toast.tsx for the
@@ -49,6 +51,7 @@ export interface BannerQueueEntry {
 export const BANNER_QUEUE: BannerQueueEntry[] = [
 	{ id: 'connection', tier: 'violation', Component: ConnectionBanner },
 	{ id: 'trust-review', tier: 'violation', Component: TrustReviewBanner },
+	{ id: 'terminal-restore', tier: 'violation', Component: TerminalRestoreBanner },
 	{ id: 'updater', tier: 'update', Component: UpdaterBanner },
 	{ id: 'pkg-auto-updater', tier: 'update', Component: PkgAutoUpdater },
 	{ id: 'connector', tier: 'info', Component: ConnectorBanner },

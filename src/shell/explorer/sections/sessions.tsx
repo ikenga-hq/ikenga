@@ -70,7 +70,11 @@ export function SessionsSection(_ctx: ExplorerSectionContext) {
 
 	// A failed restore is not "no sessions": say so above whatever is shown.
 	const restoreRow = restoreError ? (
-		<SectionErrorRow message={restoreError.message} onRetry={dismissRestoreError} actionLabel="Dismiss" />
+		<SectionErrorRow
+			message={restoreError.message}
+			onRetry={dismissRestoreError}
+			actionLabel={restoreError.holdsSave ? 'Resume saving' : 'Dismiss'}
+		/>
 	) : null;
 
 	if (tabs.length === 0 && restoreRow) {

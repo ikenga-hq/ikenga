@@ -282,7 +282,14 @@ function AuthBadge({ authed, loading }: { authed: boolean | null; loading: boole
 function TerminalSectionBody() {
 	const { scope, projectId, result, refresh } = useSettingsSection();
 	const queryClient = useQueryClient();
-	const { profiles, selectedProfile, setDefaultProfileId, isLoading } = useDefaultShellProfile();
+	const {
+		profiles,
+		selectedProfile,
+		setDefaultProfileId,
+		isLoading,
+		readError: defaultShellReadError,
+		retryRead: retryDefaultShellRead,
+	} = useDefaultShellProfile();
 	const { refetch: refetchProfiles, isFetching } = useShellProfiles();
 	const {
 		addCustomProfile,
@@ -455,6 +462,7 @@ function TerminalSectionBody() {
 					label="Default interactive shell"
 					desc="The shell used when opening a new terminal tab via shortcuts (Ctrl+T) or the tab strip."
 				>
+					<div className="flex flex-col items-end">
 					<select
 						value={selectedProfile.id}
 						onChange={(e) => setDefaultProfileId(e.target.value)}
@@ -467,6 +475,25 @@ function TerminalSectionBody() {
 							</option>
 						))}
 					</select>
+					{defaultShellReadError && (
+						<div
+							role="alert"
+							data-testid="default-shell-read-error"
+							className="mt-1 flex items-center gap-2 text-xs"
+							style={{ color: 'var(--danger)' }}
+						>
+							<span>{defaultShellReadError}</span>
+							<button
+								type="button"
+								className="underline-offset-2 hover:underline"
+								style={{ color: 'var(--primary)' }}
+								onClick={retryDefaultShellRead}
+							>
+								Retry
+							</button>
+						</div>
+					)}
+					</div>
 				</SettingsFieldRow>
 
 				{isWindows && (

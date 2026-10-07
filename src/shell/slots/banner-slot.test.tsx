@@ -50,6 +50,9 @@ vi.mock('@/shell/pkg-auto-updater', async () => ({
 vi.mock('@/shell/connector-banner', async () => ({
 	ConnectorBanner: make(await import('react'), 'connector'),
 }));
+vi.mock('@/shell/terminal-restore-banner', async () => ({
+	TerminalRestoreBanner: make(await import('react'), 'terminal-restore'),
+}));
 
 import { BANNER_QUEUE, BannerSlot, LEGACY_BANNER_MOUNT_ORDER } from './banner-slot';
 
@@ -77,12 +80,14 @@ describe('<BannerSlot />', () => {
 		expect(BANNER_QUEUE.map((b) => `${b.tier}:${b.id}`)).toEqual([
 			'violation:connection',
 			'violation:trust-review',
+			'violation:terminal-restore',
 			'update:updater',
 			'update:pkg-auto-updater',
 			'info:connector',
 		]);
 		// Every banner that mounted before still mounts — nothing dropped.
-		expect([...LEGACY_BANNER_MOUNT_ORDER].sort()).toEqual(BANNER_QUEUE.map((b) => b.id).sort());
+		const ids = BANNER_QUEUE.map((b) => b.id);
+		for (const legacy of LEGACY_BANNER_MOUNT_ORDER) expect(ids).toContain(legacy);
 	});
 
 	it('T4: renders only one banner when three are eligible — the violation', async () => {

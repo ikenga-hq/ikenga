@@ -577,7 +577,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 				if (readError) {
 					set({
 						restoreError: {
-							message: `Couldn't restore your previous terminals: ${readError}. Saving is paused so the saved list isn't overwritten — dismiss to start saving again.`,
+							message: `Couldn't restore your previous terminals: ${readError}. Terminal saving is paused so that list isn't overwritten. Resume saving to replace it with the terminals open now.`,
 							holdsSave: true,
 						},
 					});

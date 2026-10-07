@@ -26,6 +26,7 @@ import { useEffect, useState } from 'react';
 
 import { Button } from '@/components/ui/button';
 import { StatusChip } from '@/components/ui/status-chip';
+import { AuthPill } from './auth-pill';
 import { cn } from '@/components/ui/utils';
 import {
 	fetchIndex,
@@ -672,22 +673,6 @@ function Pill({ children }: { children: React.ReactNode }) {
 			style={{ background: 'var(--bg-raised)', color: 'var(--fg-muted)' }}
 		>
 			{children}
-		</span>
-	);
-}
-
-function AuthPill({ authed, hint }: { authed: boolean | null; hint: string | null }) {
-	if (authed === true) {
-		return <StatusChip tone="live">signed in</StatusChip>;
-	}
-	if (authed === false) {
-		return <StatusChip tone="warn">auth required</StatusChip>;
-	}
-	// `null` is "couldn't tell" — say so (with the probe's reason when it
-	// gave one) rather than rendering nothing, which reads as fine.
-	return (
-		<span title={hint ?? undefined} data-testid="auth-pill-unknown">
-			<StatusChip tone="faint">sign-in unknown</StatusChip>
 		</span>
 	);
 }
