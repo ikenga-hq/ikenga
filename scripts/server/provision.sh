@@ -28,6 +28,7 @@ ENV_FILE="$INSTALL_DIR/.env"
 REPO="ikenga-hq/ikenga"
 
 DRY_RUN=0
+ALLOW_DOWNGRADE=0
 ASSUME_YES=0
 SKIP_HARDENING=0
 PROFILE_FILE=""
@@ -70,6 +71,7 @@ while [[ $# -gt 0 ]]; do
     --force) FORCE=1; shift ;;
     --profile) PROFILE_FILE="${2:?--profile needs a file}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --allow-downgrade) ALLOW_DOWNGRADE=1; shift ;;
     --yes|-y) ASSUME_YES=1; shift ;;
     --skip-hardening) SKIP_HARDENING=1; shift ;;
     -h|--help)
@@ -514,6 +516,14 @@ install_daemon() {
   log "Install ikenga-server $VERSION"
   local have=""; have="$("$INSTALL_DIR/bin/ikenga-server" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
   if [[ "$have" == "$VERSION" ]]; then note "already $VERSION"; return; fi
+  # A profile that still names an older release must never silently replace a
+  # newer install: the tarball would overwrite bin/, dist/ and the units, and
+  # the next restart would run old code on data a newer release migrated. This
+  # happened on 2026-10-06 (VERSION=0.19.4 left in a profile after an upgrade
+  # to 0.20.1). Downgrades need an explicit --allow-downgrade.
+  if [[ -n "$have" ]] && semver_lt "$VERSION" "$have" && [[ $ALLOW_DOWNGRADE -ne 1 ]]; then
+    die "installed ikenga-server $have is newer than the profile's VERSION=$VERSION; refusing to downgrade. Set VERSION=$have in the profile (or pass --allow-downgrade if you really mean it)."
+  fi
 
   local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
   local tarball="ikenga-server_${VERSION}_linux_${ARCH}.tar.gz"

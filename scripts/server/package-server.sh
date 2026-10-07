@@ -28,6 +28,10 @@ set -euo pipefail
 # RHEL/Rocky/Alma 9 (glibc 2.34) as well as Ubuntu 20.04 and newer.
 GLIBC_FLOOR="${GLIBC_FLOOR:-2.31}"
 
+# First release published with server tarballs (#381): the default
+# min_upgrade_from for every later release.
+FIRST_SERVER_RELEASE="0.19.4"
+
 SHELL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MANIFEST_SCHEMA="ikenga-server-release/1"
 
@@ -188,14 +192,13 @@ cmd_pack() {
   [[ "$tag" == "v$version" ]] || die "tag '$tag' does not match version '$version'"
   [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || die "--commit must be a 40-character lowercase hex sha"
   [[ -n "$channel" ]] || { [[ "$version" == *-* ]] && channel=next || channel=stable; }
-  # No floor unless one is asked for. The old default (this release's own
-  # version) made every manifest refuse every upgrade from an older install,
-  # since `provision.sh upgrade` honours the floor and release.yml never
-  # passes one. Name a floor only for a release an older box truly cannot
-  # upgrade to directly.
-  if [[ -n "$min_upgrade_from" ]]; then
-    [[ "$min_upgrade_from" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--min-upgrade-from must look like X.Y.Z"
-  fi
+  # The oldest release a server can upgrade from directly. Defaulting this to
+  # the release's own version made every published manifest refuse every
+  # upgrade (found upgrading a live box to v0.20.1). Default to the first
+  # release that shipped server tarballs; a release with a breaking migration
+  # raises it explicitly with --min-upgrade-from.
+  [[ -n "$min_upgrade_from" ]] || min_upgrade_from="$FIRST_SERVER_RELEASE"
+  [[ "$min_upgrade_from" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--min-upgrade-from must look like X.Y.Z"
   [[ -n "$published_at" ]] || published_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   mkdir -p "$out_dir"

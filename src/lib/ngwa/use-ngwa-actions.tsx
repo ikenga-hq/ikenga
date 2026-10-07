@@ -67,7 +67,8 @@ import {
 	type RemoteUpdateRequest,
 } from '@/shell/ngwa/ngwa-remote-dialogs';
 import { placementTarget } from '@/shell/ngwa/ngwa-scope-model';
-import { openExternalUrl, writeClipboardText } from '@/lib/transport';
+import { canOpenLocalPath, openLocalPath, writeClipboardText } from '@/lib/transport';
+import { DESKTOP_ONLY_REASON } from '@/lib/desktop-only';
 import type { PkgViewEntry } from '@/lib/pkg/use-activity-bar-entries';
 import { handToChi } from '@/shell/companion/companion-store';
 import {
@@ -736,14 +737,18 @@ export function useNgwaItemActions({
 
 			// ── Open folder / Hand to Chi ──
 			const folder = folderOf(item);
+			// A folder on the server has no browser equivalent: disabled there, with the
+			// shared reason, instead of `window.open`-ing a path.
 			const openFolder: NgwaAct = folder
-				? {
-						label: 'Open folder',
-						run: () =>
-							void openExternalUrl(folder).catch((e) =>
-								setStatus({ tone: 'err', text: `Open folder failed: ${errText(e)}` })
-							),
-					}
+				? canOpenLocalPath('folder')
+					? {
+							label: 'Open folder',
+							run: () =>
+								void openLocalPath(folder, { kind: 'folder' }).catch((e) =>
+									setStatus({ tone: 'err', text: `Open folder failed: ${errText(e)}` })
+								),
+						}
+					: { label: 'Open folder', disabledReason: DESKTOP_ONLY_REASON, run: () => {} }
 				: { label: 'Open folder', disabledReason: 'No install path on disk', run: () => {} };
 			const chiPath = item.install_path ?? item.placements[0]?.path ?? item.id;
 			const chi: NgwaAct = { label: 'Hand to Chi', run: () => handToChi(`Look at ${chiPath}`) };

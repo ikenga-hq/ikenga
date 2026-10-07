@@ -42,6 +42,7 @@ import {
 	hasPendingClear,
 } from './seat-pending';
 import { seatSessionNumberText, sessionName } from './seat-sessions';
+import { copyText as copyToClipboard } from '@/lib/clipboard';
 
 const ACTOR: SeatActor = { client: UI_SEAT_CLIENT };
 
@@ -222,13 +223,9 @@ export function openSeatBoard(): void {
 	requestBoardFocus();
 }
 
-export function copyText(text: string, message: string): void {
-	try {
-		void navigator.clipboard?.writeText(text).catch(() => {});
-	} catch {
-		// no clipboard in this context
-	}
-	showSeatNotice(message);
+/** Copy, then confirm — only once the write really succeeded (a failure toasts from the helper). */
+export async function copyText(text: string, message: string): Promise<void> {
+	if (await copyToClipboard(text)) showSeatNotice(message);
 }
 
 // ─── End session (T5: the seat stays, vacant) ───────────────────────────────

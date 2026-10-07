@@ -9,6 +9,7 @@
 
 import { useId, useState } from 'react';
 import type { InstallRun } from '@/lib/ngwa/install-progress';
+import { copyText } from '@/lib/clipboard';
 
 function runLine(run: InstallRun): string {
 	const parts = [run.cancelRequested ? 'Cancelling' : run.label];
@@ -102,10 +103,9 @@ export function InstallProgressRow({
 										type="button"
 										className="iprog-toggle"
 										onClick={() => {
-											void navigator.clipboard
-												?.writeText(err.debugLogPath ?? '')
-												.then(() => setCopied(true))
-												.catch(() => {});
+											void copyText(err.debugLogPath ?? '').then((ok) => {
+												if (ok) setCopied(true);
+											});
 										}}
 									>
 										{copied ? 'Copied' : 'Copy path'}

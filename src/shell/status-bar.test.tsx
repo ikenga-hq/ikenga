@@ -48,6 +48,7 @@ import { usePaneStore } from '@/lib/panes/pane-store';
 import { queryKeys } from '@/lib/query-keys';
 import { useShellStore } from '@/lib/shell/shell-store';
 import type { Project } from '@/lib/tauri-cmd';
+import { dismissToast, toast } from '@/lib/toast';
 import { useCompanionStore } from './companion/companion-store';
 import { UNREPORTED } from './companion/seat-model';
 import { APPROVALS_REFETCH_MS, APPROVALS_ROUTE, NGWA_LINKS, StatusBar } from './status-bar';
@@ -277,5 +278,17 @@ describe('<StatusBar /> — the selected seat’s cost (G-93)', () => {
 	it('with nothing selected and nothing live, the cost item stays hidden', () => {
 		render(<StatusBar />);
 		expect(seg('cost')).toBeNull();
+	});
+});
+
+describe('<StatusBar /> — general toast host', () => {
+	it('mounts ToastHost once in the frame: toast() shows in the bar', async () => {
+		render(<StatusBar />);
+		await waitFor(() => expect(mocks.paActionsList).toHaveBeenCalled());
+		act(() => {
+			toast({ label: 'Hello from toast()', variant: 'info' });
+		});
+		expect(screen.getAllByText('Hello from toast()')).toHaveLength(1);
+		act(() => dismissToast());
 	});
 });

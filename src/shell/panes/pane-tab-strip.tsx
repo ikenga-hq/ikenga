@@ -1,6 +1,5 @@
 import { useMemo, useRef, useState } from 'react';
 import { Plus } from 'lucide-react';
-import { writeClipboardText } from '@/lib/transport';
 import type { LeafNode } from '@/lib/panes/types';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
@@ -16,6 +15,7 @@ import { viewWorkspace } from './tab-workspace';
 import { NewTabMenu, useAnchorRect } from './new-tab-menu';
 import { PinArtifactDialog } from './pin-artifact-dialog';
 import { cn } from '@/components/ui/utils';
+import { copyText } from '@/lib/clipboard';
 
 // Shipped wording of the tab menu (the registry names are longer, for the
 // Actions tab); the toggle-pin label is per tab, below.
@@ -218,9 +218,7 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 								'tab.move-to-new-pane-right': () => moveTab(leaf.id, idx, leaf.id, 'right'),
 								'tab.move-to-new-pane-down': () => moveTab(leaf.id, idx, leaf.id, 'bottom'),
 								// Copy path only where the tab has one (artifact / route), as shipped.
-								...(tabPath !== undefined
-									? { 'copy-path': () => void writeClipboardText(tabPath).catch(() => {}) }
-									: {}),
+								...(tabPath !== undefined ? { 'copy-path': () => void copyText(tabPath) } : {}),
 								'tab.close': () => void guardedCloseTab(leaf.id, idx),
 								'tab.close-others': () => closeOthers(idx),
 								'tab.close-to-right': () => closeToRight(idx),
