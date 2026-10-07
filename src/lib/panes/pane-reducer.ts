@@ -7,6 +7,7 @@ import {
 	type SplitNode,
 	MAX_LEAVES,
 } from './types';
+import { sanitizeRoutePath } from './route-path';
 
 export function newPaneId(): PaneId {
 	if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -258,6 +259,34 @@ export function replaceActiveTab(root: PaneNode, leafId: PaneId, view: PaneView)
 		const tabs = leaf.tabs.map((t, i) => (i === leaf.activeTabIdx ? next : t));
 		return { ...leaf, tabs };
 	});
+}
+
+/**
+ * Rewrite the path of the route tab whose `tabUid` is `uid` in leaf `leafId`,
+ * in place: same slot, same identity (uid + `pinned` carried), active tab
+ * untouched. The path is sanitised with `sanitizeRoutePath` (no `?token=`). Used to write a pane's own memory-router navigation (an in-pane
+ * `<Link>`) back into the tree. Returns `root` unchanged — same reference —
+ * when no such tab exists or it already holds `path`, so callers can skip
+ * the store write.
+ */
+export function setRouteTabPath(
+	root: PaneNode,
+	leafId: PaneId,
+	uid: string,
+	rawPath: string
+): PaneNode {
+	// Store boundary: a credential param (`?token=`) must not land in the
+	// tree, which is persisted as the saved layout.
+	const path = sanitizeRoutePath(rawPath);
+	const leaf = findLeaf(root, leafId);
+	if (!leaf) return root;
+	const idx = leaf.tabs.findIndex((t) => t.kind === 'route' && tabUid(t) === uid);
+	const current = idx >= 0 ? leaf.tabs[idx] : undefined;
+	if (!current || current.kind !== 'route' || current.path === path) return root;
+	const next = carryTabUid(current, { ...current, path });
+	return mapLeaves(root, (l) =>
+		l.id !== leafId ? l : { ...l, tabs: l.tabs.map((t, i) => (i === idx ? next : t)) }
+	);
 }
 
 export function switchTab(root: PaneNode, leafId: PaneId, idx: number): PaneNode {
