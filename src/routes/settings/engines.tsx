@@ -16,7 +16,7 @@ import {
 import { Banner } from '@/components/ui/banner';
 import { Button } from '@/components/ui/button';
 import { StatusChip } from '@/components/ui/status-chip';
-import { agentUnavailableText } from '@/lib/agent-unavailable';
+import { agentUnavailableText, engineFacts } from '@/lib/agent-unavailable';
 import { isWindows } from '@/lib/platform';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import {
@@ -107,11 +107,10 @@ function EngineSectionBody() {
 	const isOffline = selectedAgentId === OFFLINE_AGENT_ID;
 	// Detection couldn't check the selected agent (WSL couldn't be asked): say
 	// so, and don't fall back to the onboarding payload's stale auth verdict.
+	// The same goes for the path and version: unknown, not the stale payload.
 	const unavailable = agentUnavailableText(live);
-	const authed = unavailable ? null : (live?.authed ?? payload?.authed ?? null);
+	const { authed, execPath, version } = engineFacts(live, payload);
 	const display = live?.display ?? payload?.display ?? selectedAgentId ?? 'Not selected';
-	const execPath = live?.executable_path ?? payload?.executablePath;
-	const version = live?.version ?? payload?.version;
 
 	function handleChange() {
 		enterOnboardingEdit('engine');

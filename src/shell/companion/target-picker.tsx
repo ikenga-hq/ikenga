@@ -22,7 +22,7 @@ import { viewLabel } from '@/shell/panes/pane-views';
 import { useTerminalStore } from '@/terminal/session-store';
 import { useTerminalTitles } from '@/terminal/use-terminal-titles';
 import { useCompanionStore } from './companion-store';
-import { offeredEngines, unavailableEngine } from './offered-engines';
+import { engineOfferNote, offeredEngines, unavailableEngine } from './offered-engines';
 import { openLoginTerminal } from './login-terminal';
 import { applyTarget, copyText, openSessionInPane, sameTarget } from './seat-actions';
 import { atName, engineShort, seatChipRest, seatSessionRef, stateDotColor, UNREPORTED } from './seat-model';
@@ -53,7 +53,7 @@ export const DETECT_AGENTS_KEY = ['settings', 'agent', 'detect'] as const;
 
 // The pure engine-offer rules live in `./offered-engines` (no React / UI
 // imports, so they test cheaply); re-exported for existing importers.
-export { offeredEngines, unavailableEngine } from './offered-engines';
+export { engineOfferNote, offeredEngines, unavailableEngine } from './offered-engines';
 
 /** ⌥↑ / ⌥↓: seats, then unseated sessions, then new-on each engine, then a
  *  persistent run on the default engine (D-09 `pickerTargets`). */
@@ -282,13 +282,25 @@ export function TargetPicker({ roster }: { roster: SeatRoster }) {
 				selected: sameTarget(tgt, target),
 			});
 		}
+		// D-11: an unchecked default engine stays offered, tagged so the user
+		// knows why a run on it may fail.
+		const noteFor = (id: string) => {
+			const note = engineOfferNote(id, engines.data);
+			if (!note) return null;
+			return { note, title: agentUnavailableText(engines.data?.find((a) => a.id === id)) ?? undefined };
+		};
+		const withNote = (base: string | undefined, id: string) => {
+			const n = noteFor(id);
+			return n ? (base ? `${base} · ${n.note}` : n.note) : base;
+		};
 		for (const id of engineIds) {
 			const tgt: CompanionTarget = { kind: 'new', engine_id: id };
 			out.push({
 				id: `n:${id}`,
 				group: 'New session on…',
 				label: id,
-				sub: id === defaultEngineId ? 'default' : undefined,
+				sub: withNote(id === defaultEngineId ? 'default' : undefined, id),
+				title: noteFor(id)?.title,
 				target: tgt,
 				selected: sameTarget(tgt, target),
 			});
@@ -299,13 +311,14 @@ export function TargetPicker({ roster }: { roster: SeatRoster }) {
 				id: `p:${id}`,
 				group: 'Persistent run',
 				label: id,
-				sub: id === defaultEngineId ? '⌥↵' : undefined,
+				sub: withNote(id === defaultEngineId ? '⌥↵' : undefined, id),
+				title: noteFor(id)?.title,
 				target: tgt,
 				selected: sameTarget(tgt, target),
 			});
 		}
 		return out;
-	}, [open, target, terminals, runs.data, engineIds, defaultEngineId, roster.seats, roster.unseated, resolveTerminal, snaps]);
+	}, [open, target, terminals, runs.data, engineIds, engines.data, defaultEngineId, roster.seats, roster.unseated, resolveTerminal, snaps]);
 
 	useEffect(() => {
 		if (!open) return;

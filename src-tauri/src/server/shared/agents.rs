@@ -130,6 +130,33 @@ fn wsl_unavailable_agent(def: &AgentDef, name: &str, reason: String) -> Detected
     }
 }
 
+/// Maps the WSL fallback for an agent the host PATH didn't have onto
+/// detection. `lookup` is `None` when this machine has no `wsl.exe`.
+/// `Ok(path)` — found inside WSL, go on and probe it; `Err(None)` — absent;
+/// `Err(Some(entry))` — WSL couldn't be asked, report the agent unavailable
+/// (D-10), never absent. Pure and cfg-free so the mapping is tested on every
+/// platform.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wsl_fallback(
+    def: &AgentDef,
+    names: &[&'static str],
+    lookup: Option<WslLookup>,
+) -> Result<PathBuf, Option<DetectedAgent>> {
+    match lookup {
+        None | Some(WslLookup::NotFound) => Err(None),
+        Some(WslLookup::Found(p)) => Ok(PathBuf::from(p)),
+        Some(WslLookup::WslUnavailable(reason)) => {
+            tracing::warn!(
+                target: "ikenga::agents",
+                "couldn't check WSL for {} — reporting it unavailable, not absent: {reason}",
+                def.id
+            );
+            let name = names.first().copied().unwrap_or(def.id);
+            Err(Some(wsl_unavailable_agent(def, name, reason)))
+        }
+    }
+}
+
 pub async fn detect_all() -> Vec<DetectedAgent> {
     let os = std::env::consts::OS;
     let mut futs = Vec::new();
@@ -200,23 +227,16 @@ async fn detect_one_in(
         Some(p) => p,
         #[cfg(windows)]
         None => {
-            if !super::wsl::wsl_exe_present() {
-                return None;
-            }
-            let distro = super::wsl::configured_distro();
             let names = wsl_candidate_names(def);
-            match lookup_wsl_with(&names, |n| wsl_which(n, distro.as_deref())).await {
-                WslLookup::Found(p) => PathBuf::from(p),
-                WslLookup::NotFound => return None,
-                WslLookup::WslUnavailable(reason) => {
-                    tracing::warn!(
-                        target: "ikenga::agents",
-                        "couldn't check WSL for {} — reporting it unavailable, not absent: {reason}",
-                        def.id
-                    );
-                    let name = names.first().copied().unwrap_or(def.id);
-                    return Some(wsl_unavailable_agent(def, name, reason));
-                }
+            let lookup = if super::wsl::wsl_exe_present() {
+                let distro = super::wsl::configured_distro();
+                Some(lookup_wsl_with(&names, |n| wsl_which(n, distro.as_deref())).await)
+            } else {
+                None
+            };
+            match wsl_fallback(def, &names, lookup) {
+                Ok(p) => p,
+                Err(entry) => return entry,
             }
         }
         #[cfg(not(windows))]
@@ -1455,6 +1475,45 @@ mod tests {
         let mut uniq = names.clone();
         uniq.dedup();
         assert_eq!(uniq.len(), names.len());
+    }
+
+    /// D-10: the host-miss → WSL mapping. No wsl.exe and a WSL miss are
+    /// "absent" (no entry); a WSL hit is probed; a WSL that couldn't be asked
+    /// is an unprobed entry flagged unavailable — never absent.
+    #[test]
+    fn wsl_fallback_maps_each_lookup_outcome() {
+        let def = KNOWN_AGENTS.iter().find(|d| d.id == "claude-code").unwrap();
+        let names = wsl_candidate_names(def);
+
+        assert!(matches!(wsl_fallback(def, &names, None), Err(None)));
+        assert!(matches!(
+            wsl_fallback(def, &names, Some(WslLookup::NotFound)),
+            Err(None)
+        ));
+        match wsl_fallback(
+            def,
+            &names,
+            Some(WslLookup::Found("wsl:claude:/usr/bin/claude".into())),
+        ) {
+            Ok(p) => assert_eq!(p, PathBuf::from("wsl:claude:/usr/bin/claude")),
+            other => panic!("expected a path to probe, got {other:?}"),
+        }
+        match wsl_fallback(
+            def,
+            &names,
+            Some(WslLookup::WslUnavailable("Wsl/Service/E_FAIL".into())),
+        ) {
+            Err(Some(agent)) => {
+                assert_eq!(agent.id, "claude-code");
+                assert_eq!(agent.version, None);
+                assert_eq!(agent.authed, None);
+                assert_eq!(
+                    agent.unavailable,
+                    Some(AgentUnavailable::wsl("Wsl/Service/E_FAIL"))
+                );
+            }
+            other => panic!("expected an unavailable entry, got {other:?}"),
+        }
     }
 
     /// The wire shape: a checked agent carries no `unavailable` key at all

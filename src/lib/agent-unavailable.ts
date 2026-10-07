@@ -23,3 +23,27 @@ export function agentUnavailableText(
 export function isRunnableAgent(agent: DetectedAgent | null | undefined): agent is DetectedAgent {
 	return !!agent && !agent.unavailable;
 }
+
+/** What onboarding stored about the chosen engine (its step payload). */
+export interface EnginePayloadFacts {
+	executablePath?: string;
+	version?: string | null;
+	authed?: boolean | null;
+}
+
+/** The auth / path / version a settings surface should show for the selected
+ *  engine. Live detection wins; the onboarding payload fills gaps only when
+ *  detection actually checked the engine. For an unchecked engine (WSL
+ *  couldn't be asked) every fact is unknown — the payload is stale and the
+ *  live `executable_path` is only a placeholder name. */
+export function engineFacts(
+	live: DetectedAgent | null | undefined,
+	payload: EnginePayloadFacts | null | undefined
+): { authed: boolean | null; execPath: string | undefined; version: string | null | undefined } {
+	if (live?.unavailable) return { authed: null, execPath: undefined, version: null };
+	return {
+		authed: live?.authed ?? payload?.authed ?? null,
+		execPath: live?.executable_path ?? payload?.executablePath,
+		version: live?.version ?? payload?.version,
+	};
+}

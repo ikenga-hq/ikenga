@@ -1,11 +1,12 @@
-// D-10: an engine detection couldn't check (WSL couldn't be asked) is never
-// offered as a runnable target, and is what the empty state names.
+// D-10/D-11: an engine detection couldn't check (WSL couldn't be asked) stays
+// offered when it is the default (tagged), is otherwise not offered, and is
+// what the empty state names when nothing else is.
 
 import { describe, expect, it } from 'vitest';
 
 import type { DetectedAgent } from '@/lib/tauri-cmd';
 
-import { offeredEngines, unavailableEngine } from './offered-engines';
+import { engineOfferNote, offeredEngines, unavailableEngine } from './offered-engines';
 
 function agent(id: string, over: Partial<DetectedAgent> = {}): DetectedAgent {
 	return {
@@ -43,17 +44,28 @@ describe('offeredEngines', () => {
 		);
 	});
 
-	it('never offers an engine detection could not check — default or not', () => {
+	it('keeps an unchecked default engine seatable (D-11), drops other unchecked ones', () => {
 		const detected = [
 			agent('claude-code', { authed: null, version: null, unavailable: wslDown }),
+			agent('gemini', { authed: null, version: null, unavailable: wslDown }),
 			agent('codex'),
 		];
-		expect(offeredEngines('claude-code', detected)).toEqual(['codex']);
+		expect(offeredEngines('claude-code', detected)).toEqual(['claude-code', 'codex']);
+		expect(offeredEngines('codex', detected)).toEqual(['codex']);
 		expect(offeredEngines(null, detected)).toEqual(['codex']);
 	});
 
 	it('still offers a default engine that is absent from detection (unchanged)', () => {
 		expect(offeredEngines('claude-code', [])).toEqual(['claude-code']);
+	});
+});
+
+describe('engineOfferNote', () => {
+	it('tags only an engine detection could not check', () => {
+		const detected = [agent('claude-code', { unavailable: wslDown }), agent('codex')];
+		expect(engineOfferNote('claude-code', detected)).toBe('WSL unavailable');
+		expect(engineOfferNote('codex', detected)).toBeNull();
+		expect(engineOfferNote('gemini', undefined)).toBeNull();
 	});
 });
 
