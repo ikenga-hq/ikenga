@@ -61,6 +61,8 @@ pub mod ops;
 pub mod routing;
 /// The Chi `run_finished` / `run_failed` builder (WP-40; ungated by WP-P10).
 pub mod run;
+/// The `fix.wsl_network` builder and report (WP-2; ungated by WP-7, D-21).
+pub mod wsl;
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;

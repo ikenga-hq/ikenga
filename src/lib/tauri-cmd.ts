@@ -783,6 +783,8 @@ export interface WslHealth {
 	networkingMode: string | null;
 	/** Unix ms. */
 	checkedAt: number;
+	/** `wsl_down` rests only on wsl.exe timing out, not on an answer. */
+	inconclusive?: boolean;
 }
 
 export type WslFixAction = 'repair_dns' | 'restart_networking' | 'switch_to_nat';

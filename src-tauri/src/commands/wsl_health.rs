@@ -2,7 +2,8 @@
 //! fixes. Thin wrappers over `crate::server::shared::wsl_health`, plus the
 //! `fix.wsl_network` notification (D-2, D-8): a fresh probe that finds a
 //! WSL-caused failure records it (one row per episode per distro); a fresh
-//! `ok` probe resolves it.
+//! `ok` probe resolves it. The report is shared with the Chi pre-run probe
+//! (`server::shared::notifications::wsl::report_with_db`, D-21).
 //!
 //! Desktop-only forever (`server/desktop_only.toml`): they drive `wsl.exe`,
 //! the Windows event log and a UAC prompt on the user's own machine.
@@ -14,10 +15,10 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::commands::db::PaDb;
-use crate::notifications::{self, producers};
+use crate::server::shared::notifications::wsl::report_with_db;
 use crate::server::shared::wsl::{configured_distro, normalise_distro};
 use crate::server::shared::wsl_health::{
-    self, valid_distro_name, WslFixAction, WslFixOutcome, WslHealth, WslHealthState,
+    self, valid_distro_name, WslFixAction, WslFixOutcome, WslHealth,
 };
 
 /// `distro` as given (`"default"` / blank = the default distro), else
@@ -33,43 +34,6 @@ fn resolve_distro(distro: Option<String>) -> Result<Option<String>, String> {
     }
 }
 
-/// Raise or resolve `fix.wsl_network` rows for a freshly measured result
-/// (see [`producers::wsl_network_keys_to_resolve`] for which rows end).
-async fn report(db: &PaDb, health: &WslHealth) {
-    if let Some(n) = producers::wsl_network(health) {
-        notifications::record_with_db(db, n).await;
-        return;
-    }
-    if !matches!(
-        health.state,
-        WslHealthState::Ok | WslHealthState::NotInstalled
-    ) {
-        return;
-    }
-    let pool = match db.ensure_pool().await {
-        Ok(pool) => pool,
-        Err(e) => {
-            log::warn!(target: "ikenga::notifications", "no db pool: {e}");
-            return;
-        }
-    };
-    let open =
-        match notifications::open_rows_with_key_prefix(&pool, producers::WSL_NETWORK_KEY_PREFIX)
-            .await
-        {
-            Ok(open) => open,
-            Err(e) => {
-                log::warn!(target: "ikenga::notifications", "{e}");
-                return;
-            }
-        };
-    for key in producers::wsl_network_keys_to_resolve(health, &open) {
-        if let Err(e) = notifications::resolve_by_key(&pool, &key).await {
-            log::warn!(target: "ikenga::notifications", "could not resolve {key}: {e}");
-        }
-    }
-}
-
 /// Probe WSL networking in `distro` (omit for `engines.agentWslDistro`).
 /// Reuses a result younger than 30 s unless `force`.
 #[tauri::command]
@@ -81,7 +45,7 @@ pub async fn wsl_health_probe(
     let distro = resolve_distro(distro)?;
     let (health, fresh) = wsl_health::probe(distro.as_deref(), force.unwrap_or(false)).await;
     if fresh {
-        report(&db, &health).await;
+        report_with_db(&db, &health).await;
     }
     Ok(health)
 }
@@ -99,7 +63,7 @@ pub async fn wsl_health_fix(
     let distro = resolve_distro(distro)?;
     let outcome = wsl_health::fix(action, distro.as_deref()).await;
     if let WslFixOutcome::Done { health } = &outcome {
-        report(&db, health).await;
+        report_with_db(&db, health).await;
     }
     Ok(outcome)
 }

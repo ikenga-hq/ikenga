@@ -48,6 +48,7 @@ use super::chi::{
     OutputFiles, RunOutputFile,
 };
 use super::chi_runner::{self, RunLiveness};
+use super::wsl_health::WslHealth;
 use super::claude_sessions::event::ChatEvent;
 use super::claude_sessions::stream_parser::StreamParser;
 use crate::db::PaDb;
@@ -165,6 +166,22 @@ pub(crate) trait EngineResolver: Send + Sync {
     fn wsl_distro(&self) -> Option<String> {
         None
     }
+    /// WSL network health for a launch in `distro` (D-21), and whether it
+    /// was freshly measured; `None` = don't probe (stub resolvers, hosts
+    /// without WSL). Only asked for a WSL launch, never a native one.
+    ///
+    /// Contract: this only *measures*. Raising / resolving the
+    /// `fix.wsl_network` notification is [`ReportingResolver`]'s job, so a
+    /// caller of [`resolve_engine`] / [`build_engine_command_with`] that
+    /// holds a `PaDb` passes its resolver wrapped in one (as `spawn_run` /
+    /// `resume_run` do via `ChiEnv::reporting_resolver`); a bare resolver
+    /// still fails the launch, it just raises no notification.
+    fn wsl_health<'a>(
+        &'a self,
+        _distro: Option<&'a str>,
+    ) -> BoxFuture<'a, Option<(WslHealth, bool)>> {
+        Box::pin(std::future::ready(None))
+    }
 }
 
 /// The real resolver: augmented host PATH first, then WSL on Windows.
@@ -218,6 +235,105 @@ impl EngineResolver for HostResolver {
         } else {
             None
         }
+    }
+
+    /// The shared WSL health probe, reusing a result younger than its 30 s
+    /// cache (D-7). Bounded: every spawn in it has a timeout.
+    #[cfg(windows)]
+    fn wsl_health<'a>(
+        &'a self,
+        distro: Option<&'a str>,
+    ) -> BoxFuture<'a, Option<(WslHealth, bool)>> {
+        Box::pin(async move { Some(super::wsl_health::probe(distro, false).await) })
+    }
+}
+
+/// An [`EngineResolver`] whose fresh WSL health probes are reported to the
+/// `notifications` table (`fix.wsl_network`, D-21) — the same record /
+/// resolve the desktop's `wsl_health_probe` command does. Wraps the run's
+/// resolver for the spawn paths, which hold the run's `PaDb`.
+struct ReportingResolver<'a> {
+    inner: &'a dyn EngineResolver,
+    db: &'a PaDb,
+}
+
+impl EngineResolver for ReportingResolver<'_> {
+    fn native(&self, binary: &str) -> Option<PathBuf> {
+        self.inner.native(binary)
+    }
+    fn in_wsl<'a>(&'a self, binary: &'a str, distro: Option<&'a str>) -> BoxFuture<'a, WslLookup> {
+        self.inner.in_wsl(binary, distro)
+    }
+    fn wsl_distro(&self) -> Option<String> {
+        self.inner.wsl_distro()
+    }
+    fn wsl_health<'a>(
+        &'a self,
+        distro: Option<&'a str>,
+    ) -> BoxFuture<'a, Option<(WslHealth, bool)>> {
+        Box::pin(async move {
+            let probed = self.inner.wsl_health(distro).await;
+            // A cached result was reported when it was measured; an
+            // inconclusive one (wsl.exe timed out) neither raises nor ends
+            // an episode — it doesn't fail the run either.
+            if let Some((health, true)) = &probed {
+                if !health.inconclusive {
+                    super::notifications::wsl::report_with_db(self.db, health).await;
+                }
+            }
+            probed
+        })
+    }
+}
+
+/// How long the pre-run WSL check may hold up a run's start. A warm probe
+/// takes a few seconds; a `wsl.exe` that times out (twice) would take ~54 s.
+const WSL_PREFLIGHT_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The pre-run WSL check (D-21): a launch inside WSL whose network is
+/// broken in a way that is WSL's own fault (`no_route`, `dns_only`,
+/// `wsl_down`) fails now with the cause, instead of spawning an engine that
+/// can't sign in or reach its API. `ok` and `host_offline` (Windows is
+/// offline too — not WSL's fault, and not ours to block) proceed, as does
+/// `not_installed` (the binary lookup that got us here already answered).
+///
+/// "Couldn't tell" proceeds too: a probe that outruns
+/// [`WSL_PREFLIGHT_BUDGET`], or a `wsl_down` that rests only on `wsl.exe`
+/// timing out ([`WslHealth::inconclusive`]) — the binary lookup that got us
+/// here has just seen WSL answer, so a slow probe is not evidence it's down.
+async fn wsl_preflight(resolver: &dyn EngineResolver, distro: Option<&str>) -> Result<(), String> {
+    wsl_preflight_within(resolver, distro, WSL_PREFLIGHT_BUDGET).await
+}
+
+async fn wsl_preflight_within(
+    resolver: &dyn EngineResolver,
+    distro: Option<&str>,
+    budget: std::time::Duration,
+) -> Result<(), String> {
+    let probed = match tokio::time::timeout(budget, resolver.wsl_health(distro)).await {
+        Ok(probed) => probed,
+        Err(_) => {
+            tracing::warn!(
+                target: "ikenga::chi",
+                "WSL health check took over {}s; launching without it",
+                budget.as_secs()
+            );
+            return Ok(());
+        }
+    };
+    match probed {
+        Some((health, _)) if health.state.is_wsl_fault() && health.inconclusive => {
+            tracing::warn!(
+                target: "ikenga::chi",
+                "WSL health check inconclusive ({}); launching anyway",
+                health.detail
+            );
+            Ok(())
+        }
+        Some((health, _)) if health.state.is_wsl_fault() => {
+            Err(format!("Can't start the engine in WSL — {}", health.detail))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -357,6 +473,47 @@ pub(crate) fn not_detachable_warning(engine_id: &str) -> String {
     )
 }
 
+/// The engine binary `engine_id` launches (what [`build_engine_command_with`]
+/// resolves).
+fn engine_binary(engine_id: &str) -> Option<&'static str> {
+    match engine_id {
+        "claude-code" => Some("claude"),
+        "antigravity-cli" => Some("agy"),
+        "codex" => Some("codex"),
+        "opencode" => Some("opencode"),
+        "pi" => Some("pi"),
+        _ => None,
+    }
+}
+
+/// The warning a persistent run of an engine installed only inside WSL
+/// carries: chi-runner launches engines from the host PATH and has no WSL
+/// launch, so the run went in-process (where the WSL launch works) instead.
+pub(crate) fn wsl_only_warning(engine_id: &str) -> String {
+    format!(
+        "persistent run fell back to in-process: {engine_id} is installed only inside WSL,          which persistent runs don't support yet. This run will NOT survive quitting the app."
+    )
+}
+
+/// Whether a persistent run of `engine_id` can go to chi-runner, which
+/// launches engines from the host PATH only. `Ok(None)` = yes (a native
+/// engine, or one this check doesn't know); `Ok(Some(warning))` = the engine
+/// resolves only inside WSL, so the run must stay in-process; `Err` = the
+/// engine can't launch at all (not installed, WSL's pre-run check failed).
+async fn detached_launch_check(
+    resolver: &dyn EngineResolver,
+    engine_id: &str,
+    cwd: &str,
+) -> Result<Option<String>, String> {
+    let Some(binary) = engine_binary(engine_id) else {
+        return Ok(None);
+    };
+    match resolve_engine(binary, resolver, cwd).await? {
+        EngineLaunch::Native(_) => Ok(None),
+        EngineLaunch::Wsl { .. } => Ok(Some(wsl_only_warning(engine_id))),
+    }
+}
+
 impl ChiEnv {
     /// The desktop's shape: no default cwd, stored output paths, host PATH,
     /// full cwd expansion.
@@ -370,6 +527,15 @@ impl ChiEnv {
             files: OutputFiles::AsStored,
             resolver: Arc::new(HostResolver),
             cwd_expansion: CwdExpansion::Full,
+        }
+    }
+
+    /// The run's resolver, reporting its WSL pre-run probes (D-21) to the
+    /// run's `notifications` table.
+    fn reporting_resolver(&self) -> ReportingResolver<'_> {
+        ReportingResolver {
+            inner: &*self.resolver,
+            db: &self.db,
         }
     }
 
@@ -896,10 +1062,13 @@ pub(crate) async fn resolve_engine(
     }
     let distro = launch_distro(cwd, resolver);
     match resolver.in_wsl(binary, distro.as_deref()).await {
-        WslLookup::Found(_) => Ok(EngineLaunch::Wsl {
-            binary: binary.to_string(),
-            distro,
-        }),
+        WslLookup::Found(_) => {
+            wsl_preflight(resolver, distro.as_deref()).await?;
+            Ok(EngineLaunch::Wsl {
+                binary: binary.to_string(),
+                distro,
+            })
+        }
         // Not "install it": the CLI may well be installed in a WSL that
         // didn't answer, and reinstalling would not help.
         WslLookup::WslUnavailable(reason) => Err(format!(
@@ -1958,6 +2127,25 @@ pub(crate) async fn spawn_run(
         tracing::warn!(target: "ikenga::chi", "chi run {run_id}: {warning}");
         fallback_warning = Some(warning);
     } else if opts.persistent {
+        // chi-runner has no WSL launch: an engine found only inside WSL would
+        // not start there, so it stays in-process (which launches it through
+        // wsl.exe) and says so. An engine that can't launch at all fails here.
+        match detached_launch_check(&env.reporting_resolver(), &opts.engine_id, &cwd).await {
+            Ok(None) => {}
+            Ok(Some(warning)) => {
+                tracing::warn!(target: "ikenga::chi", "chi run {run_id}: {warning}");
+                fallback_warning = Some(warning);
+            }
+            Err(e) => {
+                tracing::warn!(target: "ikenga::chi", "chi run {run_id} failed to start: {e}");
+                cache_update_done(&env.db, &run_id, "failed", Some(&e), false, None)
+                    .await
+                    .ok();
+                return Err(e);
+            }
+        }
+    }
+    if opts.persistent && fallback_warning.is_none() {
         let model = runner_model(&opts.engine_id, opts.model.as_deref());
         let conf = chi_runner::RunnerConf {
             run_id: &run_id,
@@ -2008,7 +2196,7 @@ pub(crate) async fn spawn_run(
 
     // ── In-process (non-persistent) path ─────────────────────────────────────
     let cmd = build_engine_command_with(
-        &*env.resolver,
+        &env.reporting_resolver(),
         &opts.engine_id,
         &cwd,
         opts.model.as_deref(),
@@ -2096,7 +2284,7 @@ pub(crate) async fn resume_run(
 
     let cwd = env.run_cwd(row.cwd.as_deref());
     let cmd = build_engine_command_with(
-        &*env.resolver,
+        &env.reporting_resolver(),
         &row.engine_id,
         &cwd,
         row.model.as_deref(),

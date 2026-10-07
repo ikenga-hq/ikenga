@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::server::shared::chi::{cache_list, parse_output_file};
+use crate::server::shared::wsl_health::WslHealthState;
 
 pub(crate) async fn test_db() -> PaDb {
     let file_name = format!("ikenga-chi-test-{}.db", uuid::Uuid::new_v4());
@@ -45,6 +46,17 @@ struct FakeResolver {
     distro: Option<&'static str>,
     /// The distro each `in_wsl` probe asked.
     probed: std::sync::Mutex<Vec<Option<String>>>,
+    /// The WSL network health a pre-run probe reports (D-21); `None` = no
+    /// probe, as for a host without WSL.
+    health: Option<WslHealthState>,
+    /// The distro each pre-run health probe asked.
+    health_asked: std::sync::Mutex<Vec<Option<String>>>,
+    /// `health` comes from the probe's cache (`fresh == false`).
+    cached: bool,
+    /// `health` rests on `wsl.exe` timing out ([`WslHealth::inconclusive`]).
+    inconclusive: bool,
+    /// The health probe never answers.
+    hang: bool,
 }
 
 impl FakeResolver {
@@ -55,6 +67,11 @@ impl FakeResolver {
             wsl_down: None,
             distro: None,
             probed: Default::default(),
+            health: None,
+            health_asked: Default::default(),
+            cached: false,
+            inconclusive: false,
+            hang: false,
         }
     }
     fn wsl(bins: &[&'static str]) -> Self {
@@ -64,6 +81,11 @@ impl FakeResolver {
             wsl_down: None,
             distro: None,
             probed: Default::default(),
+            health: None,
+            health_asked: Default::default(),
+            cached: false,
+            inconclusive: false,
+            hang: false,
         }
     }
 }
@@ -83,6 +105,30 @@ impl EngineResolver for FakeResolver {
     }
     fn wsl_distro(&self) -> Option<String> {
         self.distro.map(str::to_string)
+    }
+    fn wsl_health<'a>(
+        &'a self,
+        distro: Option<&'a str>,
+    ) -> BoxFuture<'a, Option<(WslHealth, bool)>> {
+        self.health_asked.lock().unwrap().push(distro.map(str::to_string));
+        if self.hang {
+            return Box::pin(std::future::pending());
+        }
+        let health = self.health.map(|state| {
+            (
+                WslHealth {
+                    state,
+                    distro: distro.map(str::to_string),
+                    detail: format!("probe said {}", state.as_str()),
+                    mirrored_failure: None,
+                    networking_mode: Some("mirrored".into()),
+                    checked_at: 1,
+                    inconclusive: self.inconclusive,
+                },
+                !self.cached,
+            )
+        });
+        Box::pin(std::future::ready(health))
     }
 }
 
@@ -1969,4 +2015,315 @@ async fn failed_run_error_names_the_stderr_cause() {
         explain_failure(Some("x"), StderrTail(None)).await.as_deref(),
         Some("x")
     );
+}
+
+// ── WSL pre-run probe (honest-failure-states WP-7, D-21) ─────────────────
+
+fn wsl_with_health(state: WslHealthState) -> FakeResolver {
+    FakeResolver {
+        distro: Some("Ubuntu"),
+        health: Some(state),
+        ..FakeResolver::wsl(&["claude", "codex"])
+    }
+}
+
+/// `no_route`, `dns_only` and `wsl_down` are WSL's own fault: the launch
+/// fails with the cause instead of building a command.
+#[tokio::test]
+async fn a_wsl_launch_with_broken_wsl_networking_fails_before_building() {
+    for state in [
+        WslHealthState::NoRoute,
+        WslHealthState::DnsOnly,
+        WslHealthState::WslDown,
+    ] {
+        let r = wsl_with_health(state);
+        let err = build_engine_command_with(&r, "claude-code", "/tmp", None, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            format!("Can't start the engine in WSL — probe said {}", state.as_str()),
+            "{state:?}"
+        );
+        assert_eq!(*r.health_asked.lock().unwrap(), [Some("Ubuntu".to_string())]);
+    }
+}
+
+/// `ok`, `host_offline` (not WSL's fault) and `not_installed` (the lookup
+/// already answered) launch as before.
+#[tokio::test]
+async fn a_wsl_launch_proceeds_when_wsl_is_not_at_fault() {
+    for state in [
+        WslHealthState::Ok,
+        WslHealthState::HostOffline,
+        WslHealthState::NotInstalled,
+    ] {
+        let r = wsl_with_health(state);
+        let cmd = build_engine_command_with(&r, "codex", "/tmp", None, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{state:?}: {e}"));
+        assert_eq!(cmd.program, std::ffi::OsString::from("wsl.exe"), "{state:?}");
+        assert_eq!(r.health_asked.lock().unwrap().len(), 1, "{state:?}");
+    }
+    // No probe at all (a host without WSL health): proceeds too.
+    let r = FakeResolver::wsl(&["claude"]);
+    assert!(build_engine_command_with(&r, "claude-code", "/tmp", None, None, None)
+        .await
+        .is_ok());
+}
+
+/// A native engine is never probed: the check costs non-WSL launches
+/// nothing, even while WSL is down.
+#[tokio::test]
+async fn a_native_launch_never_probes_wsl() {
+    let r = FakeResolver {
+        native: vec!["claude"],
+        ..wsl_with_health(WslHealthState::NoRoute)
+    };
+    build_engine_command_with(&r, "claude-code", "/tmp", None, None, None)
+        .await
+        .unwrap();
+    assert!(r.health_asked.lock().unwrap().is_empty());
+}
+
+/// Through the run path: the run fails at once without spawning, the row
+/// carries the cause, and the same `fix.wsl_network` row the desktop's probe
+/// raises is recorded (alongside the run's own `run_failed`).
+#[tokio::test]
+async fn a_run_on_broken_wsl_fails_immediately_and_raises_the_wsl_notification() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(test_db().await);
+    let env = ChiEnv {
+        resolver: Arc::new(wsl_with_health(WslHealthState::NoRoute)),
+        ..ChiEnv::new(db.clone(), tmp.path().join("chi-cache"), Arc::new(ChiRuntime::new()))
+    };
+    let err = spawn_run(
+        &env,
+        &NoInProcessEngines,
+        opts("claude-code", "hi", Some("/tmp")),
+        "cli",
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(err, "Can't start the engine in WSL — probe said no_route");
+    let rows = cache_list(&db, Some("claude-code"), 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+    assert_eq!(rows[0].error.as_deref(), Some(err.as_str()));
+    assert!(env.runtime.remove(&rows[0].run_id).await.is_none(), "nothing was spawned");
+
+    let pool = db.ensure_pool().await.unwrap();
+    let open = crate::server::shared::notifications::open_rows_with_key_prefix(
+        &pool,
+        crate::server::shared::notifications::wsl::WSL_NETWORK_KEY_PREFIX,
+    )
+    .await
+    .unwrap();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].0, "wsl:network:ubuntu");
+}
+
+/// The open `fix.wsl_network` rows' keys.
+async fn open_wsl_rows(db: &PaDb) -> Vec<String> {
+    let pool = db.ensure_pool().await.unwrap();
+    crate::server::shared::notifications::open_rows_with_key_prefix(
+        &pool,
+        crate::server::shared::notifications::wsl::WSL_NETWORK_KEY_PREFIX,
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(key, _)| key)
+    .collect()
+}
+
+fn env_with(db: &Arc<PaDb>, root: &Path, resolver: FakeResolver) -> ChiEnv {
+    ChiEnv {
+        resolver: Arc::new(resolver),
+        ..ChiEnv::new(db.clone(), root.join("chi-cache"), Arc::new(ChiRuntime::new()))
+    }
+}
+
+/// A `wsl_down` that rests only on `wsl.exe` timing out is "couldn't
+/// tell": the binary lookup just saw WSL answer, so the launch proceeds.
+/// One that rests on an answer still fails.
+#[tokio::test]
+async fn an_inconclusive_wsl_down_does_not_block_the_launch() {
+    let r = FakeResolver {
+        inconclusive: true,
+        ..wsl_with_health(WslHealthState::WslDown)
+    };
+    let cmd = build_engine_command_with(&r, "claude-code", "/tmp", None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(cmd.program, std::ffi::OsString::from("wsl.exe"));
+
+    let r = wsl_with_health(WslHealthState::WslDown);
+    assert!(build_engine_command_with(&r, "claude-code", "/tmp", None, None, None)
+        .await
+        .is_err());
+}
+
+/// A probe that outruns the pre-run budget doesn't hold the run up: the
+/// launch proceeds without it.
+#[tokio::test]
+async fn a_probe_past_the_preflight_budget_proceeds() {
+    let r = FakeResolver {
+        hang: true,
+        ..wsl_with_health(WslHealthState::NoRoute)
+    };
+    let started = std::time::Instant::now();
+    wsl_preflight_within(&r, Some("Ubuntu"), std::time::Duration::from_millis(50))
+        .await
+        .unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(r.health_asked.lock().unwrap().len(), 1);
+}
+
+/// A cached verdict still fails the run (it is still evidence), but it was
+/// reported when it was measured, so the run raises no second row; and an
+/// inconclusive fresh one raises none at all.
+#[tokio::test]
+async fn only_fresh_conclusive_probes_raise_the_wsl_notification() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(test_db().await);
+
+    let cached = env_with(
+        &db,
+        tmp.path(),
+        FakeResolver {
+            cached: true,
+            ..wsl_with_health(WslHealthState::NoRoute)
+        },
+    );
+    let err = spawn_run(&cached, &NoInProcessEngines, opts("claude-code", "hi", Some("/tmp")), "cli")
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err, "Can't start the engine in WSL — probe said no_route");
+    assert!(open_wsl_rows(&db).await.is_empty(), "a cached probe re-reported");
+
+    let inconclusive = env_with(
+        &db,
+        tmp.path(),
+        FakeResolver {
+            inconclusive: true,
+            ..wsl_with_health(WslHealthState::WslDown)
+        },
+    );
+    let reporting = inconclusive.reporting_resolver();
+    wsl_preflight(&reporting, Some("Ubuntu")).await.unwrap();
+    assert!(open_wsl_rows(&db).await.is_empty(), "an inconclusive probe raised a row");
+}
+
+/// One episode, one row: two failing runs coalesce into a single open
+/// `wsl:network:<distro>` row, and the next fresh `ok` probe ends it.
+#[tokio::test]
+async fn repeated_failing_runs_share_one_row_until_an_ok_probe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(test_db().await);
+    let broken = env_with(&db, tmp.path(), wsl_with_health(WslHealthState::NoRoute));
+    for _ in 0..2 {
+        assert!(spawn_run(&broken, &NoInProcessEngines, opts("claude-code", "hi", Some("/tmp")), "cli")
+            .await
+            .is_err());
+    }
+    assert_eq!(open_wsl_rows(&db).await, ["wsl:network:ubuntu"]);
+
+    let healthy = env_with(&db, tmp.path(), wsl_with_health(WslHealthState::Ok));
+    let reporting = healthy.reporting_resolver();
+    wsl_preflight(&reporting, Some("Ubuntu")).await.unwrap();
+    assert!(open_wsl_rows(&db).await.is_empty(), "ok didn't resolve the row");
+}
+
+/// `resume_run` goes through the same check: the resumed turn fails with
+/// the cause, the row records it, and the notification is raised.
+#[tokio::test]
+async fn a_resume_on_broken_wsl_fails_with_the_cause() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(test_db().await);
+    let env = env_with(&db, tmp.path(), wsl_with_health(WslHealthState::DnsOnly));
+    env.ensure_cache_dir().unwrap();
+    let run_id = "resume-wsl";
+    let mut first = opts("claude-code", "hi", Some("/tmp"));
+    first.resume_session_id = Some("sess-1".into());
+    cache_insert(&db, run_id, &first, &env.run_output_path(run_id), "cli")
+        .await
+        .unwrap();
+
+    let err = resume_run(&env, &NoInProcessEngines, run_id.into(), "again".into())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err, "Can't start the engine in WSL — probe said dns_only");
+    let row = crate::server::shared::chi::cache_get(&db, run_id).await.unwrap().unwrap();
+    assert_eq!(row.status, "failed");
+    assert_eq!(row.error.as_deref(), Some(err.as_str()));
+    assert_eq!(open_wsl_rows(&db).await, ["wsl:network:ubuntu"]);
+}
+
+// ── Persistent runs and WSL-only engines (WP-7, D-21) ────────────────────
+
+/// chi-runner launches engines from the host PATH only, so a persistent run
+/// of an engine found only inside WSL stays in-process (which launches it
+/// through wsl.exe) and says so; a native engine may go detached; an engine
+/// that can't launch at all fails with the same cause the in-process path
+/// would give.
+#[tokio::test]
+async fn detached_launch_check_keeps_wsl_only_engines_in_process() {
+    let native = FakeResolver::native(&["claude", "codex"]);
+    for engine in ["claude-code", "codex"] {
+        assert_eq!(
+            detached_launch_check(&native, engine, "/tmp").await,
+            Ok(None),
+            "{engine}"
+        );
+    }
+
+    let wsl_only = wsl_with_health(WslHealthState::Ok);
+    for engine in ["claude-code", "codex"] {
+        let warning = detached_launch_check(&wsl_only, engine, "/tmp")
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{engine}: went detached"));
+        assert_eq!(warning, wsl_only_warning(engine));
+        assert!(warning.contains("installed only inside WSL"), "{warning}");
+        assert!(warning.contains("NOT survive"), "{warning}");
+        assert!(warning.starts_with("persistent run fell back to in-process"), "{warning}");
+    }
+
+    let missing = FakeResolver::native(&[]);
+    let err = detached_launch_check(&missing, "claude-code", "/tmp")
+        .await
+        .unwrap_err();
+    assert!(err.contains("engine binary `claude` not found"), "{err}");
+
+    let broken = wsl_with_health(WslHealthState::NoRoute);
+    assert_eq!(
+        detached_launch_check(&broken, "claude-code", "/tmp").await,
+        Err("Can't start the engine in WSL — probe said no_route".to_string())
+    );
+}
+
+/// A persistent run on broken WSL fails at once with the cause — before any
+/// chi-runner is tried — and raises the WSL notification, like a one-off.
+#[tokio::test]
+async fn a_persistent_run_on_broken_wsl_fails_before_chi_runner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(test_db().await);
+    let env = env_with(&db, tmp.path(), wsl_with_health(WslHealthState::DnsOnly));
+    let mut o = opts("claude-code", "hi", Some("/tmp"));
+    o.persistent = true;
+    let err = spawn_run(&env, &NoInProcessEngines, o, "cli")
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err, "Can't start the engine in WSL — probe said dns_only");
+    let rows = cache_list(&db, Some("claude-code"), 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+    assert_eq!(rows[0].error.as_deref(), Some(err.as_str()));
+    assert_eq!(rows[0].pid, None, "no chi-runner was spawned");
+    assert_eq!(open_wsl_rows(&db).await, ["wsl:network:ubuntu"]);
 }

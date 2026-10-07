@@ -133,6 +133,12 @@ pub struct WslHealth {
     pub networking_mode: Option<String>,
     /// Unix ms the probe ran.
     pub checked_at: i64,
+    /// `wsl_down` rests on `wsl.exe` timing out (twice), not on an answer.
+    /// The surfaces still show the state; a caller that has just seen WSL
+    /// answer (the Chi pre-run check, after its binary lookup) treats it as
+    /// "couldn't tell" rather than failing on it. See [`is_inconclusive`].
+    #[serde(default)]
+    pub inconclusive: bool,
 }
 
 /// A fix the UI can ask for. Wire form: `"repair_dns"` etc.
@@ -729,6 +735,16 @@ pub fn classify(
     (WslHealthState::DnsOnly, why.into())
 }
 
+/// Whether `state` (from [`classify`] on `probe`) rests on a timeout rather
+/// than on an answer: `wsl_down` because `wsl.exe` never answered. A slow or
+/// loaded box looks exactly like that. A `wsl.exe` that answered with an
+/// error, `no_route` and `dns_only` are evidence — including a DNS lookup cut
+/// off at 8 s: that already outlasts glibc's 5 s per-try timeout, so the
+/// engine's own lookups would be failing too.
+pub fn is_inconclusive(probe: &Result<DistroProbe, ProbeFailure>, state: WslHealthState) -> bool {
+    state == WslHealthState::WslDown && matches!(probe, Err(ProbeFailure::TimedOut(_)))
+}
+
 /// Nameservers for [`WslFixAction::RepairDns`]: the DNS tunnelling proxy when
 /// the distro has it, then up to two of the host's own IPv4 servers, then a
 /// public fallback — at most three (glibc reads no more). Every entry is a
@@ -1028,6 +1044,7 @@ mod imp {
             mirrored_failure: mirrored,
             networking_mode: read_networking_mode(),
             checked_at,
+            inconclusive: is_inconclusive(&probe, state),
         }
     }
 
@@ -1234,6 +1251,7 @@ pub async fn probe(distro: Option<&str>, _force: bool) -> (WslHealth, bool) {
             mirrored_failure: None,
             networking_mode: None,
             checked_at: now_ms(),
+            inconclusive: false,
         },
         false,
     )
@@ -1424,6 +1442,53 @@ mod tests {
             "wsl.exe did not answer within 27s".into(),
         ));
         assert_eq!(classify(&slow, true, None).0, WslHealthState::WslDown);
+    }
+
+    /// Only a `wsl.exe` that never answered is inconclusive (a pre-run check
+    /// won't fail a run on it); faults backed by an answer are not.
+    #[test]
+    fn timeouts_are_inconclusive_answers_are_evidence() {
+        let verdict = |p: Result<DistroProbe, ProbeFailure>| {
+            let state = classify(&p, true, None).0;
+            (state, is_inconclusive(&p, state))
+        };
+        let with = |route: bool, resolv: ResolvState, dns: DnsCheck| {
+            let mut p = probe(route, &["eth0"], resolv, false);
+            p.dns = dns;
+            Ok(p)
+        };
+        // wsl.exe timed out twice vs answered with an error.
+        assert_eq!(
+            verdict(Err(ProbeFailure::TimedOut("did not answer within 27s".into()))),
+            (WslHealthState::WslDown, true)
+        );
+        assert_eq!(
+            verdict(Err(ProbeFailure::Down("Wsl/Service/E_UNEXPECTED".into()))),
+            (WslHealthState::WslDown, false)
+        );
+        // DNS faults are evidence, including a lookup cut off at 8 s.
+        assert_eq!(
+            verdict(with(true, ResolvState::Ok(1), DnsCheck::TimedOut)),
+            (WslHealthState::DnsOnly, false)
+        );
+        assert_eq!(
+            verdict(with(true, ResolvState::Dangling, DnsCheck::TimedOut)),
+            (WslHealthState::DnsOnly, false)
+        );
+        assert_eq!(
+            verdict(with(true, ResolvState::Ok(1), DnsCheck::Failed)),
+            (WslHealthState::DnsOnly, false)
+        );
+        // No route is evidence whatever the lookup did.
+        assert_eq!(
+            verdict(with(false, ResolvState::Ok(1), DnsCheck::TimedOut)),
+            (WslHealthState::NoRoute, false)
+        );
+        // Not a fault: never inconclusive.
+        assert_eq!(
+            verdict(Err(ProbeFailure::NotInstalled("no distro".into()))),
+            (WslHealthState::NotInstalled, false)
+        );
     }
 
     #[test]
