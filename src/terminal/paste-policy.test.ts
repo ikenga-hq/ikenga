@@ -9,7 +9,15 @@ describe('paste-policy', () => {
 
 	it('leaves the paste keys to the browser in a browser session', () => {
 		expect(pasteKeyIsNative()).toBe(true);
-		expect(menuPasteBlockedHint()).toMatch(/Ctrl\+Shift\+V/);
+	});
+
+	it('names the registry key per platform, not a hard-coded Ctrl+V', () => {
+		expect(menuPasteBlockedHint({ mac: false })).toMatch(
+			/press Ctrl\+Shift\+V \(or Ctrl\+V\) to paste/
+		);
+		const mac = menuPasteBlockedHint({ mac: true });
+		expect(mac).toMatch(/⌘V/);
+		expect(mac).not.toMatch(/Ctrl/);
 	});
 
 	it('keeps the programmatic Tauri clipboard path on the desktop', () => {

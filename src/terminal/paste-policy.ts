@@ -11,17 +11,25 @@
 // permission involved. Reading the clipboard ourselves needs a permission
 // grant, isn't supported by Firefox, and used to fail silently, so Ctrl+V /
 // Ctrl+Shift+V did nothing.
+import { isMacPlatform } from '@/lib/keymap/platform';
 import { isTauri } from '@/lib/transport';
+import { terminalKeyLabel } from './keybindings';
 
 /** True when the paste keys should be left to the browser's native paste. */
 export function pasteKeyIsNative(): boolean {
 	return !isTauri();
 }
 
-/** Shown when a menu-driven clipboard read is refused (browsers only allow it
- *  with a permission grant; Firefox not at all). */
-export function menuPasteBlockedHint(): string {
-	return isTauri()
-		? "Couldn't read the clipboard."
-		: 'Your browser blocked paste from the menu — press Ctrl+Shift+V (or Ctrl+V) to paste.';
+/** Shown when a menu-driven clipboard read is refused or impossible (browsers
+ *  only allow it with a permission grant, Firefox not at all, and on an
+ *  insecure origin there is no clipboard API at all). The key text comes from
+ *  the registry, so it follows the platform and the user's own rebinding —
+ *  never a hard-coded Ctrl+V, which on macOS sends ^V to the shell. */
+export function menuPasteBlockedHint(opts?: { mac?: boolean }): string {
+	if (isTauri()) return "Couldn't read the clipboard.";
+	const mac = opts?.mac ?? isMacPlatform();
+	const key = terminalKeyLabel('paste', { mac });
+	// Off macOS, plain Ctrl+V also pastes natively (xterm-host leaves it alone).
+	const alt = !mac && key !== 'Ctrl+V' ? ' (or Ctrl+V)' : '';
+	return `Your browser blocked paste from the menu — press ${key}${alt} to paste.`;
 }

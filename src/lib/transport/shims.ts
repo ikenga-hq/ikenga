@@ -23,6 +23,53 @@ export async function openExternalUrl(url: string): Promise<void> {
 	window.open(url, '_blank', 'noopener,noreferrer');
 }
 
+/**
+ * Thrown when the clipboard cannot be reached. The usual cause is a browser
+ * session on an insecure origin (plain HTTP on a tailnet), where
+ * `navigator.clipboard` is `undefined`; a denied permission lands here too.
+ * Callers tell the user instead of pretending the copy/paste happened.
+ */
+export class ClipboardUnavailableError extends Error {
+	readonly operation: 'read' | 'write';
+
+	constructor(operation: 'read' | 'write', detail?: string) {
+		super(
+			operation === 'read'
+				? `Clipboard read is unavailable${detail ? `: ${detail}` : ''}`
+				: `Clipboard write is unavailable${detail ? `: ${detail}` : ''}`
+		);
+		this.name = 'ClipboardUnavailableError';
+		this.operation = operation;
+	}
+}
+
+/**
+ * Legacy copy path for contexts without the async clipboard API (insecure
+ * origins). Needs a user gesture, which every Copy action has. Restores focus
+ * and the selection afterwards so the terminal keeps its caret.
+ */
+function execCommandCopy(text: string): boolean {
+	if (typeof document === 'undefined' || typeof document.execCommand !== 'function') return false;
+	const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+	const area = document.createElement('textarea');
+	area.value = text;
+	area.setAttribute('readonly', '');
+	area.setAttribute('aria-hidden', 'true');
+	area.style.cssText = 'position:fixed;top:0;left:-9999px;opacity:0;pointer-events:none;';
+	document.body.appendChild(area);
+	try {
+		area.focus({ preventScroll: true });
+		area.select();
+		area.setSelectionRange(0, text.length);
+		return document.execCommand('copy');
+	} catch {
+		return false;
+	} finally {
+		area.remove();
+		active?.focus({ preventScroll: true });
+	}
+}
+
 export async function writeClipboardText(text: string): Promise<void> {
 	if (isTauri()) {
 		try {
@@ -33,9 +80,17 @@ export async function writeClipboardText(text: string): Promise<void> {
 			console.warn('Tauri clipboard plugin error, falling back to navigator.clipboard', e);
 		}
 	}
-	if (navigator.clipboard) {
-		await navigator.clipboard.writeText(text);
+	let cause = 'navigator.clipboard is unavailable (insecure origin?)';
+	if (navigator.clipboard?.writeText) {
+		try {
+			await navigator.clipboard.writeText(text);
+			return;
+		} catch (e) {
+			cause = e instanceof Error ? e.message : String(e);
+		}
 	}
+	if (execCommandCopy(text)) return;
+	throw new ClipboardUnavailableError('write', cause);
 }
 
 export async function readClipboardText(): Promise<string> {
@@ -47,10 +102,17 @@ export async function readClipboardText(): Promise<string> {
 			console.warn('Tauri clipboard plugin error, falling back to navigator.clipboard', e);
 		}
 	}
-	if (navigator.clipboard) {
-		return await navigator.clipboard.readText();
+	if (!navigator.clipboard?.readText) {
+		throw new ClipboardUnavailableError(
+			'read',
+			'navigator.clipboard is unavailable (insecure origin?)'
+		);
 	}
-	return '';
+	try {
+		return await navigator.clipboard.readText();
+	} catch (e) {
+		throw new ClipboardUnavailableError('read', e instanceof Error ? e.message : String(e));
+	}
 }
 
 // ─── Core transport helpers ──────────────────────────────────────────────────
