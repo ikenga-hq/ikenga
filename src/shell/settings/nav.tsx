@@ -191,7 +191,10 @@ export const SETTINGS_SECTIONS: readonly SettingsSectionMeta[] = [
 		label: 'Storage & backup',
 		Icon: HardDrive,
 		description: 'Screenshot destination, caches, backup and restore, danger zone.',
-		fields: [{ field: 'storage.screenshotDirectory', label: 'Screenshot directory' }],
+		fields: [
+			{ field: null, label: 'Folders you can open', help: 'file roots, fs allowlist' },
+			{ field: 'storage.screenshotDirectory', label: 'Screenshot directory' },
+		],
 	},
 	{
 		id: 'about',

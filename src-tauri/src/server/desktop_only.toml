@@ -122,18 +122,6 @@ tag = "desktop-only-forever"
 reason = "Companion release for dev_bind_port's debug-only smoke-test port holder; same 'dev ports' desktop-only-forever bucket."
 
 
-[fs_roots_add]
-tag = "WP-20"
-reason = "On the daemon the fs allowlist (<data-dir>/fs_roots.json) is the operator's boundary on the token holder — the one every served fs_* / project / actions arm checks, and the only one when an executor tier isolates the PTYs. Serving the mutation would let a remote caller redefine it (add '/'), and FsRoots::add/remove update the live set before persisting (non-atomic; concurrent persists share one .tmp). Needs the owner-vs-operator authority decided under G-PRINCIPAL; add/remove/reset stay together (remove alone would be a one-way lockout)."
-
-[fs_roots_remove]
-tag = "WP-20"
-reason = "On the daemon the fs allowlist (<data-dir>/fs_roots.json) is the operator's boundary on the token holder — the one every served fs_* / project / actions arm checks, and the only one when an executor tier isolates the PTYs. Serving the mutation would let a remote caller redefine it (add '/'), and FsRoots::add/remove update the live set before persisting (non-atomic; concurrent persists share one .tmp). Needs the owner-vs-operator authority decided under G-PRINCIPAL; add/remove/reset stay together (remove alone would be a one-way lockout)."
-
-[fs_roots_reset]
-tag = "WP-20"
-reason = "On the daemon the fs allowlist (<data-dir>/fs_roots.json) is the operator's boundary on the token holder — the one every served fs_* / project / actions arm checks, and the only one when an executor tier isolates the PTYs. Serving the mutation would let a remote caller redefine it (add '/'), and FsRoots::add/remove update the live set before persisting (non-atomic; concurrent persists share one .tmp). Needs the owner-vs-operator authority decided under G-PRINCIPAL; add/remove/reset stay together (remove alone would be a one-way lockout)."
-
 [fs_unwatch]
 tag = "desktop-only-forever"
 reason = "Pair of fs_watch: in a remote web session tauri-cmd.ts fsUnwatch releases the watch on the /ws/fs socket (server/fs_ws.rs); an RPC arm would have no watcher of its own to release."

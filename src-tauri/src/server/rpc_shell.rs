@@ -199,6 +199,17 @@ impl PathGuard {
         }
     }
 
+    /// The root set this guard checks against — the one the `fs_roots_*`
+    /// arms list and edit (`server::rpc_fs_roots`). `None` when the
+    /// production allowlist was never installed (no `--data-dir`).
+    pub(crate) fn allowlist_roots(&self) -> Option<std::sync::Arc<crate::fs_roots::FsRoots>> {
+        match &self.roots {
+            GuardRoots::Allowlist => crate::fs_roots::current(),
+            #[cfg(test)]
+            GuardRoots::Local(roots) => Some(roots.clone()),
+        }
+    }
+
     /// A caller's path, resolved exactly as the desktop's
     /// `path_allow::resolve_allowlisted` resolves it (`~` / env expansion,
     /// absolute, canonicalized — the parent when the leaf does not exist yet),

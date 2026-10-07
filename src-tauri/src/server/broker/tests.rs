@@ -1321,3 +1321,141 @@ async fn a_narrowing_refusal_proxies_nothing() {
     }
     assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 0);
 }
+
+// ─── an admin's edit of another principal's folder list ────────────────────
+
+/// Gap audit 2026-10-06 rank 1: `fs_roots_*` naming another principal is an
+/// admin's call. The broker routes it into the TARGET's child with the
+/// argument removed and only `files, settings` granted; the caller's own
+/// child sees nothing.
+#[tokio::test]
+async fn an_admin_edits_another_principals_folder_list_in_their_child() {
+    let h = harness().await;
+    let ada = insert_account(&h.pool, "ada", 20_001, true).await;
+    let bob = insert_account(&h.pool, "bob", 20_002, false).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+
+    for (cmd, named) in [
+        ("fs_roots_add", json!("bob")),
+        ("fs_roots_list", json!(bob.to_string())),
+    ] {
+        let (status, body) = rpc(
+            &h.app,
+            Some(&cookie),
+            json!({"cmd": cmd, "args": {"path": "/srv/bob/work", "principal": named}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let reqs = h.launcher.seen_for(bob).requests.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2);
+    let (_, headers, sent) = &reqs[0];
+    let sent: Value = serde_json::from_str(sent).unwrap();
+    assert_eq!(
+        sent,
+        json!({"cmd": "fs_roots_add", "args": {"path": "/srv/bob/work"}})
+    );
+    assert_eq!(headers.get("x-ikenga-caps").unwrap(), "files,settings");
+    assert_eq!(headers.get("x-ikenga-principal").unwrap(), &bob.to_string());
+    assert!(
+        h.launcher
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|s| s.principal != ada),
+        "the admin's own child is never involved"
+    );
+}
+
+/// A non-admin naming someone else is refused before anything is looked up
+/// or launched — whether or not the name exists — and so is an admin
+/// demoted after signing in (the flag is read per call, not from the
+/// session).
+#[tokio::test]
+async fn a_non_admin_cannot_edit_another_principals_folder_list() {
+    let h = harness().await;
+    insert_account(&h.pool, "ada", 20_001, true).await;
+    let bob = insert_account(&h.pool, "bob", 20_002, false).await;
+    let bob_cookie = login_cookie(&h.app, "bob").await;
+    for named in ["ada", "nobody-here"] {
+        let (status, body) = rpc(
+            &h.app,
+            Some(&bob_cookie),
+            json!({"cmd": "fs_roots_reset", "args": {"principal": named}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], false);
+        assert!(
+            body["error"].as_str().unwrap().starts_with("forbidden:"),
+            "{body}"
+        );
+    }
+
+    let ada_cookie = login_cookie(&h.app, "ada").await;
+    sqlx::query("UPDATE accounts SET is_admin = 0 WHERE username = 'ada'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (_, body) = rpc(
+        &h.app,
+        Some(&ada_cookie),
+        json!({"cmd": "fs_roots_add", "args": {"path": "/", "principal": bob.to_string()}}),
+    )
+    .await;
+    assert!(
+        body["error"].as_str().unwrap().starts_with("forbidden:"),
+        "{body}"
+    );
+    assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 0);
+}
+
+/// Naming oneself is the own-scope call (to one's own child, argument
+/// removed); an unknown target is `not_found` for an admin; and other
+/// commands carrying a `principal` argument pass through untouched.
+#[tokio::test]
+async fn naming_oneself_unknown_targets_and_other_commands() {
+    let h = harness().await;
+    let ada = insert_account(&h.pool, "ada", 20_001, true).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+
+    let (_, body) = rpc(
+        &h.app,
+        Some(&cookie),
+        json!({"cmd": "fs_roots_list", "args": {"principal": "nobody-here"}}),
+    )
+    .await;
+    assert_eq!(
+        body["error"], "not_found: no active account `nobody-here`",
+        "{body}"
+    );
+    assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 0);
+
+    let (status, _) = rpc(
+        &h.app,
+        Some(&cookie),
+        json!({"cmd": "fs_roots_list", "args": {"principal": "ADA"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = rpc(
+        &h.app,
+        Some(&cookie),
+        json!({"cmd": "pty_list", "args": {"principal": "bob"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let reqs = h.launcher.seen_for(ada).requests.lock().unwrap().clone();
+    let bodies: Vec<Value> = reqs
+        .iter()
+        .map(|(_, _, b)| serde_json::from_str(b).unwrap())
+        .collect();
+    assert_eq!(
+        bodies,
+        vec![
+            json!({"cmd": "fs_roots_list", "args": {}}),
+            json!({"cmd": "pty_list", "args": {"principal": "bob"}}),
+        ]
+    );
+}
