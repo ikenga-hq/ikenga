@@ -73,6 +73,8 @@ describe('detectBrowserTier', () => {
 		const web = new transport.WebRemoteTransport();
 		web.openPtySocket('t');
 		web.openFsSocket();
+		web.openEventsSocket();
+		expect(FakeWebSocket.urls.some((u) => u.includes('/ws/events'))).toBe(true);
 		expect(FakeWebSocket.urls.some((u) => u.includes('token='))).toBe(false);
 
 		useReauthStore.setState({ isOpen: true, errorMsg: null, tokenInput: '' });

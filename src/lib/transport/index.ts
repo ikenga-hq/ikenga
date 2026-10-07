@@ -1,4 +1,5 @@
 import { isDeviceSession } from './device-session';
+import { EventsSocketClient, type OpenEventsSocket } from './events-socket';
 import { detectT1Server, isT1Session } from './t1-session';
 
 export interface RpcTransport {
@@ -227,9 +228,14 @@ export class TauriTransport implements RpcTransport {
 }
 
 export class WebRemoteTransport implements RpcTransport {
-	private eventListeners: Map<string, Set<(event: { event: string; payload: unknown }) => void>> =
-		new Map();
-	private warnedEvents: Set<string> = new Set();
+	/** The daemon's `/ws/events` channel — one socket for every listener on
+	 *  the page (see `transport/events-socket.ts`). */
+	private readonly events: EventsSocketClient;
+
+	/** `openEventsSocket` is a test seam; the page uses the real socket. */
+	constructor(opts: { openEventsSocket?: OpenEventsSocket } = {}) {
+		this.events = new EventsSocketClient(opts.openEventsSocket ?? (() => this.openEventsSocket()));
+	}
 
 	async invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 		const token = transportToken();
@@ -279,57 +285,41 @@ export class WebRemoteTransport implements RpcTransport {
 	}
 
 	/**
-	 * Register an event handler.
+	 * Register an event handler — the browser half of Tauri's `listen()`.
 	 *
-	 * ⚠ Nothing delivers events to a browser client yet. The headless daemon
-	 * has no counterpart to Tauri's event bus — `emit` on the Rust side goes
-	 * to an `AppHandle` that does not exist here — so every subscription made
-	 * through this transport stays silent. That is a real functional gap for
-	 * the ~30 `listen()`-based features in `tauri-cmd.ts`
-	 * (`projects:active-changed`, the pa-action approve-gate, runtime events).
-	 * `ptyListen` and `fsListenWatch` are the two exceptions, and both bypass
-	 * this path for a dedicated WebSocket (`/ws/pty/:id`, `/ws/fs`).
-	 *
-	 * Handlers are still registered so that the moment a producer lands it
-	 * can fan out through {@link WebRemoteTransport.dispatch}. Until then
-	 * each distinct event name warns once, so a dead subscription shows up in
-	 * the console instead of being mistaken for "no events happened".
+	 * Events arrive on the daemon's `/ws/events` socket, which carries the
+	 * same names and payloads the desktop emits wherever the daemon has a
+	 * producer (settings, the active project, actions, notifications, the
+	 * approve gate). Resolves to the unlisten function, as Tauri's does. A
+	 * name the daemon never publishes is noted once on the console when the
+	 * socket says what it serves. `ptyListen` and `fsListenWatch` bypass this
+	 * for their own sockets (`/ws/pty/:id`, `/ws/fs`).
 	 */
 	async listen<T>(
 		event: string,
 		handler: (event: { event: string; payload: T }) => void
 	): Promise<() => void> {
-		if (!this.warnedEvents.has(event)) {
-			this.warnedEvents.add(event);
-			console.warn(
-				`[transport] listen('${event}') has no event source in browser mode — ` +
-					'this subscription will never fire. See WebRemoteTransport.listen.'
-			);
-		}
+		return this.events.listen(
+			event,
+			handler as (event: { event: string; payload: unknown }) => void
+		);
+	}
 
-		let listeners = this.eventListeners.get(event);
-		if (!listeners) {
-			listeners = new Set();
-			this.eventListeners.set(event, listeners);
-		}
-		const entry = handler as (event: { event: string; payload: unknown }) => void;
-		listeners.add(entry);
-
-		return () => {
-			listeners?.delete(entry);
-		};
+	/** Deliver an event to everything registered for `name` on this page. */
+	dispatch(name: string, payload: unknown): void {
+		this.events.dispatch(name, payload);
 	}
 
 	/**
-	 * Deliver an event to everything registered for `name`. The single entry
-	 * point for a future server-side event channel; nothing calls it yet.
+	 * Open the event channel. Never carries the share selection: events are
+	 * about this principal's own state, so a tab viewing a share still hears
+	 * its own notifications (and the daemon refuses a share here anyway).
 	 */
-	dispatch(name: string, payload: unknown): void {
-		const listeners = this.eventListeners.get(name);
-		if (!listeners) return;
-		for (const handler of listeners) {
-			handler({ event: name, payload });
-		}
+	openEventsSocket(): WebSocket {
+		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+		const token = transportToken();
+		const query = token ? `?token=${encodeURIComponent(token)}` : '';
+		return new WebSocket(`${protocol}//${window.location.host}/ws/events${query}`);
 	}
 
 	openPtySocket(id: string, opts?: { spawn?: boolean }): WebSocket {

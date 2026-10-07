@@ -603,6 +603,7 @@ async fn i6_token_bearer_and_no_cookie_are_all_401() {
         ("GET", "/ws/pty/abc"),
         ("GET", "/ws/chat/t1"),
         ("GET", "/ws/fs"),
+        ("GET", "/ws/events"),
         ("GET", "/pkgs/com.x/index.html"),
         ("GET", "/pkgs/com.x/"),
         ("POST", "/api/shutdown"),
@@ -1750,3 +1751,6 @@ async fn running_endpoints_never_launches() {
     assert_eq!((eps.len(), partial), (1, false));
     assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 1);
 }
+
+/// `/ws/events` under T1 (principal isolation through the proxy).
+mod events;

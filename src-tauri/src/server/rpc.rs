@@ -582,8 +582,8 @@ pub async fn rpc_handler(
         // Bodies in `server::rpc_shell`, over `server::shared::{notifications,
         // projects, activity_bar, comments, studio_threads}` — the cores the
         // desktop commands call. All need `--data-dir`; the mute half of
-        // notifications also needs the settings home. No events are emitted
-        // (no event channel here). The project filesystem arms stay inside the
+        // notifications also needs the settings home. Events go out on the
+        // daemon's bus (`server::events`, `/ws/events`). The project filesystem arms stay inside the
         // fs allowlist and the project root. Left desktop-only:
         // `notifications_record_update` (its sweep needs the shell version +
         // pkg kernel). `pin_screenshot_write` joined in slice 8, and
@@ -743,8 +743,8 @@ pub async fn rpc_handler(
         // — the cores the desktop commands call. Every caller path goes
         // through the fs allowlist (`PathGuard`, the `fs_read` / `fs_write`
         // boundary); a project's `.ikenga/` files are reached only when its
-        // root is inside it. No `actions://changed` is emitted (no event
-        // channel). Writes never touch the trust record, which lives in
+        // root is inside it. `actions://changed` goes out on the event bus
+        // (`server::events`). Writes never touch the trust record, which lives in
         // `--data-dir`. Left allowlisted: `fs_trash` (OS trash outside the
         // allowlist), `fs_watch` / `fs_unwatch` (`/ws/fs` covers them),
         // `actions_open_file` (spawns the OS opener).
@@ -769,8 +769,8 @@ pub async fn rpc_handler(
         // Bodies in `server::rpc_local` (over `server::shared::{pa_actions,
         // pkg_db}`, the daemon's `ikenga.db`) and `server::rpc_files` (over
         // `server::shared::{atelier, git}`, every caller root through the fs
-        // allowlist and refused inside the daemon's own state). No
-        // `pa-action-*` events (no event channel). Commit / retry wake the
+        // allowlist and refused inside the daemon's own state). `pa-action-*`
+        // go out on the event bus (`server::events`). Commit / retry wake the
         // mutation worker with the hardcoded `mutation:send-worker` only —
         // `agent_ops_run_now` is its own arm (below), confined to the
         // principal's own jobs.

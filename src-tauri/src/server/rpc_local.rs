@@ -29,6 +29,7 @@ use serde_json::Value;
 use tokio::sync::OnceCell;
 use tracing::warn;
 
+use super::events::Topic;
 use super::rpc::RpcResponse;
 use super::rpc_shell::targ;
 use super::shared::chi::OutputFiles;
@@ -158,8 +159,11 @@ pub(super) fn supabase_config_clear(state: &AppState) -> RpcResponse {
 // ─── Settings ────────────────────────────────────────────────────────────────
 
 /// The daemon's `SettingsManager`: the desktop's, rooted at `--data-dir`
-/// (`ikenga.db` for `settings_kv`, `screenshot-config.json`) with no change
-/// notifier — so no `settings://changed` emits and no file watchers.
+/// (`ikenga.db` for `settings_kv`, `screenshot-config.json`). Its notifier
+/// (the router passes `server::events::settings_notifier`) publishes
+/// `settings://changed` after the manager's own writes, as the desktop's
+/// does; it starts no file watchers, so a hand edit on the server is seen by
+/// the next read rather than announced.
 ///
 /// Initialized on first use, not at boot: `PaDb` is lazy so a daemon nobody
 /// queries never touches `ikenga.db`, and `initialize` opens it (and runs the
@@ -173,11 +177,25 @@ pub(crate) struct DaemonSettings {
 }
 
 impl DaemonSettings {
-    pub(crate) fn new(db: Arc<PaDb>, data_dir: PathBuf, home: PathBuf) -> Self {
+    pub(crate) fn new(
+        db: Arc<PaDb>,
+        data_dir: PathBuf,
+        home: PathBuf,
+        notifier: Option<crate::server::shared::settings::ChangeNotifier>,
+    ) -> Self {
         Self {
-            manager: SettingsManager::with_notifier(None, db, data_dir, home),
+            manager: SettingsManager::with_notifier(notifier, db, data_dir, home)
+                .without_file_watchers(),
             ready: OnceCell::new(),
         }
+    }
+
+    /// `workspace.notifications.mutedKinds`, for the `muted` flag the event
+    /// bus stamps on `notifications://changed` (`server::events`).
+    pub(crate) async fn muted_kinds(
+        &self,
+    ) -> Vec<crate::server::shared::notifications::NotificationKind> {
+        crate::server::shared::notifications::mute::muted_kinds(self.manager().await)
     }
 
     async fn manager(&self) -> &SettingsManager {
@@ -661,11 +679,10 @@ pub(super) fn os_username() -> RpcResponse {
 // Over `server::shared::{pa_actions, pkg_db}` — the cores the desktop commands
 // call — and the daemon's `ikenga.db`; without `--data-dir` each is `NO_DB`.
 //
-// **No events.** After the same writes the desktop emits `pa-action-paused`,
-// `pa-action-committed`, `pa-action-retried` and `pa-action-rejected`. The
-// daemon has no event channel (the web transport's `listen()` is a no-op), so
-// these arms change the same rows and emit nothing; `/outbox/approvals` polls
-// `pa_actions_list`, and the FE invalidates on each call's own result.
+// **Events.** After the same writes the desktop emits `pa-action-paused`,
+// `pa-action-committed`, `pa-action-retried` and `pa-action-rejected`; these
+// arms publish the same names and payloads on the daemon's event bus
+// (`server::events`, delivered over `/ws/events`).
 //
 // **The wake.** Commit and retry then wake the mutation worker the way the
 // desktop does: a detached, fire-and-forget POST to the local agent-ops
@@ -691,7 +708,12 @@ pub(super) async fn pa_actions_pause(state: &AppState, args: &Value) -> RpcRespo
         let batch_id: String = targ(args, &["batchId", "batch_id"])?;
         let action_id: String = targ(args, &["actionId", "action_id"])?;
         let drafts: Vec<pa_actions::PaPauseDraftInput> = targ(args, &["drafts"])?;
-        pa_actions::pause(pa_db(state)?, &batch_id, &action_id, &drafts).await
+        let count = pa_actions::pause(pa_db(state)?, &batch_id, &action_id, &drafts).await?;
+        state.events.publish(
+            Topic::PaActionPaused,
+            pa_actions::PaActionPausedEvent { batch_id, count },
+        );
+        Ok(count)
     }
     .await;
     respond_named("pa_actions_pause", r)
@@ -723,9 +745,9 @@ pub(super) async fn pa_actions_update(state: &AppState, args: &Value) -> RpcResp
 pub(super) async fn pa_actions_commit(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let draft_id: String = targ(args, &["draftId", "draft_id"])?;
-        // The returned row is the desktop's `pa-action-committed` payload;
-        // there is no channel to emit it on here.
-        pa_actions::commit(pa_db(state)?, &draft_id).await?;
+        // The returned row is the desktop's `pa-action-committed` payload.
+        let committed = pa_actions::commit(pa_db(state)?, &draft_id).await?;
+        state.events.publish(Topic::PaActionCommitted, committed);
         drop(pa_actions::wake_send_worker(state.home.clone()));
         Ok(())
     }
@@ -738,6 +760,10 @@ pub(super) async fn pa_actions_retry(state: &AppState, args: &Value) -> RpcRespo
         let draft_id: String = targ(args, &["draftId", "draft_id"])?;
         pa_actions::retry(pa_db(state)?, &draft_id).await?;
         drop(pa_actions::wake_send_worker(state.home.clone()));
+        state.events.publish(
+            Topic::PaActionRetried,
+            serde_json::json!({ "draftId": draft_id }),
+        );
         Ok(())
     }
     .await;
@@ -747,7 +773,12 @@ pub(super) async fn pa_actions_retry(state: &AppState, args: &Value) -> RpcRespo
 pub(super) async fn pa_actions_reject(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let draft_id: String = targ(args, &["draftId", "draft_id"])?;
-        pa_actions::reject(pa_db(state)?, &draft_id).await
+        pa_actions::reject(pa_db(state)?, &draft_id).await?;
+        state.events.publish(
+            Topic::PaActionRejected,
+            pa_actions::PaActionRejectedEvent { draft_id },
+        );
+        Ok(())
     }
     .await;
     respond("pa_actions_reject", r)
