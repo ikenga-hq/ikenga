@@ -4320,7 +4320,8 @@ export interface SystemCheck {
 export interface SystemReport {
 	os: string;
 	arch: string;
-	disk_free_gb: number;
+	/** Null when no mounted volume matched the app-data dir (unknown, not zero). */
+	disk_free_gb: number | null;
 	app_data_dir: string;
 	app_data_writable: boolean;
 	vault_key_present: boolean;

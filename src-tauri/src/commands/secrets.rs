@@ -113,10 +113,11 @@ impl SecretsLock {
         self.replace_store(Arc::new(UnavailableSecretStore::new(reason)))
     }
 
-    pub fn probe(&self, app: &AppHandle) -> Result<(), String> {
+    /// Keeps the typed [`StoreError`] so callers can tell a locked or
+    /// unreachable keychain from a store that was disabled at startup.
+    pub fn probe(&self, app: &AppHandle) -> Result<(), StoreError> {
         let state = self.store.clone();
         with_store(app, &state, self.unlock.as_ref(), |store| store.probe())
-            .map_err(|error| error.to_string())
     }
 
     pub fn prepare_encryption(&self, app: &AppHandle) -> Result<(), String> {
