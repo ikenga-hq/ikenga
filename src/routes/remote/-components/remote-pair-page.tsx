@@ -39,6 +39,11 @@ export function outcomeCopy(o: PairOutcome): { title: string; body: string } {
 				title: "This browser didn't keep the pairing",
 				body: "The computer allowed this device, but this connection isn't HTTPS, so the browser dropped the device credential. Pair over a Tailscale address, serve it over HTTPS, or start ikenga-server with --insecure-cookie, then remove this device on the computer and pair again.",
 			};
+		case 'auth_unavailable':
+			return {
+				title: "Paired, but the computer couldn't confirm it yet",
+				body: "The computer allowed this device, but its sign-in check is temporarily unavailable, so it couldn't confirm this browser kept the device credential. Open your workspace to try again; if it keeps failing, restart ikenga-server on the computer.",
+			};
 		case 'denied':
 			return {
 				title: 'The computer said no',
@@ -203,7 +208,16 @@ export function RemotePairPage({
 						<p className="m-0 text-[length:var(--text-body-sm)] leading-relaxed text-[var(--fg-muted)]">
 							{outcomeCopy(phase.outcome).body}
 						</p>
-						{phase.outcome.kind !== 'allowed' && (
+						{phase.outcome.kind === 'auth_unavailable' && (
+							<button
+								type="button"
+								onClick={() => onPaired()}
+								className="rounded-md border border-[var(--border)] px-4 py-2 text-[length:var(--text-body-sm)] hover:bg-[var(--bg-hover,var(--bg-sunken))]"
+							>
+								Open your workspace
+							</button>
+						)}
+						{phase.outcome.kind !== 'allowed' && phase.outcome.kind !== 'auth_unavailable' && (
 							<button
 								type="button"
 								onClick={() => {

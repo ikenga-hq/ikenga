@@ -58,6 +58,8 @@ function fakeHost(opts: {
 	helloStatus?: number;
 	/** The browser kept the device cookie (default true). */
 	cookieKept?: boolean;
+	/** Status + body the cookie probe answers with (overrides `cookieKept`). */
+	probe?: { status: number; body: unknown };
 }) {
 	const storeId = opts.storeId ?? 'store-1';
 	const pairingId = 'pid-1';
@@ -86,6 +88,7 @@ function fakeHost(opts: {
 			});
 		}
 		if (path === '/api/rpc') {
+			if (opts.probe) return res(opts.probe.status, opts.probe.body);
 			return opts.cookieKept === false
 				? res(401, { ok: false, error: 'unauthorized' })
 				: res(200, { ok: true, data: { credential: { via: 'device', deviceId: 'd1' } } });
@@ -132,6 +135,24 @@ describe('runPairing', () => {
 		const host = fakeHost({ code: 'K7P42Q', cookieKept: false });
 		const out = await runPairing('K7P42Q', device, {}, { fetch: host.f, ...fast });
 		expect(out).toEqual({ kind: 'cookie_rejected', deviceId: 'd1' });
+	});
+
+	it('a 503 auth_unavailable cookie probe is its own outcome, not cookie_rejected', async () => {
+		const host = fakeHost({
+			code: 'K7P42Q',
+			probe: {
+				status: 503,
+				body: { ok: false, error: 'authentication is temporarily unavailable', code: 'auth_unavailable' },
+			},
+		});
+		const out = await runPairing('K7P42Q', device, {}, { fetch: host.f, ...fast });
+		expect(out).toEqual({ kind: 'auth_unavailable', deviceId: 'd1' });
+	});
+
+	it('any other non-200 cookie probe is unknown (the boot path finds out), not cookie_rejected', async () => {
+		const host = fakeHost({ code: 'K7P42Q', probe: { status: 502, body: {} } });
+		const out = await runPairing('K7P42Q', device, {}, { fetch: host.f, ...fast });
+		expect(out).toEqual({ kind: 'allowed', deviceId: 'd1', tier: 'dispatch' });
 	});
 
 	it('review m5: a QR-pinned store id beats a substituted one in the hello reply', async () => {

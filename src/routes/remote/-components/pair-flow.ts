@@ -71,6 +71,12 @@ export type PairOutcome =
 	 * loopback (review M1). The device holds nothing.
 	 */
 	| { kind: 'cookie_rejected'; deviceId: string }
+	/**
+	 * The host allowed the device, but its credential check answered 503
+	 * `auth_unavailable`, so whether the browser kept the cookie is unknown.
+	 * Not a rejection: retrying (opening the workspace) may just work.
+	 */
+	| { kind: 'auth_unavailable'; deviceId: string }
 	| { kind: 'denied' }
 	| { kind: 'expired' }
 	| { kind: 'burned' }
@@ -226,9 +232,9 @@ export async function runPairing(
 		if (state === 'allowed') {
 			const deviceId = String(st.body.device_id ?? '');
 			// The status response set the cookie — if the browser kept it.
-			if ((await probeDeviceCookie(f, deviceId)) === 'missing') {
-				return { kind: 'cookie_rejected', deviceId };
-			}
+			const cookie = await probeDeviceCookie(f, deviceId);
+			if (cookie === 'missing') return { kind: 'cookie_rejected', deviceId };
+			if (cookie === 'auth_unavailable') return { kind: 'auth_unavailable', deviceId };
 			return { kind: 'allowed', deviceId, tier: String(st.body.tier ?? '') };
 		}
 		const done = STATE_OUTCOME[state];
@@ -239,14 +245,16 @@ export async function runPairing(
 
 /**
  * After `allowed`: did the browser keep the device cookie? `access_status`
- * over `/api/rpc` with the cookie only (review M1). `missing` when the
- * server doesn't see this device's credential; `unknown` when it can't be
- * asked (network) — the boot path finds out then.
+ * over `/api/rpc` with the cookie only (review M1). `missing` only on
+ * positive evidence: a 401, or a 200 that names another (or no) credential.
+ * A 503 `auth_unavailable` means the server couldn't check credentials at
+ * all; any other failure (network, 5xx) is `unknown` — the boot path finds
+ * out then. Neither is reported as a dropped cookie.
  */
 export async function probeDeviceCookie(
 	f: typeof fetch,
 	deviceId: string
-): Promise<'ok' | 'missing' | 'unknown'> {
+): Promise<'ok' | 'missing' | 'auth_unavailable' | 'unknown'> {
 	let res: { status: number; body: Json };
 	try {
 		res = await call(f, '/api/rpc', {
@@ -260,6 +268,9 @@ export async function probeDeviceCookie(
 	const data = res.body.data as
 		| { credential?: { via?: string; deviceId?: string | null } }
 		| undefined;
-	const cred = res.status === 200 && res.body.ok ? data?.credential : undefined;
+	if (res.status === 503 && res.body.code === 'auth_unavailable') return 'auth_unavailable';
+	if (res.status === 401) return 'missing';
+	if (res.status !== 200 || !res.body.ok) return 'unknown';
+	const cred = data?.credential;
 	return cred?.via === 'device' && cred.deviceId === deviceId ? 'ok' : 'missing';
 }
