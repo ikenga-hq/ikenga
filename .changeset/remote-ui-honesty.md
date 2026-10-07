@@ -1,0 +1,5 @@
+---
+"ikenga-desktop": patch
+---
+
+Browser sessions on a headless server stop offering or claiming what the server cannot do. Native-webview pkgs and the webview "Clear session" control, "Open in browser" / "Copy viewer URL", and the Backup export/restore controls are hidden or read "Not available on this server yet"; HTML, audio and video panes say "Preview not available in the browser yet" instead of a broken localhost frame; package install and update buttons (Store, update sheet, banners, onboarding) are disabled before the click, and the onboarding Done step now counts only installs that actually succeeded and lists the ones that did not (the offline-engine failure names its real cause instead of blaming the registry). The statusline HUD says telemetry isn't available in the browser, Claude-config queries refetch on window focus in place of live watcher events, and "Run now" (Automations), the webview "Clear session" action and the pin composer surface their failures instead of swallowing them.

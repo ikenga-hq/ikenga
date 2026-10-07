@@ -1,10 +1,13 @@
-import { render, screen, waitFor } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CostHud, type StatuslineSnapshot } from './cost-hud';
+
+const h = vi.hoisted(() => ({ remote: false }));
 
 const eventHandlers: Array<(payload: { payload: StatuslineSnapshot }) => void> = [];
 
 vi.mock('@/lib/transport', () => ({
+	isRemoteWebSession: () => h.remote,
 	listen: vi.fn((_channel: string, handler: (event: { payload: StatuslineSnapshot }) => void) => {
 		eventHandlers.push(handler);
 		return Promise.resolve(() => {});
@@ -16,6 +19,8 @@ vi.mock('@/lib/iyke/client', () => ({
 	// path and the test can assert per-terminal filtering.
 	iykeFetch: vi.fn().mockResolvedValue({ ok: false }),
 }));
+
+afterEach(cleanup);
 
 describe('CostHud per-terminal filtering', () => {
 	it('shows only events for its own session id', async () => {
@@ -52,5 +57,22 @@ describe('CostHud per-terminal filtering', () => {
 			expect(screen.getByText(/0\.123/i)).toBeDefined();
 		});
 		expect(screen.getByText(/listening for statusline telemetry/i)).toBeDefined();
+	});
+});
+
+// Gap audit rank 10 stopgap — a browser session never receives
+// `statusline://snapshot`, so "listening" would wait forever.
+describe('CostHud in a remote session', () => {
+	it('says telemetry is not available in the browser instead of listening', () => {
+		h.remote = true;
+		try {
+			render(<CostHud sessionId="term-a" />);
+			expect(
+				screen.getByText("Statusline telemetry isn't available in the browser yet")
+			).toBeDefined();
+			expect(screen.queryByText(/listening for statusline telemetry/i)).toBeNull();
+		} finally {
+			h.remote = false;
+		}
 	});
 });

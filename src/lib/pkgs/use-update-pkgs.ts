@@ -8,6 +8,7 @@
 // Powers both the "Update all" button on the /packages surface and the
 // background auto-updater mounted in the workspace.
 
+import { honestRpcError } from '@/lib/transport/unavailable';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { resolveInstallPlan } from '@/lib/registry/client';
 import {
@@ -120,7 +121,7 @@ export function useUpdatePkgs() {
 					failed.push({
 						id: row.id,
 						name: row.name,
-						error: e instanceof Error ? e.message : String(e),
+						error: honestRpcError(e),
 					});
 				}
 			}
