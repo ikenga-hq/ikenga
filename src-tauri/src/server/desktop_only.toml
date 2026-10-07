@@ -474,3 +474,11 @@ reason = "Takes a surface out of a native OS window's WindowRegistry entry, clos
 [window_spawn]
 tag = "desktop-only-forever"
 reason = "Spawns a native OS window via WindowRegistry."
+
+[wsl_health_fix]
+tag = "desktop-only-forever"
+reason = "Repairs WSL networking on the user's own Windows machine: runs wsl.exe as root in a distro, raises a UAC prompt for an elevated HNS + WSL restart, and edits the user's .wslconfig. A UAC prompt and the local WSL VM have no daemon or browser meaning."
+
+[wsl_health_probe]
+tag = "desktop-only-forever"
+reason = "Probes the local WSL VM (wsl.exe), the Windows Application event log (PowerShell Get-WinEvent) and the user's .wslconfig on the desktop's own machine, and raises the fix.wsl_network notification whose fixes only the desktop can run."

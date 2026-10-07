@@ -58,7 +58,7 @@ vi.mock('@/lib/iyke/client', () => ({
 }));
 
 import { setHostDecideBlock } from './actions';
-import { NotificationsPopoverContent } from './popover';
+import { KIND_META, NotificationsPopoverContent } from './popover';
 
 function render(ui: ReactElement) {
 	const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -86,7 +86,7 @@ function row(overrides: Partial<NotificationRow>): NotificationRow {
 
 const MUTE_STATE: NotificationsMuteState = {
 	muted: ['update'],
-	mutable: ['run_finished', 'run_failed', 'update', 'invite'],
+	mutable: ['run_finished', 'run_failed', 'update', 'invite', 'system'],
 };
 
 beforeEach(() => {
@@ -157,6 +157,31 @@ describe('NotificationsPopoverContent', () => {
 		await waitFor(() => expect(mocks.notificationsMarkRead).toHaveBeenCalledWith([7]));
 	});
 
+	it('a WSL network row is tagged with its own "system" kind (D-19)', async () => {
+		mocks.notificationsList.mockResolvedValue([
+			row({
+				id: 9,
+				kind: 'system',
+				title: 'WSL has no network · Ubuntu',
+				action: { kind: 'fix.wsl_network', distro: 'Ubuntu', state: 'no_route' },
+				dedupeKey: 'wsl:network:ubuntu',
+			}),
+		]);
+		render(<NotificationsPopoverContent onClose={vi.fn()} />);
+
+		await screen.findByText('WSL has no network · Ubuntu');
+		expect(screen.getByText('system')).toBeTruthy();
+		expect(screen.queryByText('violation')).toBeNull();
+		expect(screen.queryByText('wsl network')).toBeNull();
+	});
+
+	it('the system tag border never relies on an undefined --warning-soft token alone', () => {
+		// The token sets define --warning but no --warning-soft; a bare var()
+		// would resolve to currentColor (a hard amber outline).
+		expect(KIND_META.system.border).not.toBe('var(--warning-soft)');
+		expect(KIND_META.system.border).toContain('color-mix(in srgb, var(--warning)');
+	});
+
 	it('the mute menu offers only mutable kinds and reflects current mute state', async () => {
 		mocks.notificationsList.mockResolvedValue([row({})]);
 		render(<NotificationsPopoverContent onClose={vi.fn()} />);
@@ -165,7 +190,7 @@ describe('NotificationsPopoverContent', () => {
 		await userEvent.click(screen.getByRole('button', { name: 'Mute a kind' }));
 
 		const menu = await screen.findByRole('menu');
-		for (const label of ['run finished', 'run failed', 'update', 'invite']) {
+		for (const label of ['run finished', 'run failed', 'update', 'invite', 'system']) {
 			expect(within(menu).getByText(label)).toBeTruthy();
 		}
 		expect(within(menu).queryByText('permission')).toBeNull();
