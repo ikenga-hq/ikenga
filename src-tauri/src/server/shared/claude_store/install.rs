@@ -122,6 +122,31 @@ const OUTPUT_OPTS: PipedOpts = PipedOpts {
     new_process_group: false,
 };
 
+/// Name the actual cause of a failed spawn. A spawn reports `NotFound` both
+/// when the program is missing and when the working directory is (and
+/// Windows reports a missing cwd as "directory name is invalid"), so the
+/// cwd is checked first; only then is `NotFound` read as a missing tool.
+fn spawn_error_message(
+    cmd: &str,
+    install_hint: &str,
+    cwd: Option<&Path>,
+    error: &std::io::Error,
+) -> String {
+    if let Some(dir) = cwd {
+        if !dir.is_dir() {
+            return format!(
+                "{cmd}: working directory {} does not exist ({error})",
+                dir.display()
+            );
+        }
+    }
+    if error.kind() == std::io::ErrorKind::NotFound {
+        format!("`{cmd}` not found on PATH — {install_hint}")
+    } else {
+        format!("{cmd}: {error}")
+    }
+}
+
 fn run(cmd: &str, args: &[&str], cwd: Option<&Path>) -> Result<std::process::Output, String> {
     let mut c = SpawnSpec::new(cmd);
     c.args(args);
@@ -138,11 +163,12 @@ fn run(cmd: &str, args: &[&str], cwd: Option<&Path>) -> Result<std::process::Out
     crate::executor::current()
         .spawn_output_blocking(c, OUTPUT_OPTS)
         .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                format!("`{cmd}` not found on PATH — install it to use {cmd}-sourced primitives")
-            } else {
-                format!("{cmd}: {e}")
-            }
+            spawn_error_message(
+                cmd,
+                &format!("install it to use {cmd}-sourced primitives"),
+                cwd,
+                &e,
+            )
         })
 }
 
@@ -282,12 +308,12 @@ fn npx_skills_add(spec: &str, staging: &Path) -> Result<(), String> {
     let out = crate::executor::current()
         .spawn_output_blocking(c, OUTPUT_OPTS)
         .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "`npx` not found on PATH — install Node.js to use npx-sourced primitives"
-                    .to_string()
-            } else {
-                format!("npx: {e}")
-            }
+            spawn_error_message(
+                "npx",
+                "install Node.js to use npx-sourced primitives",
+                Some(staging),
+                &e,
+            )
         })?;
     if !out.status.success() {
         return Err(format!(
@@ -314,12 +340,12 @@ fn npx_skills_add_all(spec: &str, staging: &Path) -> Result<(), String> {
     let out = crate::executor::current()
         .spawn_output_blocking(c, OUTPUT_OPTS)
         .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "`npx` not found on PATH — install Node.js to use npx-sourced primitives"
-                    .to_string()
-            } else {
-                format!("npx: {e}")
-            }
+            spawn_error_message(
+                "npx",
+                "install Node.js to use npx-sourced primitives",
+                Some(staging),
+                &e,
+            )
         })?;
     if !out.status.success() {
         return Err(format!(
@@ -2354,6 +2380,39 @@ pub async fn resolve_pkg_requires(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spawn_not_found_with_missing_cwd_names_the_cwd_not_the_tool() {
+        let missing = std::env::temp_dir().join("ikenga-claude-store-no-such-cwd-wp5");
+        let _ = std::fs::remove_dir_all(&missing);
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let msg = super::spawn_error_message("git", "install it", Some(&missing), &not_found);
+        assert!(msg.contains("working directory"), "{msg}");
+        assert!(msg.contains("does not exist"), "{msg}");
+        assert!(!msg.contains("not found on PATH"), "{msg}");
+    }
+
+    #[test]
+    fn spawn_not_found_with_present_or_no_cwd_is_a_missing_tool() {
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let msg = super::spawn_error_message("git", "install it", None, &not_found);
+        assert_eq!(msg, "`git` not found on PATH — install it");
+        let here = std::env::temp_dir();
+        let msg = super::spawn_error_message("npx", "install Node.js", Some(&here), &not_found);
+        assert_eq!(msg, "`npx` not found on PATH — install Node.js");
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let msg = super::spawn_error_message("git", "install it", None, &denied);
+        assert!(msg.starts_with("git: "), "{msg}");
+    }
+
+    #[test]
+    fn run_with_missing_cwd_reports_the_cwd() {
+        let missing = std::env::temp_dir().join("ikenga-claude-store-no-such-cwd-run-wp5");
+        let _ = std::fs::remove_dir_all(&missing);
+        let err = super::run("git", &["--version"], Some(&missing)).unwrap_err();
+        assert!(err.contains("working directory"), "{err}");
+        assert!(!err.contains("not found on PATH"), "{err}");
+    }
+
     use super::*;
     use std::process::Command;
 
