@@ -14,13 +14,15 @@ import { useNavigate } from '@tanstack/react-router';
 import { Bot, ChevronDown, ChevronRight, User } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { EmptyState, OfflineState } from '@/components/states';
+import { agentUnavailableText } from '@/lib/agent-unavailable';
 import { type CompanionTarget, useShellStore } from '@/lib/shell/shell-store';
 import { useSeats } from '@/lib/queries/seats';
-import { chiList, type DetectedAgent, detectAgents, type SeatStatus, type SeatView } from '@/lib/tauri-cmd';
+import { chiList, detectAgents, type SeatStatus, type SeatView } from '@/lib/tauri-cmd';
 import { viewLabel } from '@/shell/panes/pane-views';
 import { useTerminalStore } from '@/terminal/session-store';
 import { useTerminalTitles } from '@/terminal/use-terminal-titles';
 import { useCompanionStore } from './companion-store';
+import { offeredEngines, unavailableEngine } from './offered-engines';
 import { openLoginTerminal } from './login-terminal';
 import { applyTarget, copyText, openSessionInPane, sameTarget } from './seat-actions';
 import { atName, engineShort, seatChipRest, seatSessionRef, stateDotColor, UNREPORTED } from './seat-model';
@@ -49,18 +51,9 @@ const CURSOR_CURRENT = -2;
 /** The detected-engine query the picker (and the ⌥↑/⌥↓ cycle) share. */
 export const DETECT_AGENTS_KEY = ['settings', 'agent', 'detect'] as const;
 
-/** Engines a *New session on…* / *Persistent run* row may name: the default
- *  first, then every detected engine that isn't known to be signed out. */
-export function offeredEngines(defaultEngineId: string | null, detected: readonly DetectedAgent[] | undefined): string[] {
-	const signedOut = (id: string) => detected?.find((a) => a.id === id)?.authed === false;
-	const out: string[] = [];
-	if (defaultEngineId && !signedOut(defaultEngineId)) out.push(defaultEngineId);
-	for (const a of detected ?? []) {
-		if (a.authed === false || out.includes(a.id)) continue;
-		out.push(a.id);
-	}
-	return out;
-}
+// The pure engine-offer rules live in `./offered-engines` (no React / UI
+// imports, so they test cheaply); re-exported for existing importers.
+export { offeredEngines, unavailableEngine } from './offered-engines';
 
 /** ⌥↑ / ⌥↓: seats, then unseated sessions, then new-on each engine, then a
  *  persistent run on the default engine (D-09 `pickerTargets`). */
@@ -180,6 +173,13 @@ export function TargetPicker({ roster }: { roster: SeatRoster }) {
 		}
 		return null;
 	}, [defaultEngineId, engines.data]);
+
+	// An engine detection couldn't check — shown instead of "No engine
+	// installed", which would be the wrong verdict and the wrong fix.
+	const wslDownEngine = useMemo(
+		() => unavailableEngine(defaultEngineId, engines.data),
+		[defaultEngineId, engines.data]
+	);
 
 	const items = useMemo<PickerItem[]>(() => {
 		if (open === 'session') {
@@ -453,6 +453,14 @@ export function TargetPicker({ roster }: { roster: SeatRoster }) {
 										close();
 									},
 								}}
+								className="min-h-0"
+							/>
+						) : wslDownEngine ? (
+							<OfflineState
+								data-state="companion-engine-unavailable"
+								icon={Bot}
+								heading={`Couldn't check ${wslDownEngine.display}`}
+								body={`${(agentUnavailableText(wslDownEngine) ?? '').replace(/\.$/, '')}. It isn't offered as a target until WSL answers.`}
 								className="min-h-0"
 							/>
 						) : (

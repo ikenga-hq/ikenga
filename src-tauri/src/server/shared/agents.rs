@@ -15,8 +15,6 @@ use tokio::time::timeout;
 use super::known::{
     family_matches, AgentCapabilities, AgentDef, AuthCheck, ExecutableSpec, KNOWN_AGENTS,
 };
-// Only `lookup_wsl_executable` reads the family tag directly.
-#[cfg(windows)]
 use super::known::TargetFamily;
 use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 
@@ -88,6 +86,48 @@ pub struct DetectedAgent {
     pub authed: Option<bool>,
     pub auth_hint: Option<String>,
     pub capabilities: AgentCapabilities,
+    /// Set when detection couldn't check for this agent at all — today only
+    /// "WSL couldn't be asked" (D-10). Such an agent is neither installed nor
+    /// missing: `version` / `authed` are `None` and it is not runnable.
+    /// Additive: omitted from the wire when absent, so a consumer that
+    /// predates it sees exactly the old shape for every checked agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<AgentUnavailable>,
+}
+
+/// Why an agent couldn't be checked. `kind` names the dependency that failed
+/// (only `"wsl"` today) so the UI can word it; `reason` is the probe's own
+/// detail (e.g. wsl.exe's `Wsl/…` error code).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentUnavailable {
+    pub kind: &'static str,
+    pub reason: String,
+}
+
+impl AgentUnavailable {
+    pub fn wsl(reason: impl Into<String>) -> Self {
+        Self {
+            kind: "wsl",
+            reason: reason.into(),
+        }
+    }
+}
+
+/// The entry reported for an agent whose WSL lookup couldn't run: named, not
+/// probed, flagged [`AgentUnavailable`] so the UI says "WSL unavailable"
+/// rather than "not installed".
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wsl_unavailable_agent(def: &AgentDef, name: &str, reason: String) -> DetectedAgent {
+    DetectedAgent {
+        id: def.id.to_string(),
+        display: def.display.to_string(),
+        executable_path: format!("{name} (WSL)"),
+        version: None,
+        authed: None,
+        auth_hint: None,
+        capabilities: def.capabilities,
+        unavailable: Some(AgentUnavailable::wsl(reason)),
+    }
 }
 
 pub async fn detect_all() -> Vec<DetectedAgent> {
@@ -101,7 +141,9 @@ pub async fn detect_all() -> Vec<DetectedAgent> {
 }
 
 /// Detect a single known agent by id. Returns `None` when the id isn't in
-/// `KNOWN_AGENTS` or the executable couldn't be resolved on the current OS.
+/// `KNOWN_AGENTS` or the executable is positively absent on the current OS.
+/// When WSL couldn't be asked, returns the agent flagged
+/// [`DetectedAgent::unavailable`] rather than `None` (D-10).
 /// Surfaced as the per-engine variant so the onboarding UI can fan out one
 /// call per engine and reveal results as they land instead of blocking on
 /// the slowest probe.
@@ -157,7 +199,26 @@ async fn detect_one_in(
     let exec_path = match resolve_executable_in(def, os, search_path) {
         Some(p) => p,
         #[cfg(windows)]
-        None => lookup_wsl_executable(def, super::wsl::configured_distro().as_deref()).await?,
+        None => {
+            if !super::wsl::wsl_exe_present() {
+                return None;
+            }
+            let distro = super::wsl::configured_distro();
+            let names = wsl_candidate_names(def);
+            match lookup_wsl_with(&names, |n| wsl_which(n, distro.as_deref())).await {
+                WslLookup::Found(p) => PathBuf::from(p),
+                WslLookup::NotFound => return None,
+                WslLookup::WslUnavailable(reason) => {
+                    tracing::warn!(
+                        target: "ikenga::agents",
+                        "couldn't check WSL for {} — reporting it unavailable, not absent: {reason}",
+                        def.id
+                    );
+                    let name = names.first().copied().unwrap_or(def.id);
+                    return Some(wsl_unavailable_agent(def, name, reason));
+                }
+            }
+        }
         #[cfg(not(windows))]
         None => return None,
     };
@@ -190,6 +251,7 @@ async fn detect_one_in(
         authed,
         auth_hint,
         capabilities: def.capabilities,
+        unavailable: None,
     })
 }
 
@@ -199,7 +261,7 @@ fn resolve_executable(def: &AgentDef, os: &str) -> Option<PathBuf> {
 }
 
 /// The agent's executable on the host (PATH, then its `extra_dirs`). The WSL
-/// fallback is separate ([`lookup_wsl_executable`]) because it spawns.
+/// fallback is separate ([`lookup_wsl_with`]) because it spawns.
 fn resolve_executable_in(
     def: &AgentDef,
     os: &str,
@@ -216,16 +278,11 @@ fn resolve_executable_in(
     None
 }
 
-/// The agent inside WSL, as a `wsl:<name>:<path>` detection path. When WSL
-/// couldn't be asked the agent is skipped with a warning — not cached, not
-/// reported as a verdict — and the next detection asks again.
-#[cfg(windows)]
-async fn lookup_wsl_executable(def: &AgentDef, distro: Option<&str>) -> Option<PathBuf> {
-    if !super::wsl::wsl_exe_present() {
-        return None;
-    }
-
-    let mut names = Vec::new();
+/// The names to try for `def` inside WSL: its Unix/Any spellings (falling
+/// back to the first spec's), with Windows shim suffixes stripped.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wsl_candidate_names(def: &AgentDef) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = Vec::new();
     for spec in def.executables {
         if matches!(spec.target_family, TargetFamily::Unix | TargetFamily::Any) {
             names.extend(spec.names.iter().copied());
@@ -236,33 +293,40 @@ async fn lookup_wsl_executable(def: &AgentDef, distro: Option<&str>) -> Option<P
             names.extend(spec.names.iter().copied());
         }
     }
-
+    let mut out: Vec<&'static str> = Vec::new();
     for name in names {
-        let clean_name = name
+        let clean = name
             .strip_suffix(".cmd")
             .or_else(|| name.strip_suffix(".exe"))
             .or_else(|| name.strip_suffix(".bat"))
             .unwrap_or(name);
-
-        // One candidate name failing to resolve says nothing about the next
-        // one — keep probing instead of giving up on the agent. WSL itself
-        // failing does: every further name would wait out the same failure.
-        match wsl_which(clean_name, distro).await {
-            WslLookup::Found(path_str) => {
-                return Some(PathBuf::from(format!("wsl:{clean_name}:{path_str}")));
-            }
-            WslLookup::NotFound => {}
-            WslLookup::WslUnavailable(reason) => {
-                tracing::warn!(
-                    target: "ikenga::agents",
-                    "couldn't check WSL for {} — skipping it this scan, not reporting it absent: {reason}",
-                    def.id
-                );
-                return None;
-            }
+        if !out.contains(&clean) {
+            out.push(clean);
         }
     }
-    None
+    out
+}
+
+/// Try each candidate name with `which`. `Found` carries the
+/// `wsl:<name>:<path>` detection path. One name missing says nothing about
+/// the next, so a miss keeps probing; WSL itself failing stops at once —
+/// every further name would wait out the same failure — and is reported as
+/// `WslUnavailable`, never as a miss. Not cached: the next detection asks
+/// again.
+#[cfg_attr(not(windows), allow(dead_code))]
+async fn lookup_wsl_with<F, Fut>(names: &[&'static str], mut which: F) -> WslLookup
+where
+    F: FnMut(&'static str) -> Fut,
+    Fut: std::future::Future<Output = WslLookup>,
+{
+    for name in names {
+        match which(name).await {
+            WslLookup::Found(path) => return WslLookup::Found(format!("wsl:{name}:{path}")),
+            WslLookup::NotFound => {}
+            unavailable @ WslLookup::WslUnavailable(_) => return unavailable,
+        }
+    }
+    WslLookup::NotFound
 }
 
 /// Where `name` lives on `distro`'s login PATH (`None` = the default
@@ -1343,6 +1407,79 @@ mod tests {
     fn sh_quote_survives_single_quotes() {
         assert_eq!(sh_quote("claude"), "'claude'");
         assert_eq!(sh_quote("it's"), r"'it'\''s'");
+    }
+
+    /// D-10: a WSL that couldn't be asked stops the name walk at once and is
+    /// reported as unavailable — never as a miss; a miss moves on to the next
+    /// candidate name; a hit carries the `wsl:<name>:<path>` detection path.
+    #[tokio::test]
+    async fn lookup_wsl_with_keeps_unavailable_apart_from_a_miss() {
+        use std::cell::RefCell;
+        let asked = RefCell::new(Vec::<String>::new());
+        let r = lookup_wsl_with(&["a", "b", "c"], |n| {
+            asked.borrow_mut().push(n.to_string());
+            let v = match n {
+                "a" => WslLookup::NotFound,
+                "b" => WslLookup::WslUnavailable("Wsl/Service/E_FAIL".into()),
+                _ => WslLookup::Found("/usr/bin/c".into()),
+            };
+            async move { v }
+        })
+        .await;
+        assert_eq!(r, WslLookup::WslUnavailable("Wsl/Service/E_FAIL".into()));
+        assert_eq!(*asked.borrow(), vec!["a", "b"], "stops at the first WSL failure");
+
+        let r = lookup_wsl_with(&["a", "c"], |n| {
+            let v = if n == "c" {
+                WslLookup::Found("/usr/bin/c".into())
+            } else {
+                WslLookup::NotFound
+            };
+            async move { v }
+        })
+        .await;
+        assert_eq!(r, WslLookup::Found("wsl:c:/usr/bin/c".into()));
+
+        let r = lookup_wsl_with(&["a"], |_| async { WslLookup::NotFound }).await;
+        assert_eq!(r, WslLookup::NotFound);
+    }
+
+    #[test]
+    fn wsl_candidate_names_strip_windows_shims_and_dedupe() {
+        let claude = KNOWN_AGENTS.iter().find(|d| d.id == "claude-code").unwrap();
+        let names = wsl_candidate_names(claude);
+        assert!(!names.is_empty());
+        for n in &names {
+            assert!(!n.ends_with(".cmd") && !n.ends_with(".exe") && !n.ends_with(".bat"), "{n}");
+        }
+        let mut uniq = names.clone();
+        uniq.dedup();
+        assert_eq!(uniq.len(), names.len());
+    }
+
+    /// The wire shape: a checked agent carries no `unavailable` key at all
+    /// (older consumers see the old shape); an unavailable one carries
+    /// `{kind: "wsl", reason}` with nothing probed.
+    #[test]
+    fn unavailable_is_additive_on_the_wire() {
+        let def = KNOWN_AGENTS.iter().find(|d| d.id == "claude-code").unwrap();
+        let agent = wsl_unavailable_agent(def, "claude", "Wsl/Service/E_FAIL".into());
+        let v = serde_json::to_value(&agent).unwrap();
+        assert_eq!(v["id"], "claude-code");
+        assert_eq!(v["executable_path"], "claude (WSL)");
+        assert_eq!(v["version"], serde_json::Value::Null);
+        assert_eq!(v["authed"], serde_json::Value::Null);
+        assert_eq!(
+            v["unavailable"],
+            serde_json::json!({ "kind": "wsl", "reason": "Wsl/Service/E_FAIL" })
+        );
+
+        let checked = DetectedAgent {
+            unavailable: None,
+            ..wsl_unavailable_agent(def, "claude", String::new())
+        };
+        let v = serde_json::to_value(&checked).unwrap();
+        assert!(v.get("unavailable").is_none(), "{v}");
     }
 
     /// Regression: the old `futures_join_all` awaited each probe in turn, so

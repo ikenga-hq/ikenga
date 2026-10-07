@@ -16,6 +16,7 @@ import {
 import { Banner } from '@/components/ui/banner';
 import { Button } from '@/components/ui/button';
 import { StatusChip } from '@/components/ui/status-chip';
+import { agentUnavailableText } from '@/lib/agent-unavailable';
 import { isWindows } from '@/lib/platform';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import {
@@ -104,7 +105,10 @@ function EngineSectionBody() {
 
 	const live = detected?.find((a) => a.id === selectedAgentId) ?? null;
 	const isOffline = selectedAgentId === OFFLINE_AGENT_ID;
-	const authed = live?.authed ?? payload?.authed ?? null;
+	// Detection couldn't check the selected agent (WSL couldn't be asked): say
+	// so, and don't fall back to the onboarding payload's stale auth verdict.
+	const unavailable = agentUnavailableText(live);
+	const authed = unavailable ? null : (live?.authed ?? payload?.authed ?? null);
 	const display = live?.display ?? payload?.display ?? selectedAgentId ?? 'Not selected';
 	const execPath = live?.executable_path ?? payload?.executablePath;
 	const version = live?.version ?? payload?.version;
@@ -183,7 +187,15 @@ function EngineSectionBody() {
 									Whether the selected agent is currently signed in / has a working API key.
 								</div>
 							</div>
-							<AuthBadge authed={authed} loading={isLoading} />
+							{unavailable ? (
+								<span title={unavailable} data-testid="engine-auth-unavailable">
+									<StatusChip tone="warn" dot>
+										WSL unavailable
+									</StatusChip>
+								</span>
+							) : (
+								<AuthBadge authed={authed} loading={isLoading} />
+							)}
 						</div>
 						<div className="grid grid-cols-[1fr_auto] items-center gap-4 px-4 py-3">
 							<div className="min-w-0 space-y-0.5">
@@ -224,6 +236,30 @@ function EngineSectionBody() {
 						Change agent
 					</Button>
 				</div>
+
+				{unavailable && live && (
+					<div className="px-4 pb-3">
+						<Banner
+							tone="warning"
+							icon={<AlertTriangle />}
+							role="alert"
+							className="rounded-md border"
+							actions={
+								<Button variant="ghost" size="sm" onClick={() => refetch()}>
+									Re-check
+								</Button>
+							}
+						>
+							<div className="text-[13px] font-semibold" data-testid="engine-unavailable">
+								Couldn&apos;t check {live.display}: {unavailable}
+							</div>
+							<div className="mt-1 text-xs" style={{ color: 'var(--fg-muted)' }}>
+								This isn&apos;t a missing install — WSL didn&apos;t answer, so Ikenga couldn&apos;t
+								look for the CLI or its sign-in. Runs on it will fail until WSL starts.
+							</div>
+						</Banner>
+					</div>
+				)}
 
 				{authed === false && live && (
 					<div className="px-4 pb-3">

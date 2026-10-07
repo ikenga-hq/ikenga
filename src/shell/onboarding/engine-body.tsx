@@ -282,7 +282,9 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 
 	const anyDetected = SUPPORTED_ENGINE_IDS.some((id) => results[id]?.status === 'detected');
 	const anyPending = SUPPORTED_ENGINE_IDS.some((id) => results[id]?.status === 'pending');
-	const anyUnknown = SUPPORTED_ENGINE_IDS.some((id) => results[id]?.status === 'unknown');
+	const anyUnknown = SUPPORTED_ENGINE_IDS.some(
+		(id) => results[id]?.status === 'unknown' || results[id]?.status === 'unavailable'
+	);
 	const allMissing = computeAllMissing(results);
 
 	const offlineButtonLabel = (long: boolean) => {
@@ -482,7 +484,8 @@ interface EngineCardProps {
 	onOpenDocs: () => void;
 }
 
-function EngineCard({ meta, entry, selected, onSelect, onOpenDocs }: EngineCardProps) {
+/** Exported for tests. */
+export function EngineCard({ meta, entry, selected, onSelect, onOpenDocs }: EngineCardProps) {
 	const interactive = entry.status === 'detected';
 	// `div role="button"` (not a real <button>) so the "Docs →" affordance can
 	// nest inside — the HTML spec and React forbid <button> inside <button>.
@@ -571,6 +574,17 @@ function EngineCard({ meta, entry, selected, onSelect, onOpenDocs }: EngineCardP
 							{entry.agent.executable_path}
 						</span>
 					</div>
+				) : entry.status === 'unavailable' ? (
+					<div className="flex items-center justify-between gap-2">
+						<span
+							className="truncate text-[11.5px]"
+							style={{ color: 'var(--warning)' }}
+							title={entry.error}
+							data-testid="agent-unavailable"
+						>
+							Couldn&apos;t check: {entry.error ?? 'WSL unavailable'}
+						</span>
+					</div>
 				) : entry.status === 'unknown' ? (
 					<div className="flex items-center justify-between gap-2">
 						<span
@@ -644,6 +658,15 @@ function StatusPill({ entry }: { entry: AgentDetectEntry }) {
 			<span data-testid="status-pill" data-status="detected">
 				<StatusChip tone="live" dot>
 					Detected
+				</StatusChip>
+			</span>
+		);
+	}
+	if (entry.status === 'unavailable') {
+		return (
+			<span data-testid="status-pill" data-status="unavailable" title={entry.error}>
+				<StatusChip tone="warn" dot>
+					WSL unavailable
 				</StatusChip>
 			</span>
 		);
