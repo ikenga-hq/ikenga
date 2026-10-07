@@ -36,7 +36,7 @@ export function outcomeCopy(o: PairOutcome): { title: string; body: string } {
 			if (o.cookieUnconfirmed) {
 				return {
 					title: "Paired, but couldn't confirm the pairing cookie",
-					body: `The computer allowed this device, but checking that this browser kept the device credential failed (${o.cookieUnconfirmed}). Opening your workspace anyway; if it asks you to pair again, the browser didn't keep it.`,
+					body: `The computer allowed this device, but checking that this browser kept the device credential failed (${o.cookieUnconfirmed}). You can still open your workspace; if it asks you to pair again, the browser didn't keep it.`,
 				};
 			}
 			return { title: 'Paired', body: 'Opening your workspace…' };
@@ -88,10 +88,6 @@ export function outcomeCopy(o: PairOutcome): { title: string; body: string } {
 	}
 }
 
-/** How long the "couldn't confirm the pairing cookie" warning shows before
- *  the page proceeds to the workspace on its own. */
-export const UNCONFIRMED_COOKIE_PROCEED_MS = 6000;
-
 export function RemotePairPage({
 	onPaired = () => window.location.assign('/remote'),
 }: {
@@ -134,21 +130,13 @@ export function RemotePairPage({
 		});
 		if (ctl.signal.aborted) return;
 		setPhase({ kind: 'done', outcome });
-		// An unconfirmed cookie still proceeds, after a pause so the warning
-		// is seen (D-16); the effect below does that.
+		// An unconfirmed cookie waits on the warning until the user clicks
+		// "Open your workspace" (D-16, D-17: no auto-continue).
 		if (outcome.kind === 'allowed' && !outcome.cookieUnconfirmed) onPaired();
 	};
 
 	const unconfirmed =
 		phase.kind === 'done' && phase.outcome.kind === 'allowed' && !!phase.outcome.cookieUnconfirmed;
-	// A ref, so a parent re-render (new `onPaired`) doesn't restart the timer.
-	const onPairedRef = useRef(onPaired);
-	onPairedRef.current = onPaired;
-	useEffect(() => {
-		if (!unconfirmed) return;
-		const t = setTimeout(() => onPairedRef.current(), UNCONFIRMED_COOKIE_PROCEED_MS);
-		return () => clearTimeout(t);
-	}, [unconfirmed]);
 
 	const card =
 		'w-full max-w-[390px] overflow-hidden rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] text-[var(--fg)] shadow-2xl';

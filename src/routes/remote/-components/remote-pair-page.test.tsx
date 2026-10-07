@@ -1,5 +1,6 @@
 // D-16: an unexpected cookie-probe answer (e.g. a proxy 502) lets pairing
 // proceed, but the page shows "couldn't confirm the pairing cookie" first.
+// D-17: it then waits for the user's click; there is no auto-continue.
 
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -12,7 +13,7 @@ vi.mock('./pair-flow', async (orig) => ({
 	runPairing: (...args: unknown[]) => runPairingMock(...args),
 }));
 
-import { outcomeCopy, RemotePairPage, UNCONFIRMED_COOKIE_PROCEED_MS } from './remote-pair-page';
+import { outcomeCopy, RemotePairPage } from './remote-pair-page';
 
 afterEach(() => {
 	cleanup();
@@ -37,7 +38,7 @@ describe('<RemotePairPage /> cookie probe outcomes', () => {
 		expect(document.querySelector('[data-pair-warning]')).toBeNull();
 	});
 
-	it('an unconfirmed cookie shows the warning, then proceeds', async () => {
+	it('an unconfirmed cookie shows the warning and waits for the user', async () => {
 		vi.useFakeTimers();
 		runPairingMock.mockResolvedValue({
 			kind: 'allowed',
@@ -54,9 +55,15 @@ describe('<RemotePairPage /> cookie probe outcomes', () => {
 		expect(warning?.textContent).toContain('HTTP 502');
 		expect(onPaired).not.toHaveBeenCalled();
 
+		// Well past any former auto-continue delay: still waiting.
 		act(() => {
-			vi.advanceTimersByTime(UNCONFIRMED_COOKIE_PROCEED_MS);
+			vi.advanceTimersByTime(60_000);
 		});
+		expect(onPaired).not.toHaveBeenCalled();
+		expect(document.querySelector('[data-pair-warning="cookie-unconfirmed"]')).not.toBeNull();
+		expect(warning?.textContent).not.toMatch(/opening your workspace anyway/i);
+
+		fireEvent.click(screen.getByRole('button', { name: 'Open your workspace' }));
 		expect(onPaired).toHaveBeenCalledTimes(1);
 	});
 
