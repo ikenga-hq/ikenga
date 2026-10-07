@@ -7,6 +7,8 @@
 // times. The summary never shows that; the details view shows each distinct
 // line once, with a repeat count, truncated.
 
+import { NOT_AVAILABLE_ON_SERVER } from '@/lib/transport/unavailable';
+
 export type InstallErrorKind =
 	| 'disk-space'
 	| 'network'
@@ -14,6 +16,7 @@ export type InstallErrorKind =
 	| 'permission'
 	| 'integrity'
 	| 'cancelled'
+	| 'unavailable'
 	| 'unknown';
 
 export interface ClassifiedInstallError {
@@ -32,6 +35,8 @@ export interface ClassifiedInstallError {
  *  network and permission because a full disk also surfaces as write errors. */
 const RULES: Array<[InstallErrorKind, RegExp]> = [
 	['cancelled', /\binstall cancelled\b/i],
+	// The browser's daemon doesn't serve install yet (gap audit rank 3).
+	['unavailable', /not implemented in headless daemon/i],
 	['disk-space', /\bENOSPC\b|no space left on device|not enough space on the disk|os error 112\b/i],
 	['integrity', /\bEINTEGRITY\b|integrity mismatch|integrity checksum failed|sha-?512.*mismatch/i],
 	['not-found', /\bE404\b|\b404 Not Found\b|status client error \(404|registry returned 404/i],
@@ -64,6 +69,8 @@ export function installErrorMessage(kind: InstallErrorKind, name: string): strin
 			return `${name}'s download didn't match its published checksum, so nothing was installed. Try again; if it keeps failing, the published package is broken.`;
 		case 'cancelled':
 			return `Install of ${name} was cancelled. Nothing was left behind.`;
+		case 'unavailable':
+			return `${NOT_AVAILABLE_ON_SERVER}. ${name} can be installed from the Ikenga desktop app.`;
 		default:
 			return `${name} couldn't be installed. Show details has the full error; try again once it's fixed.`;
 	}
@@ -136,7 +143,7 @@ export function classifyInstallError(error: unknown, name: string): ClassifiedIn
 		details: dedupeInstallLog(raw),
 		debugLogPath: extractDebugLogPath(raw),
 		// A 404 can clear once the Store's index is refreshed, so every kind
-		// keeps Retry; this is here for callers that want to dim it.
-		retryable: true,
+		// keeps Retry except an install the server doesn't run at all.
+		retryable: kind !== 'unavailable',
 	};
 }

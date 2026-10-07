@@ -63,6 +63,7 @@ import { readSettingsFile } from '@/lib/settings/client';
 import { isDailyAddressEnabled } from '@/lib/settings/daily-address';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { type ChiCacheRow, chiList, type NotificationRow } from '@/lib/tauri-cmd';
+import { installUnavailableReason } from '@/lib/desktop-only';
 import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { useUpdater } from '@/lib/updater/use-updater';
 import { decideHookRequest } from '@/shell/notifications/actions';
@@ -497,6 +498,7 @@ function UpdatesTile() {
 		);
 	}
 
+	const installBlocked = installUnavailableReason();
 	const shellRow = updater.available
 		? `shell · ${updater.available.currentVersion ?? ''} → ${updater.available.version}`.trim()
 		: null;
@@ -512,13 +514,14 @@ function UpdatesTile() {
 							type="button"
 							size="sm"
 							variant="outline"
-							disabled={updater.installing || updatePkgs.isPending}
+							disabled={updater.installing || updatePkgs.isPending || !!installBlocked}
+							title={installBlocked || undefined}
 							onClick={() => {
 								if (pkgUpdates.length > 0) updatePkgs.mutate({ rows: pkgUpdates });
 								if (updater.available) void updater.install();
 							}}
 						>
-							{updater.installed ? 'Restart to finish' : 'Update all'}
+							{installBlocked || (updater.installed ? 'Restart to finish' : 'Update all')}
 						</Button>
 					)}
 					<span className="flex-1" />

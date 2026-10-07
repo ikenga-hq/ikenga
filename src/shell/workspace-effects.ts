@@ -17,6 +17,7 @@ import { usePaneStore } from '@/lib/panes/pane-store';
 import { useRouterPaneSync } from '@/lib/panes/router-pane-sync';
 import { loadPanelSizes, registerPanelSizesSetter } from '@/lib/shell/panel-sizes';
 import { useProjectsSync } from '@/lib/shell/use-projects-sync';
+import { useRemoteConfigFocusRefetch } from '@/lib/queries/claude-config';
 import { usePaActionsListener } from '@/lib/use-pa-actions';
 import { usePreloadViewers } from '@/lib/use-preload-viewers';
 import { useScreenshotListener } from '@/lib/use-screenshot-listener';
@@ -57,6 +58,9 @@ export function useWorkspaceEffects(
 	// Phase A: console + fetch shims, DOM/click/type/key/wait/query-cache
 	// listeners. Mount once at workspace level only.
 	useIykeBridge();
+	// Browser sessions only: refetch Claude-config queries on window focus (no
+	// server-side watcher events yet).
+	useRemoteConfigFocusRefetch();
 	// Warm the `--settings` path so the first `claude` terminal already carries
 	// it. `buildAgentArgs` is synchronous, so it can only read a primed value;
 	// unprimed it omits the flag and the session loses the shell's live view.

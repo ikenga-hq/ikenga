@@ -7,6 +7,7 @@ import {
 	fsWatch,
 	viewerPort,
 	viewerServe,
+	isRemoteWebSession,
 	viewerStop,
 	type ViewerHandle,
 } from '@/lib/tauri-cmd';
@@ -25,6 +26,7 @@ import { useEffectiveMenu } from '@/lib/actions/store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { resolveMenuItems } from '@/shell/menu/resolve';
 import { pickViewerRoot } from '../lib/relative-root';
+import { PreviewUnavailable } from './preview-unavailable';
 import { PinComposer, type PickResult } from '@/shell/artifact-studio/pin-composer';
 import * as M from '@/lib/artifact/bridge-messages';
 import { wrapHostMessage } from '@/lib/artifact/bridge-messages';
@@ -66,7 +68,14 @@ interface HtmlFrameProps {
 //   below) and the CSP explicitly allows that origin.
 // External script loads are blocked by the CSP header injected on every
 // response from the viewer server.
-export function HtmlFrame({ path, paneId }: HtmlFrameProps) {
+export function HtmlFrame(props: HtmlFrameProps) {
+	// The viewer server is desktop-only (gap audit rank 8): its localhost URL
+	// would point at the browser's own machine.
+	if (isRemoteWebSession()) return <PreviewUnavailable name={props.path.split('/').pop()} />;
+	return <LocalHtmlFrame {...props} />;
+}
+
+function LocalHtmlFrame({ path, paneId }: HtmlFrameProps) {
 	const [state, setState] = useState<
 		| { kind: 'loading' }
 		| { kind: 'ready'; src: string; handle: ViewerHandle }

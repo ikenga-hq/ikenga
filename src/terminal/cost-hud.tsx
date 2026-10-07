@@ -1,4 +1,4 @@
-import { listen } from '@/lib/transport';
+import { isRemoteWebSession, listen } from '@/lib/transport';
 import { Activity, AlertTriangle, Cpu, DollarSign, Gauge, ShieldAlert } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { iykeFetch } from '@/lib/iyke/client';
@@ -91,7 +91,14 @@ export function CostHud({ sessionId }: { sessionId?: string | null }) {
 			<div className="flex h-7 items-center justify-between border-b border-border/40 bg-card px-3 text-[11px] text-muted-foreground backdrop-blur font-mono select-none">
 				<div className="flex items-center gap-1.5">
 					<Gauge className="h-3 w-3 text-muted-foreground/60" />
-					<span>HUD: listening for statusline telemetry...</span>
+					{/* A browser session never receives `statusline://snapshot` (no
+					    server-to-browser event channel yet, gap audit rank 10), so
+					    "listening" would wait forever. */}
+					<span>
+						{isRemoteWebSession()
+							? "Statusline telemetry isn't available in the browser yet"
+							: 'HUD: listening for statusline telemetry...'}
+					</span>
 				</div>
 			</div>
 		);

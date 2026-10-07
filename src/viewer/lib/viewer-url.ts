@@ -12,7 +12,7 @@
 // token registration that lives until the app restarts, same as any other
 // `viewerServe` caller that doesn't pair it with `viewerStop`).
 
-import { fsRead, viewerPort, viewerServe } from '@/lib/tauri-cmd';
+import { fsRead, isRemoteWebSession, viewerPort, viewerServe } from '@/lib/tauri-cmd';
 import { pickViewerRoot } from './relative-root';
 
 /** Default bound port, matched to `html-frame.tsx`'s own fallback — only hit
@@ -25,6 +25,8 @@ export function isHtmlArtifactPath(path: string): boolean {
 }
 
 export async function resolveHtmlViewerUrl(path: string): Promise<string> {
+	// The URL below would point at the browser's own localhost (gap audit rank 8).
+	if (isRemoteWebSession()) throw new Error('Preview not available in the browser yet');
 	const res = await fsRead(path);
 	const html = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(res.bytes));
 	const { root, file } = pickViewerRoot(path, html);

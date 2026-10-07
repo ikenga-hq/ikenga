@@ -15,6 +15,7 @@ import {
 	claudePrimitiveRemove,
 	claudeStoreImport,
 	claudeStoreList,
+	isRemoteWebSession,
 	ngwaCrossEngineCopy,
 	obaAutoUpdateAll,
 	obaBackfillRegistry,
@@ -60,6 +61,7 @@ import {
 	catalogRefs,
 	type PrimitiveCatalogEntry,
 } from '@/lib/registry/primitives';
+import { ngwaSnapshotQueryKey } from '@/lib/ngwa/use-ngwa-snapshot';
 import { queryKeys } from '@/lib/query-keys';
 
 // Re-export the scan-result entry types plus the Ngwa Phase-2 cross-system
@@ -144,6 +146,36 @@ export function useClaudeConfigWatch(projectRoots: readonly string[], enabled = 
 		};
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [key, enabled]);
+}
+
+/** STOPGAP (gap audit rank 24): the daemon serves no `claude_config_watch`, so a
+ *  browser session never hears about edits made on the server (a skill saved in
+ *  a terminal, a `claude mcp add`). Until the server-to-browser event channel
+ *  (rank 10) delivers `claude-config:changed`, refetch the config, store and
+ *  Ngwa-snapshot queries whenever the tab regains focus. Only stale queries
+ *  refetch, so their own `staleTime` stops a focus storm re-running the scan.
+ *  Desktop: inert (the FS watcher does it). Delete when the events channel lands. */
+export function useRemoteConfigFocusRefetch() {
+	const queryClient = useQueryClient();
+	useEffect(() => {
+		if (!isRemoteWebSession()) return;
+		const refetch = () => {
+			if (document.visibilityState === 'hidden') return;
+			for (const queryKey of [
+				queryKeys.claudeConfig.all,
+				queryKeys.claudeStore.all,
+				ngwaSnapshotQueryKey,
+			]) {
+				void queryClient.refetchQueries({ queryKey, type: 'active', stale: true });
+			}
+		};
+		window.addEventListener('focus', refetch);
+		document.addEventListener('visibilitychange', refetch);
+		return () => {
+			window.removeEventListener('focus', refetch);
+			document.removeEventListener('visibilitychange', refetch);
+		};
+	}, [queryClient]);
 }
 
 function makeDebounce(ms: number) {
