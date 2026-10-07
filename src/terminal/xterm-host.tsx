@@ -10,6 +10,7 @@ import { fileUrlToPath, resolvePath } from '@/lib/paths/file-paths';
 import { isWindows } from '@/lib/platform';
 import { createOscObserver, fireOscNotification } from '@/lib/terminal/osc-notify';
 import { readClipboardText, writeClipboardText } from '@/lib/transport/shims';
+import { explainEmptyPaste, onTerminalPasteEvent } from './paste-image';
 import { type KeyPeek, peekKeypress } from '@/lib/keymap/dispatcher';
 import { eventMatchesCombo, strokesFromEvent } from '@/lib/keymap/platform';
 import { evaluateTerminalKey, terminalKeyLabel } from './keybindings';
@@ -906,6 +907,7 @@ export function XTermHost({
 				readClipboardText()
 					.then((t) => {
 						if (t) term.paste(t);
+						else void explainEmptyPaste();
 					})
 					.catch(() => {});
 			};
@@ -1215,6 +1217,16 @@ export function XTermHost({
 		return () => el.removeEventListener(OS_FILE_DROP_EVENT, onPaths);
 	}, []);
 
+	// An image pasted with no text does nothing in a browser (the terminal only
+	// takes text, and there is no upload yet): say so instead of staying silent.
+	// Capture phase so it runs before xterm's own textarea paste handler.
+	useEffect(() => {
+		const el = wrapperRef.current;
+		if (!el) return;
+		el.addEventListener('paste', onTerminalPasteEvent, true);
+		return () => el.removeEventListener('paste', onTerminalPasteEvent, true);
+	}, []);
+
 	const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
 
 	useEffect(() => {
@@ -1310,6 +1322,8 @@ export function XTermHost({
 									if (t) {
 										livePtyRef.current?.write(t).catch(() => {});
 										termRef.current?.focus();
+									} else {
+										void explainEmptyPaste();
 									}
 								})
 								.catch(() => {});
