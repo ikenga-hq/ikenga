@@ -19,7 +19,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from '@tanstack/react-router';
 import { open as openTauriDialog } from '@/lib/transport/dialog-shim';
-import * as Icons from 'lucide-react';
 
 import {
 	Dialog,
@@ -34,6 +33,7 @@ import { cn } from '@/components/ui/utils';
 import { useShellStore } from '@/lib/shell/shell-store';
 import type { Project } from '@/lib/tauri-cmd';
 import { AgentIcon } from '@/shell/artifact-wizard/agent-icon';
+import { ArchetypeGlyph } from '@/shell/artifact-wizard/archetype-glyph';
 import {
 	ARCHETYPES,
 	type Archetype,
@@ -387,7 +387,6 @@ function ArchetypeGrid({
 			<label className="text-xs font-medium">Archetype</label>
 			<div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
 				{ARCHETYPES.map((a) => {
-					const Glyph = resolveGlyph(a.glyphName);
 					const active = archetype?.slug === a.slug;
 					return (
 						<button
@@ -402,7 +401,7 @@ function ArchetypeGrid({
 							)}
 						>
 							<div className="flex items-center gap-1.5 text-sm font-medium">
-								<Glyph className="h-4 w-4" />
+								<ArchetypeGlyph name={a.glyphName} className="h-4 w-4" />
 								<span>{a.label}</span>
 							</div>
 							<p className="text-[10px] leading-snug text-muted-foreground">{a.description}</p>
@@ -550,11 +549,4 @@ function joinPath(folder: string, name: string): string {
 function shortenPath(p: string): string {
 	if (p.length <= 36) return p;
 	return `…${p.slice(p.length - 35)}`;
-}
-
-type LucideIcon = (typeof Icons)['Square'];
-
-function resolveGlyph(name: string): LucideIcon {
-	const map = Icons as unknown as Record<string, LucideIcon>;
-	return map[name] ?? Icons.Square;
 }
