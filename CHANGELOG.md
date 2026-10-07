@@ -1,5 +1,12 @@
 # ikenga-desktop
 
+## 0.21.1
+
+### Patch Changes
+
+- 989b358: Engine detection and Chi runs no longer mistake an infrastructure failure for a verdict. An auth probe that couldn't run (timeout, spawn failure, WSL down, no network) now reports sign-in as unknown instead of "not signed in", so the engine stays in the Chi target picker. A failed run's error names the cause found in the engine's stderr — e.g. "network unreachable from the engine (EAI_AGAIN)" or "WSL failed to start" — without exposing the raw stderr. WSL CLI detection now tolerates login-shell banners printed before `which` output.
+- 322ab13: Release build: pin `@codemirror/language` below 6.13.0, whose missing `@codemirror/streamparser` dependency broke the v0.21.0 desktop builds. Same contents as 0.21.0.
+
 ## 0.21.0
 
 ### Minor Changes
