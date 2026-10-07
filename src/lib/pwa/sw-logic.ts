@@ -126,3 +126,142 @@ export function isSkipWaitingMessage(data: unknown): boolean {
 		(data as { type?: unknown }).type === SKIP_WAITING_MESSAGE.type
 	);
 }
+
+// ── Push (plans/pwa S4 §5–§6, W4) ────────────────────────────────────────────
+//
+// The server sends only `{v: 1, k: <kind>, r: <opaque ref>}`. Titles are fixed
+// per kind here and click targets are built from the kind enum, never from
+// payload text: a payload can't put words on the lock screen or send a tap to
+// another site.
+
+export const PUSH_KINDS = [
+	'permission',
+	'run_finished',
+	'run_failed',
+	'run_cancelled',
+	'invite',
+	'pairing',
+	'update',
+	'test',
+] as const;
+
+export type PushWireKind = (typeof PUSH_KINDS)[number];
+
+export interface PushMessage {
+	k: PushWireKind;
+	r: string;
+}
+
+const PUSH_TITLES: Record<PushWireKind, string> = {
+	permission: 'Approval needed in Ikenga',
+	run_finished: 'Run finished',
+	run_failed: 'Run failed',
+	run_cancelled: 'Run cancelled',
+	invite: 'Someone joined from your invite',
+	pairing: 'A device is asking to pair',
+	update: 'Server update available',
+	test: 'Notifications are on',
+};
+
+/** Where a tap on each kind lands. */
+const PUSH_ROUTES: Record<PushWireKind, string> = {
+	permission: '/',
+	run_finished: '/automations?view=runs',
+	run_failed: '/automations?view=runs',
+	run_cancelled: '/automations?view=runs',
+	invite: '/settings/members',
+	pairing: '/settings/devices',
+	update: '/settings/about',
+	test: '/settings/notifications',
+};
+
+export const GENERIC_PUSH_TITLE = 'Ikenga needs your attention';
+export const PUSH_BODY = 'Open Ikenga to see details';
+
+/** `r`: opaque, ≤64, `[A-Za-z0-9:_-]` (the server's own check). */
+export function isValidPushRef(r: unknown): r is string {
+	return typeof r === 'string' && /^[A-Za-z0-9:_-]{1,64}$/.test(r);
+}
+
+export function isPushKind(k: unknown): k is PushWireKind {
+	return typeof k === 'string' && (PUSH_KINDS as readonly string[]).includes(k);
+}
+
+/** A decrypted push payload → a message, or `null` when it isn't ours. */
+export function parsePush(data: unknown): PushMessage | null {
+	if (typeof data !== 'object' || data === null) return null;
+	const { v, k, r } = data as { v?: unknown; k?: unknown; r?: unknown };
+	if (v !== 1 || !isPushKind(k) || !isValidPushRef(r)) return null;
+	return { k, r };
+}
+
+export interface PushNotificationSpec {
+	title: string;
+	options: {
+		body: string;
+		icon: string;
+		badge: string;
+		tag: string;
+		renotify?: boolean;
+		requireInteraction?: boolean;
+		data: { k: PushWireKind; r: string } | null;
+	};
+}
+
+/**
+ * What to show for a push. `userVisibleOnly` means every push must show a
+ * notification, so an unknown payload still gets the generic one.
+ */
+export function notificationFor(msg: PushMessage | null): PushNotificationSpec {
+	const base = { body: PUSH_BODY, icon: '/icons/icon-192.png', badge: '/icons/badge-72.png' };
+	if (!msg) {
+		return { title: GENERIC_PUSH_TITLE, options: { ...base, tag: 'ikenga', data: null } };
+	}
+	const spec: PushNotificationSpec = {
+		title: PUSH_TITLES[msg.k],
+		options: { ...base, tag: `${msg.k}:${msg.r}`, data: { k: msg.k, r: msg.r } },
+	};
+	if (msg.k === 'permission') {
+		spec.options.renotify = true;
+		spec.options.requireInteraction = true;
+	}
+	return spec;
+}
+
+/** The same-origin path a tap opens: the kind's route plus `push` / `ref`. */
+export function clickUrl(data: unknown): string {
+	const msg =
+		typeof data === 'object' && data !== null
+			? parsePush({ v: 1, ...(data as Record<string, unknown>) })
+			: null;
+	if (!msg) return '/';
+	const route = PUSH_ROUTES[msg.k];
+	const sep = route.includes('?') ? '&' : '?';
+	return `${route}${sep}push=${msg.k}&ref=${encodeURIComponent(msg.r)}`;
+}
+
+/** The message the worker posts to an open window on a tap. */
+export const PUSH_OPEN_MESSAGE = 'ikenga:push-open';
+
+export function isPushOpenMessage(data: unknown): data is { type: string } & PushMessage {
+	if (typeof data !== 'object' || data === null) return false;
+	const d = data as { type?: unknown; k?: unknown; r?: unknown };
+	return d.type === PUSH_OPEN_MESSAGE && isPushKind(d.k) && isValidPushRef(d.r);
+}
+
+/** The `/api/rpc` body the worker sends from `pushsubscriptionchange`: the new
+ *  subscription, replacing the old endpoint (whose kinds and label the server
+ *  carries over). Cookie credentials only — a worker has no bearer token. */
+export function resubscribeBody(
+	sub: { endpoint: string; keys: { p256dh: string; auth: string } },
+	oldEndpoint: string | null
+): string {
+	return JSON.stringify({
+		cmd: 'access_push_subscribe',
+		args: {
+			endpoint: sub.endpoint,
+			keys: sub.keys,
+			...(oldEndpoint ? { replaces: oldEndpoint } : {}),
+		},
+	});
+}

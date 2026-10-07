@@ -130,7 +130,7 @@ export function SettingsSectionHeader({ sectionId, searchActive }: SettingsSecti
 				<div className="min-w-0">
 					<div className="text-sm font-semibold text-foreground">Search settings</div>
 					<div className="truncate font-mono text-[10px] text-muted-foreground">
-						all nine sections
+						all ten sections
 					</div>
 				</div>
 			) : (

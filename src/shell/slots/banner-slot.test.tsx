@@ -56,6 +56,9 @@ vi.mock('@/shell/pwa/pwa-update-banner', async () => ({
 vi.mock('@/shell/pwa/install-hint', async () => ({
 	InstalledTokenBanner: make(await import('react'), 'pwa-token-session'),
 }));
+vi.mock('@/shell/pwa/push-open', async () => ({
+	PushOpenBanner: make(await import('react'), 'push-open'),
+}));
 
 import { BANNER_QUEUE, BannerSlot, LEGACY_BANNER_MOUNT_ORDER } from './banner-slot';
 
@@ -88,6 +91,7 @@ describe('<BannerSlot />', () => {
 			'update:pwa-update',
 			'info:connector',
 			'info:pwa-token-session',
+			'info:push-open',
 		]);
 		// Every banner that mounted before still mounts — nothing dropped.
 		const ids = BANNER_QUEUE.map((b) => b.id);

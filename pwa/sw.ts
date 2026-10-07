@@ -14,9 +14,14 @@
 
 import {
 	classify,
+	clickUrl,
 	isSkipWaitingMessage,
+	notificationFor,
+	PUSH_OPEN_MESSAGE,
+	parsePush,
 	RUNTIME_CACHE,
 	RUNTIME_CACHE_MAX_ENTRIES,
+	resubscribeBody,
 	shellCacheName,
 	shouldStore,
 	staleShellCaches,
@@ -125,3 +130,75 @@ async function trimRuntimeCache(): Promise<void> {
 	if (excess <= 0) return;
 	await Promise.all(keys.slice(0, excess).map((k) => cache.delete(k)));
 }
+
+// ── Push (plans/pwa S4 §5–§6, W4) ───────────────────────────────────────────
+//
+// The browser decrypts; the payload is only `{v, k, r}`. Every push shows a
+// notification (`userVisibleOnly`), with a title fixed per kind — never text
+// from the payload — and a tap opens a same-origin URL built from the kind.
+
+self.addEventListener('push', (event) => {
+	let data: unknown = null;
+	try {
+		data = event.data?.json() ?? null;
+	} catch {
+		data = null;
+	}
+	const spec = notificationFor(parsePush(data));
+	event.waitUntil(self.registration.showNotification(spec.title, spec.options));
+});
+
+self.addEventListener('notificationclick', (event) => {
+	event.notification.close();
+	const data = event.notification.data as { k?: string; r?: string } | null;
+	const url = clickUrl(data);
+	event.waitUntil(
+		(async () => {
+			const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+			const own = windows.find((c) => new URL(c.url).origin === self.location.origin);
+			if (own) {
+				await own.focus();
+				if (data?.k && data.r) own.postMessage({ type: PUSH_OPEN_MESSAGE, k: data.k, r: data.r });
+				return;
+			}
+			await self.clients.openWindow(url);
+		})()
+	);
+});
+
+// The browser rotated the subscription. Re-subscribe with the same server key
+// and tell the server, replacing the old endpoint. Cookie credentials only
+// (a paired device or a T1 session); a T0 link-token tab has none here and is
+// reconciled the next time the app opens.
+self.addEventListener('pushsubscriptionchange', (event) => {
+	const change = event as Event & {
+		oldSubscription?: PushSubscription | null;
+		newSubscription?: PushSubscription | null;
+		waitUntil(p: Promise<unknown>): void;
+	};
+	change.waitUntil(
+		(async () => {
+			const old = change.oldSubscription ?? null;
+			let sub = change.newSubscription ?? null;
+			if (!sub) {
+				const key = old?.options?.applicationServerKey;
+				if (!key) return;
+				sub = await self.registration.pushManager.subscribe({
+					userVisibleOnly: true,
+					applicationServerKey: key,
+				});
+			}
+			const json = sub.toJSON() as { endpoint?: string; keys?: { p256dh?: string; auth?: string } };
+			if (!json.endpoint || !json.keys?.p256dh || !json.keys.auth) return;
+			await fetch('/api/rpc', {
+				method: 'POST',
+				credentials: 'same-origin',
+				headers: { 'content-type': 'application/json' },
+				body: resubscribeBody(
+					{ endpoint: json.endpoint, keys: { p256dh: json.keys.p256dh, auth: json.keys.auth } },
+					old?.endpoint ?? null
+				),
+			}).catch(() => {});
+		})()
+	);
+});

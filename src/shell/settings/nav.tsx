@@ -1,4 +1,5 @@
 import {
+	Bell,
 	Bot,
 	FolderKanban,
 	HardDrive,
@@ -23,6 +24,7 @@ export type SettingsSectionId =
 	| 'secrets'
 	| 'integrations'
 	| 'people'
+	| 'notifications'
 	| 'storage'
 	| 'about';
 
@@ -187,6 +189,22 @@ export const SETTINGS_SECTIONS: readonly SettingsSectionMeta[] = [
 		],
 	},
 	{
+		// plans/pwa S4 §3: Web Push to this browser.
+		id: 'notifications',
+		label: 'Notifications',
+		Icon: Bell,
+		description: 'Push to this device: approvals, Chi runs, invites and pairing, server updates.',
+		fields: [
+			{ field: null, label: 'Push to this device', keywords: 'push notifications web push phone' },
+			{ field: null, label: 'Approvals needed', help: 'permission requests' },
+			{ field: null, label: 'Chi runs', help: 'finished, failed, cancelled' },
+			{ field: null, label: 'Invites and pairing requests' },
+			{ field: null, label: 'Server updates', help: 'admins' },
+			{ field: null, label: 'Send a test' },
+			{ field: null, label: 'Devices getting notifications' },
+		],
+	},
+	{
 		id: 'storage',
 		label: 'Storage & backup',
 		Icon: HardDrive,
@@ -211,7 +229,7 @@ export const SETTINGS_NAV_GROUPS: ReadonlyArray<{
 	ids: readonly SettingsSectionId[];
 }> = [
 	{ label: 'Workspace', ids: ['appearance', 'projects', 'engines', 'workspace'] },
-	{ label: 'Access', ids: ['secrets', 'integrations', 'people'] },
+	{ label: 'Access', ids: ['secrets', 'integrations', 'people', 'notifications'] },
 	{ label: 'System', ids: ['storage', 'about'] },
 ];
 
