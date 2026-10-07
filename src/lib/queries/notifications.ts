@@ -164,8 +164,10 @@ export function useSetNotificationKindMuted() {
 
 /**
  * Subscribe to `notifications://changed` and invalidate every notifications
- * query on each event. `onEvent` sees the raw event (the toast bridge uses it:
- * `reason === 'created' && !muted` → show a transient copy of the row).
+ * query on each event. `onEvent` sees the raw event; the toast bridge filters
+ * it with `isToastWorthy` (`src/components/ui/floating-toast-chip.tsx`): only
+ * `created` / `coalesced` events for unmuted rows toast. `updated` (D-20: a
+ * repeat in the same episode with changed copy) only refreshes the lists.
  */
 export function subscribeNotificationChanges(
 	qc: QueryClient,

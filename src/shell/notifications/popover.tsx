@@ -51,8 +51,14 @@ export const KIND_META: Record<NotificationKind, { label: string; fg: string; bo
 	run_finished: { label: 'run finished', fg: 'var(--live)', border: 'var(--live-soft)' },
 	update: { label: 'update', fg: 'var(--info)', border: 'var(--info-soft)' },
 	invite: { label: 'invite', fg: 'var(--agent)', border: 'var(--agent-soft)' },
-	// Environment problems (D-19): a calm warning, not a danger.
-	system: { label: 'system', fg: 'var(--warning)', border: 'var(--warning-soft)' },
+	// Environment problems (D-19): a calm warning, not a danger. The tokens
+	// define no --warning-soft, so the muted border is mixed from --warning
+	// (a bare var(--warning-soft) would fall back to a hard amber outline).
+	system: {
+		label: 'system',
+		fg: 'var(--warning)',
+		border: 'var(--warning-soft, color-mix(in srgb, var(--warning) 30%, transparent))',
+	},
 };
 
 function KindTag({ row }: { row: NotificationRow }) {

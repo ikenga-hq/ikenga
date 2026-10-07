@@ -58,7 +58,7 @@ vi.mock('@/lib/iyke/client', () => ({
 }));
 
 import { setHostDecideBlock } from './actions';
-import { NotificationsPopoverContent } from './popover';
+import { KIND_META, NotificationsPopoverContent } from './popover';
 
 function render(ui: ReactElement) {
 	const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -173,6 +173,13 @@ describe('NotificationsPopoverContent', () => {
 		expect(screen.getByText('system')).toBeTruthy();
 		expect(screen.queryByText('violation')).toBeNull();
 		expect(screen.queryByText('wsl network')).toBeNull();
+	});
+
+	it('the system tag border never relies on an undefined --warning-soft token alone', () => {
+		// The token sets define --warning but no --warning-soft; a bare var()
+		// would resolve to currentColor (a hard amber outline).
+		expect(KIND_META.system.border).not.toBe('var(--warning-soft)');
+		expect(KIND_META.system.border).toContain('color-mix(in srgb, var(--warning)');
 	});
 
 	it('the mute menu offers only mutable kinds and reflects current mute state', async () => {
