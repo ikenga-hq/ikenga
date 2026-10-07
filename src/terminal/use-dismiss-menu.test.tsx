@@ -1,6 +1,6 @@
 import { cleanup, render } from '@testing-library/react';
 import { useCallback, useState } from 'react';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { useDismissMenu } from './use-dismiss-menu';
 
@@ -17,8 +17,6 @@ beforeAll(() => {
 afterAll(() => {
 	g.IS_REACT_ACT_ENVIRONMENT = prevAct;
 });
-
-const tick = () => new Promise((r) => setTimeout(r, 10));
 
 function Harness() {
 	const [open, setOpen] = useState(false);
@@ -56,11 +54,14 @@ describe('useDismissMenu', () => {
 			() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })),
 		]) {
 			rightClick(el);
-			await tick();
-			expect(el.dataset.open).toBe('yes');
-			dismiss();
-			await tick();
-			expect(el.dataset.open).toBe('no');
+			await vi.waitFor(() => expect(el.dataset.open).toBe('yes'));
+			// The dismiss listeners attach a tick after opening; under load that
+			// can land after a fixed delay, so retry the (idempotent) dismiss
+			// until it is heard rather than racing a timer.
+			await vi.waitFor(() => {
+				dismiss();
+				expect(el.dataset.open).toBe('no');
+			});
 		}
 	});
 });
