@@ -819,11 +819,43 @@ pub(crate) fn engines_info(world: &WorldSnapshot) -> Vec<SeatEngineInfo> {
         .collect()
 }
 
-/// How long a "not installed" answer is reused. A WSL probe costs seconds,
-/// and seat listings are rebuilt often; a CLI installed meanwhile shows up
-/// within this window. Hits are remembered by the resolver itself, and
-/// "couldn't tell" is never remembered.
+/// How long a "not installed" or "couldn't tell" answer is reused. A WSL
+/// probe costs seconds — up to its full cold-start timeout when WSL is
+/// wedged — and seat listings are rebuilt often; without this every rebuild
+/// would wait that timeout out again. A CLI installed (or a WSL repaired)
+/// meanwhile shows up within this window. Hits are remembered by the
+/// resolver itself.
 const ENGINE_MISS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The last non-hit install answer per binary: `false` = not installed,
+/// `true` = couldn't tell (which counts as available).
+#[derive(Default)]
+struct InstallCache(std::sync::Mutex<HashMap<String, (std::time::Instant, bool)>>);
+
+impl InstallCache {
+    fn fresh(&self, binary: &str, now: std::time::Instant) -> Option<bool> {
+        let map = self.0.lock().ok()?;
+        let (at, available) = map.get(binary)?;
+        (now.saturating_duration_since(*at) < ENGINE_MISS_TTL).then_some(*available)
+    }
+
+    /// Record a probe outcome (`None` = couldn't tell) and return what it
+    /// means for seating.
+    fn record(&self, binary: &str, outcome: Option<bool>, now: std::time::Instant) -> bool {
+        let available = outcome.unwrap_or(true);
+        if let Ok(mut map) = self.0.lock() {
+            match outcome {
+                Some(true) => {
+                    map.remove(binary);
+                }
+                _ => {
+                    map.insert(binary.to_string(), (now, available));
+                }
+            }
+        }
+        available
+    }
+}
 
 /// Whether `binary` is installed — on the host PATH or, on Windows, inside
 /// the configured WSL distro (the same lookup a chi run makes). It used to
@@ -832,29 +864,39 @@ const ENGINE_MISS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 /// available: "couldn't tell" must not read as "not installed", and chi
 /// still fails the run with the real reason if it is absent.
 async fn binary_available(binary: &str) -> bool {
-    type Misses = std::sync::Mutex<HashMap<String, std::time::Instant>>;
-    static MISSES: std::sync::OnceLock<Misses> = std::sync::OnceLock::new();
-    let misses = MISSES.get_or_init(Default::default);
-    let fresh_miss = misses
-        .lock()
-        .ok()
-        .and_then(|m| m.get(binary).map(|at| at.elapsed() < ENGINE_MISS_TTL))
-        .unwrap_or(false);
-    if fresh_miss {
-        return false;
+    static CACHE: std::sync::OnceLock<InstallCache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(available) = cache.fresh(binary, std::time::Instant::now()) {
+        return available;
     }
-    match crate::server::shared::chi_exec::engine_installed(binary).await {
-        Some(installed) => {
-            if let Ok(mut m) = misses.lock() {
-                if installed {
-                    m.remove(binary);
-                } else {
-                    m.insert(binary.to_string(), std::time::Instant::now());
-                }
-            }
-            installed
-        }
-        None => true,
+    let outcome = crate::server::shared::chi_exec::engine_installed(binary).await;
+    cache.record(binary, outcome, std::time::Instant::now())
+}
+
+#[cfg(test)]
+mod install_cache_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Regression: a wedged WSL ("couldn't tell") was never cached, so every
+    /// seat listing re-paid the full WSL probe timeout. It is now reused for
+    /// the TTL like a miss — and still reads as available.
+    #[test]
+    fn couldnt_tell_and_misses_are_reused_for_the_ttl() {
+        let cache = InstallCache::default();
+        let t0 = Instant::now();
+        assert_eq!(cache.fresh("codex", t0), None);
+
+        assert!(cache.record("codex", None, t0));
+        assert_eq!(cache.fresh("codex", t0 + Duration::from_secs(5)), Some(true));
+        assert_eq!(cache.fresh("codex", t0 + ENGINE_MISS_TTL), None);
+
+        assert!(!cache.record("pi", Some(false), t0));
+        assert_eq!(cache.fresh("pi", t0 + Duration::from_secs(5)), Some(false));
+
+        // A hit clears the entry; the resolver remembers hits itself.
+        assert!(cache.record("pi", Some(true), t0));
+        assert_eq!(cache.fresh("pi", t0), None);
     }
 }
 

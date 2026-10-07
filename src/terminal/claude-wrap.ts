@@ -70,7 +70,7 @@ function psQuote(arg: string): string {
  */
 export function toWslPath(p: string): string {
 	// `\\wsl.localhost\<distro>\…` / `\\wsl$\<distro>\…` → the path inside
-	// the distro (`to_wsl_path` in `chi_exec.rs` does the same).
+	// the distro (`wsl_cd` in `chi_exec.rs` does the same for a run's cwd).
 	const share = /^[\\/]{2}(?:wsl\.localhost|wsl\$)[\\/][^\\/]+(.*)$/i.exec(p);
 	if (share) {
 		const inner = share[1].replace(/\\/g, '/').replace(/\/+$/, '');

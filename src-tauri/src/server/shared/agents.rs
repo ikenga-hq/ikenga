@@ -889,8 +889,15 @@ async fn probe_auth_files_in_wsl(
         .collect();
     let budget = super::wsl::probe_budget(exec, Duration::from_secs(5));
     let scan = tokio::task::spawn_blocking(move || {
+        // The CLI runs in the configured (else the default) distro as that
+        // distro's default user; only that user's home signs it in. When
+        // the registry doesn't say, fall back to the configured distro (or
+        // every distro) and every home in it.
+        let identity = super::wsl::launch_identity(distro.as_deref());
+        let only = identity.as_ref().map(|(name, _)| name.clone()).or(distro);
+        let uid = identity.and_then(|(_, uid)| uid);
         let roots = super::wsl::share_roots();
-        scan_wsl_shares(&roots, &rels, distro.as_deref())
+        scan_wsl_shares(&roots, &rels, only.as_deref(), uid)
     });
     match timeout(budget, scan).await {
         Ok(Ok(ShareScan::Found)) => (Some(true), None),
@@ -923,17 +930,26 @@ enum ShareScan {
     Unreadable(String),
 }
 
-/// Look for any of `rels` (home-relative) under `/root` and every
-/// `/home/<user>` of each distro in `roots` (the `\\wsl.localhost` and
-/// `\\wsl$` share roots, which list the same distros — the first one that
-/// lists answers). `only` limits the scan to the configured distro; Docker
-/// Desktop's internal distros are never scanned.
+/// Look for any of `rels` (home-relative) in the WSL shares `roots` (the
+/// `\\wsl.localhost` and `\\wsl$` share roots, which list the same distros
+/// — the first one that lists answers). `only` limits the scan to the distro
+/// the CLI launches in; Docker Desktop's internal distros are never scanned.
+/// With `uid` (that distro's default user) only the home `/etc/passwd` gives
+/// it is read — a file in another user's home doesn't sign the CLI in.
+/// Without it, or when the distro's `/etc/passwd` doesn't name that uid,
+/// `/root` and every `/home/<user>` are read.
 ///
 /// Permission-denied on a home is skipped, not an error: `/root` and other
 /// users' homes are normally closed to the share's (default) user, and that
-/// user's own home is the one its CLI reads.
+/// user's own home is the one its CLI reads. A share root that lists no
+/// distro to scan is "couldn't tell", not "missing".
 #[cfg_attr(not(windows), allow(dead_code))]
-fn scan_wsl_shares(roots: &[PathBuf], rels: &[String], only: Option<&str>) -> ShareScan {
+fn scan_wsl_shares(
+    roots: &[PathBuf],
+    rels: &[String],
+    only: Option<&str>,
+    uid: Option<u32>,
+) -> ShareScan {
     use std::io::ErrorKind;
 
     // `Ok(true)` present, `Ok(false)` absent or closed to us, `Err` unknown.
@@ -975,12 +991,26 @@ fn scan_wsl_shares(roots: &[PathBuf], rels: &[String], only: Option<&str>) -> Sh
             }
             scanned += 1;
             let base = entry.path();
-            let mut homes = vec![base.join("root")];
-            match std::fs::read_dir(base.join("home")) {
-                Ok(users) => homes.extend(users.flatten().map(|u| u.path())),
-                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {}
-                Err(e) => errors.push(format!("{}: {e}", base.join("home").display())),
-            }
+            let default_home = uid.and_then(|uid| {
+                let passwd = std::fs::read_to_string(base.join("etc").join("passwd")).ok()?;
+                super::wsl::home_for_uid(&passwd, uid)
+            });
+            let homes = match default_home {
+                Some(home) => vec![base.join(home.trim_start_matches('/'))],
+                None => {
+                    let mut homes = vec![base.join("root")];
+                    match std::fs::read_dir(base.join("home")) {
+                        Ok(users) => homes.extend(users.flatten().map(|u| u.path())),
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                ErrorKind::NotFound | ErrorKind::PermissionDenied
+                            ) => {}
+                        Err(e) => errors.push(format!("{}: {e}", base.join("home").display())),
+                    }
+                    homes
+                }
+            };
             for home in &homes {
                 for rel in rels {
                     match file_at(&home.join(rel)) {
@@ -991,8 +1021,11 @@ fn scan_wsl_shares(roots: &[PathBuf], rels: &[String], only: Option<&str>) -> Sh
                 }
             }
         }
-        if let (Some(d), 0) = (only, scanned) {
-            errors.push(format!("WSL distro `{d}` is not listed under {}", root.display()));
+        if scanned == 0 {
+            errors.push(match only {
+                Some(d) => format!("WSL distro `{d}` is not listed under {}", root.display()),
+                None => format!("no WSL distro listed under {}", root.display()),
+            });
         }
         return if errors.is_empty() {
             ShareScan::Missing
@@ -1354,12 +1387,12 @@ mod tests {
         let share = fake_share(&[("Ubuntu", &["me"])]);
         let roots = [share.path().to_path_buf()];
         let rel = rels(&[".claude/.credentials.json"]);
-        assert_eq!(scan_wsl_shares(&roots, &rel, None), ShareScan::Missing);
+        assert_eq!(scan_wsl_shares(&roots, &rel, None, None), ShareScan::Missing);
 
         let cred = share.path().join("Ubuntu/root/.claude/.credentials.json");
         std::fs::create_dir_all(cred.parent().unwrap()).unwrap();
         std::fs::write(&cred, "{}").unwrap();
-        assert_eq!(scan_wsl_shares(&roots, &rel, None), ShareScan::Found);
+        assert_eq!(scan_wsl_shares(&roots, &rel, None, None), ShareScan::Found);
     }
 
     #[test]
@@ -1374,11 +1407,11 @@ mod tests {
         }
         // docker-desktop never counts; Debian counts only when it is the
         // configured distro (or none is configured).
-        assert_eq!(scan_wsl_shares(&roots, &rel, Some("Ubuntu")), ShareScan::Missing);
-        assert_eq!(scan_wsl_shares(&roots, &rel, Some("debian")), ShareScan::Found);
-        assert_eq!(scan_wsl_shares(&roots, &rel, None), ShareScan::Found);
+        assert_eq!(scan_wsl_shares(&roots, &rel, Some("Ubuntu"), None), ShareScan::Missing);
+        assert_eq!(scan_wsl_shares(&roots, &rel, Some("debian"), None), ShareScan::Found);
+        assert_eq!(scan_wsl_shares(&roots, &rel, None, None), ShareScan::Found);
         std::fs::remove_file(share.path().join("Debian/home/u/.codex/auth.json")).unwrap();
-        assert_eq!(scan_wsl_shares(&roots, &rel, None), ShareScan::Missing);
+        assert_eq!(scan_wsl_shares(&roots, &rel, None, None), ShareScan::Missing);
     }
 
     /// A share that can't be listed (WSL down, the share not mounted) or a
@@ -1388,16 +1421,58 @@ mod tests {
         let gone = tempfile::tempdir().unwrap().path().join("no-such-share");
         let rel = rels(&[".claude/.credentials.json"]);
         assert!(matches!(
-            scan_wsl_shares(&[gone.clone(), gone], &rel, None),
+            scan_wsl_shares(&[gone.clone(), gone], &rel, None, None),
             ShareScan::Unreadable(_)
         ));
 
         let share = fake_share(&[("Ubuntu", &["me"])]);
         let roots = [share.path().to_path_buf()];
-        match scan_wsl_shares(&roots, &rel, Some("Arch")) {
+        match scan_wsl_shares(&roots, &rel, Some("Arch"), None) {
             ShareScan::Unreadable(why) => assert!(why.contains("Arch"), "{why}"),
             other => panic!("expected Unreadable, got {other:?}"),
         }
+
+        // A share root that lists nothing (no distro running) or only
+        // Docker Desktop's distros, with none configured: couldn't tell.
+        let empty = tempfile::tempdir().unwrap();
+        match scan_wsl_shares(&[empty.path().to_path_buf()], &rel, None, None) {
+            ShareScan::Unreadable(why) => assert!(why.contains("no WSL distro"), "{why}"),
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
+        let docker = fake_share(&[("docker-desktop", &["u"])]);
+        assert!(matches!(
+            scan_wsl_shares(&[docker.path().to_path_buf()], &rel, None, None),
+            ShareScan::Unreadable(_)
+        ));
+    }
+
+    /// With the distro's default uid known, only that user's home counts: a
+    /// stale credential in another user's home doesn't sign the CLI in. A
+    /// passwd that doesn't name the uid falls back to every home.
+    #[test]
+    fn wsl_share_scan_reads_only_the_default_users_home() {
+        let share = fake_share(&[("Ubuntu", &["me", "old"])]);
+        let roots = [share.path().to_path_buf()];
+        let rel = rels(&[".claude/.credentials.json"]);
+        std::fs::create_dir_all(share.path().join("Ubuntu/etc")).unwrap();
+        std::fs::write(
+            share.path().join("Ubuntu/etc/passwd"),
+            "root:x:0:0:root:/root:/bin/bash\nme:x:1000:1000::/home/me:/bin/bash\nold:x:1001:1001::/home/old:/bin/bash\n",
+        )
+        .unwrap();
+        let stale = share.path().join("Ubuntu/home/old/.claude/.credentials.json");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, "{}").unwrap();
+
+        assert_eq!(scan_wsl_shares(&roots, &rel, Some("Ubuntu"), Some(1000)), ShareScan::Missing);
+        assert_eq!(scan_wsl_shares(&roots, &rel, Some("Ubuntu"), Some(1001)), ShareScan::Found);
+        // uid not in passwd: every home, as before.
+        assert_eq!(scan_wsl_shares(&roots, &rel, Some("Ubuntu"), Some(4242)), ShareScan::Found);
+
+        let mine = share.path().join("Ubuntu/home/me/.claude/.credentials.json");
+        std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
+        std::fs::write(&mine, "{}").unwrap();
+        assert_eq!(scan_wsl_shares(&roots, &rel, Some("Ubuntu"), Some(1000)), ShareScan::Found);
     }
 
     /// A host CLI's credential is the host file; nothing under WSL counts.

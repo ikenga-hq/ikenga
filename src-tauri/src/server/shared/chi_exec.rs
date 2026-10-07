@@ -157,9 +157,9 @@ pub struct ChiRunHandle {
 pub(crate) trait EngineResolver: Send + Sync {
     /// Resolved host path of `binary`, if it is on the (augmented) PATH.
     fn native(&self, binary: &str) -> Option<PathBuf>;
-    /// Whether `binary` is on the WSL distro's login PATH — or that WSL
-    /// couldn't be asked, which is not the same as "no".
-    fn in_wsl<'a>(&'a self, binary: &'a str) -> BoxFuture<'a, WslLookup>;
+    /// Whether `binary` is on `distro`'s login PATH (`None` = the default
+    /// distro) — or that WSL couldn't be asked, which is not the same as "no".
+    fn in_wsl<'a>(&'a self, binary: &'a str, distro: Option<&'a str>) -> BoxFuture<'a, WslLookup>;
     /// The distro WSL launches use (`engines.agentWslDistro`); `None` = the
     /// default distro.
     fn wsl_distro(&self) -> Option<String> {
@@ -182,7 +182,7 @@ impl EngineResolver for HostResolver {
     }
 
     #[cfg(all(windows, feature = "desktop"))]
-    fn in_wsl<'a>(&'a self, binary: &'a str) -> BoxFuture<'a, WslLookup> {
+    fn in_wsl<'a>(&'a self, binary: &'a str, distro: Option<&'a str>) -> BoxFuture<'a, WslLookup> {
         Box::pin(async move {
             // `wsl.exe … command -v` costs ~0.5–2 s warm (far more cold), so
             // remember hits — per distro — for the life of the process.
@@ -191,12 +191,11 @@ impl EngineResolver for HostResolver {
             type Hits = std::sync::Mutex<std::collections::HashSet<(Option<String>, String)>>;
             static FOUND: std::sync::OnceLock<Hits> = std::sync::OnceLock::new();
             let found = FOUND.get_or_init(Default::default);
-            let distro = self.wsl_distro();
-            let key = (distro.clone(), binary.to_string());
+            let key = (distro.map(str::to_string), binary.to_string());
             if found.lock().map(|s| s.contains(&key)).unwrap_or(false) {
                 return WslLookup::Found(binary.to_string());
             }
-            let lookup = super::agents::wsl_which(binary, distro.as_deref()).await;
+            let lookup = super::agents::wsl_which(binary, distro).await;
             if matches!(lookup, WslLookup::Found(_)) {
                 if let Ok(mut s) = found.lock() {
                     s.insert(key);
@@ -209,7 +208,7 @@ impl EngineResolver for HostResolver {
     /// The daemon (and every non-Windows build) resolves on the host PATH
     /// only.
     #[cfg(not(all(windows, feature = "desktop")))]
-    fn in_wsl<'a>(&'a self, _binary: &'a str) -> BoxFuture<'a, WslLookup> {
+    fn in_wsl<'a>(&'a self, _binary: &'a str, _distro: Option<&'a str>) -> BoxFuture<'a, WslLookup> {
         Box::pin(std::future::ready(WslLookup::NotFound))
     }
 
@@ -225,12 +224,14 @@ impl EngineResolver for HostResolver {
 /// Whether an engine binary is installed, for seat install state: on the
 /// host PATH, or inside WSL on Windows. `None` = couldn't tell (WSL didn't
 /// answer); callers must not read that as "not installed".
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
 pub(crate) async fn engine_installed(binary: &str) -> Option<bool> {
     let resolver = HostResolver;
     if resolver.native(binary).is_some() {
         return Some(true);
     }
-    match resolver.in_wsl(binary).await {
+    let distro = resolver.wsl_distro();
+    match resolver.in_wsl(binary, distro.as_deref()).await {
         WslLookup::Found(_) => Some(true),
         WslLookup::NotFound => Some(false),
         WslLookup::WslUnavailable(reason) => {
@@ -864,22 +865,35 @@ pub(crate) enum EngineLaunch {
     /// uses (`src/terminal/claude-wrap.ts`).
     Wsl {
         binary: String,
-        /// `engines.agentWslDistro`; `None` = the default distro.
+        /// The distro the run's cwd lives in when it is a distro share path,
+        /// else `engines.agentWslDistro`; `None` = the default distro.
         distro: Option<String>,
     },
+}
+
+/// The distro a WSL run in `cwd` launches in: the one a distro share path
+/// (`\\wsl.localhost\<distro>\…`) names — its directory exists only there —
+/// else the configured one.
+fn launch_distro(cwd: &str, resolver: &dyn EngineResolver) -> Option<String> {
+    match super::wsl::unc_to_linux(cwd) {
+        Some((distro, _)) => Some(distro),
+        None => resolver.wsl_distro(),
+    }
 }
 
 pub(crate) async fn resolve_engine(
     binary: &str,
     resolver: &dyn EngineResolver,
+    cwd: &str,
 ) -> Result<EngineLaunch, String> {
     if let Some(path) = resolver.native(binary) {
         return Ok(EngineLaunch::Native(path));
     }
-    match resolver.in_wsl(binary).await {
+    let distro = launch_distro(cwd, resolver);
+    match resolver.in_wsl(binary, distro.as_deref()).await {
         WslLookup::Found(_) => Ok(EngineLaunch::Wsl {
             binary: binary.to_string(),
-            distro: resolver.wsl_distro(),
+            distro,
         }),
         // Not "install it": the CLI may well be installed in a WSL that
         // didn't answer, and reinstalling would not help.
@@ -903,27 +917,6 @@ pub(crate) async fn resolve_engine(
 /// Single-quote `s` for a POSIX shell.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
-}
-
-/// A host path as the Linux path a WSL process sees: a distro share path
-/// (`\\wsl.localhost\<distro>\…`, `\\wsl$\<distro>\…`) becomes the path inside
-/// the distro, `C:\Users\x` → `/mnt/c/Users/x` (WSL's default automount);
-/// anything else passes through. Mirrors `toWslPath` in
-/// `src/terminal/claude-wrap.ts`.
-pub(crate) fn to_wsl_path(p: &str) -> String {
-    if let Some((_distro, linux)) = super::wsl::unc_to_linux(p) {
-        return linux;
-    }
-    let bytes = p.as_bytes();
-    if bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
-    {
-        let drive = (bytes[0] as char).to_ascii_lowercase();
-        return format!("/mnt/{drive}/{}", p[3..].replace('\\', "/"));
-    }
-    p.to_string()
 }
 
 /// Stdio wiring for every in-process engine child: all three streams piped
@@ -1037,7 +1030,7 @@ pub(crate) async fn build_engine_command_with(
                 .unwrap_or_default()
                 .as_claude_flag();
 
-            let launch = resolve_engine("claude", resolver).await?;
+            let launch = resolve_engine("claude", resolver, cwd).await?;
             let mut args: Vec<String> = [
                 "--permission-prompt-tool",
                 "stdio",
@@ -1066,7 +1059,7 @@ pub(crate) async fn build_engine_command_with(
         // input (no `-p`) reads one `{"event":"user",…}` line per turn from
         // stdin instead, and ends at EOF.
         "antigravity-cli" => {
-            let launch = resolve_engine("agy", resolver).await?;
+            let launch = resolve_engine("agy", resolver, cwd).await?;
             let mut args = vec![
                 s("--input-format"),
                 s("stream-json"),
@@ -1090,14 +1083,17 @@ pub(crate) async fn build_engine_command_with(
         // arbitrary project dirs (codex defaults to refusing outside a
         // git repo). `-` as the positional arg means "read prompt from stdin".
         "codex" => {
-            let launch = resolve_engine("codex", resolver).await?;
+            let launch = resolve_engine("codex", resolver, cwd).await?;
             let mut args = match resume_id {
                 Some(id) => vec![s("exec"), s("resume"), s(id), s("--json")],
                 None => vec![s("exec"), s("--json")],
             };
-            // `--cd` is read by codex itself, so a WSL codex needs a Linux path.
+            // `--cd` is read by codex itself. A WSL codex is already started
+            // in the directory (`wsl.exe --cd`, which translates drive paths
+            // through the distro's own automount root), so it gets `.` rather
+            // than a guessed `/mnt/<drive>` path.
             let codex_cwd = match launch {
-                EngineLaunch::Wsl { .. } => to_wsl_path(cwd),
+                EngineLaunch::Wsl { .. } => s("."),
                 EngineLaunch::Native(_) => s(cwd),
             };
             args.extend([s("--skip-git-repo-check"), s("--cd"), codex_cwd, s("-")]);
@@ -1112,7 +1108,7 @@ pub(crate) async fn build_engine_command_with(
         // `opencode run` with no message reads a non-TTY stdin as the message;
         // `--format json` streams its events. (`-p` here is `--password`.)
         "opencode" => {
-            let launch = resolve_engine("opencode", resolver).await?;
+            let launch = resolve_engine("opencode", resolver, cwd).await?;
             let mut args = vec![s("run"), s("--format"), s("json")];
             if let Some(id) = resume_id {
                 args.extend([s("--session"), s(id)]);
@@ -1125,7 +1121,7 @@ pub(crate) async fn build_engine_command_with(
         // `pi --mode json` merges piped stdin into the initial prompt and
         // streams its session events as JSON lines.
         "pi" => {
-            let launch = resolve_engine("pi", resolver).await?;
+            let launch = resolve_engine("pi", resolver, cwd).await?;
             let mut args = vec![s("--mode"), s("json")];
             if let Some(id) = resume_id {
                 args.extend([s("--session"), s(id)]);

@@ -43,6 +43,8 @@ struct FakeResolver {
     /// `Some(reason)`: WSL can't be asked.
     wsl_down: Option<&'static str>,
     distro: Option<&'static str>,
+    /// The distro each `in_wsl` probe asked.
+    probed: std::sync::Mutex<Vec<Option<String>>>,
 }
 
 impl FakeResolver {
@@ -52,6 +54,7 @@ impl FakeResolver {
             wsl: vec![],
             wsl_down: None,
             distro: None,
+            probed: Default::default(),
         }
     }
     fn wsl(bins: &[&'static str]) -> Self {
@@ -60,6 +63,7 @@ impl FakeResolver {
             wsl: bins.to_vec(),
             wsl_down: None,
             distro: None,
+            probed: Default::default(),
         }
     }
 }
@@ -68,7 +72,8 @@ impl EngineResolver for FakeResolver {
     fn native(&self, binary: &str) -> Option<PathBuf> {
         self.native.contains(&binary).then(|| PathBuf::from(binary))
     }
-    fn in_wsl<'a>(&'a self, binary: &'a str) -> BoxFuture<'a, WslLookup> {
+    fn in_wsl<'a>(&'a self, binary: &'a str, distro: Option<&'a str>) -> BoxFuture<'a, WslLookup> {
+        self.probed.lock().unwrap().push(distro.map(str::to_string));
         let lookup = match self.wsl_down {
             Some(why) => WslLookup::WslUnavailable(why.to_string()),
             None if self.wsl.contains(&binary) => WslLookup::Found(format!("/usr/bin/{binary}")),
@@ -152,7 +157,7 @@ impl EngineResolver for StubResolver {
     fn native(&self, binary: &str) -> Option<PathBuf> {
         (binary == "claude").then(|| self.0.clone())
     }
-    fn in_wsl<'a>(&'a self, _binary: &'a str) -> BoxFuture<'a, WslLookup> {
+    fn in_wsl<'a>(&'a self, _binary: &'a str, _distro: Option<&'a str>) -> BoxFuture<'a, WslLookup> {
         Box::pin(std::future::ready(WslLookup::NotFound))
     }
 }
@@ -346,7 +351,7 @@ async fn resolve_engine_prefers_host_path_over_wsl() {
         ..FakeResolver::wsl(&["claude"])
     };
     assert_eq!(
-        resolve_engine("claude", &r).await.unwrap(),
+        resolve_engine("claude", &r, "/tmp").await.unwrap(),
         EngineLaunch::Native(PathBuf::from("claude"))
     );
 }
@@ -354,7 +359,7 @@ async fn resolve_engine_prefers_host_path_over_wsl() {
 #[tokio::test]
 async fn resolve_engine_falls_back_to_wsl() {
     assert_eq!(
-        resolve_engine("claude", &FakeResolver::wsl(&["claude"])).await.unwrap(),
+        resolve_engine("claude", &FakeResolver::wsl(&["claude"]), "/tmp").await.unwrap(),
         EngineLaunch::Wsl {
             binary: "claude".into(),
             distro: None,
@@ -370,7 +375,7 @@ async fn resolve_engine_reports_wsl_unavailable_instead_of_not_installed() {
         wsl_down: Some("wsl.exe did not answer within 20s"),
         ..FakeResolver::wsl(&["claude"])
     };
-    let err = resolve_engine("claude", &r).await.unwrap_err();
+    let err = resolve_engine("claude", &r, "/tmp").await.unwrap_err();
     assert!(
         err.contains("WSL unavailable: wsl.exe did not answer within 20s"),
         "{err}"
@@ -390,7 +395,7 @@ async fn wsl_launch_uses_the_configured_distro() {
         ..FakeResolver::wsl(&["claude"])
     };
     assert_eq!(
-        resolve_engine("claude", &r).await.unwrap(),
+        resolve_engine("claude", &r, "/tmp").await.unwrap(),
         EngineLaunch::Wsl {
             binary: "claude".into(),
             distro: Some("Debian".into()),
@@ -409,7 +414,7 @@ async fn wsl_launch_uses_the_configured_distro() {
 /// (`\\wsl.localhost\Ubuntu\home\me\proj`) failed to start with "The
 /// directory name is invalid (os error 267)" — the host-side cwd was set to
 /// a path Windows can't enter. Now the cwd goes only to `wsl.exe --cd`, as
-/// the Linux path, and codex's own `--cd` gets the same Linux path.
+/// the Linux path, in the distro the path names.
 #[tokio::test]
 async fn wsl_share_project_runs_without_a_host_cwd() {
     let share = r"\\wsl.localhost\Ubuntu\home\me\proj";
@@ -424,7 +429,10 @@ async fn wsl_share_project_runs_without_a_host_cwd() {
     .await
     .unwrap();
     assert_eq!(claude.cwd, None);
-    assert_eq!(&args_of(&claude)[..2], ["--cd", "/home/me/proj"]);
+    assert_eq!(
+        &args_of(&claude)[..4],
+        ["-d", "Ubuntu", "--cd", "/home/me/proj"]
+    );
 
     let codex =
         build_engine_command_with(&FakeResolver::wsl(&["codex"]), "codex", share, None, None, None)
@@ -432,20 +440,48 @@ async fn wsl_share_project_runs_without_a_host_cwd() {
             .unwrap();
     assert_eq!(codex.cwd, None);
     let args = args_of(&codex);
-    assert!(args[6].contains("'--cd' '/home/me/proj'"), "{args:?}");
+    assert_eq!(&args[2..4], ["--cd", "/home/me/proj"], "{args:?}");
+    assert!(args[8].contains("'--cd' '.'"), "{args:?}");
 }
 
-#[test]
-fn to_wsl_path_maps_share_paths_into_the_distro() {
-    assert_eq!(to_wsl_path(r"\\wsl.localhost\Ubuntu\home\me"), "/home/me");
-    assert_eq!(to_wsl_path(r"\\wsl$\Debian\srv\app"), "/srv/app");
-    assert_eq!(to_wsl_path(r"C:\Users\x"), "/mnt/c/Users/x");
-    assert_eq!(to_wsl_path("/already/linux"), "/already/linux");
+/// A project on a distro share (`\\wsl.localhost\Debian\…`) exists only in
+/// that distro: the run is looked up and launched there, not in the
+/// configured (or default) one, where `--cd` would miss or land in a
+/// same-named directory of another tree.
+#[tokio::test]
+async fn wsl_share_project_runs_in_the_distro_it_lives_in() {
+    let r = FakeResolver {
+        distro: Some("Ubuntu"),
+        ..FakeResolver::wsl(&["claude"])
+    };
+    let cmd = build_engine_command_with(
+        &r,
+        "claude-code",
+        r"\\wsl.localhost\Debian\home\me\proj",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        &args_of(&cmd)[..4],
+        ["-d", "Debian", "--cd", "/home/me/proj"]
+    );
+    assert_eq!(*r.probed.lock().unwrap(), [Some("Debian".to_string())]);
+
+    // A drive path keeps the configured distro.
+    r.probed.lock().unwrap().clear();
+    let cmd = build_engine_command_with(&r, "claude-code", r"C:\work", None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(&args_of(&cmd)[..2], ["-d", "Ubuntu"]);
+    assert_eq!(*r.probed.lock().unwrap(), [Some("Ubuntu".to_string())]);
 }
 
 #[tokio::test]
 async fn resolve_engine_errors_clearly_when_nothing_resolves() {
-    let err = resolve_engine("claude", &FakeResolver::native(&[])).await.unwrap_err();
+    let err = resolve_engine("claude", &FakeResolver::native(&[]), "/tmp").await.unwrap_err();
     assert!(err.contains("`claude` not found"), "{err}");
     assert!(err.contains("install it or add it to PATH"), "{err}");
     // …and build_engine_command surfaces it instead of an OS spawn error.
@@ -660,8 +696,11 @@ async fn spawn_engine_child_pipes_all_three_streams() {
     assert_eq!(err.trim(), "err");
 }
 
+/// A WSL codex is started in the directory by `wsl.exe --cd`, which maps a
+/// drive path through the distro's own automount root; its own `--cd` is
+/// `.`, never a guessed `/mnt/<drive>` path.
 #[tokio::test]
-async fn codex_in_wsl_gets_a_linux_cd_path() {
+async fn codex_in_wsl_cds_through_wsl_exe() {
     let cmd = build_engine_command_with(
         &FakeResolver::wsl(&["codex"]),
         "codex",
@@ -673,12 +712,8 @@ async fn codex_in_wsl_gets_a_linux_cd_path() {
     .unwrap();
     let args = args_of(&cmd);
     assert_eq!(args[1], "C:/Users/x/proj");
-    assert!(
-        args[6].contains("'--cd' '/mnt/c/Users/x/proj'"),
-        "{}",
-        args[6]
-    );
-    assert_eq!(to_wsl_path("/already/linux"), "/already/linux");
+    assert!(args[6].contains("'--cd' '.'"), "{}", args[6]);
+    assert!(!args[6].contains("/mnt/"), "{}", args[6]);
 }
 
 /// A persistent run that fell back to in-process surfaces the fallback in
@@ -1494,7 +1529,7 @@ impl EngineResolver for StubDirResolver {
         let path = self.0.join(binary);
         path.is_file().then_some(path)
     }
-    fn in_wsl<'a>(&'a self, _binary: &'a str) -> BoxFuture<'a, WslLookup> {
+    fn in_wsl<'a>(&'a self, _binary: &'a str, _distro: Option<&'a str>) -> BoxFuture<'a, WslLookup> {
         Box::pin(std::future::ready(WslLookup::NotFound))
     }
 }

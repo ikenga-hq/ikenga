@@ -88,8 +88,7 @@ pub(crate) fn wsl_exe_present() -> bool {
 /// with a NUL between every character.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn decode_wsl_output(bytes: &[u8]) -> String {
-    let utf16 = bytes.len() >= 2
-        && (bytes[1] == 0 || (bytes[0] == 0xff && bytes[1] == 0xfe));
+    let utf16 = bytes.len() >= 2 && (bytes[1] == 0 || (bytes[0] == 0xff && bytes[1] == 0xfe));
     if utf16 {
         let units: Vec<u16> = bytes
             .chunks_exact(2)
@@ -141,6 +140,141 @@ pub(crate) fn unc_to_linux(p: &str) -> Option<(String, String)> {
     Some((distro.to_string(), path.to_string()))
 }
 
+/// Who a `wsl.exe [-d <distro>]` launch runs as, read from the WSL
+/// registrations under `HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss`
+/// without starting WSL: the distro it lands in (`distro`, or the default
+/// one when `None`) and that distro's default uid, if one is registered.
+/// `None` when the registry doesn't say (no WSL, a distro that isn't
+/// registered, an unreadable key).
+#[cfg(windows)]
+pub(crate) fn launch_identity(distro: Option<&str>) -> Option<(String, Option<u32>)> {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+    };
+    const LXSS: &str = r"Software\Microsoft\Windows\CurrentVersion\Lxss";
+
+    let lxss = wide(LXSS);
+    let mut key: HKEY = std::ptr::null_mut();
+    // SAFETY: valid NUL-terminated key name and out-pointer.
+    if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, lxss.as_ptr(), 0, KEY_READ, &mut key) } != 0 {
+        return None;
+    }
+    let wanted = match distro {
+        Some(d) => Some(d.to_string()),
+        None => reg_sz(key, "", "DefaultDistribution")
+            .and_then(|guid| reg_sz(key, &guid, "DistributionName")),
+    };
+    let mut found = None;
+    if let Some(wanted) = wanted {
+        let mut index = 0u32;
+        loop {
+            let mut name = [0u16; 256];
+            let mut len = name.len() as u32;
+            // SAFETY: `name` holds `len` u16s; optional out-params are null.
+            let rc = unsafe {
+                RegEnumKeyExW(
+                    key,
+                    index,
+                    name.as_mut_ptr(),
+                    &mut len,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc != 0 {
+                break;
+            }
+            index += 1;
+            let sub = String::from_utf16_lossy(&name[..len as usize]);
+            if reg_sz(key, &sub, "DistributionName")
+                .is_some_and(|n| n.eq_ignore_ascii_case(&wanted))
+            {
+                found = Some((wanted.clone(), reg_dword(key, &sub, "DefaultUid")));
+                break;
+            }
+        }
+    }
+    // SAFETY: `key` was opened above.
+    unsafe { RegCloseKey(key) };
+    found
+}
+
+#[cfg(windows)]
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn reg_sz(
+    key: windows_sys::Win32::System::Registry::HKEY,
+    sub: &str,
+    value: &str,
+) -> Option<String> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, RRF_RT_REG_SZ};
+    let (sub, value) = (wide(sub), wide(value));
+    let mut buf = [0u16; 512];
+    let mut bytes = std::mem::size_of_val(&buf) as u32;
+    // SAFETY: `buf` holds `bytes` bytes; RRF_RT_REG_SZ NUL-terminates.
+    let rc = unsafe {
+        RegGetValueW(
+            key,
+            sub.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let units = &buf[..(bytes as usize / 2)];
+    let text = String::from_utf16_lossy(units);
+    let text = text.trim_end_matches('\0').trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+#[cfg(windows)]
+fn reg_dword(
+    key: windows_sys::Win32::System::Registry::HKEY,
+    sub: &str,
+    value: &str,
+) -> Option<u32> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, RRF_RT_REG_DWORD};
+    let (sub, value) = (wide(sub), wide(value));
+    let mut out = 0u32;
+    let mut bytes = std::mem::size_of::<u32>() as u32;
+    // SAFETY: `out` is a u32 and `bytes` its size.
+    let rc = unsafe {
+        RegGetValueW(
+            key,
+            sub.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            (&mut out as *mut u32).cast(),
+            &mut bytes,
+        )
+    };
+    (rc == 0).then_some(out)
+}
+
+/// The home directory `/etc/passwd` gives `uid`, as a Linux path.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn home_for_uid(passwd: &str, uid: u32) -> Option<String> {
+    passwd.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() < 6 || fields[2].trim().parse::<u32>().ok()? != uid {
+            return None;
+        }
+        let home = fields[5].trim();
+        home.starts_with('/').then(|| home.to_string())
+    })
+}
+
 /// The WSL share roots Windows exposes, newest name first.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn share_roots() -> [PathBuf; 2] {
@@ -165,8 +299,14 @@ mod tests {
     #[test]
     fn wsl_probe_budgets_include_a_cold_start() {
         let base = Duration::from_secs(5);
-        assert_eq!(probe_budget(std::path::Path::new("wsl:claude:/usr/bin/claude"), base), base + COLD_START);
-        assert_eq!(probe_budget(std::path::Path::new("/usr/bin/claude"), base), base);
+        assert_eq!(
+            probe_budget(std::path::Path::new("wsl:claude:/usr/bin/claude"), base),
+            base + COLD_START
+        );
+        assert_eq!(
+            probe_budget(std::path::Path::new("/usr/bin/claude"), base),
+            base
+        );
     }
 
     #[test]
@@ -198,5 +338,30 @@ mod tests {
         assert_eq!(unc_to_linux(r"\\server\share\x"), None);
         assert_eq!(unc_to_linux(r"C:\Users\me"), None);
         assert_eq!(unc_to_linux(r"\\wsl.localhost\"), None);
+    }
+
+    #[test]
+    fn passwd_names_the_default_users_home() {
+        let passwd = "root:x:0:0:root:/root:/bin/bash\n\
+                      daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n\
+                      me:x:1000:1000:Me,,,:/home/me:/bin/bash\n\
+                      odd:x:1001:1001::relative:/bin/sh\n";
+        assert_eq!(home_for_uid(passwd, 0).as_deref(), Some("/root"));
+        assert_eq!(home_for_uid(passwd, 1000).as_deref(), Some("/home/me"));
+        assert_eq!(home_for_uid(passwd, 1001), None);
+        assert_eq!(home_for_uid(passwd, 4242), None);
+        assert_eq!(home_for_uid("", 0), None);
+    }
+
+    /// Reads the real registry; asserts only shape, since the machine may
+    /// have no WSL at all.
+    #[cfg(windows)]
+    #[test]
+    fn launch_identity_never_panics() {
+        if let Some((name, _uid)) = launch_identity(None) {
+            assert!(!name.is_empty());
+            assert!(launch_identity(Some(&name)).is_some());
+        }
+        assert_eq!(launch_identity(Some("no-such-distro-ikenga-test")), None);
     }
 }

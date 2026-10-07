@@ -243,7 +243,9 @@ keyring = { version = "=3.6.3", default-features = false, features = ["windows-n
 webview2-com = "0.38"
 # Threading + Foundation: the detached chi-runner pid probe
 # (commands/chi_runner.rs — OpenProcess / GetExitCodeProcess).
-windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_Threading"] }
+# Registry: the default WSL distro and its default user
+# (server/shared/wsl.rs — HKCU\…\Lxss), read without starting WSL.
+windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_Threading", "Win32_System_Registry"] }
 
 # Mac-only polish (window vibrancy + dock-tile badge) was removed
 # in the strip-down. The resolved objc2 v0.5 didn't export
