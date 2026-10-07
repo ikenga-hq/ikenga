@@ -28,7 +28,9 @@ describe('OS file drop in a browser', () => {
 		const off = await initOsFileDrop();
 		const over = drag('dragover', ['Files']);
 		expect(over.defaultPrevented).toBe(true);
-		expect((over.dataTransfer as DataTransfer).dropEffect).toBe('none');
+		// Regression: dropEffect='none' makes Chromium suppress the real `drop`
+		// event, so the inline notice never showed. Must be left untouched.
+		expect((over.dataTransfer as DataTransfer).dropEffect).not.toBe('none');
 		expect(drag('drop', ['Files']).defaultPrevented).toBe(true);
 		off();
 	});

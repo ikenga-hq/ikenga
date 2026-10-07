@@ -187,8 +187,11 @@ function showBrowserDropNotice(e: DragEvent): void {
 export function installBrowserFileDropGuard(): () => void {
 	const onDragOver = (e: DragEvent) => {
 		if (!hasFiles(e)) return;
+		// preventDefault alone marks the surface a valid drop target so Chromium
+		// still fires `drop` (which is what shows the notice). Do NOT set
+		// dropEffect='none': that makes Chromium cancel the drag and never fire
+		// `drop`, so the notice would never appear on a real file drop.
 		e.preventDefault();
-		if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
 	};
 	const onDrop = (e: DragEvent) => {
 		if (!hasFiles(e)) return;
