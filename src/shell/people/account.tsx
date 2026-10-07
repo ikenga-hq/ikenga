@@ -24,6 +24,7 @@ import { type AuthMe, currentPrincipal, fetchAuthMe } from '@/lib/transport/t1-s
 
 import { D05_DANGER, D05_FOCUS } from './focus';
 import { Kv, PeopleBlock, PeopleRow } from './frame';
+import { copyText } from '@/lib/clipboard';
 
 /** §2.2 / §3.10 copy: signing out ends one session and bumps no epoch. */
 export const SIGN_OUT_COPY =
@@ -109,12 +110,7 @@ export function AccountBlock() {
 
 	const copyId = async () => {
 		if (!me) return;
-		try {
-			await navigator.clipboard.writeText(me.principal_id);
-			setCopied(true);
-		} catch {
-			setCopied(false);
-		}
+		setCopied(await copyText(me.principal_id));
 	};
 
 	return (

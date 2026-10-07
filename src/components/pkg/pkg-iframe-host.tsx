@@ -21,6 +21,12 @@
 // On unmount: tears down the AppBridge and calls pkg_content_revoke to drop
 // the token.
 //
+// Downloads and external links: the sandbox deliberately has no
+// `allow-downloads` / `allow-popups` (MCP Apps model; widening it would let a
+// pkg skip the host's checks and escape the sandbox in a popup). In a browser
+// session a pkg's open-link / download-file requests are mediated by the host
+// instead — see `host-mediated.ts`.
+//
 // Sandbox: `allow-scripts allow-same-origin`. With `srcdoc`, the iframe
 // inherits the parent origin only when the sandbox includes `allow-same-origin`;
 // without it, the frame is opaque. `allow-same-origin` is kept so AppBridge can
@@ -36,6 +42,7 @@
 import type { OperatorIdentity } from '@ikenga/contract/host-context';
 import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/app-bridge';
 import { useEffect, useRef, useState } from 'react';
+import { hostDownloadFile, hostOpenLink } from './host-mediated';
 import { registerIykeIframe } from '@/lib/iyke/iframe-registry';
 import { usePkgLifecycle } from '@/lib/pkgs/lifecycle';
 import {
@@ -91,7 +98,7 @@ import {
 	type SqlValue,
 	skillRosterRead,
 } from '@/lib/tauri-cmd';
-import { isTauri, listen, type UnlistenFn } from '@/lib/transport';
+import { isBrowserHost, isTauri, listen, type UnlistenFn } from '@/lib/transport';
 import { open as openDialog } from '@/lib/transport/dialog-shim';
 import { isUnavailableOnServer } from '@/lib/transport/unavailable';
 import {
@@ -143,6 +150,9 @@ const HOST_CAPABILITIES = {
 	serverTools: {},
 	logging: {},
 } as const;
+// A browser session also mediates downloads (see `host-mediated.ts`).
+const BROWSER_HOST_CAPABILITIES = { ...HOST_CAPABILITIES, downloadFile: {} } as const;
+const hostCapabilities = () => (isBrowserHost() ? BROWSER_HOST_CAPABILITIES : HOST_CAPABILITIES);
 
 // Result shape an MCP-style CallTool handler must return. AppBridge's
 // `oncalltool` typing is wide; we narrow to what we actually emit so the
@@ -765,7 +775,9 @@ export async function dispatchHostCall(
 			if (!granted) {
 				granted = (await requestNotificationPermission()) === 'granted';
 			}
-			if (!granted) {
+			// A browser tab without OS permission still delivers: `sendNotification`
+			// falls back to an in-app toast.
+			if (!granted && !isBrowserHost()) {
 				return {
 					content: [{ type: 'text', text: 'host.notify: OS notification permission not granted' }],
 					isError: true,
@@ -1518,7 +1530,7 @@ export function PkgIframeHostInner({
 			if (!iframe.contentWindow) return;
 			didConnect = true;
 			const transport = new PostMessageTransport(iframe.contentWindow, iframe.contentWindow);
-			bridge = new AppBridge(null, HOST_INFO, HOST_CAPABILITIES, {
+			bridge = new AppBridge(null, HOST_INFO, hostCapabilities(), {
 				hostContext: buildHostContext({
 					pkgId,
 					authToken: authTokenRef.current,
@@ -1591,6 +1603,12 @@ export function PkgIframeHostInner({
 				// statically prove from a runtime JSON value; trust the sidecar
 				// here and cast at the boundary.
 			}) as AppBridge['oncalltool'];
+			if (isBrowserHost()) {
+				// The sandbox has no allow-popups / allow-downloads (see the header
+				// note), so a pkg's link or export goes through the host.
+				bridge.onopenlink = async (params) => hostOpenLink(params.url);
+				bridge.ondownloadfile = async (params) => hostDownloadFile(params.contents);
+			}
 			bridge.addEventListener('initialized', () => {
 				handshakeDoneRef.current = true;
 				setHandshakeDone(true);

@@ -13,9 +13,16 @@
 //   violation — ConnectionBanner (a blocking condition: the host is gone),
 //               TrustReviewBanner (capability review — P10 folds trust into
 //               violations)
-//   update    — UpdaterBanner (app binary), PkgAutoUpdater (pkg progress /
+//   update    — UpdaterBanner (app binary), ServerUpdateBanner (the server,
+//               browser admins only — WP-P9), PkgAutoUpdater (pkg progress /
 //               failure / success strip)
 //   info      — ConnectorBanner
+//
+// plans/pwa S1 adds two browser-only banners (both render nothing under
+// Tauri): PwaUpdateBanner ("Reload to update", `update` tier, after the
+// app-binary updater) and InstalledTokenBanner (an installed app on a T0 link
+// token, `info` tier). S4 adds PushOpenBanner (`info`): it consumes a
+// notification tap and says when the ask was already answered elsewhere.
 //
 // The banner components are untouched — their own eligibility logic, dismiss
 // / snooze persistence keys and updater wiring stay exactly as they were. Each
@@ -31,11 +38,16 @@ import type { ComponentType } from 'react';
 import { ConnectionBanner } from '@/shell/connection-banner';
 import { ConnectorBanner } from '@/shell/connector-banner';
 import { PkgAutoUpdater } from '@/shell/pkg-auto-updater';
+import { InstalledTokenBanner } from '@/shell/pwa/install-hint';
+import { PushOpenBanner } from '@/shell/pwa/push-open';
+import { PwaUpdateBanner } from '@/shell/pwa/pwa-update-banner';
 import { TrustReviewBanner } from '@/shell/trust-review-banner';
 // WP-41: moved into src/shell/updater/ (absorbed folder) — see that folder's
 // update-sheet.tsx / status-bar-slot.tsx / post-restart-toast.tsx for the
 // rest of the consolidated update-flow surface (mounted in workspace.tsx).
 import { UpdaterBanner } from '@/shell/updater/updater-banner';
+// WP-P9: the server's own update (browser admins / the T0 operator only).
+import { ServerUpdateBanner } from '@/shell/updater/server-update-banner';
 
 export type BannerTier = 'violation' | 'update' | 'info';
 
@@ -50,8 +62,12 @@ export const BANNER_QUEUE: BannerQueueEntry[] = [
 	{ id: 'connection', tier: 'violation', Component: ConnectionBanner },
 	{ id: 'trust-review', tier: 'violation', Component: TrustReviewBanner },
 	{ id: 'updater', tier: 'update', Component: UpdaterBanner },
+	{ id: 'server-update', tier: 'update', Component: ServerUpdateBanner },
 	{ id: 'pkg-auto-updater', tier: 'update', Component: PkgAutoUpdater },
+	{ id: 'pwa-update', tier: 'update', Component: PwaUpdateBanner },
 	{ id: 'connector', tier: 'info', Component: ConnectorBanner },
+	{ id: 'pwa-token-session', tier: 'info', Component: InstalledTokenBanner },
+	{ id: 'push-open', tier: 'info', Component: PushOpenBanner },
 ];
 
 /** Mount order before WP-09, recorded for the PR (DoD T4). */

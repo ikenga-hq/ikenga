@@ -20,6 +20,7 @@ import {
 	settingsSection,
 } from '@/shell/settings/nav';
 import { SettingsSearchResults } from '@/shell/settings/search';
+import { copyText } from '@/lib/clipboard';
 
 export const Route = createFileRoute('/settings')({
 	beforeLoad: ({ location }) => {
@@ -120,7 +121,7 @@ function SettingsLayout() {
 								type="button"
 								className="ml-auto shrink-0 rounded p-1 outline-none transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-offset-2 focus-visible:outline-primary"
 								aria-label="Copy the iyke command"
-								onClick={() => void navigator.clipboard.writeText(iykeLine).catch(() => {})}
+								onClick={() => void copyText(iykeLine)}
 							>
 								<Copy className="h-3 w-3" />
 							</button>

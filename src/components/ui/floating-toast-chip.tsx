@@ -1,4 +1,12 @@
-import { AlertTriangle, CheckCircle2, Download, ShieldAlert, UserPlus, X, XCircle } from 'lucide-react';
+import {
+	AlertTriangle,
+	CheckCircle2,
+	Download,
+	ShieldAlert,
+	UserPlus,
+	X,
+	XCircle,
+} from 'lucide-react';
 import * as React from 'react';
 import { cn } from '@/components/ui/utils';
 import { useNotificationsLiveSync } from '@/lib/queries/notifications';
@@ -87,11 +95,18 @@ export function FloatingToastChip({
 	ttlMs,
 	className,
 }: FloatingToastChipProps) {
+	// Callers pass an inline `onDismiss`, so its identity changes on every parent
+	// render. Keep the latest in a ref and key the timer on `ttlMs` + presence of
+	// a handler only — otherwise each re-render clears and restarts the timeout
+	// and a toast can stay up forever. (A new toast remounts via `key`.)
+	const onDismissRef = React.useRef(onDismiss);
+	onDismissRef.current = onDismiss;
+	const hasDismiss = !!onDismiss;
 	React.useEffect(() => {
-		if (!ttlMs || !onDismiss) return;
-		const t = setTimeout(onDismiss, ttlMs);
+		if (!ttlMs || !hasDismiss) return;
+		const t = setTimeout(() => onDismissRef.current?.(), ttlMs);
 		return () => clearTimeout(t);
-	}, [ttlMs, onDismiss]);
+	}, [ttlMs, hasDismiss]);
 
 	const isError = variant === 'error';
 	return (

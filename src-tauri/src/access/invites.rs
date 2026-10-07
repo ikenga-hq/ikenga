@@ -861,7 +861,7 @@ pub async fn accept(
     if let Some(calls) = &host.calls {
         let title = format!("{username} accepted your invite");
         let body = format!("{} · {project_name}", role_title(inv.role));
-        if let Err(e) = calls
+        match calls
             .call(
                 owner,
                 "notifications_record_access",
@@ -869,7 +869,20 @@ pub async fn accept(
             )
             .await
         {
-            tracing::warn!("invite accepted, but the Owner's notification failed: {e}");
+            // plans/pwa S3 §4: pushed broker-side, straight after the row
+            // exists, with only its id (W4).
+            Ok(v) => {
+                if let Some(id) = v.get("id").and_then(Value::as_i64) {
+                    crate::server::push::emit(crate::server::push::PushEvent::new(
+                        Some(owner),
+                        crate::server::push::PushKind::Invite,
+                        format!("n:{id}"),
+                    ));
+                }
+            }
+            Err(e) => {
+                tracing::warn!("invite accepted, but the Owner's notification failed: {e}")
+            }
         }
     }
     Ok(Accepted {

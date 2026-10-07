@@ -179,6 +179,10 @@ pub async fn logout(
     }
     let recorded = async {
         let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // plans/pwa S2: this session's push subscriptions end with it.
+        if let Some(session_id) = ctx.via.session_id() {
+            crate::server::push::store::delete_for_session(&mut tx, session_id).await?;
+        }
         auth_events::record(
             &mut tx,
             AuthEvent::new(AuthEventKind::Logout)

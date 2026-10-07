@@ -9,9 +9,9 @@ import { FeedbackState } from '@/components/ui/feedback-state';
 import { Input } from '@/components/ui/input';
 import { StatusChip } from '@/components/ui/status-chip';
 import { iykeMcpInfo, isRemoteWebSession } from '@/lib/tauri-cmd';
-import { writeClipboardText } from '@/lib/transport';
 
 import { SettingRow } from './setting-row';
+import { copyText } from '@/lib/clipboard';
 
 export const DESKTOP_ONLY_IYKE_MCP =
 	'Desktop app only. The iyke MCP server runs beside the Ikenga desktop app; open Settings there to copy its path and client config.';
@@ -68,12 +68,9 @@ export function IykeMcpSection() {
 	);
 
 	async function copy(kind: 'path' | 'json', text: string) {
-		try {
-			await writeClipboardText(text);
+		if (await copyText(text)) {
 			setCopied(kind);
 			setTimeout(() => setCopied((c) => (c === kind ? null : c)), 1500);
-		} catch (e) {
-			console.error('[iyke-mcp] clipboard write failed', e);
 		}
 	}
 

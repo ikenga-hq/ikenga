@@ -58,7 +58,8 @@ import {
 	type PkgSettingsField,
 	type PkgSettingsSnapshot,
 } from '@/lib/tauri-cmd';
-import { openExternalUrl } from '@/lib/transport';
+import { toast } from '@/lib/toast';
+import { canOpenLocalPath, isBrowserHost, openLocalPath } from '@/lib/transport';
 import { NOT_AVAILABLE_ON_SERVER_LABEL } from '@/lib/transport/unavailable';
 import type { NgwaAct, NgwaActionStatus, NgwaItemActionSet } from '@/lib/ngwa/use-ngwa-actions';
 import { NgwaFlowRenderer } from './ngwa-flow-renderer';
@@ -644,9 +645,16 @@ function PkgSettingsTab({ item }: { item: NgwaItem }) {
 					<button
 						type="button"
 						className="btn ghost"
-						onClick={() => void openExternalUrl(settingsFilePath)}
+						onClick={() =>
+							void openLocalPath(settingsFilePath, { kind: 'file' }).catch((e) =>
+								toast({
+									label: `Could not open the settings file: ${e instanceof Error ? e.message : String(e)}`,
+									variant: 'error',
+								})
+							)
+						}
 					>
-						<FileText className="h-3.5 w-3.5" /> Open file
+						<FileText className="h-3.5 w-3.5" /> {isBrowserHost() ? 'Download file' : 'Open file'}
 					</button>
 				</span>
 			</div>
@@ -911,11 +919,18 @@ function PkgFilesTab({
 				<span>install path: </span>
 				<span className="path">{item.install_path ?? '—'}</span>
 				<span className="rt">
-					{item.install_path && (
+					{item.install_path && canOpenLocalPath('folder') && (
 						<button
 							type="button"
 							className="btn ghost"
-							onClick={() => void openExternalUrl(item.install_path!)}
+							onClick={() =>
+								void openLocalPath(item.install_path!, { kind: 'folder' }).catch((e) =>
+									toast({
+										label: `Could not open the folder: ${e instanceof Error ? e.message : String(e)}`,
+										variant: 'error',
+									})
+								)
+							}
 						>
 							<Folder className="h-3.5 w-3.5" /> Reveal in Files
 						</button>

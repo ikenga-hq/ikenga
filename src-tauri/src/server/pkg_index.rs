@@ -1,15 +1,18 @@
 //! The daemon's read-only index of the pkgs under `--pkgs-dir` (WP-19).
 //!
 //! Backs the `pkg_kernel_status`, `list_skill_actions`,
-//! `list_all_skill_actions`, `pkg_settings_get` and `pkg_health_scan` RPC
-//! arms, and the pkg half of `ngwa_snapshot`. Built once, in `create_router`, from the
+//! `list_all_skill_actions`, `pkg_settings_get` / `pkg_settings_set`,
+//! `pkg_sidecar_call` and `pkg_health_scan` RPC arms, and the pkg half of
+//! `ngwa_snapshot`. Built once, in `create_router`, from the
 //! same directory walk that feeds [`super::PkgStaticService`], so the two can
 //! never disagree about which directories are pkgs.
 //!
 //! # What this is not
 //!
-//! Not a kernel. The daemon installs, trusts, enables and spawns nothing (see
-//! `server::pkg_static`). This index only answers "what is on disk, and what
+//! Not a kernel. The daemon installs, trusts and enables nothing, and
+//! supervises no pkg child (see `server::pkg_static`); the one thing it runs
+//! is a one-shot `pkg_sidecar_call`, resolved through [`PkgIndex::sidecar`].
+//! This index only answers "what is on disk, and what
 //! would its UI routes be" — so the one registry it runs is the real
 //! [`UiRoutesRegistry`], fed by the real `register()`. `pkg_kernel_status`
 //! reports exactly that registry and no other: listing a desktop registry the
@@ -66,7 +69,9 @@ use tracing::{info, warn};
 use crate::pkg::manifest::{
     Package, SettingsField, IKENGA_API_MIN_SUPPORTED, IKENGA_API_VERSION,
 };
-use crate::pkg::registries::{ActivityBarBadge, ActivityBarRegistry, UiRoutesRegistry, ViewsRegistry};
+use crate::pkg::registries::{
+    ActivityBarBadge, ActivityBarRegistry, UiRoutesRegistry, ViewsRegistry,
+};
 use crate::pkg::registry::Registry;
 use crate::pkg::skill_actions::{list_actions_for_pkg, SkillAction};
 use crate::pkg::{assemble_status, InstallSource, InstalledSummary, KernelStatus};
@@ -280,6 +285,19 @@ pub struct PkgIndex {
     /// What the index could not take, for `pkg_health_scan`: skipped
     /// directories, incompatible pkgs and registry rejections.
     issues: Vec<HealthIssue>,
+    /// `pkg_id` → the loaded pkg, for live pkgs only (compatible +
+    /// registered): what [`Self::sidecar`] resolves a `pkg_sidecar_call`
+    /// against. An incompatible pkg never goes live, so it runs nothing —
+    /// as on the desktop, where it never reaches the `SidecarsRegistry`.
+    live: HashMap<String, Package>,
+}
+
+/// A sidecar binary [`PkgIndex::sidecar`] resolved: canonical, a regular
+/// file, inside its pkg's canonical install dir.
+#[derive(Debug, Clone)]
+pub struct ResolvedSidecar {
+    pub bin_path: PathBuf,
+    pub install_path: PathBuf,
 }
 
 impl PkgIndex {
@@ -299,6 +317,7 @@ impl PkgIndex {
         let views = ViewsRegistry::new();
         let activity_bar = ActivityBarRegistry::new();
         let mut settings_schemas = HashMap::new();
+        let mut live = HashMap::new();
         let mut installed: Vec<InstalledSummary> = Vec::with_capacity(pkgs.len());
         for pkg in pkgs {
             let compatible = pkg.is_compatible();
@@ -337,6 +356,7 @@ impl PkgIndex {
                 if let Some(schema) = crate::pkg::settings_values::declared_schema(pkg) {
                     settings_schemas.insert(pkg.manifest.id.clone(), schema);
                 }
+                live.insert(pkg.manifest.id.clone(), pkg.clone());
             } else {
                 warn!(
                     "[pkg_index] {} declares ikenga_api={} outside this host's support window — \
@@ -388,6 +408,7 @@ impl PkgIndex {
             activity_bar,
             settings_schemas,
             issues,
+            live,
         }
     }
 
@@ -404,6 +425,57 @@ impl PkgIndex {
         });
         out.extend(self.issues.iter().cloned());
         out
+    }
+
+    /// Resolve `pkg_id`'s sidecar `name` the way the desktop
+    /// `SidecarsRegistry` validates one at install — target triple,
+    /// `{target}` expansion, a regular file that canonicalizes inside the
+    /// pkg's install dir (so a symlink or `..` in `bin` cannot point it
+    /// anywhere else) — but at call time and read-only: nothing is chmodded,
+    /// since `--pkgs-dir` is the operator's and a T1 principal child cannot
+    /// write it anyway. Only a sidecar the pkg ITSELF declares resolves, so a
+    /// caller naming another pkg's sidecar gets "declares no sidecar".
+    pub fn sidecar(&self, pkg_id: &str, name: &str) -> Result<ResolvedSidecar, String> {
+        let pkg = self
+            .live
+            .get(pkg_id)
+            .ok_or_else(|| format!("pkg `{pkg_id}` is not installed on this server"))?;
+        let spec = pkg
+            .manifest
+            .sidecars
+            .iter()
+            .find(|s| s.name == name)
+            .ok_or_else(|| format!("pkg `{pkg_id}` declares no sidecar `{name}`"))?;
+        let host_target = super::shared::sidecar_call::host_target_triple();
+        if !pkg.manifest.targets.is_empty() && !pkg.manifest.targets.contains(&host_target) {
+            return Err(format!(
+                "pkg `{pkg_id}` ships targets {:?}, this server is `{host_target}`",
+                pkg.manifest.targets
+            ));
+        }
+        let bin_rel = spec.bin.replace("{target}", &host_target);
+        let bin_path = pkg
+            .resolve_relative(&bin_rel)
+            .map_err(|e| format!("sidecar `{name}` of `{pkg_id}`: {e:#}"))?;
+        if !bin_path.is_file() {
+            return Err(format!(
+                "sidecar `{name}` of `{pkg_id}`: bin `{}` is not a file",
+                bin_path.display()
+            ));
+        }
+        let install_path = pkg
+            .install_path
+            .canonicalize()
+            .map_err(|e| format!("pkg `{pkg_id}` install dir: {e}"))?;
+        Ok(ResolvedSidecar {
+            bin_path,
+            install_path,
+        })
+    }
+
+    /// The live pkg `pkg_id` (compatible + registered), if this index has it.
+    pub fn live_pkg(&self, pkg_id: &str) -> Option<&Package> {
+        self.live.get(pkg_id)
     }
 
     /// The declared settings schema for `pkg_id`, or `None` — for a pkg that

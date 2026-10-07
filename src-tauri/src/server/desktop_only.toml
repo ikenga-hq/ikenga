@@ -25,17 +25,9 @@
 # `rpc.rs` arm AND deleting its table here in the same change. Adding a table
 # is only for a NEW Tauri command, with an honest tag and reason.
 
-[action_exec]
-tag = "WP-18b"
-reason = "exec() (action_exec.rs) spawns a pinned headless shell command via executor::current().spawn_piped (new_process_group, so the timeout kill_tree reaches the whole group); executor-routed since WP-18b part b, rpc.rs arm still pending."
-
 [actions_open_file]
 tag = "desktop-only-forever"
 reason = "manager.open_file -> open_path spawns explorer.exe/open/xdg-open — native open-in-OS-app, same as settings_open_file."
-
-[agent_ops_run_now]
-tag = "WP-18b"
-reason = "POSTs the {port, secret} from ~/.agent-ops/daemon.lock to a SEPARATE local agent-ops daemon's /jobs/<id>/trigger endpoint, which then runs the job (a shell command or `claude -p`) outside the session executor; serving it would let any token holder fire host jobs remotely. Held until executor routing + principal scoping (WP-20) decide who may."
 
 [app_lock_clear_secret]
 tag = "WP-20"
@@ -96,10 +88,6 @@ reason = "Releases claude_config_watch's watcher ids; nothing to release while c
 [claude_config_watch]
 tag = "WP-19"
 reason = "Registers FsWatchManager watchers that emit `claude-config:changed` on the Tauri event channel; the daemon has none (the web transport's listen() is a no-op, and /ws/fs is its own subscription protocol, not these watcher ids). Not served in slice 5b; needs an event channel first."
-
-[comment_route]
-tag = "WP-18b"
-reason = "RouteSink::Chi calls commands::chi::spawn_chi_run with the desktop's managed ChiCache/ChiRuntime/AppHandle; the chi core itself is daemon-served since WP-P10 (shared::chi_exec), but comment_route's sink resolution and its other sinks are still desktop-state-bound, so no rpc.rs arm yet."
 
 [db_export_ndjson]
 tag = "WP-19"
@@ -304,20 +292,12 @@ tag = "WP-19"
 reason = "Reads a manifest-declared screenshot file off disk and base64-encodes it; unrelated to native window capture."
 
 [pkg_set_enabled]
-tag = "WP-18b"
-reason = "kernel.set_enabled registers/unregisters all registries incl. SidecarSupervisor, spawning or killing the pkg's supervised child on toggle."
+tag = "desktop-only-forever"
+reason = "kernel.set_enabled registers/unregisters every registry, incl. the SidecarSupervisor that spawns or kills the pkg's supervised child. The daemon has no pkg kernel or supervisor: its pkgs are the operator's read-only --pkgs-dir index (every one served, none toggleable), so there is nothing to enable or disable from a browser; the operator changes --pkgs-dir and restarts the daemon."
 
 [pkg_set_scope]
 tag = "WP-19"
 reason = "kernel.set_scope only UPDATEs pkg_installed.project_id and the in-memory map; no registry (re)register/spawn touched."
-
-[pkg_settings_set]
-tag = "WP-19"
-reason = "pkg_settings.pkg_id REFERENCES pkg_installed(id) and sqlx enforces foreign keys, so the upsert needs an installed row; the daemon installs nothing (its pkgs are a read-only --pkgs-dir index), so every set would fail. Needs a decision on how daemon-indexed pkgs own pkg_settings rows."
-
-[pkg_sidecar_call]
-tag = "WP-18b"
-reason = "Plan §j: pkg_sidecar_call spawns the manifest-declared sidecar binary per call; executor-routed since WP-18b part b, rpc.rs arm still pending."
 
 [pkg_sidecar_rpc_send]
 tag = "WP-18b"
@@ -332,8 +312,8 @@ tag = "desktop-only-forever"
 reason = "prompt_for_access uses app.dialog() (native modal dialog) and blocks on the click; native-dialog category."
 
 [pkg_supervisor_restart]
-tag = "WP-18b"
-reason = "supervisor.restart() kicks/relaunches the SidecarSupervisor's long-lived child (lifecycle.rs spawn site) for a Blocked/Crashed/Parked entry."
+tag = "desktop-only-forever"
+reason = "supervisor.restart() relaunches the SidecarSupervisor's long-lived child (lifecycle.rs spawn site) for a Blocked/Crashed/Parked entry. The daemon runs no SidecarSupervisor — it supervises no long-lived pkg children at all (pkg_sidecar_call is one-shot) — so there is no entry to restart."
 
 [pkg_trust_approve]
 tag = "WP-18b"
@@ -360,8 +340,8 @@ tag = "WP-19"
 reason = "Deletes the pkg_trust row that only the desktop's trust::evaluate reads (elevated-verb gating via resolve_elevated_trust, pkg_mcp, the trust list) — all of which need the kernel's installed set; the daemon has no kernel or trust evaluation, so serving it would write state nothing on the daemon consults. Held with the pkg_trust family until the daemon has a trust model."
 
 [pkg_uninstall]
-tag = "WP-18b"
-reason = "kernel.uninstall walks registries.unregister(); SidecarSupervisor::unregister kills the pkg's child process."
+tag = "desktop-only-forever"
+reason = "kernel.uninstall walks registries.unregister(), whose SidecarSupervisor kills the pkg's child, and deletes the install. The daemon installs nothing and has no kernel or supervisor; its --pkgs-dir is the operator's read-only directory, which a principal child cannot write. Removing a pkg is an operator action on that directory plus a daemon restart."
 
 [pkg_webview_allow_origin]
 tag = "desktop-only-forever"
