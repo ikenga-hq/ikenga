@@ -4,8 +4,8 @@
 // its rules are unit-tested in `src/lib/pwa/sw-logic.ts`. This plugin only
 //   1. computes the precache list from the real bundle (`collectPrecache`),
 //   2. hashes it into a BUILD_ID, and
-//   3. bundles `pwa/sw.ts` with esbuild (Vite 6's own bundler dependency) as a
-//      classic iife with both inlined, emitted as `sw.js` at the dist root.
+//   3. bundles `pwa/sw.ts` with Vite's own `build()` (minified by Vite's esbuild
+//      step, one iife chunk) with both inlined, emitted as `sw.js` at the dist root.
 // Any change to a precached file changes the list, the BUILD_ID and so the
 // bytes of `sw.js`, which is what drives the "Reload to update" flow.
 //
@@ -15,8 +15,8 @@
 import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { build } from 'esbuild';
-import type { Plugin } from 'vite';
+import type { Plugin, Rollup } from 'vite';
+import { build } from 'vite';
 import { collectPrecache, type PrecacheBundle } from '../../src/lib/pwa/precache';
 
 export interface SwPluginOptions {
@@ -86,23 +86,41 @@ export function swPlugin(opts: SwPluginOptions): Plugin {
 				const buildId = buildIdFor(precache, unhashed);
 
 				const result = await build({
-					entryPoints: [path.join(opts.root, 'pwa', 'sw.ts')],
-					bundle: true,
-					write: false,
-					format: 'iife',
-					platform: 'browser',
-					target: 'es2022',
-					minify: true,
-					legalComments: 'none',
+					configFile: false,
+					root: opts.root,
+					logLevel: 'silent',
+					publicDir: false,
 					define: {
 						__PRECACHE__: JSON.stringify(precache),
 						__BUILD_ID__: JSON.stringify(buildId),
 					},
+					build: {
+						write: false,
+						emptyOutDir: false,
+						target: 'es2022',
+						minify: 'esbuild',
+						modulePreload: false,
+						reportCompressedSize: false,
+						rollupOptions: {
+							input: path.join(opts.root, 'pwa', 'sw.ts'),
+							output: {
+								format: 'iife',
+								inlineDynamicImports: true,
+								entryFileNames: 'sw.js',
+							},
+						},
+					},
 				});
-				const out = result.outputFiles[0];
-				if (!out) throw new Error('pwa: esbuild produced no sw.js');
+				const outputs = (Array.isArray(result) ? result : [result as Rollup.RollupOutput]).flatMap(
+					(r) => r.output
+				);
+				const out = outputs.find((o) => o.type === 'chunk' && o.fileName === 'sw.js');
+				if (!out || out.type !== 'chunk') throw new Error('pwa: vite produced no sw.js');
+				if (outputs.length !== 1) {
+					throw new Error('pwa: sw.js must be one self-contained file, got ' + outputs.length);
+				}
 
-				this.emitFile({ type: 'asset', fileName: 'sw.js', source: out.text });
+				this.emitFile({ type: 'asset', fileName: 'sw.js', source: out.code });
 				this.info(`sw.js: build ${buildId}, ${precache.length} precached files`);
 			},
 		},

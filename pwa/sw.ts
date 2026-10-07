@@ -2,7 +2,7 @@
 // daemon (`server/static_files.rs`, `Cache-Control: no-cache`, no
 // `Service-Worker-Allowed`), scope `/`. Never registered under Tauri.
 //
-// Built by `scripts/pwa/vite-plugin-sw.ts` with esbuild (iife), which inlines
+// Built by `scripts/pwa/vite-plugin-sw.ts` with Vite build() (iife), which inlines
 // `__PRECACHE__` (this build's shell files) and `__BUILD_ID__` (a hash of that
 // list). Any change to a precached file changes this script's bytes, which is
 // what makes the browser install a new worker — and the new worker WAITS
