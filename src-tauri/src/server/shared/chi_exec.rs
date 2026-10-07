@@ -169,6 +169,13 @@ pub(crate) trait EngineResolver: Send + Sync {
     /// WSL network health for a launch in `distro` (D-21), and whether it
     /// was freshly measured; `None` = don't probe (stub resolvers, hosts
     /// without WSL). Only asked for a WSL launch, never a native one.
+    ///
+    /// Contract: this only *measures*. Raising / resolving the
+    /// `fix.wsl_network` notification is [`ReportingResolver`]'s job, so a
+    /// caller of [`resolve_engine`] / [`build_engine_command_with`] that
+    /// holds a `PaDb` passes its resolver wrapped in one (as `spawn_run` /
+    /// `resume_run` do via `ChiEnv::reporting_resolver`); a bare resolver
+    /// still fails the launch, it just raises no notification.
     fn wsl_health<'a>(
         &'a self,
         _distro: Option<&'a str>,
@@ -266,13 +273,22 @@ impl EngineResolver for ReportingResolver<'_> {
     ) -> BoxFuture<'a, Option<(WslHealth, bool)>> {
         Box::pin(async move {
             let probed = self.inner.wsl_health(distro).await;
+            // A cached result was reported when it was measured; an
+            // inconclusive one (wsl.exe timed out) neither raises nor ends
+            // an episode — it doesn't fail the run either.
             if let Some((health, true)) = &probed {
-                super::notifications::wsl::report_with_db(self.db, health).await;
+                if !health.inconclusive {
+                    super::notifications::wsl::report_with_db(self.db, health).await;
+                }
             }
             probed
         })
     }
 }
+
+/// How long the pre-run WSL check may hold up a run's start. A warm probe
+/// takes a few seconds; a `wsl.exe` that times out (twice) would take ~54 s.
+const WSL_PREFLIGHT_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// The pre-run WSL check (D-21): a launch inside WSL whose network is
 /// broken in a way that is WSL's own fault (`no_route`, `dns_only`,
@@ -280,8 +296,40 @@ impl EngineResolver for ReportingResolver<'_> {
 /// can't sign in or reach its API. `ok` and `host_offline` (Windows is
 /// offline too — not WSL's fault, and not ours to block) proceed, as does
 /// `not_installed` (the binary lookup that got us here already answered).
+///
+/// "Couldn't tell" proceeds too: a probe that outruns
+/// [`WSL_PREFLIGHT_BUDGET`], or a `wsl_down` that rests only on `wsl.exe`
+/// timing out ([`WslHealth::inconclusive`]) — the binary lookup that got us
+/// here has just seen WSL answer, so a slow probe is not evidence it's down.
 async fn wsl_preflight(resolver: &dyn EngineResolver, distro: Option<&str>) -> Result<(), String> {
-    match resolver.wsl_health(distro).await {
+    wsl_preflight_within(resolver, distro, WSL_PREFLIGHT_BUDGET).await
+}
+
+async fn wsl_preflight_within(
+    resolver: &dyn EngineResolver,
+    distro: Option<&str>,
+    budget: std::time::Duration,
+) -> Result<(), String> {
+    let probed = match tokio::time::timeout(budget, resolver.wsl_health(distro)).await {
+        Ok(probed) => probed,
+        Err(_) => {
+            tracing::warn!(
+                target: "ikenga::chi",
+                "WSL health check took over {}s; launching without it",
+                budget.as_secs()
+            );
+            return Ok(());
+        }
+    };
+    match probed {
+        Some((health, _)) if health.state.is_wsl_fault() && health.inconclusive => {
+            tracing::warn!(
+                target: "ikenga::chi",
+                "WSL health check inconclusive ({}); launching anyway",
+                health.detail
+            );
+            Ok(())
+        }
         Some((health, _)) if health.state.is_wsl_fault() => {
             Err(format!("WSL has no network — {}", health.detail))
         }

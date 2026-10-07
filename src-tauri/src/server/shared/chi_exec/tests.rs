@@ -51,6 +51,12 @@ struct FakeResolver {
     health: Option<WslHealthState>,
     /// The distro each pre-run health probe asked.
     health_asked: std::sync::Mutex<Vec<Option<String>>>,
+    /// `health` comes from the probe's cache (`fresh == false`).
+    cached: bool,
+    /// `health` rests on `wsl.exe` timing out ([`WslHealth::inconclusive`]).
+    inconclusive: bool,
+    /// The health probe never answers.
+    hang: bool,
 }
 
 impl FakeResolver {
@@ -63,6 +69,9 @@ impl FakeResolver {
             probed: Default::default(),
             health: None,
             health_asked: Default::default(),
+            cached: false,
+            inconclusive: false,
+            hang: false,
         }
     }
     fn wsl(bins: &[&'static str]) -> Self {
@@ -74,6 +83,9 @@ impl FakeResolver {
             probed: Default::default(),
             health: None,
             health_asked: Default::default(),
+            cached: false,
+            inconclusive: false,
+            hang: false,
         }
     }
 }
@@ -99,6 +111,9 @@ impl EngineResolver for FakeResolver {
         distro: Option<&'a str>,
     ) -> BoxFuture<'a, Option<(WslHealth, bool)>> {
         self.health_asked.lock().unwrap().push(distro.map(str::to_string));
+        if self.hang {
+            return Box::pin(std::future::pending());
+        }
         let health = self.health.map(|state| {
             (
                 WslHealth {
@@ -108,8 +123,9 @@ impl EngineResolver for FakeResolver {
                     mirrored_failure: None,
                     networking_mode: Some("mirrored".into()),
                     checked_at: 1,
+                    inconclusive: self.inconclusive,
                 },
-                true,
+                !self.cached,
             )
         });
         Box::pin(std::future::ready(health))
@@ -2106,4 +2122,143 @@ async fn a_run_on_broken_wsl_fails_immediately_and_raises_the_wsl_notification()
     .unwrap();
     assert_eq!(open.len(), 1, "{open:?}");
     assert_eq!(open[0].0, "wsl:network:ubuntu");
+}
+
+/// The open `fix.wsl_network` rows' keys.
+async fn open_wsl_rows(db: &PaDb) -> Vec<String> {
+    let pool = db.ensure_pool().await.unwrap();
+    crate::server::shared::notifications::open_rows_with_key_prefix(
+        &pool,
+        crate::server::shared::notifications::wsl::WSL_NETWORK_KEY_PREFIX,
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(key, _)| key)
+    .collect()
+}
+
+fn env_with(db: &Arc<PaDb>, root: &Path, resolver: FakeResolver) -> ChiEnv {
+    ChiEnv {
+        resolver: Arc::new(resolver),
+        ..ChiEnv::new(db.clone(), root.join("chi-cache"), Arc::new(ChiRuntime::new()))
+    }
+}
+
+/// A `wsl_down` that rests only on `wsl.exe` timing out is "couldn't
+/// tell": the binary lookup just saw WSL answer, so the launch proceeds.
+/// One that rests on an answer still fails.
+#[tokio::test]
+async fn an_inconclusive_wsl_down_does_not_block_the_launch() {
+    let r = FakeResolver {
+        inconclusive: true,
+        ..wsl_with_health(WslHealthState::WslDown)
+    };
+    let cmd = build_engine_command_with(&r, "claude-code", "/tmp", None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(cmd.program, std::ffi::OsString::from("wsl.exe"));
+
+    let r = wsl_with_health(WslHealthState::WslDown);
+    assert!(build_engine_command_with(&r, "claude-code", "/tmp", None, None, None)
+        .await
+        .is_err());
+}
+
+/// A probe that outruns the pre-run budget doesn't hold the run up: the
+/// launch proceeds without it.
+#[tokio::test]
+async fn a_probe_past_the_preflight_budget_proceeds() {
+    let r = FakeResolver {
+        hang: true,
+        ..wsl_with_health(WslHealthState::NoRoute)
+    };
+    let started = std::time::Instant::now();
+    wsl_preflight_within(&r, Some("Ubuntu"), std::time::Duration::from_millis(50))
+        .await
+        .unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(r.health_asked.lock().unwrap().len(), 1);
+}
+
+/// A cached verdict still fails the run (it is still evidence), but it was
+/// reported when it was measured, so the run raises no second row; and an
+/// inconclusive fresh one raises none at all.
+#[tokio::test]
+async fn only_fresh_conclusive_probes_raise_the_wsl_notification() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(test_db().await);
+
+    let cached = env_with(
+        &db,
+        tmp.path(),
+        FakeResolver {
+            cached: true,
+            ..wsl_with_health(WslHealthState::NoRoute)
+        },
+    );
+    let err = spawn_run(&cached, &NoInProcessEngines, opts("claude-code", "hi", Some("/tmp")), "cli")
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err, "WSL has no network — probe said no_route");
+    assert!(open_wsl_rows(&db).await.is_empty(), "a cached probe re-reported");
+
+    let inconclusive = env_with(
+        &db,
+        tmp.path(),
+        FakeResolver {
+            inconclusive: true,
+            ..wsl_with_health(WslHealthState::WslDown)
+        },
+    );
+    let reporting = inconclusive.reporting_resolver();
+    wsl_preflight(&reporting, Some("Ubuntu")).await.unwrap();
+    assert!(open_wsl_rows(&db).await.is_empty(), "an inconclusive probe raised a row");
+}
+
+/// One episode, one row: two failing runs coalesce into a single open
+/// `wsl:network:<distro>` row, and the next fresh `ok` probe ends it.
+#[tokio::test]
+async fn repeated_failing_runs_share_one_row_until_an_ok_probe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(test_db().await);
+    let broken = env_with(&db, tmp.path(), wsl_with_health(WslHealthState::NoRoute));
+    for _ in 0..2 {
+        assert!(spawn_run(&broken, &NoInProcessEngines, opts("claude-code", "hi", Some("/tmp")), "cli")
+            .await
+            .is_err());
+    }
+    assert_eq!(open_wsl_rows(&db).await, ["wsl:network:ubuntu"]);
+
+    let healthy = env_with(&db, tmp.path(), wsl_with_health(WslHealthState::Ok));
+    let reporting = healthy.reporting_resolver();
+    wsl_preflight(&reporting, Some("Ubuntu")).await.unwrap();
+    assert!(open_wsl_rows(&db).await.is_empty(), "ok didn't resolve the row");
+}
+
+/// `resume_run` goes through the same check: the resumed turn fails with
+/// the cause, the row records it, and the notification is raised.
+#[tokio::test]
+async fn a_resume_on_broken_wsl_fails_with_the_cause() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(test_db().await);
+    let env = env_with(&db, tmp.path(), wsl_with_health(WslHealthState::DnsOnly));
+    env.ensure_cache_dir().unwrap();
+    let run_id = "resume-wsl";
+    let mut first = opts("claude-code", "hi", Some("/tmp"));
+    first.resume_session_id = Some("sess-1".into());
+    cache_insert(&db, run_id, &first, &env.run_output_path(run_id), "cli")
+        .await
+        .unwrap();
+
+    let err = resume_run(&env, &NoInProcessEngines, run_id.into(), "again".into())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err, "WSL has no network — probe said dns_only");
+    let row = crate::server::shared::chi::cache_get(&db, run_id).await.unwrap().unwrap();
+    assert_eq!(row.status, "failed");
+    assert_eq!(row.error.as_deref(), Some(err.as_str()));
+    assert_eq!(open_wsl_rows(&db).await, ["wsl:network:ubuntu"]);
 }

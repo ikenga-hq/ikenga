@@ -157,6 +157,7 @@ mod tests {
             mirrored_failure: None,
             networking_mode: Some("mirrored".into()),
             checked_at: 1,
+            inconclusive: false,
         }
     }
 
