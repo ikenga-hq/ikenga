@@ -204,6 +204,7 @@ fn s(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
+#[cfg(unix)]
 fn euid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
