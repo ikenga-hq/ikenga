@@ -228,10 +228,10 @@ mod tests {
 
     #[test]
     fn parse_muted_ignores_unknown_and_unmutable_kinds() {
-        let v = json!(["update", "permission", "violation", "nope", 3, "update", "invite"]);
+        let v = json!(["update", "permission", "violation", "nope", 3, "update", "invite", "system"]);
         assert_eq!(
             parse_muted(Some(&v)),
-            vec![NotificationKind::Update, NotificationKind::Invite]
+            vec![NotificationKind::Update, NotificationKind::Invite, NotificationKind::System]
         );
         assert!(parse_muted(None).is_empty());
         assert!(parse_muted(Some(&json!({"update": true}))).is_empty());
@@ -260,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn mute_state_lists_the_four_mutable_kinds() {
+    fn mute_state_lists_the_five_mutable_kinds() {
         let s = MuteState::from_muted(vec![]);
         assert_eq!(
             s.mutable,
@@ -268,7 +268,8 @@ mod tests {
                 NotificationKind::RunFinished,
                 NotificationKind::RunFailed,
                 NotificationKind::Update,
-                NotificationKind::Invite
+                NotificationKind::Invite,
+                NotificationKind::System
             ]
         );
         assert_eq!(

@@ -19,4 +19,25 @@ describe('offlineInstallErrorMessage', () => {
 		expect(msg).toContain('tarball integrity mismatch');
 		expect(msg).not.toMatch(/reach the registry/i);
 	});
+
+	it('names a failed signature check as a verification failure, not a network one', () => {
+		const msg = offlineInstallErrorMessage(
+			new Error('registry index signature verification failed')
+		);
+		expect(msg).toMatch(
+			/couldn't be verified \(signature check failed\), so nothing was installed/
+		);
+		expect(msg).not.toMatch(/reach/i);
+	});
+
+	it('reads a bare webview fetch failure as a network error', () => {
+		const msg = offlineInstallErrorMessage(new TypeError('Failed to fetch'));
+		expect(msg).toContain("the registry couldn't be reached (network error)");
+		expect(msg).not.toContain('Failed to fetch');
+	});
+
+	it('keeps an integrity mismatch as its own failure text', () => {
+		const msg = offlineInstallErrorMessage(new Error('tarball integrity mismatch (signature ok)'));
+		expect(msg).toContain('tarball integrity mismatch');
+	});
 });

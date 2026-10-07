@@ -42,8 +42,12 @@ impl EngineResolver for NoEngines {
     fn native(&self, _binary: &str) -> Option<PathBuf> {
         None
     }
-    fn in_wsl(&self, _binary: &str) -> bool {
-        false
+    fn in_wsl<'a>(
+        &'a self,
+        _binary: &'a str,
+        _distro: Option<&'a str>,
+    ) -> futures_util::future::BoxFuture<'a, crate::server::shared::agents::WslLookup> {
+        Box::pin(std::future::ready(crate::server::shared::agents::WslLookup::NotFound))
     }
 }
 

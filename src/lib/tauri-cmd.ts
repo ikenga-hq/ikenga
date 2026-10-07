@@ -555,7 +555,9 @@ export type NotificationKind =
 	| 'run_failed'
 	| 'update'
 	| 'violation'
-	| 'invite';
+	| 'invite'
+	/** An environment problem blocking work, e.g. WSL has no network (D-19). */
+	| 'system';
 
 /**
  * `{ kind, ...params }` for the action kinds producers emit; the centre
@@ -591,7 +593,14 @@ export type KnownNotificationAction =
 	  }
 	| { kind: 'open.release_notes'; source: 'shell'; version: string }
 	| { kind: 'open.pkg_updates'; pkgId: string; version: string }
-	| { kind: 'open.violations'; pkgId: string };
+	| { kind: 'open.violations'; pkgId: string }
+	| {
+			/** WSL has no network (honest-failure-states WP-2): offer the fix
+			 *  that fits `state`. `distro` null = the default distro. */
+			kind: 'fix.wsl_network';
+			distro: string | null;
+			state: 'no_route' | 'dns_only' | 'wsl_down';
+	  };
 
 export type KnownNotificationActionKind = KnownNotificationAction['kind'];
 
@@ -670,6 +679,9 @@ export interface NotificationsListOptions {
 export type NotificationsChangeReason =
 	| 'created'
 	| 'coalesced'
+	/** A row's copy changed within an open episode (D-20): refresh lists,
+	 *  never toast. */
+	| 'updated'
 	| 'read'
 	| 'read_all'
 	| 'mute_changed';
@@ -677,7 +689,7 @@ export type NotificationsChangeReason =
 /** Payload of `notifications://changed`. */
 export interface NotificationsChangedEvent {
 	reason: NotificationsChangeReason;
-	/** Present for `created` / `coalesced`. */
+	/** Present for `created` / `coalesced` / `updated`. */
 	notification: NotificationRow | null;
 	/** True when the row's kind is muted — the toast bridge stays quiet. */
 	muted: boolean;
@@ -744,6 +756,62 @@ export async function notificationsRecordUpdate(
 		pkgId: args.pkgId ?? null,
 		pkgName: args.pkgName ?? null,
 	});
+}
+
+// ─── WSL network health (honest-failure-states WP-2) ─────────────────────────
+// Rust: src-tauri/src/commands/wsl_health.rs over server/shared/wsl_health.rs.
+// Windows-only in effect; elsewhere the probe answers `not_installed` and every
+// fix `failed`.
+
+export type WslHealthState =
+	| 'ok'
+	| 'host_offline'
+	| 'no_route'
+	| 'dns_only'
+	| 'wsl_down'
+	| 'not_installed';
+
+export interface WslHealth {
+	state: WslHealthState;
+	/** The distro probed; `null` = the default distro. */
+	distro: string | null;
+	/** One short sentence naming the cause. */
+	detail: string;
+	/** Newest "falling back to networkingMode None" WSL event this boot. */
+	mirroredFailure: { at: number; errorCode: string | null } | null;
+	/** `[wsl2] networkingMode` from .wslconfig (lower-case); null = unset/unreadable. */
+	networkingMode: string | null;
+	/** Unix ms. */
+	checkedAt: number;
+	/** `wsl_down` rests only on wsl.exe timing out, not on an answer. */
+	inconclusive?: boolean;
+}
+
+export type WslFixAction = 'repair_dns' | 'restart_networking' | 'switch_to_nat';
+
+export type WslFixOutcome =
+	| { outcome: 'done'; health: WslHealth }
+	| { outcome: 'cancelled_by_user' }
+	| { outcome: 'failed'; reason: string };
+
+/** Probe WSL networking. `distro` omitted = `engines.agentWslDistro`; results
+ *  are cached 30 s per distro unless `force`. */
+export async function wslHealthProbe(
+	args: { distro?: string | null; force?: boolean } = {},
+): Promise<WslHealth> {
+	return invoke<WslHealth>('wsl_health_probe', {
+		distro: args.distro ?? null,
+		force: args.force ?? false,
+	});
+}
+
+/** Run one WSL network fix. `restart_networking` (UAC prompt) and
+ *  `switch_to_nat` shut WSL down — confirm first, relaunch sessions after. */
+export async function wslHealthFix(
+	action: WslFixAction,
+	distro?: string | null,
+): Promise<WslFixOutcome> {
+	return invoke<WslFixOutcome>('wsl_health_fix', { action, distro: distro ?? null });
 }
 
 // ─── Secrets (Stronghold) ─────────────────────────────────────────────────────
@@ -4254,7 +4322,8 @@ export interface SystemCheck {
 export interface SystemReport {
 	os: string;
 	arch: string;
-	disk_free_gb: number;
+	/** Null when no mounted volume matched the app-data dir (unknown, not zero). */
+	disk_free_gb: number | null;
 	app_data_dir: string;
 	app_data_writable: boolean;
 	vault_key_present: boolean;
@@ -4281,6 +4350,18 @@ export interface DetectedAgent {
 	/** Human-readable hint when `authed === false` or probe was inconclusive. */
 	auth_hint: string | null;
 	capabilities: AgentCapabilities;
+	/** Present only when detection couldn't check for this agent at all —
+	 *  today, WSL couldn't be asked (D-10). Such an agent is neither installed
+	 *  nor missing: `version` / `authed` are null and it is not runnable.
+	 *  Absent on older daemons and on every agent that was checked. */
+	unavailable?: AgentUnavailable | null;
+}
+
+/** Why detection couldn't check an agent. `kind` names the dependency that
+ *  failed (`'wsl'` today); `reason` is the probe's own detail. */
+export interface AgentUnavailable {
+	kind: 'wsl' | (string & {});
+	reason: string;
 }
 
 export interface AgentConfigInventory {
