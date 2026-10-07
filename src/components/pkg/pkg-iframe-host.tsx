@@ -176,19 +176,62 @@ interface HostCallResult {
 // them. Verbs that touch a sensitive capability must therefore check the
 // calling pkg's declared scope here. Manifest permissions are shaped as
 // `{ <resource>: [<action>, …] }` (contract/src/manifest.ts), so `engine:invoke`
-// is `permissions.engine` containing `'invoke'`. Fails closed on any error.
-async function pkgDeclaresScope(pkgId: string, resource: string, action: string): Promise<boolean> {
+// is `permissions.engine` containing `'invoke'`.
+//
+// Every check below is tri-state: `granted`, `denied` (the manifest was read
+// and doesn't declare it), or `unavailable` (the kernel / manifest read
+// failed, so we couldn't tell). Both non-granted outcomes refuse the call,
+// still fail-closed, but an `unavailable` refusal says so and carries
+// `reason: 'check-unavailable'`, so a pkg isn't told "scope not declared"
+// because of a transient kernel error. See `capRefusal`.
+export type CapCheck = { kind: 'granted' } | { kind: 'denied' } | { kind: 'unavailable'; detail: string };
+
+const GRANTED: CapCheck = { kind: 'granted' };
+const DENIED: CapCheck = { kind: 'denied' };
+
+type PkgManifestLike = Awaited<ReturnType<typeof pkgPreviewManifest>>;
+
+/** Read the calling pkg's manifest and apply `pred`. A pkg the kernel does
+ *  not list is `denied` (positive evidence: it declares nothing); a failed
+ *  kernel or manifest read is `unavailable`. */
+async function checkPkgManifest(
+	pkgId: string,
+	label: string,
+	pred: (manifest: PkgManifestLike) => boolean
+): Promise<CapCheck> {
+	let manifest: PkgManifestLike;
 	try {
 		const status = await pkgKernelStatus();
 		const entry = status.installed.find((p) => p.id === pkgId);
-		if (!entry) return false;
-		const manifest = await pkgPreviewManifest(entry.install_path);
+		if (!entry) return DENIED;
+		manifest = await pkgPreviewManifest(entry.install_path);
+	} catch (e) {
+		console.warn(`[pkg-host] ${label} check for ${pkgId} failed:`, e);
+		return { kind: 'unavailable', detail: (e as Error)?.message ?? String(e) };
+	}
+	return pred(manifest) ? GRANTED : DENIED;
+}
+
+async function pkgDeclaresScope(pkgId: string, resource: string, action: string): Promise<CapCheck> {
+	return checkPkgManifest(pkgId, `scope ${resource}:${action}`, (manifest) => {
 		const actions = (manifest.permissions as Record<string, unknown> | undefined)?.[resource];
 		return Array.isArray(actions) && actions.includes(action);
-	} catch (e) {
-		console.warn(`[pkg-host] scope check ${resource}:${action} for ${pkgId} failed:`, e);
-		return false;
+	});
+}
+
+/** Message for a check that couldn't run. Never phrased as a denial. */
+function capUnavailableText(verb: string, detail: string): string {
+	return `${verb}: couldn't check the pkg's declared capabilities (${detail}). This is not a denial; try again`;
+}
+
+/** The refusal for a non-granted check. `denied` keeps each verb's existing
+ *  message and envelope unchanged (pkgs match on them); `unavailable` adds
+ *  `reason: 'check-unavailable'` to the structured content. */
+function capRefusal(verb: string, check: CapCheck, deniedText: string): HostCallResult {
+	if (check.kind === 'unavailable') {
+		return errResult(capUnavailableText(verb, check.detail), 'check-unavailable');
 	}
+	return errResult(`${verb}: ${deniedText}`);
 }
 
 // Per-pkg rate limit for `host.notify` (WP-26). An OS notification reaches
@@ -219,37 +262,23 @@ function notifyRateLimited(pkgId: string): boolean {
 
 // Whether the pkg declared `capabilities.sqlite` (opt-in to reading the local
 // `ikenga.db`). Gates `host.dbQuery`. Same manifest-lookup shape as
-// `pkgDeclaresScope`; fails closed on any error.
-async function pkgDeclaresSqlite(pkgId: string): Promise<boolean> {
-	try {
-		const status = await pkgKernelStatus();
-		const entry = status.installed.find((p) => p.id === pkgId);
-		if (!entry) return false;
-		const manifest = await pkgPreviewManifest(entry.install_path);
+// `pkgDeclaresScope`; tri-state (see `CapCheck`).
+async function pkgDeclaresSqlite(pkgId: string): Promise<CapCheck> {
+	return checkPkgManifest(pkgId, 'sqlite capability', (manifest) => {
 		const caps = manifest.capabilities as Record<string, unknown> | undefined;
 		return !!caps?.sqlite;
-	} catch (e) {
-		console.warn(`[pkg-host] sqlite capability check for ${pkgId} failed:`, e);
-		return false;
-	}
+	});
 }
 
 // Whether the pkg declared `capabilities.agentOps` (opt-in to the privileged
 // `host.agentOps.*` verbs — run-now / enable-disable / list-jobs that reach the
 // always-on cron daemon + read its config/state files). Gates all three verbs.
-// Same manifest-lookup shape as `pkgDeclaresSqlite`; fails closed on any error.
-async function pkgDeclaresAgentOps(pkgId: string): Promise<boolean> {
-	try {
-		const status = await pkgKernelStatus();
-		const entry = status.installed.find((p) => p.id === pkgId);
-		if (!entry) return false;
-		const manifest = await pkgPreviewManifest(entry.install_path);
+// Same manifest-lookup shape as `pkgDeclaresSqlite`; tri-state (see `CapCheck`).
+async function pkgDeclaresAgentOps(pkgId: string): Promise<CapCheck> {
+	return checkPkgManifest(pkgId, 'agentOps capability', (manifest) => {
 		const caps = manifest.capabilities as Record<string, unknown> | undefined;
 		return !!caps?.agentOps;
-	} catch (e) {
-		console.warn(`[pkg-host] agentOps capability check for ${pkgId} failed:`, e);
-		return false;
-	}
+	});
 }
 
 // Whether the pkg declared `capabilities.http` (opt-in to the mediated
@@ -257,32 +286,21 @@ async function pkgDeclaresAgentOps(pkgId: string): Promise<boolean> {
 // allowlist is `permissions.net` and the auth wiring lives in the manifest, all
 // enforced Rust-side in `pkg_fetch`. This FE check is fail-fast UX only — a
 // hostile iframe skips it and still hits the authoritative Rust gate. Same
-// manifest-lookup shape as `pkgDeclaresSqlite`; fails closed on any error.
-async function pkgDeclaresHttp(pkgId: string): Promise<boolean> {
-	try {
-		const status = await pkgKernelStatus();
-		const entry = status.installed.find((p) => p.id === pkgId);
-		if (!entry) return false;
-		const manifest = await pkgPreviewManifest(entry.install_path);
+// manifest-lookup shape as `pkgDeclaresSqlite`; tri-state (see `CapCheck`).
+async function pkgDeclaresHttp(pkgId: string): Promise<CapCheck> {
+	return checkPkgManifest(pkgId, 'http capability', (manifest) => {
 		const caps = manifest.capabilities as Record<string, unknown> | undefined;
 		return !!caps?.http;
-	} catch (e) {
-		console.warn(`[pkg-host] http capability check for ${pkgId} failed:`, e);
-		return false;
-	}
+	});
 }
 
 // Whether the pkg declared `capabilities.invoke` AND lists `command` in its
 // `capabilities.invoke.commands` allowlist (ADR-017 D-06, TRUSTED-only). The
 // allowlist is invoke's OWN field (not permissions["shell.execute"]). Glob-
 // matches `command` against the declared entries. Rust re-checks (trust + the
-// same allowlist) — this is fail-fast UX only. Fails closed on any error.
-async function pkgDeclaresInvoke(pkgId: string, command: string): Promise<boolean> {
-	try {
-		const status = await pkgKernelStatus();
-		const entry = status.installed.find((p) => p.id === pkgId);
-		if (!entry) return false;
-		const manifest = await pkgPreviewManifest(entry.install_path);
+// same allowlist) — this is fail-fast UX only. Tri-state (see `CapCheck`).
+async function pkgDeclaresInvoke(pkgId: string, command: string): Promise<CapCheck> {
+	return checkPkgManifest(pkgId, 'invoke capability', (manifest) => {
 		const caps = manifest.capabilities as Record<string, unknown> | undefined;
 		const invoke = caps?.invoke as { commands?: unknown } | undefined;
 		if (!invoke) return false;
@@ -290,10 +308,7 @@ async function pkgDeclaresInvoke(pkgId: string, command: string): Promise<boolea
 			? invoke.commands.filter((c): c is string => typeof c === 'string')
 			: [];
 		return commands.some((glob) => globMatch(glob, command));
-	} catch (e) {
-		console.warn(`[pkg-host] invoke capability check for ${pkgId} failed:`, e);
-		return false;
-	}
+	});
 }
 
 // Minimal glob match (`*` any-sequence, `?` one-char) mirroring the Rust
@@ -307,21 +322,17 @@ function globMatch(glob: string, name: string): boolean {
 
 // The tables a pkg declared it may touch via `permissions['sqlite.tables']`.
 // Used to scope `host.dbExec` writes to the pkg's own tables. Same
-// manifest-lookup shape as `pkgDeclaresSqlite`; fails closed (empty list) on
-// any error so an unreadable manifest can write nothing.
-async function pkgSqliteTables(pkgId: string): Promise<string[]> {
-	try {
-		const status = await pkgKernelStatus();
-		const entry = status.installed.find((p) => p.id === pkgId);
-		if (!entry) return [];
-		const manifest = await pkgPreviewManifest(entry.install_path);
+// manifest-lookup shape as `pkgDeclaresSqlite`. An unreadable manifest is
+// `{ unavailable }` (the caller refuses, saying the check could not run).
+async function pkgSqliteTables(pkgId: string): Promise<string[] | { unavailable: string }> {
+	let tables: string[] = [];
+	const check = await checkPkgManifest(pkgId, 'sqlite.tables', (manifest) => {
 		const perms = manifest.permissions as Record<string, unknown> | undefined;
-		const tables = perms?.['sqlite.tables'];
-		return Array.isArray(tables) ? tables.filter((t): t is string => typeof t === 'string') : [];
-	} catch (e) {
-		console.warn(`[pkg-host] sqlite.tables lookup for ${pkgId} failed:`, e);
-		return [];
-	}
+		const declared = perms?.['sqlite.tables'];
+		tables = Array.isArray(declared) ? declared.filter((t): t is string => typeof t === 'string') : [];
+		return true;
+	});
+	return check.kind === 'unavailable' ? { unavailable: check.detail } : tables;
 }
 
 // Best-effort target-table extraction from a single write statement, for the
@@ -390,11 +401,18 @@ export function readSourceTables(sql: string): string[] {
 // via `readSourceTables`) and `host.dbExec` (writes, via `writeTargetTable`) so
 // the scope check lives in exactly one place. Defense-in-depth over a
 // single-user local ikenga.db, not a hard boundary.
-async function checkSqliteTableScope(pkgId: string, targets: string[]): Promise<string | null> {
+async function checkSqliteTableScope(
+	verb: string,
+	pkgId: string,
+	targets: string[]
+): Promise<HostCallResult | null> {
 	const allowed = await pkgSqliteTables(pkgId);
+	if (!Array.isArray(allowed)) {
+		return errResult(capUnavailableText(verb, allowed.unavailable), 'check-unavailable');
+	}
 	for (const t of targets) {
 		if (!allowed.includes(t)) {
-			return `table '${t}' not in the pkg's declared sqlite.tables`;
+			return errResult(`${verb}: table '${t}' not in the pkg's declared sqlite.tables`);
 		}
 	}
 	return null;
@@ -506,17 +524,16 @@ export async function dispatchHostCall(
 		if (!/^\s*(select|with)\b/i.test(sql)) {
 			return errResult('host.dbQuery: only SELECT/WITH read queries are allowed');
 		}
-		if (!(await pkgDeclaresSqlite(pkgId))) {
-			return errResult("host.dbQuery: pkg lacks the 'sqlite' capability");
+		const sqliteCap = await pkgDeclaresSqlite(pkgId);
+		if (sqliteCap.kind !== 'granted') {
+			return capRefusal('host.dbQuery', sqliteCap, "pkg lacks the 'sqlite' capability");
 		}
 		const readTargets = readSourceTables(sql);
 		if (readTargets.length === 0) {
 			return errResult('host.dbQuery: could not identify the source table(s)');
 		}
-		const readScopeErr = await checkSqliteTableScope(pkgId, readTargets);
-		if (readScopeErr) {
-			return errResult(`host.dbQuery: ${readScopeErr}`);
-		}
+		const readScopeErr = await checkSqliteTableScope('host.dbQuery', pkgId, readTargets);
+		if (readScopeErr) return readScopeErr;
 		const params = Array.isArray(args.params) ? (args.params as SqlValue[]) : [];
 		try {
 			const rows = await dbQuery(sql, params);
@@ -548,17 +565,16 @@ export async function dispatchHostCall(
 		if (!/^\s*(insert|update|delete)\b/i.test(sql)) {
 			return errResult('host.dbExec: only INSERT/UPDATE/DELETE write statements are allowed');
 		}
-		if (!(await pkgDeclaresSqlite(pkgId))) {
-			return errResult("host.dbExec: pkg lacks the 'sqlite' capability");
+		const sqliteCap = await pkgDeclaresSqlite(pkgId);
+		if (sqliteCap.kind !== 'granted') {
+			return capRefusal('host.dbExec', sqliteCap, "pkg lacks the 'sqlite' capability");
 		}
 		const target = writeTargetTable(sql);
 		if (!target) {
 			return errResult('host.dbExec: could not identify the target table');
 		}
-		const writeScopeErr = await checkSqliteTableScope(pkgId, [target]);
-		if (writeScopeErr) {
-			return errResult(`host.dbExec: ${writeScopeErr}`);
-		}
+		const writeScopeErr = await checkSqliteTableScope('host.dbExec', pkgId, [target]);
+		if (writeScopeErr) return writeScopeErr;
 		const params = Array.isArray(args.params) ? (args.params as SqlValue[]) : [];
 		try {
 			await dbExec(sql, params);
@@ -744,7 +760,11 @@ export async function dispatchHostCall(
 			return errResult('host.notify: missing required `title` argument');
 		}
 		const body = typeof args.body === 'string' ? args.body : undefined;
-		if (!(await pkgDeclaresScope(pkgId, 'notify', 'send'))) {
+		const notifyScope = await pkgDeclaresScope(pkgId, 'notify', 'send');
+		if (notifyScope.kind === 'unavailable') {
+			return capRefusal('host.notify', notifyScope, '');
+		}
+		if (notifyScope.kind === 'denied') {
 			return {
 				content: [{ type: 'text', text: "host.notify: pkg lacks the 'notify:send' scope" }],
 				isError: true,
@@ -794,7 +814,11 @@ export async function dispatchHostCall(
 			return errResult('host.sendToActiveSession: missing required `prompt` or `text` argument');
 		}
 
-		if (!(await pkgDeclaresScope(pkgId, 'engine', 'invoke'))) {
+		const engineScope = await pkgDeclaresScope(pkgId, 'engine', 'invoke');
+		if (engineScope.kind === 'unavailable') {
+			return capRefusal('host.sendToActiveSession', engineScope, '');
+		}
+		if (engineScope.kind === 'denied') {
 			return {
 				content: [
 					{ type: 'text', text: "host.sendToActiveSession: pkg lacks the 'engine:invoke' scope" },
@@ -880,7 +904,11 @@ export async function dispatchHostCall(
 		if (!draftId) {
 			return errResult(`${name}: missing required \`draftId\` argument`);
 		}
-		if (!(await pkgDeclaresScope(pkgId, 'engine', 'invoke'))) {
+		const engineScope = await pkgDeclaresScope(pkgId, 'engine', 'invoke');
+		if (engineScope.kind === 'unavailable') {
+			return capRefusal(name, engineScope, '');
+		}
+		if (engineScope.kind === 'denied') {
 			return {
 				content: [{ type: 'text', text: `${name}: pkg lacks the 'engine:invoke' scope` }],
 				isError: true,
@@ -934,8 +962,9 @@ export async function dispatchHostCall(
 		if (!jobId) {
 			return errResult('host.agentOps.runNow: missing required `jobId` argument');
 		}
-		if (!(await pkgDeclaresAgentOps(pkgId))) {
-			return errResult("host.agentOps.runNow: pkg lacks the 'agentOps' capability");
+		const agentOpsCap = await pkgDeclaresAgentOps(pkgId);
+		if (agentOpsCap.kind !== 'granted') {
+			return capRefusal('host.agentOps.runNow', agentOpsCap, "pkg lacks the 'agentOps' capability");
 		}
 		try {
 			const res = (await agentOpsRunNow(jobId)) as Record<string, unknown>;
@@ -961,8 +990,9 @@ export async function dispatchHostCall(
 		if (!jobId) {
 			return errResult('host.agentOps.tailRun: missing required `jobId` argument');
 		}
-		if (!(await pkgDeclaresAgentOps(pkgId))) {
-			return errResult("host.agentOps.tailRun: pkg lacks the 'agentOps' capability");
+		const agentOpsCap = await pkgDeclaresAgentOps(pkgId);
+		if (agentOpsCap.kind !== 'granted') {
+			return capRefusal('host.agentOps.tailRun', agentOpsCap, "pkg lacks the 'agentOps' capability");
 		}
 		try {
 			const offset = typeof args.offset === 'number' ? args.offset : undefined;
@@ -991,8 +1021,9 @@ export async function dispatchHostCall(
 		if (typeof args.enabled !== 'boolean') {
 			return errResult('host.agentOps.setEnabled: missing required boolean `enabled` argument');
 		}
-		if (!(await pkgDeclaresAgentOps(pkgId))) {
-			return errResult("host.agentOps.setEnabled: pkg lacks the 'agentOps' capability");
+		const agentOpsCap = await pkgDeclaresAgentOps(pkgId);
+		if (agentOpsCap.kind !== 'granted') {
+			return capRefusal('host.agentOps.setEnabled', agentOpsCap, "pkg lacks the 'agentOps' capability");
 		}
 		try {
 			const res = (await agentOpsSetEnabled(jobId, args.enabled)) as Record<string, unknown>;
@@ -1013,8 +1044,9 @@ export async function dispatchHostCall(
 	}
 
 	if (name === 'host.agentOps.listJobs') {
-		if (!(await pkgDeclaresAgentOps(pkgId))) {
-			return errResult("host.agentOps.listJobs: pkg lacks the 'agentOps' capability");
+		const agentOpsCap = await pkgDeclaresAgentOps(pkgId);
+		if (agentOpsCap.kind !== 'granted') {
+			return capRefusal('host.agentOps.listJobs', agentOpsCap, "pkg lacks the 'agentOps' capability");
 		}
 		try {
 			const res = (await agentOpsListJobs()) as Record<string, unknown>;
@@ -1038,8 +1070,9 @@ export async function dispatchHostCall(
 		if (!job) {
 			return errResult('host.agentOps.upsertJob: missing required `job` object');
 		}
-		if (!(await pkgDeclaresAgentOps(pkgId))) {
-			return errResult("host.agentOps.upsertJob: pkg lacks the 'agentOps' capability");
+		const agentOpsCap = await pkgDeclaresAgentOps(pkgId);
+		if (agentOpsCap.kind !== 'granted') {
+			return capRefusal('host.agentOps.upsertJob', agentOpsCap, "pkg lacks the 'agentOps' capability");
 		}
 		try {
 			const res = (await agentOpsUpsertJob(job)) as Record<string, unknown>;
@@ -1062,8 +1095,9 @@ export async function dispatchHostCall(
 		if (!jobId) {
 			return errResult('host.agentOps.deleteJob: missing required `jobId` argument');
 		}
-		if (!(await pkgDeclaresAgentOps(pkgId))) {
-			return errResult("host.agentOps.deleteJob: pkg lacks the 'agentOps' capability");
+		const agentOpsCap = await pkgDeclaresAgentOps(pkgId);
+		if (agentOpsCap.kind !== 'granted') {
+			return capRefusal('host.agentOps.deleteJob', agentOpsCap, "pkg lacks the 'agentOps' capability");
 		}
 		try {
 			const res = (await agentOpsDeleteJob(jobId)) as Record<string, unknown>;
@@ -1101,8 +1135,9 @@ export async function dispatchHostCall(
 		}
 		// Gate FE-side as `pkgDeclaresCapability('http') && pkgIsTrustedForElevated`
 		// (fail-fast UX; the Rust command re-checks both server-side).
-		if (!(await pkgDeclaresHttp(pkgId))) {
-			return errResult("host.fetch: pkg lacks the 'http' capability");
+		const httpCap = await pkgDeclaresHttp(pkgId);
+		if (httpCap.kind !== 'granted') {
+			return capRefusal('host.fetch', httpCap, "pkg lacks the 'http' capability");
 		}
 		if (!(await pkgIsTrustedForElevated(pkgId))) {
 			return errResult('host.fetch: pkg is not trusted for elevated capabilities');
@@ -1147,8 +1182,13 @@ export async function dispatchHostCall(
 		if (isRemoteWebSession()) {
 			return errResult(`host.invoke: ${NOT_IN_BROWSER}`);
 		}
-		if (!(await pkgDeclaresInvoke(pkgId, command))) {
-			return errResult(`host.invoke: '${command}' not in the pkg's capabilities.invoke.commands`);
+		const invokeCap = await pkgDeclaresInvoke(pkgId, command);
+		if (invokeCap.kind !== 'granted') {
+			return capRefusal(
+				'host.invoke',
+				invokeCap,
+				`'${command}' not in the pkg's capabilities.invoke.commands`
+			);
 		}
 		if (!(await pkgIsTrustedForElevated(pkgId))) {
 			return errResult('host.invoke: pkg is not trusted for elevated capabilities');
@@ -1185,11 +1225,13 @@ function isStringRecord(v: unknown): v is Record<string, string> {
 	return Object.values(v as Record<string, unknown>).every((x) => typeof x === 'string');
 }
 
-function errResult(message: string): HostCallResult {
+/** `reason` is additive: set only where it distinguishes a case (today
+ *  `'check-unavailable'`); existing results keep their exact shape. */
+function errResult(message: string, reason?: string): HostCallResult {
 	return {
 		content: [{ type: 'text', text: message }],
 		isError: true,
-		structuredContent: { ok: false, error: message },
+		structuredContent: reason ? { ok: false, error: message, reason } : { ok: false, error: message },
 	};
 }
 
