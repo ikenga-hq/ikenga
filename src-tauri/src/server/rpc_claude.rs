@@ -37,11 +37,17 @@
 //! bodies (`server::shared::claude_store`) against the router home and store,
 //! confined to the vault — see the section comment above those arms.
 //!
+//! **The Ngwa snapshot (`ngwa_snapshot`).** The desktop's join
+//! (`server::shared::ngwa`) over the same router home, store, allowlist-
+//! confined project roots and `--pkgs-dir` index; what the daemon cannot see
+//! is reported unavailable in `sources` — see the section comment there.
+//!
 //! **No events, nothing spawned.** The desktop's `claude-config:changed`
 //! watchers (`claude_config_watch` / `_unwatch`) stay desktop-only: there is
 //! no event channel here. Nothing in this module starts a process; on Windows
 //! `terminal_detect_shells` would (`wsl.exe -l -q`), so there it refuses.
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
@@ -52,11 +58,13 @@ use super::rpc_shell::targ;
 use super::shared::claude_config::{self, ClaudeConfig, ScanError};
 use super::shared::claude_sessions::{self, projects_root_in};
 use super::shared::claude_store::{self, DaemonChecks, Vault};
-use super::shared::projects::FsReach;
+use super::shared::ngwa::{self, NotServed, PkgInput, SnapshotInputs, UsageInput};
+use super::shared::projects::{self, FsReach};
 use super::shared::{
     agent_config, agent_projects, agents, engine_layout, settings_cascade, shell_detect,
 };
 use super::AppState;
+use crate::pkg::manifest::Package;
 
 /// The desktop's own error for "no home to resolve `~/.claude` against".
 const NO_HOME: &str = "HOME unset";
@@ -134,29 +142,36 @@ fn projects_root(state: &AppState) -> Result<PathBuf, String> {
 pub(super) async fn claude_config_load(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let project_roots: Vec<String> = targ(args, &["projectRoots", "project_roots"])?;
-        let mut admitted = Vec::new();
-        let mut refused = Vec::new();
-        for raw in project_roots {
-            match caller_path(state, &raw).and_then(|p| confine(state, &p)) {
-                Ok(Some(canonical)) => admitted.push(lossy(&canonical)),
-                Ok(None) => {}
-                Err(message) => refused.push(ScanError { path: raw, message }),
-            }
-        }
-        let home = state.home.clone();
-        // G-PRINCIPAL seam: the process-resolved Ngwa store (see module doc).
-        let store = crate::pkg::skill_actions::store_root();
-        let mut config: ClaudeConfig = tokio::task::spawn_blocking(move || {
-            claude_config::scan_all_in(admitted, home.as_deref(), store.as_deref())
-        })
-        .await
-        .map_err(|e| format!("join failed: {e}"))?
-        .map_err(|e| e.to_string())?;
-        config.errors.extend(refused);
-        Ok(config)
+        scan_config(state, project_roots).await
     }
     .await;
     respond("claude_config_load", r)
+}
+
+/// [`claude_config_load`]'s body: the router home's scan over `project_roots`,
+/// each confined first. Shared with [`ngwa_snapshot`], so the snapshot's
+/// config source reads exactly what the `/claude` browser reads.
+async fn scan_config(state: &AppState, project_roots: Vec<String>) -> Result<ClaudeConfig, String> {
+    let mut admitted = Vec::new();
+    let mut refused = Vec::new();
+    for raw in project_roots {
+        match caller_path(state, &raw).and_then(|p| confine(state, &p)) {
+            Ok(Some(canonical)) => admitted.push(lossy(&canonical)),
+            Ok(None) => {}
+            Err(message) => refused.push(ScanError { path: raw, message }),
+        }
+    }
+    let home = state.home.clone();
+    // G-PRINCIPAL seam: the process-resolved Ngwa store (see module doc).
+    let store = crate::pkg::skill_actions::store_root();
+    let mut config: ClaudeConfig = tokio::task::spawn_blocking(move || {
+        claude_config::scan_all_in(admitted, home.as_deref(), store.as_deref())
+    })
+    .await
+    .map_err(|e| format!("join failed: {e}"))?
+    .map_err(|e| e.to_string())?;
+    config.errors.extend(refused);
+    Ok(config)
 }
 
 /// The desktop reads any path with a `.claude` segment. The daemon keeps that
@@ -684,6 +699,93 @@ pub(super) async fn oba_set_auto_update(state: &AppState, args: &Value) -> RpcRe
     respond("oba_set_auto_update", r)
 }
 
+// ─── Ngwa snapshot ───────────────────────────────────────────────────────────
+//
+// The desktop's own join (`server::shared::ngwa::build_snapshot`) over what
+// this daemon can see, read as the router's principal: its `ikenga.db`
+// projects, the `--pkgs-dir` index and each pkg's manifest, the router home's
+// config scan (project roots confined as `claude_config_load` confines them)
+// and its Ngwa store. What it cannot see is named in `sources` with a reason
+// carrying `ngwa::NOT_AVAILABLE_ON_SERVER`, never an empty or zeroed set:
+// pkg runtime (no sidecar supervisor), `engine_assets` placements (no such
+// registry), trust (no trust store; `pkg_trust_list` refuses with the same
+// reason) and transcript usage (the corpus is not scanned here).
+
+/// Why trust reads unavailable — the snapshot's `sources.trust` and the
+/// `pkg_trust_list` refusal.
+pub(super) const TRUST_NOT_SERVED: &str = "trust evaluation is not available on this server: the \
+     headless daemon serves pkgs read-only and keeps no trust store";
+const RUNTIME_NOT_SERVED: &str = "pkg runtime state is not available on this server: the headless \
+     daemon runs no sidecar supervisor, so no pkg process is started or tracked";
+const ENGINE_ASSETS_NOT_SERVED: &str = "engine asset placements are not available on this server: \
+     the headless daemon runs no engine_assets registry";
+const USAGE_NOT_SERVED: &str = "transcript usage is not available on this server: the headless \
+     daemon does not scan ~/.claude/projects";
+
+pub(super) async fn ngwa_snapshot(state: &AppState) -> RpcResponse {
+    let r = async {
+        let now_ms = crate::transcript::usage::now_ms();
+        // Registered projects, as the desktop lists them. Without a database
+        // there are none to key project items by; the Ọba source then
+        // reports the missing database instead of an empty store.
+        let projects: Vec<(String, String)> = match pa_db(state) {
+            Ok(db) => projects::list_projects(&db.ensure_pool().await?, false)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|p| p.root_path.map(|r| (p.id, r)))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let project_roots: Vec<String> = projects.iter().map(|(_, r)| r.clone()).collect();
+        let config = scan_config(state, project_roots).await;
+        let oba = match pa_db(state) {
+            Ok(db) => {
+                daemon_vault!(state, v);
+                claude_store::claude_store_list_in(&v, db, None).await
+            }
+            Err(e) => Err(e),
+        };
+
+        // The index is process-global and read-only; every manifest is
+        // re-read so `requires` / `cron` / the kind are current, exactly as
+        // the desktop re-reads each installed pkg's manifest.
+        let summaries = state.pkg_index.installed().to_vec();
+        let pkgs = tokio::task::spawn_blocking(move || {
+            summaries
+                .into_iter()
+                .map(|summary| PkgInput {
+                    manifest: Package::load(Path::new(&summary.install_path))
+                        .map(|p| p.manifest)
+                        .map_err(|e| format!("{e:#}")),
+                    trust: Err(TRUST_NOT_SERVED.to_string()),
+                    summary,
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| format!("manifest load task failed: {e}"))?;
+
+        Ok::<_, String>(ngwa::build_snapshot(SnapshotInputs {
+            now_ms,
+            projects,
+            pkgs,
+            registries: state.pkg_index.status().registries,
+            oba,
+            config,
+            trust_pending: Ok(HashSet::new()),
+            usage: UsageInput::unavailable(USAGE_NOT_SERVED),
+            not_served: NotServed {
+                runtime: Some(RUNTIME_NOT_SERVED.to_string()),
+                engine_assets: Some(ENGINE_ASSETS_NOT_SERVED.to_string()),
+                trust: Some(TRUST_NOT_SERVED.to_string()),
+            },
+        }))
+    }
+    .await;
+    respond("ngwa_snapshot", r)
+}
+
 fn kind_name(args: &Value) -> Result<(String, String), String> {
     Ok((targ(args, &["kind"])?, targ(args, &["name"])?))
 }
@@ -725,6 +827,13 @@ fn engine_args(args: &Value) -> Result<EngineArgs, String> {
 #[cfg(test)]
 #[path = "rpc_claude_vault_tests.rs"]
 mod vault_tests;
+
+/// Router tests for `ngwa_snapshot` and the pkg reads served beside it
+/// (`pkg_health_scan`, `pkg_trust_list`): a temp home, store, data dir and
+/// `--pkgs-dir`.
+#[cfg(test)]
+#[path = "rpc_ngwa_tests.rs"]
+mod ngwa_tests;
 
 #[cfg(test)]
 mod tests {

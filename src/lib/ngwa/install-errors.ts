@@ -7,7 +7,7 @@
 // times. The summary never shows that; the details view shows each distinct
 // line once, with a repeat count, truncated.
 
-import { NOT_AVAILABLE_ON_SERVER } from '@/lib/transport/unavailable';
+import { NOT_AVAILABLE_ON_SERVER_YET } from '@/lib/transport/unavailable';
 
 export type InstallErrorKind =
 	| 'disk-space'
@@ -70,7 +70,7 @@ export function installErrorMessage(kind: InstallErrorKind, name: string): strin
 		case 'cancelled':
 			return `Install of ${name} was cancelled. Nothing was left behind.`;
 		case 'unavailable':
-			return `${NOT_AVAILABLE_ON_SERVER}. ${name} can be installed from the Ikenga desktop app.`;
+			return `${NOT_AVAILABLE_ON_SERVER_YET}. ${name} can be installed from the Ikenga desktop app.`;
 		default:
 			return `${name} couldn't be installed. Show details has the full error; try again once it's fixed.`;
 	}

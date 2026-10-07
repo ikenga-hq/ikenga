@@ -35,7 +35,8 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { NgwaItem } from '@ikenga/contract';
 import { pkgTrustGrant, pkgTrustRevoke } from '@/lib/tauri-cmd';
-import { resolveTrustFacet } from '@/lib/ngwa/enrichment';
+import { resolveTrustFacet, trustFacetLabel, trustUnavailableReason } from '@/lib/ngwa/enrichment';
+import { NOT_AVAILABLE_ON_SERVER_LABEL } from '@/lib/transport/unavailable';
 import {
 	actionsTrustStatus,
 	readActionsFiles,
@@ -214,10 +215,17 @@ function PkgTrustSheet({
 	const totalSensitive = shellExec.length + fsWrite.length + net.length + vault.length;
 
 	const trustFacet = resolveTrustFacet(item.trust);
+	// The host does not evaluate trust at all (the headless daemon): nothing
+	// here can be granted or revoked, and `perms` is only what the manifest
+	// declares (null when it could not be read) — never "none requested".
+	const trustUnavailable = trustUnavailableReason(item.trust);
+	const grantBlocked = trustUnavailable
+		? `${NOT_AVAILABLE_ON_SERVER_LABEL}: trust cannot be granted or revoked here`
+		: null;
 
 	return (
 		<div className="trust-overlay" role="dialog" aria-modal="true" aria-labelledby="trust-sheet-title">
-			<div className="trust-sheet">
+			<div className="trust-sheet" data-trust-unavailable={trustUnavailable ? '' : undefined}>
 				{/* ── Sheet Header ── */}
 				<header className="trust-head">
 					<div className="flex items-center gap-2">
@@ -233,7 +241,7 @@ function PkgTrustSheet({
 							<div className="text-xs text-muted-foreground flex items-center gap-2 mt-0.5">
 								<span className="mono">{item.id}</span>
 								<span>·</span>
-								<span>status: <b className={`badge t-${trustFacet}`}>{trustFacet}</b></span>
+								<span>status: <b className={`badge t-${trustFacet}`}>{trustFacetLabel(trustFacet)}</b></span>
 								{item.version && <span>· v{item.version}</span>}
 							</div>
 						</div>
@@ -309,16 +317,38 @@ function PkgTrustSheet({
 						</div>
 					)}
 
+					{/* ── Trust not evaluated on this host ── */}
+					{trustUnavailable && (
+						<div
+							className="p-3 mb-4 text-xs text-muted-foreground bg-muted/20 rounded border border-dashed border-border flex items-start gap-2"
+							data-trust-unavailable-note
+						>
+							<AlertTriangle className="h-4 w-4 flex-none mt-0.5" />
+							<div>
+								<strong>{NOT_AVAILABLE_ON_SERVER_LABEL}.</strong> {trustUnavailable}. This package's
+								trust state is unknown here — not unsigned, not approved — and nothing can be granted
+								or revoked from this session.{' '}
+								{perms
+									? 'Listed below is only what its manifest declares; nothing here evaluated or approved it.'
+									: 'Its manifest could not be read, so its declared permissions are unknown too.'}
+							</div>
+						</div>
+					)}
+
 					{/* ── Standard Sensitive Permissions List ── */}
-					{!scopedGrant && (
+					{!scopedGrant && (!trustUnavailable || perms) && (
 					<div className="mb-4">
 						<div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
-							Declared sensitive capabilities ({totalSensitive})
+							{trustUnavailable
+								? `Sensitive capabilities declared in the manifest — not evaluated (${totalSensitive})`
+								: `Declared sensitive capabilities (${totalSensitive})`}
 						</div>
 
 						{totalSensitive === 0 ? (
 							<div className="p-3 text-xs text-muted-foreground bg-muted/20 rounded border border-border">
-								No sensitive permissions requested. This package runs within standard process boundaries.
+								{trustUnavailable
+									? 'The manifest declares no sensitive permissions.'
+									: 'No sensitive permissions requested. This package runs within standard process boundaries.'}
 							</div>
 						) : (
 							<div className="space-y-2">
@@ -363,12 +393,14 @@ function PkgTrustSheet({
 					</div>
 					)}
 
-					<div className="text-xs text-muted-foreground bg-muted/20 p-2.5 rounded border border-border">
-						<Shield className="h-3.5 w-3.5 inline mr-1 text-primary" />
-						{scopedGrant
-							? 'Approval grants only the target above, on top of what the package declares. Nothing else changes.'
-							: 'Approval grants these capabilities to the package runtime. Consent can be revoked at any time.'}
-					</div>
+					{!trustUnavailable && (
+						<div className="text-xs text-muted-foreground bg-muted/20 p-2.5 rounded border border-border">
+							<Shield className="h-3.5 w-3.5 inline mr-1 text-primary" />
+							{scopedGrant
+								? 'Approval grants only the target above, on top of what the package declares. Nothing else changes.'
+								: 'Approval grants these capabilities to the package runtime. Consent can be revoked at any time.'}
+						</div>
+					)}
 				</div>
 
 				{/* ── Sheet Footer ── */}
@@ -382,6 +414,7 @@ function PkgTrustSheet({
 					</button>
 
 					{!scopedGrant &&
+					!trustUnavailable &&
 					(item.trust.state === 'granted' || item.trust.state === 'auto_granted') ? (
 						<button
 							type="button"
@@ -396,7 +429,9 @@ function PkgTrustSheet({
 					<button
 						type="button"
 						className="btn primary"
-						disabled={grantMutation.isPending}
+						data-act="grant"
+						disabled={grantMutation.isPending || grantBlocked !== null}
+						title={grantBlocked ?? undefined}
 						onClick={() => grantMutation.mutate()}
 					>
 						<Check className="h-3.5 w-3.5 mr-1" />

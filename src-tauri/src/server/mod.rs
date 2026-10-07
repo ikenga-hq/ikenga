@@ -44,6 +44,7 @@ pub mod rpc;
 mod rpc_claude;
 mod rpc_exec;
 mod rpc_files;
+mod rpc_fs_roots;
 mod rpc_local;
 mod rpc_shell;
 pub mod shared;
@@ -62,6 +63,8 @@ pub mod update;
 /// lexer.
 #[cfg(test)]
 pub(crate) mod parity;
+#[cfg(test)]
+mod fs_roots_router_tests;
 #[cfg(test)]
 mod share_router_tests;
 
@@ -791,9 +794,9 @@ fn build_router(
     // included — gets the same view of `--pkgs-dir`. Walked ONCE: the static
     // server and the status index are built from the same list, so they can
     // never disagree about which directories are pkgs. Both log what they found.
-    let pkgs = pkg_index::scan(config.pkgs_dir.as_deref());
-    let pkg_static = PkgStaticService::from_packages(config.pkgs_dir.as_deref(), &pkgs);
-    let pkg_index = Arc::new(PkgIndex::from_packages(&pkgs));
+    let scanned = pkg_index::scan_dir(config.pkgs_dir.as_deref());
+    let pkg_static = PkgStaticService::from_packages(config.pkgs_dir.as_deref(), &scanned.pkgs);
+    let pkg_index = Arc::new(PkgIndex::from_scan(&scanned));
     let settings = match (&pa_db, &config.data_dir, &home) {
         (Some(db), Some(dir), Some(home)) => Some(Arc::new(rpc_local::DaemonSettings::new(
             db.clone(),
@@ -1041,7 +1044,20 @@ async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> an
     // but not the useful one. `--data-dir` is also where `ikenga.db` lives.
     if let Some(ref data_dir) = config.data_dir {
         std::fs::create_dir_all(data_dir)?;
-        match crate::fs_roots::FsRoots::load(data_dir.join("fs_roots.json")) {
+        // A T1 principal child seeds its principal's home (the `HOME` the
+        // broker launched it with) into a list nobody has set up yet — on
+        // its first launch, which is the principal's first authenticated
+        // request (gap audit 2026-10-06 rank 1). Not at account creation:
+        // `adopt-t0` requires a principal's `data/` to be empty until it has
+        // run. T0 keeps no seed.
+        let seed = if mode.principal_child {
+            crate::platform::home_dir()
+                .map(|h| vec![h.to_string_lossy().into_owned()])
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        match crate::fs_roots::FsRoots::load_seeded(data_dir.join("fs_roots.json"), seed) {
             Ok(roots) => {
                 if let Err(e) = crate::fs_roots::install(Arc::new(roots)) {
                     warn!("fs_roots install failed: {e:#}");

@@ -4,9 +4,9 @@
 // kept but disabled so the user learns why.
 
 import { isRemoteWebSession } from '@/lib/tauri-cmd';
-import { NOT_AVAILABLE_ON_SERVER } from '@/lib/transport/unavailable';
+import { NOT_AVAILABLE_ON_SERVER_YET } from '@/lib/transport/unavailable';
 
-export { NOT_AVAILABLE_ON_SERVER };
+export { NOT_AVAILABLE_ON_SERVER_YET };
 
 export const DESKTOP_ONLY_REASON = 'Desktop app only';
 
@@ -22,5 +22,5 @@ export function desktopOnlyReason(): string | false {
  *  and read this instead of failing with a raw error. Delete this gate (and its
  *  call sites) when those commands are served. */
 export function installUnavailableReason(): string | false {
-	return isRemoteWebSession() ? NOT_AVAILABLE_ON_SERVER : false;
+	return isRemoteWebSession() ? NOT_AVAILABLE_ON_SERVER_YET : false;
 }

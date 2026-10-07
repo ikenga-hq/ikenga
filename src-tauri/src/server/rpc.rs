@@ -9,6 +9,7 @@ use tracing::debug;
 use super::rpc_claude;
 use super::rpc_exec;
 use super::rpc_files;
+use super::rpc_fs_roots;
 use super::rpc_local;
 use super::rpc_shell;
 use super::AppState;
@@ -295,12 +296,14 @@ pub async fn rpc_handler(
                 Err(e) => RpcResponse::error(e),
             }
         }
-        "fs_roots_list" => {
-            let roots = crate::fs_roots::current()
-                .map(|r| r.list_inputs())
-                .unwrap_or_default();
-            RpcResponse::success(roots)
-        }
+        // The caller's own folder list (gap audit 2026-10-06 rank 1): under
+        // T1 this child's principal's, seeded with its home; on T0 the one
+        // owner's. Validation, scoping and the admin route in
+        // `server::rpc_fs_roots`.
+        "fs_roots_list" => rpc_fs_roots::fs_roots_list(&state, &payload.args),
+        "fs_roots_add" => rpc_fs_roots::fs_roots_add(&state, &payload.args),
+        "fs_roots_remove" => rpc_fs_roots::fs_roots_remove(&state, &payload.args),
+        "fs_roots_reset" => rpc_fs_roots::fs_roots_reset(&state, &payload.args),
         // The browser has no `@tauri-apps/api/path`, so `homeDir()` resolves
         // here. Without it the shim silently returns the literal string "~",
         // which then gets joined into paths and handed to `fs_read` — a
@@ -454,6 +457,19 @@ pub async fn rpc_handler(
         // The server has no install-time trust gate, so nothing is ever
         // parked for a capability review.
         "pkg_trust_list_pending" => RpcResponse::success(Vec::<serde_json::Value>::new()),
+        // No trust store, so no pkg's trust can be evaluated. An empty list
+        // would read as "nothing to trust"; the refusal names why, and the
+        // frontend renders it as "not available on this server".
+        "pkg_trust_list" => RpcResponse::error(format!(
+            "pkg_trust_list: {}",
+            rpc_claude::TRUST_NOT_SERVED
+        )),
+        // What the daemon can see: `--pkgs-dir` entries that failed to load,
+        // are api-incompatible, or a registry rejected — plus one
+        // `records_unavailable` row saying install-record health is not
+        // checked here, so the answer is never a bare `[]` that reads as
+        // healthy. Removal (`pkg_health_remove*`) stays desktop-only.
+        "pkg_health_scan" => RpcResponse::success(state.pkg_index.health_scan()),
         // Elevated trust (`host.fetch`, `host.invoke`) is granted on the
         // desktop only, and the server runs neither, so the answer here is
         // always no: the app reports the capability as unavailable instead
@@ -698,6 +714,15 @@ pub async fn rpc_handler(
         "oba_relink_dependents" => rpc_claude::oba_relink_dependents(&state, &payload.args).await,
         "oba_unlink_one" => rpc_claude::oba_unlink_one(&state, &payload.args).await,
 
+        // --- Ngwa snapshot (WP-19) ---
+        //
+        // The desktop's own join over the projects, `--pkgs-dir` index,
+        // config scan and Ọba store this router can see, read as its
+        // principal (router home, router store). Pkg runtime, engine-asset
+        // placements, trust and transcript usage are reported unavailable in
+        // `sources`, never as an empty or zeroed set. Body in `rpc_claude`.
+        "ngwa_snapshot" => rpc_claude::ngwa_snapshot(&state).await,
+
         // --- fs family + actions / keybindings / trust (WP-19 slice 5a) ---
         //
         // Bodies in `server::rpc_files`, over `server::shared::{fs, actions}`
@@ -707,8 +732,7 @@ pub async fn rpc_handler(
         // root is inside it. No `actions://changed` is emitted (no event
         // channel). Writes never touch the trust record, which lives in
         // `--data-dir`. Left allowlisted: `fs_trash` (OS trash outside the
-        // allowlist), `fs_roots_*` (would let the token holder redefine the
-        // boundary), `fs_watch` / `fs_unwatch` (`/ws/fs` covers them),
+        // allowlist), `fs_watch` / `fs_unwatch` (`/ws/fs` covers them),
         // `actions_open_file` (spawns the OS opener).
         "fs_read" => rpc_files::fs_read(&state, &payload.args).await,
         "fs_write" => rpc_files::fs_write(&state, &payload.args).await,

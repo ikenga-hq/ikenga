@@ -14,7 +14,7 @@ import {
 	Lock,
 } from 'lucide-react';
 
-import { NOT_AVAILABLE_ON_SERVER } from '@/lib/transport/unavailable';
+import { NOT_AVAILABLE_ON_SERVER_YET } from '@/lib/transport/unavailable';
 import {
 	isRemoteWebSession,
 	backupExport,
@@ -178,7 +178,7 @@ export function BackupSectionBody() {
 			{remote ? (
 				<Card className="p-5" data-testid="backup-unavailable">
 					<h2 className="text-base font-medium">Export and restore</h2>
-					<p className="mt-1 text-sm text-muted-foreground">{NOT_AVAILABLE_ON_SERVER}.</p>
+					<p className="mt-1 text-sm text-muted-foreground">{NOT_AVAILABLE_ON_SERVER_YET}.</p>
 				</Card>
 			) : (
 				<>

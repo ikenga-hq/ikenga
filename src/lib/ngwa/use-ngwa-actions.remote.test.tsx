@@ -40,7 +40,7 @@ vi.mock('@/lib/registry/use-registry', async (orig) => ({
 	useRegistryIndex: () => ({ data: { indexUrl: 'https://registry.test/index.json' } }),
 }));
 
-import { NOT_AVAILABLE_ON_SERVER } from '@/lib/transport/unavailable';
+import { NOT_AVAILABLE_ON_SERVER_YET } from '@/lib/transport/unavailable';
 import { useNgwaItemActions } from './use-ngwa-actions';
 
 const item: NgwaItem = mkItem({
@@ -84,7 +84,7 @@ describe('Installed Update — install gate', () => {
 		const { result } = setup();
 		const upd = result.current.actionsFor(item).update;
 		expect(upd.label).toBe('Update to 0.8.0');
-		expect(upd.disabledReason).toBe(NOT_AVAILABLE_ON_SERVER);
+		expect(upd.disabledReason).toBe(NOT_AVAILABLE_ON_SERVER_YET);
 	});
 
 	it('leaves Update enabled on the desktop', () => {
@@ -103,7 +103,7 @@ describe('Installed Update — install gate', () => {
 			result.current.actionsFor(item).update.run();
 		});
 		await waitFor(() => expect(result.current.status?.tone).toBe('err'));
-		expect(result.current.status?.text).toContain(NOT_AVAILABLE_ON_SERVER);
+		expect(result.current.status?.text).toContain(NOT_AVAILABLE_ON_SERVER_YET);
 		expect(result.current.status?.text).not.toMatch(/not implemented/i);
 	});
 });
