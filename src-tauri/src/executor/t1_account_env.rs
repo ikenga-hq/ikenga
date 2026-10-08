@@ -12,7 +12,8 @@
 //! passes them on by the inheritance it already has: the PTY rebuild
 //! (`pty::spawn_inner`: `env_clear` + every var that is not host-only), Chi
 //! runs and engine CLIs (`chi_exec::inherit_scrubbed_env`), the detached
-//! chi-runner, pkg MCP servers and sidecars (no `env_clear`). Nothing in the
+//! chi-runner, and pkg MCP servers and sidecars (`server/rpc_exec.rs`
+//! `sidecar_spec`: the child's environment minus host-only names). Nothing in the
 //! child reads the file, so the child needs no access logic and cannot be
 //! tricked into reading another account's file.
 //!
