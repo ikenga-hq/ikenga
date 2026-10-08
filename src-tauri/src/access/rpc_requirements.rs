@@ -255,6 +255,7 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     // ── atelier / git ──
     ("atelier_file_read", req!(shared[Files])),
     ("action_git_branch", req!(shared[Files])),
+    ("git_status", req!(shared[Files])),
     ("atelier_file_write", req!(shared[Files, Dispatch])),
     // ── slice 8 ──
     ("pin_screenshot_write", req!(shared[Files])),

@@ -505,6 +505,59 @@ pub(super) async fn action_git_branch(state: &AppState, args: &Value) -> RpcResp
     respond("action_git_branch", r)
 }
 
+/// Read-only, project-confined `git_status` (WP-G): branch name, ahead/behind,
+/// and per-file status for the title-row branch chip and explorer badges.
+///
+/// Refuses paths outside the fs allowlist / project root with an error.
+/// If `root` is not a git repository, returns `null` (None).
+pub(super) async fn git_status(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let root_arg: Option<String> = targ(args, &["root", "repo", "path"]).ok();
+        let project_id_arg: Option<String> = targ(args, &["projectId", "project_id"]).ok();
+
+        let root_str = match (root_arg, project_id_arg) {
+            (Some(r), _) => r,
+            (None, Some(pid)) => {
+                let pool = state
+                    .pa_db
+                    .as_ref()
+                    .ok_or(super::rpc::NO_DB)?
+                    .ensure_pool()
+                    .await?;
+                let resolved: Option<String> =
+                    sqlx::query_scalar("SELECT root_path FROM projects WHERE id = ?")
+                        .bind(&pid)
+                        .fetch_optional(&pool)
+                        .await
+                        .map_err(|e| format!("db query project: {e}"))?;
+                resolved.ok_or_else(|| format!("project `{pid}` not found"))?
+            }
+            (None, None) => return Err("`root` is required".to_string()),
+        };
+
+        fs_boundary(state)?;
+        let root = PathBuf::from(&root_str);
+        if !root.is_absolute() {
+            return Err("`root` must be an absolute path".to_string());
+        }
+        if root
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("`root` may not contain `..`".to_string());
+        }
+
+        let canonical_root = state.path_guard.resolve_deep(&root_str)?;
+        if !canonical_root.is_dir() {
+            return Err(format!("`{}` is not a directory", canonical_root.display()));
+        }
+
+        git::run_hardened_git_status(&canonical_root).await
+    }
+    .await;
+    respond("git_status", r)
+}
+
 // ─── pkg manifests + scaffold (WP-19 slice 8) ────────────────────────────────
 //
 // None of these needs the live pkg kernel: a preview parses one manifest, the
@@ -1411,7 +1464,12 @@ mod tests {
         let p = d.allowed.join("big.txt");
         let text = "abcdefghijklmnopqrstuvwxyz0123456789\n".repeat(3 * 1024 * 1024 / 37 + 1);
         assert!(text.len() > 3 * 1024 * 1024);
-        ok(&d.router, "fs_write", json!({ "path": s(&p), "content": text })).await;
+        ok(
+            &d.router,
+            "fs_write",
+            json!({ "path": s(&p), "content": text }),
+        )
+        .await;
         assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
     }
 
@@ -1790,7 +1848,8 @@ mod tests {
         std::fs::create_dir(a.join("newdir")).unwrap();
         let newdir = s(&a.join("newdir"));
 
-        let args = json!({ "from": s(&a.join("note.txt")), "toName": "moved.txt", "toDir": newdir });
+        let args =
+            json!({ "from": s(&a.join("note.txt")), "toName": "moved.txt", "toDir": newdir });
         let dest = ok(r, "fs_rename", args).await;
         assert_eq!(dest, s(&a.join("newdir/moved.txt")));
         assert!(!a.join("note.txt").exists());
@@ -1798,7 +1857,8 @@ mod tests {
 
         // Destination exists in the target folder.
         std::fs::write(a.join("other.txt"), b"o").unwrap();
-        let args = json!({ "from": s(&a.join("other.txt")), "toName": "moved.txt", "toDir": newdir });
+        let args =
+            json!({ "from": s(&a.join("other.txt")), "toName": "moved.txt", "toDir": newdir });
         let e = err(r, "fs_rename", args).await;
         assert!(e.contains("destination exists"), "{e}");
 
@@ -2711,6 +2771,179 @@ mod tests {
                 ok(&r, "action_git_branch", json!({ "root": s(&wt) })).await,
                 Value::Null
             );
+        }
+
+        // ── git_status (WP-G) ───────────────────────────────────────────────
+
+        #[tokio::test]
+        async fn git_status_refuses_roots_the_guard_refuses() {
+            let d = daemon();
+            let r = &d.router;
+            let mut roots = vec![
+                s(&d.outside),
+                s(&d.outside.join("repo")),
+                format!("{}/..", s(&d.allowed)),
+                "relative".to_string(),
+            ];
+            #[cfg(unix)]
+            {
+                symlink(&d.outside, &d.allowed.join("link_status"));
+                roots.push(s(&d.allowed.join("link_status")));
+            }
+            for root in roots {
+                let e = err(r, "git_status", json!({ "root": root })).await;
+                assert!(e.starts_with("git_status: "), "{root}: {e}");
+            }
+            let e = err(r, "git_status", json!({})).await;
+            assert!(e.contains("`root` is required"), "{e}");
+        }
+
+        #[tokio::test]
+        async fn git_status_not_a_repo_returns_null() {
+            let d = daemon();
+            let r = &d.router;
+            let non_repo = d.allowed.join("not-a-repo");
+            std::fs::create_dir_all(&non_repo).unwrap();
+            let got = ok(r, "git_status", json!({ "root": s(&non_repo) })).await;
+            assert_eq!(got, Value::Null);
+        }
+
+        #[tokio::test]
+        async fn git_status_malicious_repo_config_never_executes_scripts() {
+            let d = daemon();
+            let r = &d.router;
+            let repo = d.allowed.join("evil-repo");
+            std::fs::create_dir_all(&repo).unwrap();
+
+            assert!(std::process::Command::new("git")
+                .arg("init")
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success());
+
+            let marker = repo.join("pwned.marker");
+            let script = repo.join("evil.sh");
+            std::fs::write(
+                &script,
+                format!("#!/bin/sh\necho evil > \"{}\"\n", marker.display()),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&script).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&script, perms).unwrap();
+            }
+
+            let git_config = repo.join(".git/config");
+            let malicious_cfg = format!(
+                "\n[core]\n    fsmonitor = \"{}\"\n    hooksPath = \"{}\"\n[filter \"evil\"]\n    clean = \"{}\"\n    smudge = \"{}\"\n[diff \"evil\"]\n    textconv = \"{}\"\n    command = \"{}\"\n",
+                script.display(),
+                repo.display(),
+                script.display(),
+                script.display(),
+                script.display(),
+                script.display(),
+            );
+            let mut cfg_content = std::fs::read_to_string(&git_config).unwrap();
+            cfg_content.push_str(&malicious_cfg);
+            std::fs::write(&git_config, cfg_content).unwrap();
+
+            std::fs::write(repo.join(".gitattributes"), "* filter=evil diff=evil\n").unwrap();
+            std::fs::write(repo.join("file.txt"), "hello\n").unwrap();
+
+            let got = ok(r, "git_status", json!({ "root": s(&repo) })).await;
+            assert!(
+                got.is_object(),
+                "expected git status result object, got: {got:?}"
+            );
+            assert!(
+                !marker.exists(),
+                "malicious script was executed! Marker file exists at {}",
+                marker.display()
+            );
+        }
+
+        #[tokio::test]
+        async fn git_status_returns_matching_shape_for_valid_repo() {
+            let d = daemon();
+            let r = &d.router;
+            let repo = d.allowed.join("valid-repo");
+            std::fs::create_dir_all(&repo).unwrap();
+
+            assert!(std::process::Command::new("git")
+                .arg("init")
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success());
+
+            std::fs::write(repo.join("tracked.txt"), "initial\n").unwrap();
+            assert!(std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "add",
+                    "tracked.txt"
+                ])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success());
+            assert!(std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "init"
+                ])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success());
+
+            std::fs::write(repo.join("tracked.txt"), "modified\n").unwrap();
+            std::fs::write(repo.join("untracked.txt"), "untracked\n").unwrap();
+            std::fs::write(repo.join("staged.txt"), "staged\n").unwrap();
+            assert!(std::process::Command::new("git")
+                .args(["add", "staged.txt"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success());
+
+            let got = ok(r, "git_status", json!({ "root": s(&repo) })).await;
+            assert!(got.is_object());
+            assert!(got["branch"].is_string());
+            assert_eq!(got["detached"], false);
+            assert_eq!(got["modified"], 3);
+            assert!(got["staged"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["path"] == "staged.txt"));
+            assert!(got["unstaged"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["path"] == "tracked.txt"));
+            assert!(got["untracked"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["path"] == "untracked.txt"));
         }
     }
 }

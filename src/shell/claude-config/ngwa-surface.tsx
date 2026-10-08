@@ -488,7 +488,10 @@ function BrowseSurface({
 	// sub-header rather than interleaving. Only emitted when more than one engine
 	// is active — a single active engine collapses to the flat list so the
 	// Claude-only view is byte-identical to today (regression guard).
-	const engineGroups = useMemo<Array<{ system: NgwaSystemId; items: EngineConfigItem[] }> | null>(() => {
+	const engineGroups = useMemo<Array<{
+		system: NgwaSystemId;
+		items: EngineConfigItem[];
+	}> | null>(() => {
 		const activeCount = present.filter((e) => activeSystems.has(e)).length;
 		if (activeCount <= 1) return null;
 		const by = new Map<NgwaSystemId, EngineConfigItem[]>();
@@ -742,7 +745,7 @@ function StoreSurface({ store, isLoading, error, onEdit, projectScopes }: StoreP
 						className="ngwa-btn"
 						disabled={autoSweep.isPending}
 						title="Re-check every auto-update primitive (curated catalog installs) against its remote and refresh the stale ones in place."
-						onClick={() => autoSweep.mutate()}
+						onClick={() => autoSweep.mutate(undefined)}
 					>
 						{autoSweep.isPending ? 'Checking…' : 'Check updates'}
 					</button>
@@ -2271,29 +2274,28 @@ function StoreDetail({
 				{/* per-scope enable/disable toggles */}
 				<Section label="Per-scope state">
 					<div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-						{[
-							{ key: 'workspace' as ClaudeStoreScope, label: 'Personal' },
-							...projectScopes,
-						].map((s) => {
-							const isOn = enabledSet.has(s.key);
-							return (
-								<label key={s.key} className="ngwa-toggle">
-									<span
-										className={cn('ngwa-sw', isOn && 'on')}
-										role="button"
-										tabIndex={0}
-										onClick={() =>
-											isOn
-												? disable.mutate({ kind: entry.kind, name: entry.name, scope: s.key })
-												: enable.mutate({ kind: entry.kind, name: entry.name, scope: s.key })
-										}
-									/>
-									<span className="ngwa-stword" style={{ textTransform: 'none' }}>
-										{s.label}
-									</span>
-								</label>
-							);
-						})}
+						{[{ key: 'workspace' as ClaudeStoreScope, label: 'Personal' }, ...projectScopes].map(
+							(s) => {
+								const isOn = enabledSet.has(s.key);
+								return (
+									<label key={s.key} className="ngwa-toggle">
+										<span
+											className={cn('ngwa-sw', isOn && 'on')}
+											role="button"
+											tabIndex={0}
+											onClick={() =>
+												isOn
+													? disable.mutate({ kind: entry.kind, name: entry.name, scope: s.key })
+													: enable.mutate({ kind: entry.kind, name: entry.name, scope: s.key })
+											}
+										/>
+										<span className="ngwa-stword" style={{ textTransform: 'none' }}>
+											{s.label}
+										</span>
+									</label>
+								);
+							}
+						)}
 						{disable.isError && (
 							<span
 								className="ngwa-stword"

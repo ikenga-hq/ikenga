@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { useShellStore } from '@/lib/shell/shell-store';
-import { pkgSidecarCall } from '@/lib/tauri-cmd';
+import { gitStatus, isRemoteWebSession, pkgSidecarCall } from '@/lib/tauri-cmd';
 
 export type GitFileStatus = 'modified' | 'added' | 'untracked' | 'conflicted';
 
@@ -22,6 +22,68 @@ export function useGitStatus() {
 			}
 
 			const repoRoot = project.root_path;
+
+			const buildMapFromChanges = (changes: {
+				conflicted?: Array<{ path?: string }>;
+				staged?: Array<{ path?: string }>;
+				unstaged?: Array<{ path?: string }>;
+				untracked?: Array<{ path?: string }>;
+			}) => {
+				const files = new Map<string, GitFileStatus>();
+				const dirtyFolders = new Set<string>();
+
+				const addPath = (relOrAbsPath: string, status: GitFileStatus) => {
+					const fullPath = relOrAbsPath.startsWith('/')
+						? relOrAbsPath
+						: `${repoRoot}/${relOrAbsPath}`;
+
+					files.set(fullPath, status);
+
+					// Propagate dirty state up folder hierarchy
+					let cur = fullPath;
+					while (true) {
+						const idx = cur.lastIndexOf('/');
+						if (idx <= 0) break;
+						cur = cur.slice(0, idx);
+						if (cur === repoRoot || !cur.startsWith(repoRoot)) break;
+						dirtyFolders.add(cur);
+					}
+				};
+
+				if (Array.isArray(changes.conflicted)) {
+					for (const item of changes.conflicted) {
+						if (item?.path) addPath(item.path, 'conflicted');
+					}
+				}
+				if (Array.isArray(changes.staged)) {
+					for (const item of changes.staged) {
+						if (item?.path) addPath(item.path, 'added');
+					}
+				}
+				if (Array.isArray(changes.unstaged)) {
+					for (const item of changes.unstaged) {
+						if (item?.path) addPath(item.path, 'modified');
+					}
+				}
+				if (Array.isArray(changes.untracked)) {
+					for (const item of changes.untracked) {
+						if (item?.path) addPath(item.path, 'untracked');
+					}
+				}
+
+				return { files, dirtyFolders };
+			};
+
+			if (isRemoteWebSession()) {
+				try {
+					const res = await gitStatus({ root: repoRoot, projectId: activeProjectId ?? undefined });
+					if (!res) return { files: new Map(), dirtyFolders: new Set() };
+					return buildMapFromChanges(res);
+				} catch {
+					return { files: new Map(), dirtyFolders: new Set() };
+				}
+			}
+
 			const request = {
 				jsonrpc: '2.0',
 				id: 1,
@@ -52,49 +114,7 @@ export function useGitStatus() {
 					return { files: new Map(), dirtyFolders: new Set() };
 				}
 
-				const files = new Map<string, GitFileStatus>();
-				const dirtyFolders = new Set<string>();
-
-				const addPath = (relOrAbsPath: string, status: GitFileStatus) => {
-					const fullPath = relOrAbsPath.startsWith('/')
-						? relOrAbsPath
-						: `${repoRoot}/${relOrAbsPath}`;
-
-					files.set(fullPath, status);
-
-					// Propagate dirty state up folder hierarchy
-					let cur = fullPath;
-					while (true) {
-						const idx = cur.lastIndexOf('/');
-						if (idx <= 0) break;
-						cur = cur.slice(0, idx);
-						if (cur === repoRoot || !cur.startsWith(repoRoot)) break;
-						dirtyFolders.add(cur);
-					}
-				};
-
-				if (Array.isArray(changes.conflicted)) {
-					for (const item of changes.conflicted) {
-						if (item.path) addPath(item.path, 'conflicted');
-					}
-				}
-				if (Array.isArray(changes.staged)) {
-					for (const item of changes.staged) {
-						if (item.path) addPath(item.path, 'added');
-					}
-				}
-				if (Array.isArray(changes.unstaged)) {
-					for (const item of changes.unstaged) {
-						if (item.path) addPath(item.path, 'modified');
-					}
-				}
-				if (Array.isArray(changes.untracked)) {
-					for (const item of changes.untracked) {
-						if (item.path) addPath(item.path, 'untracked');
-					}
-				}
-
-				return { files, dirtyFolders };
+				return buildMapFromChanges(changes);
 			} catch {
 				return { files: new Map(), dirtyFolders: new Set() };
 			}

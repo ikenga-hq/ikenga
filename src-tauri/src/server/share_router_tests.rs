@@ -177,7 +177,11 @@ fn has_cost_key(v: &Value) -> bool {
 fn read_text(resp: &Value) -> String {
     let bytes: Vec<u8> = resp["data"]["bytes"]
         .as_array()
-        .map(|a| a.iter().filter_map(|b| b.as_u64().map(|b| b as u8)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|b| b.as_u64().map(|b| b as u8))
+                .collect()
+        })
         .unwrap_or_default();
     String::from_utf8_lossy(&bytes).into_owned()
 }
@@ -421,4 +425,50 @@ async fn share_project_info_says_why_a_folderless_project_cannot_be_shared() {
     )
     .unwrap();
     assert_eq!(body["error"], "not_found: no such project", "{body}");
+}
+
+#[tokio::test]
+async fn git_status_under_share_confinement() {
+    let c = child().await;
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+
+    // 1. Inside the shared project: git_status is allowed for a share member (viewer).
+    // (c.project is not a git repo, so it returns ok: true with data: null).
+    let inside = call(
+        &c,
+        Some("viewer"),
+        "git_status",
+        json!({ "root": s(&c.project) }),
+    )
+    .await;
+    assert_eq!(inside["ok"], true, "{inside}");
+    assert_eq!(inside["data"], Value::Null);
+
+    // 2. A path outside the shared project: refused for a share member.
+    let outside_dir = c.outside.parent().unwrap();
+    let refused = call(
+        &c,
+        Some("viewer"),
+        "git_status",
+        json!({ "root": s(outside_dir) }),
+    )
+    .await;
+    assert_eq!(refused["ok"], false, "{refused}");
+
+    // 3. A request specifying a different projectId: refused.
+    let bad_proj = call(
+        &c,
+        Some("viewer"),
+        "git_status",
+        json!({ "root": s(&c.project), "projectId": "other-project" }),
+    )
+    .await;
+    assert_eq!(bad_proj["ok"], false, "{bad_proj}");
+    assert!(
+        bad_proj["error"]
+            .as_str()
+            .unwrap()
+            .contains("must name the shared project"),
+        "{bad_proj}"
+    );
 }

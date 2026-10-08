@@ -498,7 +498,9 @@ pub async fn rpc_handler(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
             if pkg_id.is_empty() {
-                return Json(RpcResponse::error("pkg_activity_bar_set_badge: `pkgId` is required"));
+                return Json(RpcResponse::error(
+                    "pkg_activity_bar_set_badge: `pkgId` is required",
+                ));
             }
             // Absent or null clears the badge; anything else must parse.
             let badge: Option<crate::pkg::registries::ActivityBarBadge> =
@@ -517,7 +519,9 @@ pub async fn rpc_handler(
             // `activity_bar` registry; the server has no desktop event to emit.
             match state.pkg_index.set_badge(pkg_id, badge) {
                 Ok(true) => RpcResponse::success(()),
-                Ok(false) => RpcResponse::error(format!("no activity-bar entry for pkg `{pkg_id}`")),
+                Ok(false) => {
+                    RpcResponse::error(format!("no activity-bar entry for pkg `{pkg_id}`"))
+                }
                 Err(e) => RpcResponse::error(format!("{e:#}")),
             }
         }
@@ -527,10 +531,9 @@ pub async fn rpc_handler(
         // No trust store, so no pkg's trust can be evaluated. An empty list
         // would read as "nothing to trust"; the refusal names why, and the
         // frontend renders it as "not available on this server".
-        "pkg_trust_list" => RpcResponse::error(format!(
-            "pkg_trust_list: {}",
-            rpc_claude::TRUST_NOT_SERVED
-        )),
+        "pkg_trust_list" => {
+            RpcResponse::error(format!("pkg_trust_list: {}", rpc_claude::TRUST_NOT_SERVED))
+        }
         // What the daemon can see: `--pkgs-dir` entries that failed to load,
         // are api-incompatible, or a registry rejected — plus one
         // `records_unavailable` row saying install-record health is not
@@ -843,6 +846,7 @@ pub async fn rpc_handler(
         "atelier_file_read" => rpc_files::atelier_file_read(&state, &payload.args),
         "atelier_file_write" => rpc_files::atelier_file_write(&state, &payload.args),
         "action_git_branch" => rpc_files::action_git_branch(&state, &payload.args).await,
+        "git_status" => rpc_files::git_status(&state, &payload.args).await,
 
         // --- Pin screenshots, agent-config scaffold, pkg manifest / workspace
         //     / scaffold helpers (WP-19 slice 8) ---

@@ -17,9 +17,13 @@ import type { ReactElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const sidecarMock = vi.hoisted(() => vi.fn());
+const isRemoteWebSessionMock = vi.hoisted(() => vi.fn(() => false));
+const gitStatusMock = vi.hoisted(() => vi.fn());
 vi.mock('@/lib/tauri-cmd', async (orig) => ({
 	...(await orig<typeof import('@/lib/tauri-cmd')>()),
 	pkgSidecarCall: sidecarMock,
+	isRemoteWebSession: isRemoteWebSessionMock,
+	gitStatus: gitStatusMock,
 }));
 
 import { usePaneStore } from '@/lib/panes/pane-store';
@@ -59,6 +63,9 @@ function tabbables(root: Element) {
 
 beforeEach(() => {
 	sidecarMock.mockReset();
+	isRemoteWebSessionMock.mockReset();
+	isRemoteWebSessionMock.mockReturnValue(false);
+	gitStatusMock.mockReset();
 	useShellStore.setState({ projects: [PROJECT], activeProjectId: PROJECT.id });
 });
 afterEach(cleanup);
@@ -113,6 +120,29 @@ describe('<TitleRow />', () => {
 		const stdin = JSON.parse(sidecarMock.mock.calls[0]![3].stdin);
 		expect(stdin.method).toBe('repo.snapshot');
 		expect(stdin.params).toEqual({ repo: PROJECT.root_path });
+	});
+
+	it('renders branch chip in remote web session via gitStatus RPC', async () => {
+		isRemoteWebSessionMock.mockReturnValue(true);
+		gitStatusMock.mockResolvedValue({
+			branch: 'feat/remote-branch',
+			detached: false,
+			headSha: '1234567890abcdef',
+			staged: [{ path: 'foo.ts' }],
+			unstaged: [{ path: 'bar.ts' }],
+			untracked: [],
+			conflicted: [],
+		});
+		render(<TitleRow mac />);
+		await screen.findByTestId('title-branch-chip');
+		const chip = screen.getByTestId('title-branch-chip');
+		expect(chip.textContent).toContain('feat/remote-branch');
+		expect(gitStatusMock).toHaveBeenCalledWith({
+			root: PROJECT.root_path,
+			projectId: PROJECT.id,
+		});
+		expect(sidecarMock).not.toHaveBeenCalled();
+		isRemoteWebSessionMock.mockReturnValue(false);
 	});
 
 	it('hides the branch chip entirely when the git pkg is absent', async () => {
@@ -207,7 +237,17 @@ describe('<TitleRow /> — native-menu cascade (non-mac)', () => {
 		render(<TitleRow mac={false} />);
 		const button = await screen.findByTestId('native-menu-button');
 		await user.click(button);
-		for (const label of ['Ikenga', 'File', 'Edit', 'View', 'Project', 'Chi', 'Ngwa', 'Window', 'Help']) {
+		for (const label of [
+			'Ikenga',
+			'File',
+			'Edit',
+			'View',
+			'Project',
+			'Chi',
+			'Ngwa',
+			'Window',
+			'Help',
+		]) {
 			expect(await screen.findByText(label)).toBeTruthy();
 		}
 	});
