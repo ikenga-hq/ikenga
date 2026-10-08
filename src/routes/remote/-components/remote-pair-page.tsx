@@ -33,11 +33,22 @@ type Phase =
 export function outcomeCopy(o: PairOutcome): { title: string; body: string } {
 	switch (o.kind) {
 		case 'allowed':
+			if (o.cookieUnconfirmed) {
+				return {
+					title: "Paired, but couldn't confirm the pairing cookie",
+					body: `The computer allowed this device, but checking that this browser kept the device credential failed (${o.cookieUnconfirmed}). You can still open your workspace; if it asks you to pair again, the browser didn't keep it.`,
+				};
+			}
 			return { title: 'Paired', body: 'Opening your workspace…' };
 		case 'cookie_rejected':
 			return {
 				title: "This browser didn't keep the pairing",
 				body: "The computer allowed this device, but this connection isn't HTTPS, so the browser dropped the device credential. Pair over a Tailscale address, serve it over HTTPS, or start ikenga-server with --insecure-cookie, then remove this device on the computer and pair again.",
+			};
+		case 'auth_unavailable':
+			return {
+				title: "Paired, but the computer couldn't confirm it yet",
+				body: "The computer allowed this device, but its sign-in check is temporarily unavailable, so it couldn't confirm this browser kept the device credential. Open your workspace to try again; if it keeps failing, restart ikenga-server on the computer.",
 			};
 		case 'denied':
 			return {
@@ -119,8 +130,13 @@ export function RemotePairPage({
 		});
 		if (ctl.signal.aborted) return;
 		setPhase({ kind: 'done', outcome });
-		if (outcome.kind === 'allowed') onPaired();
+		// An unconfirmed cookie waits on the warning until the user clicks
+		// "Open your workspace" (D-16, D-17: no auto-continue).
+		if (outcome.kind === 'allowed' && !outcome.cookieUnconfirmed) onPaired();
 	};
+
+	const unconfirmed =
+		phase.kind === 'done' && phase.outcome.kind === 'allowed' && !!phase.outcome.cookieUnconfirmed;
 
 	const card =
 		'w-full max-w-[390px] overflow-hidden rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] text-[var(--fg)] shadow-2xl';
@@ -196,14 +212,27 @@ export function RemotePairPage({
 				)}
 
 				{phase.kind === 'done' && (
-					<div className="flex flex-col gap-3 p-4" role="status">
+					<div
+						className="flex flex-col gap-3 p-4"
+						role={unconfirmed ? 'alert' : 'status'}
+						data-pair-warning={unconfirmed ? 'cookie-unconfirmed' : undefined}
+					>
 						<h2 className="m-0 text-[length:var(--text-body)] font-semibold">
 							{outcomeCopy(phase.outcome).title}
 						</h2>
 						<p className="m-0 text-[length:var(--text-body-sm)] leading-relaxed text-[var(--fg-muted)]">
 							{outcomeCopy(phase.outcome).body}
 						</p>
-						{phase.outcome.kind !== 'allowed' && (
+						{(phase.outcome.kind === 'auth_unavailable' || unconfirmed) && (
+							<button
+								type="button"
+								onClick={() => onPaired()}
+								className="rounded-md border border-[var(--border)] px-4 py-2 text-[length:var(--text-body-sm)] hover:bg-[var(--bg-hover,var(--bg-sunken))]"
+							>
+								Open your workspace
+							</button>
+						)}
+						{phase.outcome.kind !== 'allowed' && phase.outcome.kind !== 'auth_unavailable' && (
 							<button
 								type="button"
 								onClick={() => {

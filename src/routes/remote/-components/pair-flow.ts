@@ -64,13 +64,30 @@ export function deviceNameFromUA(ua: string): { name: string; platform: string |
 
 /** How a run ended, for the page's outcome states. */
 export type PairOutcome =
-	| { kind: 'allowed'; deviceId: string; tier: string }
+	| {
+			kind: 'allowed';
+			deviceId: string;
+			tier: string;
+			/**
+			 * D-16: the cookie probe answered something unexpected (a proxy 502,
+			 * a network drop), so whether the browser kept the device cookie is
+			 * unconfirmed. Pairing still proceeds, but the page says so. The
+			 * value is the reason, e.g. "the check answered HTTP 502".
+			 */
+			cookieUnconfirmed?: string;
+	  }
 	/**
 	 * The host allowed the device, but the browser didn't keep the
 	 * `ikenga_device` cookie — a `Secure` cookie over plain HTTP off
 	 * loopback (review M1). The device holds nothing.
 	 */
 	| { kind: 'cookie_rejected'; deviceId: string }
+	/**
+	 * The host allowed the device, but its credential check answered 503
+	 * `auth_unavailable`, so whether the browser kept the cookie is unknown.
+	 * Not a rejection: retrying (opening the workspace) may just work.
+	 */
+	| { kind: 'auth_unavailable'; deviceId: string }
 	| { kind: 'denied' }
 	| { kind: 'expired' }
 	| { kind: 'burned' }
@@ -226,10 +243,14 @@ export async function runPairing(
 		if (state === 'allowed') {
 			const deviceId = String(st.body.device_id ?? '');
 			// The status response set the cookie — if the browser kept it.
-			if ((await probeDeviceCookie(f, deviceId)) === 'missing') {
-				return { kind: 'cookie_rejected', deviceId };
+			const cookie = await probeDeviceCookieDetailed(f, deviceId);
+			if (cookie.state === 'missing') return { kind: 'cookie_rejected', deviceId };
+			if (cookie.state === 'auth_unavailable') return { kind: 'auth_unavailable', deviceId };
+			const tier = String(st.body.tier ?? '');
+			if (cookie.state === 'unknown') {
+				return { kind: 'allowed', deviceId, tier, cookieUnconfirmed: cookie.detail };
 			}
-			return { kind: 'allowed', deviceId, tier: String(st.body.tier ?? '') };
+			return { kind: 'allowed', deviceId, tier };
 		}
 		const done = STATE_OUTCOME[state];
 		if (done) return done;
@@ -239,14 +260,26 @@ export async function runPairing(
 
 /**
  * After `allowed`: did the browser keep the device cookie? `access_status`
- * over `/api/rpc` with the cookie only (review M1). `missing` when the
- * server doesn't see this device's credential; `unknown` when it can't be
- * asked (network) — the boot path finds out then.
+ * over `/api/rpc` with the cookie only (review M1). `missing` only on
+ * positive evidence: a 401, or a 200 that names another (or no) credential.
+ * A 503 `auth_unavailable` means the server couldn't check credentials at
+ * all; any other failure (network, 5xx) is `unknown` — the boot path finds
+ * out then. Neither is reported as a dropped cookie.
  */
 export async function probeDeviceCookie(
 	f: typeof fetch,
 	deviceId: string
-): Promise<'ok' | 'missing' | 'unknown'> {
+): Promise<CookieProbeState> {
+	return (await probeDeviceCookieDetailed(f, deviceId)).state;
+}
+
+type CookieProbeState = 'ok' | 'missing' | 'auth_unavailable' | 'unknown';
+
+/** `probeDeviceCookie` plus, for `unknown`, why (for the D-16 warning). */
+export async function probeDeviceCookieDetailed(
+	f: typeof fetch,
+	deviceId: string
+): Promise<{ state: CookieProbeState; detail?: string }> {
 	let res: { status: number; body: Json };
 	try {
 		res = await call(f, '/api/rpc', {
@@ -255,11 +288,15 @@ export async function probeDeviceCookie(
 			body: JSON.stringify({ cmd: 'access_status', args: {} }),
 		});
 	} catch {
-		return 'unknown';
+		return { state: 'unknown', detail: "the check didn't reach the computer" };
 	}
 	const data = res.body.data as
 		| { credential?: { via?: string; deviceId?: string | null } }
 		| undefined;
-	const cred = res.status === 200 && res.body.ok ? data?.credential : undefined;
-	return cred?.via === 'device' && cred.deviceId === deviceId ? 'ok' : 'missing';
+	if (res.status === 503 && res.body.code === 'auth_unavailable') return { state: 'auth_unavailable' };
+	if (res.status === 401) return { state: 'missing' };
+	if (res.status !== 200) return { state: 'unknown', detail: `the check answered HTTP ${res.status}` };
+	if (!res.body.ok) return { state: 'unknown', detail: 'the check returned an error' };
+	const cred = data?.credential;
+	return { state: cred?.via === 'device' && cred.deviceId === deviceId ? 'ok' : 'missing' };
 }

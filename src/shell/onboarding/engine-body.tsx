@@ -26,6 +26,7 @@ import { useEffect, useState } from 'react';
 
 import { Button } from '@/components/ui/button';
 import { StatusChip } from '@/components/ui/status-chip';
+import { AuthPill } from './auth-pill';
 import { cn } from '@/components/ui/utils';
 import { WslUnavailableChip, WslUnavailableNotice } from '@/components/wsl-unavailable-notice';
 import { firstAgentUnavailableText } from '@/lib/agent-unavailable';
@@ -582,7 +583,9 @@ export function EngineCard({ meta, entry, selected, onSelect, onOpenDocs }: Engi
 						<span className="font-mono text-[11px]">{entry.agent.version}</span>
 					</Pill>
 				)}
-				{entry.status === 'detected' && <AuthPill authed={entry.agent?.authed ?? null} />}
+				{entry.status === 'detected' && (
+					<AuthPill authed={entry.agent?.authed ?? null} hint={entry.agent?.auth_hint ?? null} />
+				)}
 			</div>
 
 			{/* D-18: an unchecked card shows only its chip — the WSL reason is in
@@ -717,16 +720,6 @@ function Pill({ children }: { children: React.ReactNode }) {
 			{children}
 		</span>
 	);
-}
-
-function AuthPill({ authed }: { authed: boolean | null }) {
-	if (authed === true) {
-		return <StatusChip tone="live">signed in</StatusChip>;
-	}
-	if (authed === false) {
-		return <StatusChip tone="warn">auth required</StatusChip>;
-	}
-	return null;
 }
 
 // ── Pure helpers (testable without DOM) ─────────────────────────────────

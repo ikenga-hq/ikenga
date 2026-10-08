@@ -53,6 +53,9 @@ vi.mock('@/shell/pkg-auto-updater', async () => ({
 vi.mock('@/shell/connector-banner', async () => ({
 	ConnectorBanner: make(await import('react'), 'connector'),
 }));
+vi.mock('@/shell/terminal-restore-banner', async () => ({
+	TerminalRestoreBanner: make(await import('react'), 'terminal-restore'),
+}));
 vi.mock('@/shell/pwa/pwa-update-banner', async () => ({
 	PwaUpdateBanner: make(await import('react'), 'pwa-update'),
 }));
@@ -89,6 +92,7 @@ describe('<BannerSlot />', () => {
 		expect(BANNER_QUEUE.map((b) => `${b.tier}:${b.id}`)).toEqual([
 			'violation:connection',
 			'violation:trust-review',
+			'violation:terminal-restore',
 			'update:updater',
 			'update:server-update',
 			'update:pkg-auto-updater',

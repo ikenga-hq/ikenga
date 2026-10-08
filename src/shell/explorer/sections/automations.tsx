@@ -8,6 +8,7 @@ import { workflowGraphsFromManifest } from '@/shell/ngwa/use-pkg-workflow-graphs
 import { cronToWords } from '@/shell/automations/cron-words';
 import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import type { ExplorerSectionContext } from '../section-registry';
+import { errorMessageOf, SectionErrorRow } from '../section-error-row';
 
 export interface AutomationItem {
 	id: string;
@@ -28,9 +29,12 @@ export interface AutomationItem {
  * `installed[]` and reads each pkg's manifest through the existing
  * `pkg_preview_manifest` command. No new Tauri command, no ACL change.
  *
+ * Pkgs whose manifest couldn't be read are pushed onto `unreadable` (by id)
+ * so the section can say so instead of implying they declare nothing.
+ *
  * Exported for the section's test.
  */
-export async function listDeclaredWorkflows(): Promise<AutomationItem[]> {
+export async function listDeclaredWorkflows(unreadable: string[] = []): Promise<AutomationItem[]> {
 	const status = await pkgKernelStatus();
 	const installed = (status.installed ?? []).filter((p) => p.enabled && p.install_path);
 
@@ -43,8 +47,11 @@ export async function listDeclaredWorkflows(): Promise<AutomationItem[]> {
 					`${pkg.install_path}/manifest.json`,
 					(manifest as { workflows?: unknown }).workflows,
 				);
-			} catch {
-				// One unreadable manifest must not blank the whole section.
+			} catch (err) {
+				// One unreadable manifest must not blank the whole section —
+				// but it is reported, not read as "declares no workflows".
+				console.warn(`[explorer/automations] manifest read failed for ${pkg.id}`, err);
+				unreadable.push(pkg.id);
 				return [];
 			}
 		}),
@@ -87,17 +94,22 @@ export async function listCronSchedules(): Promise<AutomationItem[]> {
 }
 
 export function AutomationsSection({ projectId }: ExplorerSectionContext) {
-	const query = useQuery<AutomationItem[]>({
+	const query = useQuery<{ items: AutomationItem[]; unreadable: string[] }>({
 		queryKey: ['explorer-automations', projectId],
 		queryFn: async () => {
-			const [workflows, schedules] = await Promise.all([listDeclaredWorkflows(), listCronSchedules()]);
-			return [...schedules, ...workflows];
+			const unreadable: string[] = [];
+			const [workflows, schedules] = await Promise.all([
+				listDeclaredWorkflows(unreadable),
+				listCronSchedules(),
+			]);
+			return { items: [...schedules, ...workflows], unreadable };
 		},
 		staleTime: 30_000,
 		retry: false,
 	});
 
-	const items = query.data ?? [];
+	const items = query.data?.items ?? [];
+	const unreadable = query.data?.unreadable ?? [];
 
 	const openAutomations = useCallback(() => {
 		const { focusedId, addTab } = usePaneStore.getState();
@@ -113,6 +125,29 @@ export function AutomationsSection({ projectId }: ExplorerSectionContext) {
 		const { focusedId, addTab } = usePaneStore.getState();
 		addTab(focusedId, { kind: 'route', path: '/automations?view=runs' });
 	}, []);
+
+	if (query.isError) {
+		return (
+			<SectionErrorRow
+				message="Couldn't load automations"
+				detail={errorMessageOf(query.error)}
+				onRetry={() => void query.refetch()}
+			/>
+		);
+	}
+
+	const unreadableRow =
+		unreadable.length > 0 ? (
+			<SectionErrorRow
+				message={`Couldn't read workflows for ${unreadable.length === 1 ? '1 package' : `${unreadable.length} packages`}`}
+				detail={unreadable.join(', ')}
+				onRetry={() => void query.refetch()}
+			/>
+		) : null;
+
+	if (items.length === 0 && unreadableRow) {
+		return <div className="py-1">{unreadableRow}</div>;
+	}
 
 	if (items.length === 0) {
 		return (
@@ -134,6 +169,7 @@ export function AutomationsSection({ projectId }: ExplorerSectionContext) {
 
 	return (
 		<div className="py-1">
+			{unreadableRow}
 			{items.map((item) => (
 				<EffectiveContextMenu
 					key={item.id}

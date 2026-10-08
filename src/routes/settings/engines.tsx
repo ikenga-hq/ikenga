@@ -40,6 +40,7 @@ import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/s
 import { buildAgentWrappedCmd, type AgentEngineKind } from '@/terminal/claude-wrap';
 import { SettingsFieldRow, useSettingsSection } from '@/shell/settings/field';
 import { WslHealthSettingsRow } from '@/shell/wsl-health/wsl-health-settings-row';
+import { CustomShellsStatus } from './-components/custom-shells-status';
 
 const OFFLINE_AGENT_ID = 'engine-noop';
 
@@ -305,9 +306,27 @@ function AuthBadge({ authed, loading }: { authed: boolean | null; loading: boole
 function TerminalSectionBody() {
 	const { scope, projectId, result, refresh } = useSettingsSection();
 	const queryClient = useQueryClient();
-	const { profiles, selectedProfile, setDefaultProfileId, isLoading } = useDefaultShellProfile();
+	const {
+		profiles,
+		selectedProfile,
+		setDefaultProfileId,
+		isLoading,
+		readError: defaultShellReadError,
+		retryRead: retryDefaultShellRead,
+	} = useDefaultShellProfile();
 	const { refetch: refetchProfiles, isFetching } = useShellProfiles();
-	const { addCustomProfile, removeCustomProfile } = useCustomShellProfiles();
+	const {
+		addCustomProfile,
+		removeCustomProfile,
+		canEdit: canEditCustomProfiles,
+		error: customProfilesError,
+		refetch: refetchCustomProfiles,
+		isCorrupt: customProfilesCorrupt,
+		resetCorrupt: resetCorruptCustomProfiles,
+		resetBackupKey: customProfilesBackupKey,
+		resetError: customProfilesResetError,
+		isResetting: isResettingCustomProfiles,
+	} = useCustomShellProfiles();
 
 	const [isAddingCustom, setIsAddingCustom] = useState(false);
 	const [customLabel, setCustomLabel] = useState('');
@@ -401,6 +420,9 @@ function TerminalSectionBody() {
 	const resumeTerminalsEffective = isProject
 		? (resumeTerminalsOverride ?? true)
 		: resumeTerminalsQuery.data === 'true';
+	// A failed read is "couldn't tell", not "off": the checkbox is disabled
+	// and the reason shown instead of an unchecked box.
+	const resumeTerminalsReadError = !isProject && resumeTerminalsQuery.isError;
 
 	function openTestTerminal(cmd: string[], title: string) {
 		const focusedId = usePaneStore.getState().focusedId;
@@ -431,13 +453,15 @@ function TerminalSectionBody() {
 	const handleSaveCustomProfile = () => {
 		if (!customLabel.trim() || !customCommand.trim()) return;
 		const parts = customCommand.trim().split(/\s+/);
-		addCustomProfile({
+		const saved = addCustomProfile({
 			label: customLabel.trim(),
 			icon: 'terminal',
 			cmd: parts,
 			kind: 'custom',
 			distro: null,
 		});
+		// Refused while the saved list is unread — keep the form so nothing is lost.
+		if (!saved) return;
 		setCustomLabel('');
 		setCustomCommand('');
 		setIsAddingCustom(false);
@@ -466,6 +490,7 @@ function TerminalSectionBody() {
 					label="Default interactive shell"
 					desc="The shell used when opening a new terminal tab via shortcuts (Ctrl+T) or the tab strip."
 				>
+					<div className="flex flex-col items-end">
 					<select
 						value={selectedProfile.id}
 						onChange={(e) => setDefaultProfileId(e.target.value)}
@@ -478,6 +503,25 @@ function TerminalSectionBody() {
 							</option>
 						))}
 					</select>
+					{defaultShellReadError && (
+						<div
+							role="alert"
+							data-testid="default-shell-read-error"
+							className="mt-1 flex items-center gap-2 text-xs"
+							style={{ color: 'var(--danger)' }}
+						>
+							<span>{defaultShellReadError}</span>
+							<button
+								type="button"
+								className="underline-offset-2 hover:underline"
+								style={{ color: 'var(--primary)' }}
+								onClick={retryDefaultShellRead}
+							>
+								Retry
+							</button>
+						</div>
+					)}
+					</div>
 				</SettingsFieldRow>
 
 				{isWindows && (
@@ -543,18 +587,38 @@ function TerminalSectionBody() {
 					label="Resume terminals on start"
 					desc="Respawn previously running terminals when Ikenga starts, including tabs in unfocused panes."
 				>
+					<div className="flex flex-col items-end">
 					<label className="flex items-center gap-2 text-sm">
 						<input
 							type="checkbox"
 							className="h-4 w-4 rounded border-border bg-background"
 							checked={resumeTerminalsEffective}
 							onChange={(e) => resumeTerminalsMutation.mutate(e.target.checked)}
-							disabled={resumeTerminalsQuery.isLoading && !isProject}
+							disabled={(resumeTerminalsQuery.isLoading && !isProject) || resumeTerminalsReadError}
 						/>
 						<span className={!resumeTerminalsEffective ? 'text-muted-foreground' : ''}>
 							Enabled
 						</span>
 					</label>
+					{resumeTerminalsReadError && (
+						<div role="alert" className="mt-1 flex items-center gap-2 text-xs" style={{ color: 'var(--danger)' }}>
+							<span>
+								Couldn't read this setting:{' '}
+								{resumeTerminalsQuery.error instanceof Error
+									? resumeTerminalsQuery.error.message
+									: String(resumeTerminalsQuery.error)}
+							</span>
+							<button
+								type="button"
+								className="underline-offset-2 hover:underline"
+								style={{ color: 'var(--primary)' }}
+								onClick={() => void resumeTerminalsQuery.refetch()}
+							>
+								Retry
+							</button>
+						</div>
+					)}
+					</div>
 				</SettingsFieldRow>
 
 				<div className="flex items-center justify-between px-4 py-3">
@@ -631,6 +695,16 @@ function TerminalSectionBody() {
 					</Button>
 				</div>
 
+				<CustomShellsStatus
+					error={customProfilesError}
+					isCorrupt={customProfilesCorrupt}
+					onReset={resetCorruptCustomProfiles}
+					onRetry={() => void refetchCustomProfiles()}
+					isResetting={isResettingCustomProfiles}
+					resetError={customProfilesResetError}
+					resetBackupKey={customProfilesBackupKey}
+				/>
+
 				<div className="divide-y divide-border">
 					{profiles.map((p) => {
 						const isSelected = p.id === selectedProfile.id;
@@ -670,6 +744,7 @@ function TerminalSectionBody() {
 											size="sm"
 											className="h-7 text-xs text-destructive hover:bg-destructive/10"
 											onClick={() => removeCustomProfile(p.id)}
+											disabled={!canEditCustomProfiles}
 										>
 											<Trash2 className="h-3 w-3" />
 										</Button>
@@ -721,7 +796,7 @@ function TerminalSectionBody() {
 								size="sm"
 								className="h-7 text-xs"
 								onClick={handleSaveCustomProfile}
-								disabled={!customLabel.trim() || !customCommand.trim()}
+								disabled={!customLabel.trim() || !customCommand.trim() || !canEditCustomProfiles}
 							>
 								Save profile
 							</Button>
@@ -734,6 +809,7 @@ function TerminalSectionBody() {
 							size="sm"
 							className="h-7 gap-1.5 text-xs"
 							onClick={() => setIsAddingCustom(true)}
+							disabled={!canEditCustomProfiles}
 						>
 							<Plus className="h-3.5 w-3.5" /> Add custom shell
 						</Button>

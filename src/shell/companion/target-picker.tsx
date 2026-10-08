@@ -13,11 +13,11 @@ import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
 import { Bot, ChevronDown, ChevronRight, User } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { EmptyState, OfflineState } from '@/components/states';
+import { EmptyState, ErrorState, OfflineState } from '@/components/states';
 import { agentUnavailableText } from '@/lib/agent-unavailable';
 import { type CompanionTarget, useShellStore } from '@/lib/shell/shell-store';
 import { useSeats } from '@/lib/queries/seats';
-import { chiList, detectAgents, type SeatStatus, type SeatView } from '@/lib/tauri-cmd';
+import { chiList, type DetectedAgent, detectAgents, type SeatStatus, type SeatView } from '@/lib/tauri-cmd';
 import { viewLabel } from '@/shell/panes/pane-views';
 import { useTerminalStore } from '@/terminal/session-store';
 import { useTerminalTitles } from '@/terminal/use-terminal-titles';
@@ -55,6 +55,12 @@ export const DETECT_AGENTS_KEY = ['settings', 'agent', 'detect'] as const;
 // The pure engine-offer rules live in `./offered-engines` (no React / UI
 // imports, so they test cheaply); re-exported for existing importers.
 export { engineOfferNote, offeredEngines, unavailableEngine } from './offered-engines';
+
+/** Body copy for the signed-out state when the probe gave no hint. States only
+ *  what the probe saw (it reported signed out) — not a guessed cause. */
+export function signedOutFallback(agent: Pick<DetectedAgent, 'executable_path'>): string {
+	return `The binary is on your PATH at ${agent.executable_path}, and its sign-in check reported it signed out. Sign in to use it here.`;
+}
 
 /** ⌥↑ / ⌥↓: seats, then unseated sessions, then new-on each engine, then a
  *  persistent run on the default engine (D-09 `pickerTargets`). */
@@ -456,10 +462,7 @@ export function TargetPicker({ roster }: { roster: SeatRoster }) {
 								data-state="companion-signed-out"
 								icon={User}
 								heading={`${unauthedEngine.display} is not signed in`}
-								body={
-									unauthedEngine.auth_hint ??
-									`The binary is on your PATH at ${unauthedEngine.executable_path}. It just has no credentials.`
-								}
+								body={unauthedEngine.auth_hint ?? signedOutFallback(unauthedEngine)}
 								action={{
 									label: `Run ${unauthedEngine.id} login`,
 									onClick: () => {
@@ -467,6 +470,16 @@ export function TargetPicker({ roster }: { roster: SeatRoster }) {
 										close();
 									},
 								}}
+								className="min-h-0"
+							/>
+						) : engines.isError ? (
+							// Detection failed — that says nothing about what is
+							// installed, so never fall through to "No engine installed".
+							<ErrorState
+								data-state="companion-engine-check-failed"
+								heading="Couldn't check installed engines"
+								body={engines.error instanceof Error ? engines.error.message : String(engines.error)}
+								action={{ label: 'Retry', onClick: () => void engines.refetch() }}
 								className="min-h-0"
 							/>
 						) : wslDownEngine ? (

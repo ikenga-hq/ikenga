@@ -23,7 +23,7 @@ vi.mock('@/lib/tauri-cmd', () => ({
 }));
 
 function reset() {
-	useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false });
+	useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false, restoreError: null });
 }
 
 describe('useTerminalStore ownership', () => {
@@ -356,5 +356,111 @@ describe('stripSecretEnv (ADR-013 §Addendum Decision 3)', () => {
 
 	it('passes through undefined', () => {
 		expect(stripSecretEnv(undefined)).toBeUndefined();
+	});
+});
+
+describe('rehydrate: a failed read is not "no saved terminals"', () => {
+	beforeEach(() => {
+		reset();
+		localStorage.clear();
+	});
+
+	it('an unreadable saved list reports an error and is not overwritten by the next save', async () => {
+		localStorage.setItem('terminal.tabs', '{corrupt');
+
+		await useTerminalStore.getState().rehydrateFromDb();
+
+		const err = useTerminalStore.getState().restoreError;
+		expect(err?.holdsSave).toBe(true);
+		expect(err?.message).toMatch(/Couldn't restore your previous terminals/);
+
+		// A new tab this session must not clobber the unreadable saved list.
+		useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+		await useTerminalStore.getState().persistToDb();
+		expect(localStorage.getItem('terminal.tabs')).toBe('{corrupt');
+
+		// Resume saving first copies the unreadable list to a side key (D-12),
+		// says where it went, and only then saves the open terminals.
+		await useTerminalStore.getState().resumeSaving();
+		const notice = useTerminalStore.getState().restoreError;
+		expect(notice?.holdsSave).toBe(false);
+		expect(notice?.backupKey).toMatch(/^terminal\.tabs\.unreadable-\d+$/);
+		expect(notice?.message).toContain(notice?.backupKey ?? '<none>');
+		expect(localStorage.getItem(notice?.backupKey ?? '')).toBe('{corrupt');
+		await useTerminalStore.getState().persistToDb();
+		expect(localStorage.getItem('terminal.tabs')).not.toBe('{corrupt');
+
+		useTerminalStore.getState().dismissRestoreError();
+		expect(useTerminalStore.getState().restoreError).toBeNull();
+	});
+
+	it('Resume saving stays paused when the backup copy cannot be written', async () => {
+		localStorage.setItem('terminal.tabs', '{corrupt');
+		await useTerminalStore.getState().rehydrateFromDb();
+		useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+
+		const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+			throw new Error('quota exceeded');
+		});
+		try {
+			await useTerminalStore.getState().resumeSaving();
+		} finally {
+			setItem.mockRestore();
+		}
+		const notice = useTerminalStore.getState().restoreError;
+		expect(notice?.holdsSave).toBe(true);
+		expect(notice?.message).toMatch(/Couldn't back up .*quota exceeded/);
+		await useTerminalStore.getState().persistToDb();
+		expect(localStorage.getItem('terminal.tabs')).toBe('{corrupt');
+	});
+
+	it('Resume saving restores a list that reads fine by now instead of overwriting it', async () => {
+		// First read fails transiently (e.g. a locked store).
+		const getItem = vi.spyOn(Storage.prototype, 'getItem').mockImplementationOnce(() => {
+			throw new Error('store locked');
+		});
+		const saved = [
+			{ id: 'saved-1', title: 'one', spec: { cwd: '/a', cmd: ['bash'] }, status: 'exited', exitCode: 0, createdAt: 1 },
+			{ id: 'saved-2', title: 'two', spec: { cwd: '/b', cmd: ['bash'] }, status: 'exited', exitCode: 0, createdAt: 2 },
+		];
+		localStorage.setItem('terminal.tabs', JSON.stringify(saved));
+		await useTerminalStore.getState().rehydrateFromDb();
+		getItem.mockRestore();
+		expect(useTerminalStore.getState().restoreError?.holdsSave).toBe(true);
+		const openNow = useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+
+		await useTerminalStore.getState().resumeSaving();
+
+		expect(useTerminalStore.getState().restoreError).toBeNull();
+		const ids = useTerminalStore.getState().tabs.map((t) => t.id);
+		expect(ids).toEqual([openNow, 'saved-1', 'saved-2']);
+		// No backup was made of a readable list.
+		expect(Object.keys(localStorage).filter((k) => k.includes('.unreadable-'))).toEqual([]);
+		await useTerminalStore.getState().persistToDb();
+		const persisted = JSON.parse(localStorage.getItem('terminal.tabs') ?? '[]') as { id: string }[];
+		expect(persisted.map((t) => t.id)).toEqual([openNow, 'saved-1', 'saved-2']);
+	});
+
+	it('a failed resume-setting read is reported, and nothing is respawned', async () => {
+		const id = useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+		useTerminalStore.getState().setStatus(id, 'running');
+		await useTerminalStore.getState().persistToDb();
+		useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false });
+
+		vi.mocked(settingsGet).mockRejectedValueOnce(new Error('settings store locked'));
+		vi.mocked(ptySpawn).mockClear();
+		await useTerminalStore.getState().rehydrateFromDb();
+
+		const err = useTerminalStore.getState().restoreError;
+		expect(err?.holdsSave).toBe(false);
+		expect(err?.message).toContain('settings store locked');
+		expect(useTerminalStore.getState().tabs.find((t) => t.id === id)?.status).toBe('spawning');
+		expect(ptySpawn).not.toHaveBeenCalled();
+	});
+
+	it('an empty store is a clean empty restore with no error', async () => {
+		await useTerminalStore.getState().rehydrateFromDb();
+		expect(useTerminalStore.getState().restoreError).toBeNull();
+		expect(useTerminalStore.getState().tabs).toEqual([]);
 	});
 });

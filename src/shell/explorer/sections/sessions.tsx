@@ -11,6 +11,7 @@ import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import { handToChi } from '@/shell/companion/companion-store';
 import { boardIsShowing, openBoard } from '@/shell/chi-board/board-store';
 import type { ExplorerSectionContext } from '../section-registry';
+import { SectionErrorRow } from '../section-error-row';
 
 /**
  * WP-68 (D-09): the Sessions header's "Seats" link to the seat board (`/chi`,
@@ -48,6 +49,8 @@ export function SessionsSeatsLink(_ctx: ExplorerSectionContext) {
 
 export function SessionsSection(_ctx: ExplorerSectionContext) {
 	const tabs = useTerminalStore((s) => s.tabs);
+	const restoreError = useTerminalStore((s) => s.restoreError);
+	const dismissRestoreError = useTerminalStore((s) => s.dismissRestoreError);
 
 	const openSession = useCallback((sessionId: string) => {
 		const { focusedId, addTab } = usePaneStore.getState();
@@ -65,6 +68,21 @@ export function SessionsSection(_ctx: ExplorerSectionContext) {
 		addTab(focusedId, { kind: 'terminal', sessionId });
 	}, []);
 
+	// A failed restore is not "no sessions": say so above whatever is shown.
+	const restoreRow = restoreError ? (
+		<SectionErrorRow
+			message={restoreError.message}
+			onRetry={dismissRestoreError}
+			actionLabel={restoreError.holdsSave ? 'Resume saving' : 'Dismiss'}
+			// The "saving resumed, copied to …" notice reports a success.
+			tone={restoreError.backupKey ? 'info' : 'error'}
+		/>
+	) : null;
+
+	if (tabs.length === 0 && restoreRow) {
+		return <div className="py-1">{restoreRow}</div>;
+	}
+
 	if (tabs.length === 0) {
 		return (
 			<EmptyState
@@ -79,6 +97,7 @@ export function SessionsSection(_ctx: ExplorerSectionContext) {
 
 	return (
 		<div className="py-1">
+			{restoreRow}
 			{tabs.map((tab) => {
 				const isRunning = tab.status === 'running';
 				const isSpawning = tab.status === 'spawning';
