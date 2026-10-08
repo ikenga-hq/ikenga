@@ -43,6 +43,10 @@ mod in_process;
 /// T1 — per-principal Unix uid (G-PRINCIPAL §9). Linux-only, like T1.
 #[cfg(target_os = "linux")]
 pub mod t1;
+/// A T1 account's secrets file (`/etc/ikenga/secrets/<unix_name>.env`) →
+/// the environment of that account's child. Read by the broker.
+#[cfg(target_os = "linux")]
+pub mod t1_account_env;
 /// The executor of a T1 principal child: T0 spawn mechanics, isolation
 /// verified from `/proc/self/status` (§3, topology B).
 #[cfg(target_os = "linux")]

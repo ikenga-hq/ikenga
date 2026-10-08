@@ -363,6 +363,15 @@ pub struct ServeArgs {
     #[arg(long, env = "IKENGA_PRINCIPAL_PATH")]
     pub principal_path: Option<std::ffi::OsString>,
 
+    /// T1 only: the directory of per-account secrets files the broker reads
+    /// when it launches an account's child (`<dir>/<unix_name>.env`, written
+    /// by `provision.sh`; root-owned, group = the account's, mode 0640). Their
+    /// entries become that child's environment, and so reach its terminals,
+    /// Chi runs, engine CLIs and pkg sidecars. Default `/etc/ikenga/secrets`.
+    /// Set by the operator on the broker only; no account can change it.
+    #[arg(long, env = "IKENGA_ACCOUNT_SECRETS_DIR")]
+    pub account_secrets_dir: Option<std::path::PathBuf>,
+
     /// Drop `Secure` from the session cookie (G-PRINCIPAL P-3). Only for a
     /// plain-HTTP deploy on a private network (a tailnet IP); behind HTTPS,
     /// leave it off.
@@ -584,6 +593,7 @@ async fn async_main(cli: CliArgs) -> anyhow::Result<()> {
         uid_range: args.uid_range,
         provisioning_external: args.provisioning == Provisioning::External,
         principal_path: args.principal_path,
+        account_secrets_dir: args.account_secrets_dir,
         insecure_cookie: args.insecure_cookie,
         principal_child: args.principal_child,
         expected_uid: args.expected_uid,
