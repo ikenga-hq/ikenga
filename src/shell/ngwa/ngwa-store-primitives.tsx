@@ -34,6 +34,7 @@ import {
 	type ClaudeStoreScope,
 	type ResolvedSource,
 } from '@/lib/tauri-cmd';
+import { NOT_AVAILABLE_ON_SERVER_YET } from '@/lib/transport/unavailable';
 import { kindIcon } from './ngwa-list';
 
 function errText(e: unknown): string {
@@ -310,6 +311,7 @@ export function CatalogStoreRow({
 	busy,
 	onSelect,
 	onUpdate,
+	disabledReason,
 }: {
 	row: NgwaCatalogRow;
 	closure: readonly ConsentDep[];
@@ -317,6 +319,7 @@ export function CatalogStoreRow({
 	busy: boolean;
 	onSelect: () => void;
 	onUpdate?: (row: NgwaCatalogRow) => void;
+	disabledReason?: string;
 }) {
 	return (
 		// biome-ignore lint/a11y/useSemanticElements: the same `.srow` as a registry row — it holds its own Install / Update button, so it can't be a <button>
@@ -368,7 +371,7 @@ export function CatalogStoreRow({
 						type="button"
 						className="btn"
 						disabled={!onUpdate || busy}
-						title={onUpdate ? undefined : 'Update is not available here'}
+						title={onUpdate ? undefined : (disabledReason ?? NOT_AVAILABLE_ON_SERVER_YET)}
 						onClick={(e) => {
 							e.stopPropagation();
 							onUpdate?.(row);
@@ -416,6 +419,7 @@ export function CatalogSheet({
 	updateError,
 	onRecheckCatalog,
 	onOpenInstalled,
+	disabledReason,
 }: {
 	row: NgwaCatalogRow;
 	closure: readonly ConsentDep[];
@@ -431,6 +435,7 @@ export function CatalogSheet({
 	updateError: string | null;
 	onRecheckCatalog?: () => void;
 	onOpenInstalled?: (name: string) => void;
+	disabledReason?: string;
 }) {
 	const e = row.entry;
 	const pin = catalogPin(e);
@@ -445,7 +450,7 @@ export function CatalogSheet({
 	const busy = run.step === 'installing';
 
 	let blocked: string | null = null;
-	if (!onInstall) blocked = 'Install is not available here';
+	if (!onInstall) blocked = disabledReason ?? NOT_AVAILABLE_ON_SERVER_YET;
 	else if (!allTicked)
 		blocked = consentBlockedReason(consentIds.filter((id) => ticked[id]).length, consentIds.length);
 
@@ -809,6 +814,7 @@ export function AddUrlSheet({
 	projectLabel,
 	catalog,
 	installedKeys,
+	disabledReason,
 	onClose,
 	onResolve,
 	onInstall,
@@ -820,6 +826,7 @@ export function AddUrlSheet({
 	catalog: readonly PrimitiveCatalogEntry[];
 	/** `${kind}:${name}` of the vault, for the closure's "already installed". */
 	installedKeys: ReadonlySet<string>;
+	disabledReason?: string;
 	onClose: () => void;
 	onResolve?: (
 		url: string,
@@ -1264,7 +1271,7 @@ export function AddUrlSheet({
 					projectLabel={projectLabel}
 					blocked={
 						!onInstall
-							? 'Install is not available here'
+							? (disabledReason ?? NOT_AVAILABLE_ON_SERVER_YET)
 							: allTicked
 								? null
 								: consentBlockedReason(

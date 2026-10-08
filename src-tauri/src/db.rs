@@ -614,6 +614,12 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0070_access_attribution",
         include_str!("../migrations/0070_access_attribution.sql"),
     ),
+    // widen artifact_comments.sink to admit 'clipboard' and 'chi'
+    (
+        71,
+        "0071_artifact_comments_widen_sink",
+        include_str!("../migrations/0071_artifact_comments_widen_sink.sql"),
+    ),
 ];
 
 /// Embedded migration set, kept in lockstep with `migrations/*.sql`. Tracked
@@ -2314,5 +2320,143 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(idx, 1);
+    }
+
+    /// WP-S (Item 4): 0071 widens the sink column CHECK constraint on
+    /// `artifact_comments` to accept 'clipboard' and 'chi' in addition to
+    /// 'terminal', 'sidepane', 'both'.
+    #[tokio::test]
+    async fn migration_0071_allows_clipboard_and_chi_sinks() {
+        let (db, _tmp) = fresh_db().await;
+        let pool = db.ensure_pool().await.expect("ensure_pool");
+
+        for sink in ["clipboard", "chi", "terminal", "sidepane", "both"] {
+            let res = sqlx::query(
+                "INSERT INTO artifact_comments (
+                    artifact_path, selector, text, status, created_at, sink
+                 ) VALUES (?, ?, ?, 'open', 1000, ?)",
+            )
+            .bind(format!("path/{sink}.png"))
+            .bind("#sel")
+            .bind("test text")
+            .bind(sink)
+            .execute(&pool)
+            .await;
+            assert!(res.is_ok(), "expected sink {sink} to succeed: {res:?}");
+        }
+
+        let bad_res = sqlx::query(
+            "INSERT INTO artifact_comments (
+                artifact_path, selector, text, status, created_at, sink
+             ) VALUES (?, ?, ?, 'open', 1000, 'invalid_sink')",
+        )
+        .bind("path/bad.png")
+        .bind("#sel")
+        .bind("test text")
+        .execute(&pool)
+        .await;
+        assert!(
+            bad_res.is_err(),
+            "expected invalid sink to fail CHECK constraint"
+        );
+    }
+
+    /// WP-S (Item 4): 0071 applies cleanly on a DB that was at 0070 with
+    /// pre-existing rows, preserving existing data (including 0070 author_principal_id)
+    /// and allowing new or updated rows to use 'clipboard' and 'chi' sinks.
+    #[tokio::test]
+    async fn migration_0071_applies_on_existing_db_with_rows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("existing_70.db");
+        let raw_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true)
+                    .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal),
+            )
+            .await
+            .expect("raw connect");
+
+        sqlx::query(
+            "CREATE TABLE _pa_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
+        )
+        .execute(&raw_pool)
+        .await
+        .unwrap();
+
+        for (id, name, sql) in MIGRATIONS.iter().filter(|(id, _, _)| *id < 71) {
+            for stmt in split_statements(sql) {
+                if stmt.trim().is_empty() {
+                    continue;
+                }
+                if let Err(e) = sqlx::query(&stmt).execute(&raw_pool).await {
+                    let msg = e.to_string();
+                    if !msg.contains("duplicate column name") && !msg.contains("already exists") {
+                        panic!("migration {name} failed: {msg}");
+                    }
+                }
+            }
+            sqlx::query("INSERT INTO _pa_migrations (id, applied_at) VALUES (?, ?)")
+                .bind(id)
+                .bind(now_ms())
+                .execute(&raw_pool)
+                .await
+                .unwrap();
+        }
+
+        // Insert rows prior to 0071
+        sqlx::query(
+            "INSERT INTO artifact_comments (
+                artifact_path, selector, text, status, created_at, sink, author_principal_id
+             ) VALUES ('art/1.html', '#title', 'first comment', 'open', 1000, 'terminal', 'principal-alice')",
+        )
+        .execute(&raw_pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO artifact_comments (
+                artifact_path, selector, text, status, created_at, sink
+             ) VALUES ('art/2.html', '#btn', 'second comment', 'open', 2000, NULL)",
+        )
+        .execute(&raw_pool)
+        .await
+        .unwrap();
+
+        drop(raw_pool);
+
+        // Open with PaDb and run ensure_pool to trigger migration 0071
+        let pa_db = PaDb::new(db_path);
+        let pool = pa_db.ensure_pool().await.expect("ensure_pool runs 0071");
+
+        // Verify pre-existing rows survived
+        let row1: (String, String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT artifact_path, text, sink, author_principal_id FROM artifact_comments WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row1.0, "art/1.html");
+        assert_eq!(row1.1, "first comment");
+        assert_eq!(row1.2.as_deref(), Some("terminal"));
+        assert_eq!(row1.3.as_deref(), Some("principal-alice"));
+
+        // Verify update to clipboard works
+        sqlx::query("UPDATE artifact_comments SET sink = 'clipboard' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Verify new insert with chi works
+        sqlx::query(
+            "INSERT INTO artifact_comments (
+                artifact_path, selector, text, status, created_at, sink
+             ) VALUES ('art/3.html', '#chi', 'chi comment', 'open', 3000, 'chi')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
     }
 }

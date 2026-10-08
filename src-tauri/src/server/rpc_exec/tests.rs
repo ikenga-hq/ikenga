@@ -14,10 +14,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::StatusCode;
-use axum::Router;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use super::sidecar_spec;
@@ -27,7 +27,7 @@ use crate::pty::PtyManager;
 use crate::server::rpc_local::DaemonChi;
 use crate::server::rpc_shell::PathGuard;
 use crate::server::shared::chi_exec;
-use crate::server::{router_for_exec_tests, ServerConfig};
+use crate::server::{ServerConfig, router_for_exec_tests};
 
 const PKG: &str = "com.test.exec";
 const SIDECAR: &str = "pa-com-test-exec-probe";
@@ -431,13 +431,14 @@ async fn t1_comment_route_stays_in_the_principals_ptys_db_and_allowlist() {
     .await;
     assert_eq!(routed["sink"], "clipboard", "{routed}");
     assert_eq!(routed["pty_id"], Value::Null);
-    assert!(routed["clipboard_text"]
-        .as_str()
-        .unwrap()
-        .contains("make it bigger"));
-    // `clipboard` / `chi` are not values the audit column admits; the row is
-    // left untouched rather than failing a delivered prompt.
-    assert_eq!(routed["comment"]["sink"], Value::Null);
+    assert!(
+        routed["clipboard_text"]
+            .as_str()
+            .unwrap()
+            .contains("make it bigger")
+    );
+    // `clipboard` / `chi` are recorded in the audit column (WP-S 0071).
+    assert_eq!(routed["comment"]["sink"], "clipboard");
 
     // A forced terminal with no claude PTY degrades, and is audited as such.
     let forced = ok(
@@ -447,6 +448,7 @@ async fn t1_comment_route_stays_in_the_principals_ptys_db_and_allowlist() {
     )
     .await;
     assert_eq!(forced["sink"], "clipboard", "{forced}");
+    assert_eq!(forced["comment"]["sink"], "clipboard");
 
     // Bob's db has no comment `id`.
     let bob = principal();
@@ -482,6 +484,7 @@ async fn t1_comment_route_stays_in_the_principals_ptys_db_and_allowlist() {
     )
     .await;
     assert_eq!(chi["sink"], "chi", "{chi}");
+    assert_eq!(chi["comment"]["sink"], "chi");
     let run_id = chi["run_id"].as_str().unwrap().to_string();
     assert!(
         chi_exec::tests::wait_for(|| async {

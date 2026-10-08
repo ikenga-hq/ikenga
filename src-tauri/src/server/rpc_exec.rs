@@ -44,13 +44,13 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use super::AppState;
 use super::rpc::RpcResponse;
 use super::rpc_local::{arg, opt_str, pa_db, req_str, respond};
 use super::rpc_shell::targ;
 use super::shared::action_exec::{self, ActionExecRequest, ActionExecResult};
 use super::shared::comment_route::{self as route, RouteResult, RouteSink};
 use super::shared::{agent_ops, chi_exec, comments, sidecar_call};
-use super::AppState;
 use crate::executor::SpawnSpec;
 
 // ─── pkg_sidecar_call (rank 21) ──────────────────────────────────────────────
@@ -245,23 +245,14 @@ pub(super) async fn comment_route(state: &AppState, args: &Value) -> RpcResponse
             RouteSink::Terminal if pty_id_used.is_none() => RouteSink::Clipboard,
             other => other,
         };
-        // The audit column only admits `terminal | sidepane | both` (migration
-        // 0022's CHECK, `comments::VALID_SINKS`), so a `clipboard` or `chi`
-        // delivery has no audit value to record: writing one is refused, which
-        // would turn a prompt already handed over (or a chi run already
-        // started) into a reported failure. Record only a terminal delivery.
-        let updated = if recorded_sink == RouteSink::Terminal {
-            comments::record_routing(
-                db,
-                comment.id,
-                recorded_sink.as_str().to_string(),
-                None,
-                None,
-            )
-            .await?
-        } else {
-            comment
-        };
+        let updated = comments::record_routing(
+            db,
+            comment.id,
+            recorded_sink.as_str().to_string(),
+            None,
+            None,
+        )
+        .await?;
         let recorded_sink = recorded_sink.as_str();
 
         Ok(RouteResult {

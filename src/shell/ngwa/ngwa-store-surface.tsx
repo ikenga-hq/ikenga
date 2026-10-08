@@ -17,7 +17,16 @@
 
 import { useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { AlertTriangle, Check, Download, Link2, Search, Shield, ShieldAlert, X } from 'lucide-react';
+import {
+	AlertTriangle,
+	Check,
+	Download,
+	Link2,
+	Search,
+	Shield,
+	ShieldAlert,
+	X,
+} from 'lucide-react';
 import { ErrorState, LoadingState, OfflineState } from '@/components/states';
 import {
 	Dialog,
@@ -62,6 +71,7 @@ import { registryKeys } from '@/lib/registry/use-registry';
 import type { NgwaItem } from '@ikenga/contract';
 import { kindIcon } from './ngwa-list';
 import { NgwaTrustSheet } from './ngwa-trust-sheet';
+import { NOT_AVAILABLE_ON_SERVER_YET } from '@/lib/transport/unavailable';
 import './ngwa.css';
 
 import type { StoreInstallScope } from '@/lib/ngwa/use-store-install';
@@ -83,6 +93,8 @@ export type StoreDetailLoader = (
 
 export interface NgwaStoreSurfaceProps {
 	catalog: NgwaStoreEntry[];
+	/** Reason install/update are disabled on this host (e.g. NOT_AVAILABLE_ON_SERVER_YET). */
+	disabledReason?: string;
 	isLoading?: boolean;
 	/** The Ngwa snapshot failed: what is installed is unknown, so no row can
 	 *  say installed / update / install. Not a registry outage. */
@@ -283,6 +295,7 @@ export function NgwaStoreSurface({
 	onOpenInstalled,
 	initialAddUrl = false,
 	initialSelectedId = null,
+	disabledReason,
 }: NgwaStoreSurfaceProps) {
 	const [search, setSearch] = useState('');
 	const [kindFilter, setKindFilter] = useState('*');
@@ -741,6 +754,7 @@ export function NgwaStoreSurface({
 									onUpdate={update}
 									busy={Boolean(pending[entry.id])}
 									onRetry={lastAttempt.current[entry.id] ? () => retry(entry) : undefined}
+									disabledReason={disabledReason}
 								/>
 							))}
 
@@ -756,15 +770,15 @@ export function NgwaStoreSurface({
 									busy={Boolean(pending[row.id])}
 									onSelect={() => selectRow(row.id)}
 									onUpdate={updatePrimitive}
+									disabledReason={disabledReason}
 								/>
 							))}
 
 						{!isLoading && !error && catalogStatus === 'error' && (
 							<div className="empty" data-catalog-unavailable role="status">
 								<b>Registry unreachable.</b> The signed catalog is unavailable
-								{catalogError ? ` — ${catalogError}` : ''}. None of
-								its entries are listed: a catalog that fails to verify is never replaced by the
-								bundled copy.
+								{catalogError ? ` — ${catalogError}` : ''}. None of its entries are listed: a
+								catalog that fails to verify is never replaced by the bundled copy.
 								{onRecheckCatalog && (
 									<div className="dacts">
 										<button type="button" className="btn" onClick={onRecheckCatalog}>
@@ -786,6 +800,7 @@ export function NgwaStoreSurface({
 							projectLabel={projectLabel}
 							catalog={catalogEntries}
 							installedKeys={installedKeys}
+							disabledReason={disabledReason}
 							onClose={() => setAddUrl(null)}
 							onResolve={onResolveSource}
 							onInstall={onInstallResolved}
@@ -804,6 +819,7 @@ export function NgwaStoreSurface({
 							updateError={actionErrors[selectedPrimitive.id] ?? null}
 							onRecheckCatalog={onRecheckCatalog}
 							onOpenInstalled={onOpenInstalled}
+							disabledReason={disabledReason}
 						/>
 					) : selectedEntry ? (
 						<StoreSheet
@@ -825,6 +841,7 @@ export function NgwaStoreSurface({
 									: undefined
 							}
 							onReviewTrust={setTrustReviewItem}
+							disabledReason={disabledReason}
 						/>
 					) : (
 						<div className="sheetbody sc">
@@ -868,6 +885,7 @@ function StoreRow({
 	onUpdate,
 	busy,
 	onRetry,
+	disabledReason,
 }: {
 	entry: NgwaStoreEntry;
 	selected: boolean;
@@ -876,6 +894,7 @@ function StoreRow({
 	onUpdate?: (entry: NgwaStoreEntry) => void;
 	busy: boolean;
 	onRetry?: () => void;
+	disabledReason?: string;
 }) {
 	// This row's install / update progress, when the Store hook is driving
 	// one: concurrent installs and Update all each show on their own row.
@@ -954,7 +973,7 @@ function StoreRow({
 						type="button"
 						className="btn"
 						disabled={!onUpdate || busy}
-						title={onUpdate ? undefined : 'Update is not available here'}
+						title={onUpdate ? undefined : (disabledReason ?? NOT_AVAILABLE_ON_SERVER_YET)}
 						onClick={(e) => {
 							e.stopPropagation();
 							onUpdate?.(entry);
@@ -1018,6 +1037,7 @@ function StoreSheet({
 	onRetry,
 	onReviewApproval,
 	onReviewTrust,
+	disabledReason,
 }: {
 	entry: NgwaStoreEntry;
 	loadDetail: StoreDetailLoader | undefined;
@@ -1035,6 +1055,7 @@ function StoreSheet({
 	/** Set while this entry's update is held for approval: opens the review. */
 	onReviewApproval?: () => void;
 	onReviewTrust: (item: NgwaItem) => void;
+	disabledReason?: string;
 }) {
 	const detailQuery = useStoreDetail(entry, loadDetail, true);
 	const version = detailQuery.data ?? null;
@@ -1052,7 +1073,7 @@ function StoreSheet({
 	const settings = manifest?.settings?.schema ?? [];
 
 	let installBlocked: string | null = null;
-	if (!onInstall) installBlocked = 'Install is not available here';
+	if (!onInstall) installBlocked = disabledReason ?? NOT_AVAILABLE_ON_SERVER_YET;
 	else if (!loadDetail) installBlocked = 'Permissions not read — the registry index has not loaded';
 	else if (detailQuery.isLoading) installBlocked = 'Reading the manifest…';
 	else if (!manifest) installBlocked = 'Permissions could not be read — retry first';
@@ -1283,7 +1304,7 @@ function StoreSheet({
 						className="btn primary lg"
 						disabled={!onUpdate || busy}
 						aria-busy={busy || undefined}
-						title={onUpdate ? undefined : 'Update is not available here'}
+						title={onUpdate ? undefined : (disabledReason ?? NOT_AVAILABLE_ON_SERVER_YET)}
 						onClick={() => onUpdate?.(entry)}
 					>
 						Update {entry.version} → {entry.latestVersion}

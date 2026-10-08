@@ -125,7 +125,7 @@ pub fn store_screenshot(data_dir: &Path, bytes: &[u8], limit: ShotLimit) -> Resu
 }
 
 const VALID_STATUSES: &[&str] = &["open", "in_progress", "resolved", "stale"];
-const VALID_SINKS: &[&str] = &["terminal", "sidepane", "both"];
+const VALID_SINKS: &[&str] = &["terminal", "sidepane", "both", "clipboard", "chi"];
 
 fn validate_status(s: &str) -> Result<(), String> {
     if VALID_STATUSES.contains(&s) {
@@ -487,5 +487,7 @@ mod tests {
         assert!(validate_sink("terminal").is_ok());
         assert!(validate_sink("sidepane").is_ok());
         assert!(validate_sink("both").is_ok());
+        assert!(validate_sink("clipboard").is_ok());
+        assert!(validate_sink("chi").is_ok());
     }
 }

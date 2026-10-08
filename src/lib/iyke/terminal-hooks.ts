@@ -18,7 +18,11 @@ export async function fetchStatuslineSnapshots<T>(): Promise<Record<string, T> |
 	if (isRemoteWebSession()) {
 		try {
 			return (await termHooksStatuslineSnapshot()) as Record<string, T>;
-		} catch {
+		} catch (err) {
+			const reason = err instanceof Error ? err.message : typeof err === 'string' ? err : null;
+			if (reason && !info) {
+				publish({ settingsDir: null, reason });
+			}
 			return null;
 		}
 	}

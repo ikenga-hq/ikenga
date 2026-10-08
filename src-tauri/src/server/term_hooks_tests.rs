@@ -10,11 +10,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite;
 use tower::ServiceExt;
 
@@ -23,7 +23,7 @@ use crate::db::PaDb;
 use crate::engines::EngineRegistry;
 use crate::executor::ExecutorTier;
 use crate::pty::PtyManager;
-use crate::server::{router_with_home, ServerConfig};
+use crate::server::{ServerConfig, router_with_home};
 
 thread_local! {
     /// Per-test hold for a parked gate (read by [`TermHooks::new`]).
@@ -346,6 +346,16 @@ async fn info_names_the_dir_or_says_why_not() {
         "{info}"
     );
 
+    let snap_res = rpc(&none.router, "term_hooks_statusline_snapshot", json!({})).await;
+    assert_eq!(snap_res["ok"], false);
+    assert!(
+        snap_res["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("Not available on this server"),
+        "{snap_res}"
+    );
+
     // A port the server has not bound yet.
     let unbound = daemon_with(true, 0).await;
     let info = ok(&unbound.router, "term_hooks_info", json!({})).await;
@@ -398,10 +408,12 @@ async fn pty_spawn_refuses_a_settings_path_it_would_not_have_chosen() {
     )
     .await;
     assert_eq!(res["ok"], false);
-    assert!(res["error"]
-        .as_str()
-        .unwrap()
-        .contains("Not available on this server"));
+    assert!(
+        res["error"]
+            .as_str()
+            .unwrap()
+            .contains("Not available on this server")
+    );
 }
 
 // ─── the credential ──────────────────────────────────────────────────────────
@@ -514,11 +526,12 @@ async fn a_secret_dies_with_its_terminal_and_a_respawn_keeps_its_own() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(!d
-        .data
-        .join(DIR_NAME)
-        .join(terminal_file_name("t-x"))
-        .exists());
+    assert!(
+        !d.data
+            .join(DIR_NAME)
+            .join(terminal_file_name("t-x"))
+            .exists()
+    );
     assert!(!d.data.join(DIR_NAME).join(header_file_name("t-x")).exists());
 
     // Respawned under the same id: the first PTY's exit must not revoke the
@@ -535,11 +548,12 @@ async fn a_secret_dies_with_its_terminal_and_a_respawn_keeps_its_own() {
     tokio::time::sleep(Duration::from_millis(1800)).await; // first PTY exits
     let (status, _) = post_json(&d.router, EVENT_PATH, "t-y", &second, json!({})).await;
     assert_eq!(status, StatusCode::OK, "the live terminal kept its hooks");
-    assert!(d
-        .data
-        .join(DIR_NAME)
-        .join(terminal_file_name("t-y"))
-        .exists());
+    assert!(
+        d.data
+            .join(DIR_NAME)
+            .join(terminal_file_name("t-y"))
+            .exists()
+    );
 }
 
 // ─── statusline ──────────────────────────────────────────────────────────────
