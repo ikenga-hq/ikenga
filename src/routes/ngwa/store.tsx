@@ -94,15 +94,17 @@ function NgwaStorePage() {
 	const ctx = { catalog: catalogEntries, vault: vault.entries };
 	// Gap audit rank 3: the daemon serves no install or update yet. Leaving the
 	// handlers off makes the surface disable Install / Update / Update all
-	// before the click (with its own "not available here" reason) instead of
+	// before the click (with its NOT_AVAILABLE_ON_SERVER_YET reason) instead of
 	// letting a click end in a raw error. Drop this gate once they are served.
-	const installBlocked = installUnavailableReason() !== false;
+	const installReason = installUnavailableReason();
+	const installBlocked = installReason !== false;
 
 	return (
 		<div className="view-ngwa flex-1 min-h-0 flex flex-col">
 			<NgwaTabs activeTab="store" installedCount={items.length} />
 			<NgwaStoreSurface
 				catalog={registry}
+				disabledReason={installReason || undefined}
 				isLoading={isLoading}
 				error={error}
 				onRetry={refetch}

@@ -401,6 +401,9 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
         crate::server::push::install_hub(hub);
         crate::server::push::pump::spawn(state.children.clone());
     }
+    // Daemon asks, gap 2: a child's held-hook decisions are chained here, by
+    // the store's one writer (`access::audit::child`).
+    crate::access::audit::child::spawn(state.children.clone(), access_t1.store.clone());
     // G-ACCESS §4.5 / §7 (WP-76): the broker's handle on owner children
     // (share validation, the `invite` notification, member socket closes),
     // the membership expiry sweeper, and the invite-accept host (the §7.2

@@ -55,6 +55,9 @@
 //! yet**: it assumes D-05's people surface, which does not exist in the shell.
 //! Nothing fakes one.
 
+/// The held hooks-gate `permission` row (WP-40; ungated for the daemon's
+/// terminals).
+pub mod hook_ask;
 pub mod mute;
 pub mod ops;
 /// Permission routing core (G-ACCESS §5.3–§5.7; WP-74a stub, WP-75 fills).

@@ -57,6 +57,8 @@ pub mod static_files;
 /// `ikenga-server supervise`: a minimal init that keeps detached runs alive
 /// across server restarts where there is no systemd (containers). Linux-only.
 pub mod supervisor;
+/// A held hook gate's notification row and audit trail (daemon asks).
+pub mod hook_asks;
 /// Claude terminal hooks + statusline for daemon terminals (gap audit rank
 /// 11): the per-terminal settings file, its authenticated endpoint, and the
 /// permission-gate decision.
@@ -558,7 +560,10 @@ async fn auth_middleware(
     req.extensions_mut().insert(ctx);
     // The broker's push long-poll (plans/pwa S2 §10) is not activity: a held
     // poll would otherwise keep an idle principal child alive forever.
-    let res = if req.uri().path() == push::outbox::EVENTS_PATH {
+    let res = if matches!(
+        req.uri().path(),
+        push::outbox::EVENTS_PATH | crate::access::audit::child::EVENTS_PATH
+    ) {
         next.run(req).await
     } else {
         activity::track_request(next.run(req)).await
@@ -863,6 +868,11 @@ fn build_router(
         UpdateSource::Given(u) => u,
     };
     let term_hooks = term_hooks::TermHooks::new(config.data_dir.as_deref(), events.clone());
+    // A held gate's notification row and audit trail (`server::hook_asks`).
+    if let Some(asks) = hook_asks::HookAsks::for_access(pa_db.clone(), &access) {
+        asks.sweep_orphans();
+        term_hooks.attach_asks(asks);
+    }
     let state = Arc::new(AppState {
         config,
         spa_service: spa_service.clone(),
@@ -925,9 +935,14 @@ fn build_router(
     // broker only (`internal` class: the per-child token plus the broker's
     // internal-call header; the broker never proxies `/internal/*`).
     let protected_routes = match access.mode {
-        crate::access::DaemonMode::PrincipalChild => {
-            protected_routes.route(push::outbox::EVENTS_PATH, get(push::outbox::events_handler))
-        }
+        crate::access::DaemonMode::PrincipalChild => protected_routes
+            .route(push::outbox::EVENTS_PATH, get(push::outbox::events_handler))
+            // Daemon asks, gap 2: the held-hook decisions that end in this
+            // child, for the broker to chain (`access::audit::child`).
+            .route(
+                crate::access::audit::child::EVENTS_PATH,
+                get(crate::access::audit::child::events_handler),
+            ),
         crate::access::DaemonMode::T0 => protected_routes,
     };
     let protected_routes = protected_routes.layer(middleware::from_fn_with_state(
@@ -1180,6 +1195,9 @@ async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> an
     // for the broker. Either way, created notification rows become pushes.
     if mode.principal_child {
         push::install_outbox(Arc::new(push::outbox::Outbox::new()));
+        crate::access::audit::child::install_outbox(Arc::new(
+            crate::access::audit::child::Outbox::new(),
+        ));
         push::events::spawn_bridge();
     } else if let (Some(store), Some(dir)) = (access.store(), config.data_dir.as_deref()) {
         if let Some(hub) = push::hub::boot(
