@@ -42,7 +42,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
 use super::{AuditVia, Event};
-#[cfg(target_os = "linux")]
 use crate::access::AccessStore;
 use crate::executor::PrincipalId;
 
