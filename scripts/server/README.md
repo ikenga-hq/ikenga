@@ -239,6 +239,62 @@ The daemon has no way for the root side to inject a per-account environment: a p
 
 The fix for the second group belongs in the daemon: `T1Launcher::host_env()` reading the root-owned `/etc/ikenga/secrets/<unix_name>.env` and adding its entries to the child's environment, under names the PTY denylist does not match, would carry them into every PTY and Chi run. The file format is a plain `NAME=value` list so that change needs nothing new from the provisioner. Until then, treat agent-account secrets delivered this way as available to shell-launched work only.
 
+## SSH tunnels
+
+A tunnel is a systemd unit that keeps `ssh -N -L 127.0.0.1:<port>:<host>:<port>` up to a remote host, as an unprivileged user, with a **pinned host key**. The backups use one to reach a database that only listens on its own machine. `sudo ikenga-provision tunnels` (or the full provision run, which does it **before** backups) converges all of it from the profile; `--dry-run` prints the plan.
+
+```bash
+TUNNEL_USER=ikenga-tunnel                       # default
+TUNNELS=(
+  "devotee-db=pgtunnel@157.180.123.30 5544:127.0.0.1:55432"
+  "alt-db=pgtunnel2@db.example.com:2222 5545:127.0.0.1:55433"
+)
+TUNNEL_KNOWN_HOSTS=(                            # no trust-on-first-use: the key comes from here, or the tunnel is refused
+  "157.180.123.30 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA..."
+  "[db.example.com]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA..."     # a non-22 ssh port is written [host]:port
+)
+TUNNEL_FROM=203.0.113.7                         # optional: the address printed in from="" (default: this box's public address)
+```
+
+`TUNNELS` entry: `name=user@host[:sshport] localport:remotehost:remoteport`, exactly one space. The local end is **always `127.0.0.1`**. Every field is matched against a strict pattern (name `a-z 0-9 -`, user `a-z 0-9 _ -`, host letters/digits/`.`/`-` and never a leading `-`, ports 1-65535 with no leading zero, no duplicate name or local port), so nothing in the profile can become an ssh option, a shell word or an extra unit line; a failing entry is refused by number before anything on the host changes. A local port below 1024 cannot be bound by the unprivileged user (the tunnel would sit in its restart loop). Get a host key with `ssh-keyscan -t ed25519 <host>` and **confirm its fingerprint out of band** before putting it in the profile. IPv6 literals are not supported.
+
+| Profile | Effect |
+|---------|--------|
+| `TUNNELS` not mentioned | The tunnels phase does nothing, and tunnel units already on the host are left alone (a profile written before this feature cannot remove a hand-made tunnel). |
+| `TUNNELS=( ... )` | Converge exactly these. A `<name>-tunnel.service` of `TUNNEL_USER` that is not listed is **stopped, disabled and removed**. The key, the user and `known_hosts` stay. |
+| `TUNNELS=()` | Remove every tunnel unit of `TUNNEL_USER`. |
+
+### What is installed
+
+| Path | Owner / mode | |
+|------|--------------|--|
+| `/var/lib/<TUNNEL_USER>/` | `<user>` `0700` | The user's home (`/var/lib` is root's, so the user cannot swap it for a symlink). No login shell, no supplementary groups. |
+| `.ssh/id_ed25519`, `.pub` | `<user>` `0600` / `0644` | **One key per box**, shared by every tunnel. Generated once, with comment `<user>@<hostname>`, and **never regenerated**: an existing one is adopted if it is a regular, passphrase-less ed25519 key of that user (a symlink, another owner or another type is refused; a group/other-readable mode is corrected to `0600`). |
+| `.ssh/known_hosts` | `<user>` `0644` | Exactly the `TUNNEL_KNOWN_HOSTS` entries some tunnel goes to. A changed set is written after the old file is copied to `known_hosts.bak-<time>`, and the tunnels restart to pick it up. |
+| `/etc/systemd/system/<name>-tunnel.service` | `root` `0644` | One per tunnel. |
+
+The unit runs `ssh -NT` with `StrictHostKeyChecking=yes`, `IdentitiesOnly=yes`, `BatchMode=yes`, `ExitOnForwardFailure=yes`, a 30 s keep-alive and `-L 127.0.0.1:<local>:<host>:<port>` (plus `-p <port>` for a non-22 ssh port), as `User=<TUNNEL_USER>` with `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome` and `PrivateTmp`, `ReadOnlyPaths` on the home, `Restart=always` every 10 s. `TUNNEL_USER` may not be `root`, the admin, the T0 `ikenga` user, the backup user, an `ik-*` name or anything with a uid inside `UID_RANGE`.
+
+**Root never follows or writes through a path the tunnel user controls.** Everything root does *inside* the home (look at, generate and compare the key, write `known_hosts`) is done **as the tunnel user** (`setpriv`, no groups, clean environment, time-limited), never by root through a path the user could have swapped; the home itself is checked with root's own `lstat`. A symlink at the home, `.ssh`, key, `.pub`, `known_hosts` or unit path, or a key/`known_hosts` owned by anyone else, is **refused** (the run stops before changing anything and names the path). The private key is never printed, logged or put in argv.
+
+### The remote end (you do this once per tunnel)
+
+The provisioner cannot authorise the key on the remote host. Each run prints, per tunnel, the exact line for that host's `authorized_keys` (for a `nologin` user created for this purpose):
+
+```
+restrict,port-forwarding,permitopen="127.0.0.1:55432",from="203.0.113.7" ssh-ed25519 AAAA... ikenga-tunnel@royalti-box
+```
+
+`restrict` turns off everything but what follows (no shell, no tty, no agent/X11 forwarding), `permitopen` limits the one allowed forward to the target the tunnel uses, and `from` limits the source address: this box's public address if it can be determined (the route to the internet, when it is not a private range), otherwise `<THIS-BOX-PUBLIC-IP>` for you to fill in, or set `TUNNEL_FROM`. Two tunnels to the same remote user need one line with both `permitopen` options. Until the line is installed the unit retries every 10 s, and the run says `not listening yet`; once it is in, the tunnel comes up by itself (ssh opens the local port only after the remote accepted the key).
+
+### Converge, and adopting a hand-made tunnel
+
+`tunnels` is idempotent: a rerun reports `no changes` and touches nothing; a changed unit is rewritten (the previous one is kept as `<unit>.bak-<time>`) and that tunnel restarts; a stopped tunnel is started (a tunnel waiting out its 10 s restart delay is left alone). **Units are compared by what they do**: comments, blank lines, line-continuation layout, `Description=` and `Documentation=` are ignored, so a hand-made unit with the same effect is adopted as it is, with no rewrite and no restart. The live box's `devotee-db-tunnel.service` (user `ikenga-tunnel`, key `/var/lib/ikenga-tunnel/.ssh/id_ed25519`) is adopted this way with the entry `devotee-db=pgtunnel@157.180.123.30 5544:127.0.0.1:55432` and that host's key in `TUNNEL_KNOWN_HOSTS`: same user, same key (not regenerated), same unit name. Run it with `--dry-run` first; it must say `no changes`. If a unit differs in what it does, that run says so and converges it.
+
+The container test (`test-tunnels-container.sh`) runs against real systemd with **no network**: the "remote" is a second sshd on `127.0.0.1` (ports 22 and 2222) with a `nologin` user authorised by the printed line, and a fake Postgres listener behind it.
+
+**Not handled:** the remote side (above); rotating the key (delete it by hand, rerun, install the new line, remove the old); IPv6 targets; tunnels that need a jump host or a non-default `ssh_config`; alerting on a down tunnel (a down tunnel makes the backups report `dump-failed`).
+
 ## Database backups
 
 Postgres backups run **on this box**, as system jobs, by a dedicated user that holds only the database connection strings and the GCS credentials (decision D-B10; they moved here from rex-vps). Rex's alerts only *read* a status file the jobs leave behind. `sudo ikenga-provision backups` (or the full provision run) converges all of it from the profile; `--dry-run` prints the plan by secret and file **name**, never a value.
