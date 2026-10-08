@@ -133,42 +133,10 @@ fn short_thread(thread_id: &str) -> String {
     thread_id.chars().take(8).collect()
 }
 
-/// One-line summary of a tool's input for use as a notification body. We
-/// keep it conservative: prefer well-known fields (command, path, url,
-/// question) and fall back to a generic "(tap to review)". Also used by the
-/// WP-40 permission producers (`notifications::producers`) so a persisted
-/// notification row and the OS notification describe a tool call identically.
-pub(crate) fn short_summary_of_input(tool_input: Option<&Value>) -> String {
-    let Some(input) = tool_input else {
-        return "(tap to review)".into();
-    };
-    // Try the most common high-signal fields first.
-    for key in &["command", "path", "url", "file_path", "question"] {
-        if let Some(s) = input.get(*key).and_then(Value::as_str) {
-            return truncate(s, 120);
-        }
-    }
-    // AskUserQuestion has a `questions[]` array.
-    if let Some(questions) = input.get("questions").and_then(Value::as_array) {
-        if let Some(q) = questions
-            .first()
-            .and_then(|q| q.get("question"))
-            .and_then(Value::as_str)
-        {
-            return truncate(q, 120);
-        }
-    }
-    "(tap to review)".into()
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let trimmed: String = s.chars().take(max).collect();
-        format!("{trimmed}…")
-    }
-}
+// `short_summary_of_input` moved to the ungated
+// `server::shared::notifications::hook_ask` (the daemon's held-gate row needs
+// it too); the OS-notification payload and the WP-40 producers still share it.
+pub(crate) use crate::server::shared::notifications::hook_ask::short_summary_of_input;
 
 #[cfg(test)]
 mod tests {

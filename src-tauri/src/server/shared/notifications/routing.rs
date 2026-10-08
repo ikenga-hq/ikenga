@@ -1808,29 +1808,121 @@ pub async fn decide_on_relay(
     notification_id: i64,
     decision: &str,
 ) -> Result<Value, AccessError> {
+    let audit = match &relay.store {
+        Some(store) => AuditTo::Store(store),
+        None => AuditTo::Off,
+    };
+    decide_on(
+        pool,
+        &RelayResolvers(relay.clone()),
+        Some(relay),
+        audit,
+        ctx,
+        notification_id,
+        decision,
+    )
+    .await
+}
+
+/// Where a decision's audit row is written (daemon asks, gap 2).
+pub enum AuditTo<'a> {
+    /// The chain itself: the T0 daemon's store (or the T1 broker's).
+    Store(&'a AccessStore),
+    /// A T1 principal child, which holds no store: the note is queued for the
+    /// broker (the chain's one writer) to validate and append
+    /// ([`crate::access::audit::child`]). Queued, not written.
+    Outbox(&'a crate::access::audit::child::Outbox),
+    /// No store to write to (a router built without one).
+    Off,
+}
+
+/// [`decide_with`] over any resolver table, then the audit. The relay is
+/// only for a mirror row's decision (retractable, review WP75-R2); a hook
+/// ask has none and is audited where it was decided.
+pub async fn decide_on(
+    pool: &sqlx::SqlitePool,
+    resolvers: &dyn AskResolvers,
+    relay: Option<&Arc<Relay>>,
+    audit: AuditTo<'_>,
+    ctx: &AccessCtx,
+    notification_id: i64,
+    decision: &str,
+) -> Result<Value, AccessError> {
     let report = decide_with(
         pool,
         &Decider::from_ctx(ctx),
         notification_id,
         decision,
-        &RelayResolvers(relay.clone()),
+        resolvers,
     )
     .await;
-    if let Some(ev) = audit_event_for(Some(ctx), &report) {
-        let relayed = match (&report.result, report.row.as_ref()) {
-            (Ok(()), Some(row)) => match AskKey::parse(row.dedupe_key.as_deref().unwrap_or("")) {
-                AskKey::Relay { key } => Some(key),
-                _ => None,
-            },
-            _ => None,
-        };
-        match (relayed, &relay.store) {
-            (Some(key), _) => relay.audit_decided(&key, ev).await,
-            (None, Some(store)) => append_audit(store, &ev).await,
-            (None, None) => {}
+    match audit {
+        AuditTo::Store(store) => {
+            if let Some(ev) = audit_event_for(Some(ctx), &report) {
+                let relayed = match (&report.result, report.row.as_ref(), relay) {
+                    (Ok(()), Some(row), Some(_)) => {
+                        match AskKey::parse(row.dedupe_key.as_deref().unwrap_or("")) {
+                            AskKey::Relay { key } => Some(key),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                match (relayed, relay) {
+                    (Some(key), Some(relay)) => relay.audit_decided(&key, ev).await,
+                    _ => append_audit(store, &ev).await,
+                }
+            }
         }
+        AuditTo::Outbox(outbox) => {
+            if let Some(note) = note_for(ctx, &report) {
+                outbox.push(note);
+            }
+        }
+        AuditTo::Off => {}
     }
     report.into_value()
+}
+
+/// The [`crate::access::audit::child::Note`] a T1 child queues for a report:
+/// the same facts [`audit_event_for`] puts in the chain row, as the closed
+/// record the broker will validate, with the deciding credential the broker
+/// handed this child.
+pub fn note_for(
+    ctx: &AccessCtx,
+    report: &DecideReport,
+) -> Option<crate::access::audit::child::Note> {
+    use crate::access::audit::child::{Note, NoteBy, NoteKind};
+    let row = report.row.as_ref();
+    let by = Decider::from_ctx(ctx).by;
+    let (kind, reason) = match (&report.result, report.refused) {
+        (Ok(()), _) => (NoteKind::Decided, None),
+        (Err(_), Some(reason)) => (NoteKind::Refused, Some(reason.to_string())),
+        (Err(_), None) => return None,
+    };
+    Some(Note {
+        kind: Some(kind),
+        target: row.map(|r| r.title.chars().take(120).collect()),
+        decision: if kind == NoteKind::Decided {
+            report.decision.map(|d| d.as_str().to_string())
+        } else {
+            None
+        },
+        outcome: None,
+        reason,
+        sensitive: row.map(|r| r.sensitivity.level()).unwrap_or(0),
+        requested_by: row.and_then(|r| r.requested_by.clone()),
+        project_key: match (&ctx.share, row.and_then(|r| r.project_id.as_ref())) {
+            (Some(s), _) => Some(s.project_key.clone()),
+            (None, Some(p)) => Some(format!("{}/{p}", ctx.principal_id)),
+            (None, None) => None,
+        },
+        by: Some(NoteBy {
+            principal_id: by.principal_id,
+            via: by.via.to_string(),
+            device_id: by.device_id,
+        }),
+    })
 }
 
 /// The desktop's in-process `permission_decide` (§5.5, review C-05): the

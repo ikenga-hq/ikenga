@@ -15,10 +15,14 @@
 //! * [`verify_boot`] — the reseal-aware full walk every start, verify and
 //!   export runs (§6.4), and `ikenga-server audit verify`;
 //! * [`absorb`] — `access/0002_absorb_auth_events` (§6.6, §8.3);
-//! * [`on_client_frame`] — `dispatch.sent` (§6.5, P-22).
+//! * [`on_client_frame`] — `dispatch.sent` (§6.5, P-22);
+//! * [`child`] — a T1 principal child's audit outbox, which the broker (the
+//!   chain's one writer) drains: the daemon's held-hook asks end inside a
+//!   child.
 
 pub mod absorb;
 pub mod chain;
+pub mod child;
 pub mod export;
 pub mod list;
 pub mod reseal;

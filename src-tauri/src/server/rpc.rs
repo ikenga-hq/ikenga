@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tracing::debug;
 
+use super::hook_asks;
 use super::rpc_claude;
 use super::rpc_exec;
 use super::rpc_files;
@@ -283,7 +284,10 @@ pub async fn rpc_handler(
         // Tauri commands — the desktop reaches these through the iyke bridge.
         "term_hooks_info" => term_hooks::info_arm(&state),
         "term_hooks_statusline_snapshot" => term_hooks::snapshot_arm(&state),
-        "term_hooks_decide" => term_hooks::decide_arm(&state, &payload.args),
+        "term_hooks_decide" => {
+            hook_asks::term_hooks_decide(&state, access.as_deref(), ctx.as_ref(), &payload.args)
+                .await
+        }
         "pty_write" => {
             let id = payload
                 .args
@@ -903,6 +907,14 @@ pub async fn rpc_handler(
         "agent_ops_run_now" => rpc_exec::agent_ops_run_now(&state, &payload.args).await,
         "pkg_settings_set" => rpc_exec::pkg_settings_set(&state, &payload.args).await,
 
+        // `permission_decide` on a daemon (T0 or a T1 child): the decide core
+        // with the hook resolver beside the relay's, audited where this tier
+        // audits (`server::hook_asks`). Every other §9.1 arm follows.
+        "permission_decide" => {
+            hook_asks::permission_decide(&state, access.as_deref(), ctx.as_ref(), &payload.args)
+                .await
+        }
+
         // --- G-ACCESS §9.1 (WP-74a, skeleton-first §9.2) ---
         //
         // Every access arm, the permission decide core, the T0 ask relay and
@@ -942,7 +954,6 @@ pub async fn rpc_handler(
         | "access_push_unsubscribe"
         | "access_push_list"
         | "access_push_test"
-        | "permission_decide"
         | "permission_relay_put"
         | "permission_relay_take"
         | "permission_relay_resolve"
