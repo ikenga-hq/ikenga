@@ -5,6 +5,7 @@ set -euo pipefail
 #
 #   provision.sh --profile <file> [--dry-run] [--yes] [--skip-hardening]
 #   provision.sh --profile profiles/dixtrit-public.env --dry-run
+#   provision.sh backups --profile <file> [--dry-run]    (Postgres backups to GCS only)
 #
 # One idempotent entry point. Every phase checks before it changes, and
 # --dry-run prints what each phase WOULD change without touching the host.
@@ -57,7 +58,7 @@ UPDATE_RETRY_COOLDOWN="${UPDATE_RETRY_COOLDOWN:-3600}"
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
 
 case "${1:-}" in
-  upgrade|check-update|apply-request|install-update-units|install-agent-cli-updates|sync-accounts) ACTION="$1"; shift ;;
+  upgrade|check-update|apply-request|install-update-units|install-agent-cli-updates|sync-accounts|backups) ACTION="$1"; shift ;;
 esac
 
 while [[ $# -gt 0 ]]; do
@@ -89,13 +90,15 @@ while [[ $# -gt 0 ]]; do
         exit 0
       fi
       if [[ "$ACTION" != "provision" ]]; then
-        printf 'Usage: %s check-update | apply-request | install-update-units | install-agent-cli-updates | sync-accounts [--profile <file>] [--dry-run]\n\n' "${BASH_SOURCE[0]}"
+        printf 'Usage: %s check-update | apply-request | install-update-units | install-agent-cli-updates | sync-accounts | backups [--profile <file>] [--dry-run]\n\n' "${BASH_SOURCE[0]}"
         printf '  check-update          read the release manifest and write %s/available.json (installs nothing)\n' "$STATE_DIR"
         printf '  apply-request         claim and apply an admin update request (run by ikenga-update.service)\n'
         printf '  install-update-units  install %s and the update timer, path and service units\n' "$STABLE_COPY"
         printf '  install-agent-cli-updates  install the daily npm update timer for the profile'"'"'s AGENT_CLIS\n'
         printf '  sync-accounts         converge shared project mirrors, per-account clones and scoped secrets\n'
         printf '                        (run it after creating or removing accounts; the full provision run does it too)\n'
+        printf '  backups               converge the Postgres backup jobs (BACKUPS_ENABLED): backup user, pg_dump, gcloud, scoped\n'
+        printf '                        secrets, systemd service and timers, status file (the full provision run does it too)\n'
         exit 0
       fi
       sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -174,6 +177,15 @@ PROJECTS=()            # name=git-url[#branch]
 PROJECTS_BRANCH_PREFIX=""   # each account's branch = <prefix><account>/main
 PROJECTS_TOKEN_SECRET=""    # NAME of a SECRETS_FILE entry: https deploy token for private repos
 SECRETS_FILE=""             # root-only scoped secrets (format in README)
+# Postgres backups to GCS as system jobs (D-B10). See README "Database backups".
+BACKUPS_ENABLED=0
+BACKUP_USER="ikenga-backup"     # a plain system user, NOT an Ikenga principal
+BACKUP_CONFIG=""                # path to a JSON file: {"databases":[{name,connection_secret,schedule,gcs_bucket,enabled}]}
+BACKUP_GCS_KEY_SECRET=""        # NAME of a SECRETS_FILE entry: the service-account key JSON, base64 on one line
+BACKUP_SCHEDULES=()             # name=OnCalendar overrides/additions (defaults: 4hourly daily weekly, UTC)
+BACKUP_PG_MAJOR="17"            # postgresql-client-<n> from the PGDG apt repo
+BACKUP_TIMEOUT_SEC="10800"      # a run is killed after this (keep it under the shortest interval)
+BACKUP_GCLOUD_KEY_FPRS=()       # extra accepted fingerprints for the Google Cloud apt signing key
 
 if [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]]; then
   # shellcheck disable=SC1090
@@ -214,6 +226,7 @@ validate_profile() {
   [[ -z "$TS_AUTHKEY_FILE" || -f "$TS_AUTHKEY_FILE" ]] || die "TS_AUTHKEY_FILE '$TS_AUTHKEY_FILE' does not exist"
   [[ -z "$SECRETS_FROM" || -f "$SECRETS_FROM" ]] || die "SECRETS_FROM '$SECRETS_FROM' does not exist"
   validate_accounts_profile
+  validate_backups_profile
 }
 
 # --------------------------------------------------------------- preflight
@@ -711,6 +724,10 @@ summary() {
   printf '    - %s\n' "${CHANGES[@]}"
   if [[ "$ACTION" == sync-accounts ]]; then
     note "Secrets are listed by name only (+ added, ~ value changed, - removed). Per-account files: $SECRETS_DIR (root-owned, 0640)."
+    return
+  fi
+  if [[ "$ACTION" == backups ]]; then
+    note "Secrets are listed by name only (+ added, ~ value changed, - removed). Backup secrets: $BACKUP_ENV_DST and the key file (root/backup user only)."
     return
   fi
   note "Variables are listed by name only. Secrets are in $ENV_FILE (root:root 600)."
@@ -1745,13 +1762,13 @@ secret_name_ok() {
   esac
 }
 
-is_reserved_scope() { [[ "$1" == everyone || "$1" == agents || "$1" == root ]]; }
+is_reserved_scope() { [[ "$1" == everyone || "$1" == agents || "$1" == root || "$1" == backup ]]; }
 
 validate_accounts_profile() {
   local a e name rest
   for a in "${ACCOUNTS[@]}" "${AGENT_ACCOUNTS[@]}"; do
     [[ "$a" =~ ^[a-z][a-z0-9_-]{0,30}$ ]] || die "account '$a' is not a valid login name (lowercase letters, digits, - and _; the unix user is ik-<name>)"
-    is_reserved_scope "$a" && die "account name '$a' is reserved (everyone, agents and root are secret scopes)"
+    is_reserved_scope "$a" && die "account name '$a' is reserved (everyone, agents, root and backup are secret scopes)"
   done
   [[ "$UID_RANGE" =~ ^[0-9]+-[0-9]+$ ]] || die "UID_RANGE must look like 20000-29999 (got '$UID_RANGE')"
   [[ "$PROJECTS_DIR" =~ ^/[A-Za-z0-9._/-]*[A-Za-z0-9._-]$ && "$PROJECTS_DIR" != *..* ]] || die "PROJECTS_DIR must be an absolute path without spaces or '..' (got '$PROJECTS_DIR')"
@@ -2177,7 +2194,7 @@ ensure_account_clone() {
 # Blank lines and lines starting with # are skipped. A secret with no scope is
 # an error: there is no default audience.
 
-declare -A ROOT_VALUE=() ROOT_COUNT=() ROOT_SCOPE=() SEC_BODY=() SEC_SEEN=()
+declare -A ROOT_VALUE=() ROOT_COUNT=() ROOT_SCOPE=() SEC_BODY=() SEC_SEEN=() BACKUP_VALUE=()
 SECRETS_UNREADABLE=0
 
 secrets_file_ok() {
@@ -2193,7 +2210,7 @@ secrets_file_ok() {
 }
 
 load_secrets() {
-  SEC_BODY=(); SEC_SEEN=(); ROOT_VALUE=(); ROOT_COUNT=(); ROOT_SCOPE=(); SECRETS_UNREADABLE=0
+  SEC_BODY=(); SEC_SEEN=(); ROOT_VALUE=(); ROOT_COUNT=(); ROOT_SCOPE=(); BACKUP_VALUE=(); SECRETS_UNREADABLE=0
   [[ -n "$SECRETS_FILE" ]] || return 0
   if [[ ! -r "$SECRETS_FILE" ]]; then
     [[ $DRY_RUN -eq 1 ]] || die "cannot read SECRETS_FILE $SECRETS_FILE"
@@ -2202,7 +2219,7 @@ load_secrets() {
   fi
   secrets_file_ok "$SECRETS_FILE"
   local re='^\[([^]]+)\][[:space:]]+([A-Za-z_][A-Za-z0-9_]*)=(.*)$'
-  local n=0 line scope name value tok a toks targets declared
+  local n=0 line scope name value tok a toks targets declared is_backup
   while IFS= read -r line || [[ -n "$line" ]]; do
     n=$((n+1))
     [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
@@ -2213,7 +2230,7 @@ load_secrets() {
     [[ -n "$value" ]] || die "$SECRETS_FILE line $n: $name has an empty value"
     [[ "$value" != *$'\r'* ]] || die "$SECRETS_FILE line $n: carriage return in the value of $name (CRLF file?)"
 
-    targets=" "; declared=" "
+    targets=" "; declared=" "; is_backup=0
     IFS=',' read -ra toks <<<"$scope"
     for tok in "${toks[@]}"; do
       tok="${tok//[[:space:]]/}"
@@ -2226,11 +2243,19 @@ load_secrets() {
           [[ ${#AGENT_ACCOUNTS[@]} -gt 0 ]] || die "$SECRETS_FILE line $n: scope 'agents' but AGENT_ACCOUNTS is empty"
           for a in "${AGENT_ACCOUNTS[@]}"; do [[ "$targets" == *" $a "* ]] || targets+="$a "; done ;;
         root) ;;
+        backup) is_backup=1 ;;
         *)
           [[ " ${ACCT_LOGINS[*]} " == *" $tok "* ]] || die "$SECRETS_FILE line $n: scope names '$tok', which is not a managed account (typo? or add it to ACCOUNTS)"
           [[ "$targets" == *" $tok "* ]] || targets+="$tok " ;;
       esac
     done
+    if [[ $is_backup -eq 1 ]]; then
+      # Scope `backup` is the dedicated backup user's and nobody else's: it may
+      # not be combined with any other scope, so no Ikenga account can get it.
+      [[ ${#toks[@]} -eq 1 ]] || die "$SECRETS_FILE line $n: scope 'backup' cannot be combined with other scopes ($name)"
+      [[ -z "${BACKUP_VALUE[$name]+x}" ]] || die "$SECRETS_FILE line $n: $name is already set for the backup user by an earlier line"
+      BACKUP_VALUE[$name]="$value"
+    fi
     ROOT_VALUE[$name]="$value"; ROOT_COUNT[$name]=$(( ${ROOT_COUNT[$name]:-0} + 1 )); ROOT_SCOPE[$name]="$scope"
     for a in $targets; do
       [[ -z "${SEC_SEEN[$a|$name]:-}" ]] || die "$SECRETS_FILE line $n: $name is already set for $a by an earlier line (overlapping scopes)"
@@ -2366,6 +2391,571 @@ sync_accounts() {
   [[ -z "$SECRETS_FILE" ]] || sync_secrets
 }
 
+# ------------------------------------------------- database backups (D-B10)
+#
+# Postgres backups run on THIS box as system jobs, by a dedicated user that is
+# not an Ikenga principal and holds only what the jobs need: the connection
+# strings and the GCS service-account key. Rex's alerts only read the status
+# file the jobs leave behind. Layout (all paths fixed; the unit files name them):
+#
+#   /usr/local/lib/ikenga-backup/   run-backup.sh, verify-backup.sh   root:root 0755
+#   /etc/ikenga-backup/             backup-config.json (names only)    root:<group> 0750 / 0640
+#                                   connections.env    (secrets)       root:<group> 0640
+#   /var/lib/ikenga-backup/         status.json (everyone can read)    <user> 0755 / 0644
+#     private/                      the user's home: key, gcloud config,
+#                                   scratch space, raw tool errors     <user> 0700
+#
+# The connection strings come from SECRETS_FILE lines scoped `backup`; that
+# scope can't be combined with another and is never delivered to an account.
+# Values are handled like sync_secrets does: shell variables and the printf
+# builtin, never argv, never the log, never `eval`.
+
+BACKUP_LIB_DIR="/usr/local/lib/ikenga-backup"
+BACKUP_ETC_DIR="/etc/ikenga-backup"
+BACKUP_STATE_DIR="/var/lib/ikenga-backup"
+BACKUP_PRIV_DIR="$BACKUP_STATE_DIR/private"
+BACKUP_CONFIG_DST="$BACKUP_ETC_DIR/backup-config.json"
+BACKUP_ENV_DST="$BACKUP_ETC_DIR/connections.env"
+BACKUP_KEY_DST="$BACKUP_PRIV_DIR/gcs-key.json"
+BACKUP_UNIT="ikenga-backup@.service"
+# The PGDG archive signing key (apt.postgresql.org). The download is checked
+# against this fingerprint and nothing else is accepted.
+PGDG_KEY_FPR="B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8"
+PGDG_KEY_URL="https://www.postgresql.org/media/keys/ACCC4CF8.asc"
+# The Google Cloud apt signing key ("Artifact Registry Repository Signer"),
+# observed from packages.cloud.google.com on 2026-10-08 and pinned here. If
+# Google rotates it provisioning stops with the new fingerprint named: confirm
+# it against Google's install docs, then add it to BACKUP_GCLOUD_KEY_FPRS.
+GCLOUD_KEY_FPR="35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3"
+GCLOUD_KEY_URL="https://packages.cloud.google.com/apt/doc/apt-key.gpg"
+
+declare -A BK_CAL=([4hourly]="*-*-* 00/4:00:00 UTC" [6hourly]="*-*-* 00/6:00:00 UTC" [12hourly]="*-*-* 00/12:00:00 UTC"
+                   [daily]="*-*-* 02:00:00 UTC" [weekly]="Sun *-*-* 03:00:00 UTC" [monthly]="*-*-01 04:00:00 UTC")
+BK_NAMES=(); declare -A BK_SECRET=() BK_SCHED=()
+BK_SCHEDS_USED=()
+BK_UID=""; BK_GID=""; BK_GROUP=""
+BK_NEED_SYSTEMD_RELOAD=0
+
+# Cheap checks that need nothing installed. The deep check of BACKUP_CONFIG is
+# backup_load_config, which needs jq and so runs after the packages.
+validate_backups_profile() {
+  [[ "$BACKUPS_ENABLED" == 0 || "$BACKUPS_ENABLED" == 1 ]] || die "BACKUPS_ENABLED must be 0 or 1 (got '$BACKUPS_ENABLED')"
+  [[ "$BACKUP_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "BACKUP_USER '$BACKUP_USER' is not a valid unix user name"
+  case "$BACKUP_USER" in
+    root|ikenga|nobody|postgres|"$ADMIN_USER"|ik-*) die "BACKUP_USER '$BACKUP_USER' is not allowed: it must be its own plain system user (not root, the admin, the T0 'ikenga' user, or an ik-* Ikenga account)" ;;
+  esac
+  [[ "$BACKUP_PG_MAJOR" =~ ^[0-9]{2}$ ]] || die "BACKUP_PG_MAJOR must be two digits, e.g. 17 (got '$BACKUP_PG_MAJOR')"
+  [[ "$BACKUP_TIMEOUT_SEC" =~ ^[0-9]{3,6}$ ]] || die "BACKUP_TIMEOUT_SEC must be a number of seconds (got '$BACKUP_TIMEOUT_SEC')"
+  local e name cal
+  for e in "${BACKUP_SCHEDULES[@]}"; do
+    name="${e%%=*}"; cal="${e#*=}"
+    [[ "$e" == *=* && -n "$cal" ]] || die "BACKUP_SCHEDULES entry '$e' must look like name=OnCalendar-expression"
+    [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || die "BACKUP_SCHEDULES name '$name' must be lowercase letters, digits and -"
+    # The value lands in a unit file: only what a calendar expression needs.
+    [[ "$cal" =~ ^[A-Za-z0-9*/:,.~\ -]+$ ]] || die "BACKUP_SCHEDULES '$name': the calendar expression has characters a systemd OnCalendar does not need"
+    if command -v systemd-analyze >/dev/null 2>&1; then
+      systemd-analyze calendar "$cal" >/dev/null 2>&1 || die "BACKUP_SCHEDULES '$name': systemd cannot parse the calendar expression '$cal' (try: systemd-analyze calendar '$cal')"
+    fi
+    BK_CAL[$name]="$cal"
+  done
+  for e in "${BACKUP_GCLOUD_KEY_FPRS[@]}"; do
+    [[ "$e" =~ ^[0-9A-Fa-f]{40}$ ]] || die "BACKUP_GCLOUD_KEY_FPRS entry '$e' is not a 40-hex-digit fingerprint"
+  done
+  [[ "$BACKUPS_ENABLED" == 1 ]] || return 0
+  [[ -n "$BACKUP_CONFIG" && -f "$BACKUP_CONFIG" ]] || die "BACKUPS_ENABLED needs BACKUP_CONFIG: a JSON file of databases (see scripts/server/backup/backup-config.example.json)"
+  [[ -n "$SECRETS_FILE" ]] || die "BACKUPS_ENABLED needs SECRETS_FILE (the connection strings are '[backup]' lines in it)"
+  [[ -n "$BACKUP_GCS_KEY_SECRET" ]] || die "BACKUPS_ENABLED needs BACKUP_GCS_KEY_SECRET: the NAME of the SECRETS_FILE entry holding the base64 service-account key"
+  secret_name_ok "$BACKUP_GCS_KEY_SECRET" || die "BACKUP_GCS_KEY_SECRET '$BACKUP_GCS_KEY_SECRET' is not a usable secret name"
+}
+
+backups_installed() {
+  [[ -e "$SYSTEMD_DIR/$BACKUP_UNIT" ]] || compgen -G "$SYSTEMD_DIR/ikenga-backup-*.timer" >/dev/null
+}
+
+# systemctl, quietly absent on a host without it (dry runs).
+sc() { command -v systemctl >/dev/null 2>&1 || return 0; systemctl "$@"; }
+
+# ensure_dir <mode> <owner> <group> <path>
+ensure_dir() {
+  local mode="$1" owner="$2" group="$3" d="$4" cur
+  if [[ -d "$d" ]]; then
+    cur="$(stat -c '%a %U %G' -- "$d")"
+    [[ "$cur" == "${mode#0} $owner $group" ]] && return 0
+    run chown "$owner:$group" "$d"; run chmod "$mode" "$d"
+    changed "$d: owner/mode set to $owner:$group $mode"
+  else
+    run install -d -m "$mode" -o "$owner" -g "$group" "$d"
+    changed "$d created ($owner:$group $mode)"
+  fi
+}
+
+# install_file <mode> <owner> <group> <src> <dst>: copy when the content or
+# the owner/mode differ. Returns 0 when it changed something.
+install_file() {
+  local mode="$1" owner="$2" group="$3" src="$4" dst="$5" cur
+  if [[ -f "$dst" ]] && cmp -s -- "$src" "$dst"; then
+    cur="$(stat -c '%a %U %G' -- "$dst")"
+    [[ "$cur" == "${mode#0} $owner $group" ]] && return 1
+    run chown "$owner:$group" "$dst"; run chmod "$mode" "$dst"
+    changed "$dst: owner/mode set to $owner:$group $mode"
+    return 0
+  fi
+  run install -m "$mode" -o "$owner" -g "$group" "$src" "$dst"
+  changed "$dst installed"
+  return 0
+}
+
+APT_UPDATED=0
+backup_apt_update() {
+  [[ $APT_UPDATED -eq 1 ]] && return 0
+  run env DEBIAN_FRONTEND=noninteractive apt-get update -y; APT_UPDATED=1
+}
+backup_apt_install() {
+  local missing=() p
+  for p in "$@"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
+  [[ ${#missing[@]} -gt 0 ]] || return 0
+  backup_apt_update
+  apt_install "${missing[@]}"
+}
+
+# The fingerprints of the primary keys in a key file (armored or binary), one
+# per line. Uses a throwaway GNUPGHOME so root's keyring is never touched.
+key_fingerprints() {
+  local f="$1" home; home="$(mktemp -d)"; chmod 0700 "$home"
+  GNUPGHOME="$home" gpg --batch --quiet --show-keys --with-colons --fingerprint -- "$f" 2>/dev/null \
+    | awk -F: '$1=="pub"{p=1} $1=="fpr"&&p{print toupper($10); p=0}'
+  rm -rf -- "$home"
+}
+
+# backup_apt_repo <name> <key url> <allowed fingerprints, space separated> <deb line, with {KEYRING}>
+# Adds an apt repository whose signing key is downloaded over https, checked
+# against the pinned fingerprints (EVERY key in the file must be one of them),
+# and used only through signed-by for this one repository.
+backup_apt_repo() {
+  local name="$1" url="$2" allowed="$3" line="$4"
+  local keyring="/usr/share/keyrings/ikenga-$name.gpg" list="/etc/apt/sources.list.d/ikenga-$name.list"
+  local want="${line//\{KEYRING\}/$keyring}"
+  if [[ -f "$keyring" && "$(cat "$list" 2>/dev/null || true)" == "$want" ]]; then
+    # Already set up: re-check the installed key, so a swapped keyring is noticed.
+    local f ok=1
+    for f in $(key_fingerprints "$keyring"); do [[ " $allowed " == *" $f "* ]] || ok=0; done
+    [[ $ok -eq 1 ]] || die "the installed $keyring holds a key that is not in the pinned set ($allowed); remove it and the $list to re-fetch"
+    return 0
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then
+    changed "apt repository $name ($url, key pinned to $allowed)"
+    note "[dry-run] fetch $url, require fingerprint(s) $allowed, install $keyring and $list, apt-get update"
+    return 0
+  fi
+  local tmp key fps f; tmp="$(mktemp -d)"; chmod 0700 "$tmp"
+  curl -fsSL --proto '=https' --tlsv1.2 --max-time 60 -o "$tmp/key" "$url" || { rm -rf "$tmp"; die "could not download the $name apt signing key from $url"; }
+  fps="$(key_fingerprints "$tmp/key")"
+  [[ -n "$fps" ]] || { rm -rf "$tmp"; die "the $name key download is not a PGP key"; }
+  for f in $fps; do
+    [[ " $allowed " == *" $f "* ]] || { rm -rf "$tmp"; die "the $name apt signing key has fingerprint $f, which is not one of the pinned ones ($allowed); refusing to trust it. If the vendor rotated it, confirm the new fingerprint with them and extend the pin"; }
+  done
+  # apt wants a binary keyring for signed-by.
+  if head -c 64 "$tmp/key" | grep -q 'BEGIN PGP'; then
+    gpg --batch --yes --dearmor -o "$tmp/key.gpg" "$tmp/key" 2>/dev/null || { rm -rf "$tmp"; die "could not dearmor the $name key"; }
+  else
+    cp "$tmp/key" "$tmp/key.gpg"
+  fi
+  install -m 0644 -o root -g root "$tmp/key.gpg" "$keyring"
+  printf '%s\n' "$want" > "$list"; chmod 0644 "$list"
+  rm -rf "$tmp"
+  changed "apt repository $name added (key $fps)"
+  APT_UPDATED=0; backup_apt_update
+}
+
+# ---- the config
+
+# Reads and validates BACKUP_CONFIG. Needs jq. Fills BK_NAMES and the
+# BK_SECRET/BK_SCHED maps, and BK_SCHEDS_USED.
+backup_load_config() {
+  BK_NAMES=(); BK_SECRET=(); BK_SCHED=(); BK_SCHEDS_USED=()
+  if ! command -v jq >/dev/null 2>&1; then
+    [[ $DRY_RUN -eq 1 ]] || die "jq is required to read BACKUP_CONFIG"
+    note "jq is not installed here: BACKUP_CONFIG is not validated in this dry run"; return 1
+  fi
+  jq -e '(.databases | type) == "array"' "$BACKUP_CONFIG" >/dev/null 2>&1 || die "BACKUP_CONFIG $BACKUP_CONFIG is not JSON with a top-level \"databases\" array"
+  local errs
+  errs="$(jq -r '
+    def isstr(re): type == "string" and test(re);
+    ( (.databases | to_entries[]) as $e
+      | "entry \($e.key + 1)" as $w | $e.value as $d
+      | if ($d | type) != "object" then "\($w): not an object"
+        else
+          ( if ($d.name | isstr("^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")) then empty else "\($w): name must be letters, digits, . _ - (max 63)" end ),
+          ( if ($d.connection_secret | isstr("^[A-Za-z_][A-Za-z0-9_]*$")) then empty else "\($w): connection_secret must be a secret NAME like MY_DB_CONNECTION_STRING" end ),
+          ( if ($d.schedule | isstr("^[a-z0-9][a-z0-9-]{0,31}$")) then empty else "\($w): schedule must be a name like daily" end ),
+          ( if ($d.gcs_bucket | isstr("^[a-z0-9][a-z0-9._-]{1,220}$")) then empty else "\($w): gcs_bucket is not a bucket name" end ),
+          ( if ($d | has("enabled")) and (($d.enabled | type) != "boolean") then "\($w): enabled must be true or false" else empty end )
+        end ),
+    ( [.databases[] | select(type == "object") | .name] as $n
+      | if ($n | length) != ($n | unique | length) then "duplicate database name" else empty end )
+  ' "$BACKUP_CONFIG" 2>&1 | sort -u)" || true
+  [[ -z "$errs" ]] || die "BACKUP_CONFIG is invalid:"$'\n'"$(printf '  %s\n' "$errs")"
+  local name secret sched seen=" "
+  while IFS=$'\t' read -r name secret sched; do
+    secret_name_ok "$secret" || die "BACKUP_CONFIG: database '$name' uses connection_secret '$secret', which is not an allowed secret name (reserved or shell-sensitive)"
+    [[ -n "${BK_CAL[$sched]:-}" ]] || die "BACKUP_CONFIG: database '$name' uses schedule '$sched', which has no calendar (defaults: ${!BK_CAL[*]}; add one with BACKUP_SCHEDULES=(\"$sched=<OnCalendar>\"))"
+    BK_NAMES+=("$name"); BK_SECRET[$name]="$secret"; BK_SCHED[$name]="$sched"
+    [[ "$seen" == *" $sched "* ]] || { seen+="$sched "; BK_SCHEDS_USED+=("$sched"); }
+  done < <(jq -r '.databases[] | select(.enabled != false) | [.name, .connection_secret, .schedule] | @tsv' "$BACKUP_CONFIG")
+  [[ ${#BK_NAMES[@]} -gt 0 ]] || die "BACKUP_CONFIG has no enabled database"
+  return 0
+}
+
+# ---- the secrets plan (pure: reads SECRETS_FILE state, writes nothing)
+
+BK_ENV_BODY=""; BK_KEY_JSON=""; BK_MISSING=()
+backup_plan_secrets() {
+  BK_ENV_BODY=""; BK_KEY_JSON=""; BK_MISSING=()
+  [[ $SECRETS_UNREADABLE -eq 0 ]] || return 1
+  local name db a scope used=" " k line b64
+  # Connection strings: scope `backup` only, one line each.
+  for db in "${BK_NAMES[@]}"; do
+    name="${BK_SECRET[$db]}"
+    if [[ -z "${BACKUP_VALUE[$name]+x}" ]]; then
+      if [[ -n "${ROOT_SCOPE[$name]:-}" ]]; then
+        die "the connection secret $name (database $db) is in SECRETS_FILE with scope [${ROOT_SCOPE[$name]}], not [backup]. Only the backup user may hold it: change that line's scope to [backup]"
+      fi
+      BK_MISSING+=("$db:$name"); continue
+    fi
+    [[ "$used" == *" $name "* ]] && continue
+    used+="$name "
+  done
+  # The key: scope root or backup, exactly once.
+  name="$BACKUP_GCS_KEY_SECRET"
+  [[ "${ROOT_COUNT[$name]:-0}" -eq 1 ]] || die "BACKUP_GCS_KEY_SECRET '$name' must appear exactly once in SECRETS_FILE (found ${ROOT_COUNT[$name]:-0})"
+  scope="${ROOT_SCOPE[$name]}"
+  [[ "$scope" == root || "$scope" == backup ]] || die "BACKUP_GCS_KEY_SECRET '$name' is scoped [$scope], so accounts would get the GCS service-account key. Scope it [root] (the provisioner installs it for the backup user) or [backup]"
+  b64="${ROOT_VALUE[$name]}"
+  BK_KEY_JSON="$(printf '%s' "$b64" | base64 -d 2>/dev/null)" || die "BACKUP_GCS_KEY_SECRET '$name' is not valid base64 (encode the key file on ONE line: base64 -w0 key.json)"
+  jq -e '.type == "service_account" and (.private_key | type == "string") and (.client_email | type == "string")' <<<"$BK_KEY_JSON" >/dev/null 2>&1 \
+    || die "BACKUP_GCS_KEY_SECRET '$name' does not decode to a service-account key JSON (type, private_key and client_email are required)"
+  # None of these may reach an Ikenga account.
+  for k in $used $name; do
+    for a in "${ACCT_LOGINS[@]}"; do
+      [[ -z "${SEC_SEEN[$a|$k]:-}" ]] || die "$k is a backup secret but SECRETS_FILE also delivers a secret of that name to account $a. Backup secrets must not reach any Ikenga account"
+    done
+  done
+  # Written to the env file: the referenced connection strings only.
+  for k in $(printf '%s\n' $used | sort); do BK_ENV_BODY+="$k=${BACKUP_VALUE[$k]}"$'\n'; done
+  # Backup-scoped secrets nothing refers to: named, not written.
+  local unused=()
+  for k in $(printf '%s\n' "${!BACKUP_VALUE[@]}" | sort); do
+    [[ "$used" == *" $k "* || "$k" == "$name" ]] || unused+=("$k")
+  done
+  [[ ${#unused[@]} -eq 0 ]] || note "backup-scoped secrets no database refers to (not written): ${unused[*]}"
+  return 0
+}
+
+# ---- the user and its directories
+
+backup_ensure_user() {
+  local line uid lo hi shell home
+  lo="${UID_RANGE%-*}"; hi="${UID_RANGE#*-}"
+  if line="$(getent passwd "$BACKUP_USER")"; then
+    IFS=: read -r _ _ uid _ _ home shell <<<"$line"
+    (( uid > 0 )) || die "BACKUP_USER $BACKUP_USER has uid 0"
+    (( uid < lo || uid >= hi )) || die "BACKUP_USER $BACKUP_USER has uid $uid, inside the Ikenga account range $UID_RANGE; it must be a plain system user"
+    if [[ "$home" != "$BACKUP_PRIV_DIR" ]]; then
+      run usermod -d "$BACKUP_PRIV_DIR" "$BACKUP_USER"; changed "user $BACKUP_USER: home -> $BACKUP_PRIV_DIR"
+    fi
+    if [[ "$shell" != /usr/sbin/nologin ]]; then
+      run usermod -s /usr/sbin/nologin "$BACKUP_USER"; changed "user $BACKUP_USER: login shell -> nologin"
+    fi
+    # No supplementary groups: nothing the user could read through a group.
+    if [[ "$(id -nG "$BACKUP_USER")" != "$(id -gn "$BACKUP_USER")" ]]; then
+      run usermod -G "" "$BACKUP_USER"; changed "user $BACKUP_USER: supplementary groups removed"
+    fi
+  else
+    run useradd --system --user-group --no-create-home --home-dir "$BACKUP_PRIV_DIR" --shell /usr/sbin/nologin \
+      --comment "Ikenga database backups" "$BACKUP_USER"
+    changed "system user $BACKUP_USER created (no login, home $BACKUP_PRIV_DIR)"
+  fi
+  if id "$BACKUP_USER" >/dev/null 2>&1; then
+    BK_UID="$(id -u "$BACKUP_USER")"; BK_GID="$(id -g "$BACKUP_USER")"; BK_GROUP="$(id -gn "$BACKUP_USER")"
+  else
+    BK_UID=0; BK_GID=0; BK_GROUP="$BACKUP_USER"        # dry run, user not created yet
+  fi
+}
+
+# Run a command as the backup user, with no supplementary groups and a clean
+# environment: how the service runs.
+as_backup() {
+  ( cd / && exec setpriv --reuid="$BK_UID" --regid="$BK_GID" --clear-groups \
+      env -i HOME="$BACKUP_PRIV_DIR" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 "$@" )
+}
+
+# ---- the units
+
+backup_service_unit() {
+  local gcloud_dir path
+  gcloud_dir="$(dirname -- "$(command -v gcloud 2>/dev/null || echo /usr/bin/gcloud)")"
+  path="/usr/local/bin:/usr/bin:/bin"
+  case ":$path:" in *":$gcloud_dir:"*) ;; *) path="$gcloud_dir:$path" ;; esac
+  cat <<EOF
+[Unit]
+Description=Ikenga: Postgres backup to GCS (%i)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=$BACKUP_CONFIG_DST
+
+[Service]
+Type=oneshot
+User=$BACKUP_USER
+Group=$BK_GROUP
+ExecStart=$BACKUP_LIB_DIR/run-backup.sh --schedule %i
+SyslogIdentifier=ikenga-backup
+TimeoutStartSec=$BACKUP_TIMEOUT_SEC
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+Environment=HOME=$BACKUP_PRIV_DIR
+Environment=PATH=$path
+Environment=LANG=C.UTF-8
+Environment=BACKUP_PG_MIN_MAJOR=$BACKUP_PG_MAJOR
+Environment=CLOUDSDK_CONFIG=$BACKUP_PRIV_DIR/gcloud
+# Sandbox: the job writes only its state directory; it cannot see the Ikenga
+# daemon's data, the account secrets or the project mirrors.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ReadWritePaths=$BACKUP_STATE_DIR
+InaccessiblePaths=-/etc/ikenga -/opt/ikenga -/srv/ikenga -/root
+ProtectHome=true
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+EOF
+}
+
+backup_timer_unit() {   # schedule
+  cat <<EOF
+[Unit]
+Description=Ikenga: Postgres backup timer ($1)
+
+[Timer]
+OnCalendar=${BK_CAL[$1]}
+RandomizedDelaySec=120
+AccuracySec=1min
+Persistent=true
+Unit=ikenga-backup@$1.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# write_unit (above) returns 0 when it changed the file.
+backup_sync_units() {
+  local s u timer wanted=" " f
+  if write_unit "$BACKUP_UNIT" "$(backup_service_unit)"; then BK_NEED_SYSTEMD_RELOAD=1; fi
+  declare -A tchanged=()
+  for s in "${BK_SCHEDS_USED[@]}"; do
+    wanted+="$s "
+    if write_unit "ikenga-backup-$s.timer" "$(backup_timer_unit "$s")"; then BK_NEED_SYSTEMD_RELOAD=1; tchanged[$s]=1; fi
+  done
+  # Timers of schedules no database uses any more.
+  for f in "$SYSTEMD_DIR"/ikenga-backup-*.timer; do
+    [[ -e "$f" ]] || continue
+    u="$(basename -- "$f")"; s="${u#ikenga-backup-}"; s="${s%.timer}"
+    [[ "$wanted" == *" $s "* ]] && continue
+    if [[ $DRY_RUN -eq 0 ]]; then sc disable --now "$u" >/dev/null 2>&1 || true; rm -f -- "$f"; BK_NEED_SYSTEMD_RELOAD=1; fi
+    changed "timer $u removed (no database uses schedule '$s')"
+  done
+  if [[ $DRY_RUN -eq 1 ]]; then
+    note "[dry-run] systemctl daemon-reload; enable --now $(for s in "${BK_SCHEDS_USED[@]}"; do printf 'ikenga-backup-%s.timer ' "$s"; done)"
+    return 0
+  fi
+  [[ $BK_NEED_SYSTEMD_RELOAD -eq 0 ]] || sc daemon-reload
+  for s in "${BK_SCHEDS_USED[@]}"; do
+    timer="ikenga-backup-$s.timer"
+    if ! sc is-enabled --quiet "$timer" 2>/dev/null || ! sc is-active --quiet "$timer" 2>/dev/null; then
+      sc enable --now "$timer" >/dev/null 2>&1 || soft_fail "could not enable $timer (see: systemctl status $timer)"
+      changed "timer $timer enabled"
+    elif [[ -n "${tchanged[$s]:-}" ]]; then
+      # A changed OnCalendar only takes effect when the timer restarts.
+      sc restart "$timer" >/dev/null 2>&1 || soft_fail "could not restart $timer"
+      changed "timer $timer restarted with the new schedule"
+    fi
+  done
+}
+
+backup_remove_units() {
+  local f u any=0
+  for f in "$SYSTEMD_DIR"/ikenga-backup-*.timer; do
+    [[ -e "$f" ]] || continue
+    u="$(basename -- "$f")"
+    if [[ $DRY_RUN -eq 0 ]]; then sc disable --now "$u" >/dev/null 2>&1 || true; rm -f -- "$f"; fi
+    changed "timer $u removed"; any=1
+  done
+  if [[ -e "$SYSTEMD_DIR/$BACKUP_UNIT" ]]; then
+    [[ $DRY_RUN -eq 1 ]] || rm -f -- "$SYSTEMD_DIR/$BACKUP_UNIT"
+    changed "unit $BACKUP_UNIT removed"; any=1
+  fi
+  [[ $any -eq 0 || $DRY_RUN -eq 1 ]] || sc daemon-reload
+}
+
+# ---- the status file
+
+# status.json lists, per database, the schedule it is on; it must match the
+# config. (run-backup.sh --init-status does the writing, as the backup user.)
+backup_status_matches() {
+  local f="$BACKUP_STATE_DIR/status.json" have want
+  [[ -s "$f" ]] || return 1
+  have="$(jq -c '[.enabled, (.databases // {} | to_entries | map("\(.key):\(.value.schedule)") | sort)]' "$f" 2>/dev/null)" || return 1
+  want="$(printf '%s\n' "${BK_NAMES[@]}" | while read -r n; do printf '%s:%s\n' "$n" "${BK_SCHED[$n]}"; done | LC_ALL=C sort | jq -R . | jq -sc '[true, .]')"
+  [[ "$have" == "$want" ]]
+}
+
+backup_seed_status() {
+  if backup_status_matches; then return 0; fi
+  if [[ $DRY_RUN -eq 1 ]]; then changed "status file $BACKUP_STATE_DIR/status.json initialised for ${#BK_NAMES[@]} database(s)"; return 0; fi
+  as_backup BACKUP_CONFIG_FILE="$BACKUP_CONFIG_DST" BACKUP_STATE_DIR="$BACKUP_STATE_DIR" "$BACKUP_LIB_DIR/run-backup.sh" --init-status >/dev/null \
+    || { soft_fail "could not initialise $BACKUP_STATE_DIR/status.json"; return 0; }
+  changed "status file $BACKUP_STATE_DIR/status.json initialised for ${#BK_NAMES[@]} database(s)"
+}
+
+# ---- converge
+
+sync_backups_enabled() {
+  log "Database backups (user $BACKUP_USER; ${#BACKUP_SCHEDULES[@]} schedule override(s))"
+  [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo)"
+  local src="$SCRIPT_DIR/backup" f
+  if [[ ! -f "$src/run-backup.sh" || ! -f "$src/verify-backup.sh" ]]; then
+    [[ -x "$BACKUP_LIB_DIR/run-backup.sh" && -x "$BACKUP_LIB_DIR/verify-backup.sh" ]] \
+      || die "backup scripts not found next to provision.sh ($src); run this from the repo checkout (scripts/server/)"
+    note "backup scripts not next to this copy of provision.sh; keeping the installed ones in $BACKUP_LIB_DIR"
+    src=""
+  fi
+
+  # Tools. jq first: everything below reads JSON.
+  backup_apt_install jq gnupg curl ca-certificates gzip util-linux
+  resolve_accounts
+  load_secrets
+  backup_load_config || return 0
+  backup_plan_secrets || { note "secrets plan skipped (SECRETS_FILE not readable)"; }
+
+  # pg_dump from PGDG: the servers are PostgreSQL 17, and a pg_dump older than
+  # its server refuses to dump it.
+  local codename; codename="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")"
+  [[ -n "$codename" ]] || die "cannot tell this release's codename from /etc/os-release (needed for the PGDG apt line)"
+  backup_apt_repo pgdg "$PGDG_KEY_URL" "$PGDG_KEY_FPR" \
+    "deb [signed-by={KEYRING}] https://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main"
+  backup_apt_install "postgresql-client-$BACKUP_PG_MAJOR"
+  # gcloud (gcloud storage cp). An existing gcloud is used as it is.
+  if command -v gcloud >/dev/null 2>&1; then
+    note "gcloud found at $(command -v gcloud); not installing it"
+  else
+    backup_apt_repo gcloud "$GCLOUD_KEY_URL" "$GCLOUD_KEY_FPR ${BACKUP_GCLOUD_KEY_FPRS[*]^^}" \
+      "deb [signed-by={KEYRING}] https://packages.cloud.google.com/apt cloud-sdk main"
+    backup_apt_install google-cloud-cli
+  fi
+
+  backup_ensure_user
+  ensure_dir 0755 root root "$BACKUP_LIB_DIR"
+  ensure_dir 0750 root "$BK_GROUP" "$BACKUP_ETC_DIR"
+  ensure_dir 0755 "$BACKUP_USER" "$BK_GROUP" "$BACKUP_STATE_DIR"
+  ensure_dir 0700 "$BACKUP_USER" "$BK_GROUP" "$BACKUP_PRIV_DIR"
+
+  if [[ -n "$src" ]]; then
+    for f in run-backup.sh verify-backup.sh; do install_file 0755 root root "$src/$f" "$BACKUP_LIB_DIR/$f" || true; done
+  fi
+  install_file 0640 root "$BK_GROUP" "$BACKUP_CONFIG" "$BACKUP_CONFIG_DST" || true
+
+  # The connection strings: root:<group> 0640, parsed by run-backup.sh.
+  if [[ $SECRETS_UNREADABLE -eq 0 ]]; then
+    local cur="" k diff=""
+    [[ ! -f "$BACKUP_ENV_DST" ]] || cur="$(cat -- "$BACKUP_ENV_DST" 2>/dev/null || true)"
+    parse_kv "$cur" OLD_KV; parse_kv "$BK_ENV_BODY" NEW_KV
+    for k in $(printf '%s\n' "${!NEW_KV[@]}" | sort); do
+      if [[ -z "${OLD_KV[$k]+x}" ]]; then diff+=" +$k"
+      elif [[ "${OLD_KV[$k]}" != "${NEW_KV[$k]}" ]]; then diff+=" ~$k"; fi
+    done
+    for k in $(printf '%s\n' "${!OLD_KV[@]}" | sort); do [[ -n "${NEW_KV[$k]+x}" ]] || diff+=" -$k"; done
+    if [[ -n "$diff" ]]; then
+      if [[ $DRY_RUN -eq 0 ]]; then
+        [[ ! -f "$BACKUP_ENV_DST" ]] || backup_secret_file "$BACKUP_ENV_DST"
+        local tmp; tmp="$(mktemp "$BACKUP_ETC_DIR/.tmp.XXXXXX")"
+        { printf '%s\n' "# ikenga: managed by provision.sh from SECRETS_FILE ([backup] scope); edits are overwritten"; printf '%s' "$BK_ENV_BODY"; } > "$tmp"
+        chown "0:$BK_GID" "$tmp"; chmod 0640 "$tmp"; mv -f -- "$tmp" "$BACKUP_ENV_DST"
+      fi
+      changed "secrets $BACKUP_USER:$diff"
+    else
+      local o g m; read -r o g m < <(stat -c '%u %g %a' -- "$BACKUP_ENV_DST")
+      if [[ "$o" != 0 || "$g" != "$BK_GID" || "$m" != 640 ]]; then
+        run chown "0:$BK_GID" "$BACKUP_ENV_DST"; run chmod 0640 "$BACKUP_ENV_DST"; changed "secrets $BACKUP_USER: file owner/mode restored"
+      fi
+    fi
+    # The GCS key: a 0600 file owned by the backup user, in its private directory.
+    if [[ -f "$BACKUP_KEY_DST" ]] && [[ "$(cat -- "$BACKUP_KEY_DST")" == "$BK_KEY_JSON" ]]; then
+      local ko kg km; read -r ko kg km < <(stat -c '%u %g %a' -- "$BACKUP_KEY_DST")
+      if [[ "$ko" != "$BK_UID" || "$kg" != "$BK_GID" || "$km" != 600 ]]; then
+        run chown "$BK_UID:$BK_GID" "$BACKUP_KEY_DST"; run chmod 0600 "$BACKUP_KEY_DST"; changed "GCS key file owner/mode restored"
+      fi
+    else
+      if [[ $DRY_RUN -eq 0 ]]; then
+        local ktmp; ktmp="$(mktemp "$BACKUP_PRIV_DIR/.key.XXXXXX")"
+        printf '%s\n' "$BK_KEY_JSON" > "$ktmp"; chown "$BK_UID:$BK_GID" "$ktmp"; chmod 0600 "$ktmp"; mv -f -- "$ktmp" "$BACKUP_KEY_DST"
+      fi
+      changed "GCS key file ($BACKUP_GCS_KEY_SECRET -> $BACKUP_KEY_DST)"
+    fi
+    if [[ ${#BK_MISSING[@]} -gt 0 ]]; then
+      soft_fail "no [backup] line in SECRETS_FILE for: ${BK_MISSING[*]} (database:secret). Those databases will report no-secret until it is added"
+    fi
+  fi
+
+  backup_sync_units
+  backup_seed_status
+}
+
+sync_backups_disabled() {
+  backups_installed || [[ -d "$BACKUP_ETC_DIR" || -d "$BACKUP_STATE_DIR" ]] || return 0
+  log "Database backups (disabled: timers and credentials removed, state and logs kept)"
+  [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo)"
+  backup_remove_units
+  local f
+  for f in "$BACKUP_ENV_DST" "$BACKUP_KEY_DST"; do
+    [[ -f "$f" ]] || continue
+    if [[ $DRY_RUN -eq 0 ]]; then
+      if [[ "$f" == "$BACKUP_ENV_DST" ]]; then backup_secret_file "$f"; fi
+      rm -f -- "$f"
+    fi
+    changed "$(basename -- "$f") removed (credentials are not kept while backups are disabled)"
+  done
+  local stfile="$BACKUP_STATE_DIR/status.json" tmp
+  if [[ -s "$stfile" ]] && jq -e '.enabled == true' "$stfile" >/dev/null 2>&1; then
+    if [[ $DRY_RUN -eq 0 ]]; then
+      tmp="$(mktemp "$BACKUP_STATE_DIR/.status.XXXXXX")"
+      jq --arg now "$(now_iso)" '.enabled = false | .updated = $now' "$stfile" > "$tmp"
+      chmod 0644 "$tmp"; chown --reference="$stfile" "$tmp"; mv -f -- "$tmp" "$stfile"
+    fi
+    changed "status file marked enabled=false"
+  fi
+}
+
+sync_backups() {
+  if [[ "$BACKUPS_ENABLED" == 1 ]]; then sync_backups_enabled; else sync_backups_disabled; fi
+}
+
 # ------------------------------------------------------------------ main
 
 case "$ACTION" in
@@ -2387,6 +2977,14 @@ case "$ACTION" in
     sync_accounts
     summary
     [[ $FAILED -eq 0 ]] || { echo "error: some account sync steps failed; see the warnings above" >&2; exit 1; }
+    exit 0 ;;
+  backups)
+    [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || die "backups needs a profile: pass --profile <file> (or provision once so $INSTALL_DIR/.profile.env exists)"
+    validate_accounts_profile
+    validate_backups_profile
+    sync_backups
+    summary
+    [[ $FAILED -eq 0 ]] || { echo "error: some backup steps failed; see the warnings above" >&2; exit 1; }
     exit 0 ;;
 esac
 
@@ -2410,5 +3008,6 @@ install_agent_cli_updates
 firewall
 verify
 sync_accounts
+sync_backups
 summary
-[[ $FAILED -eq 0 ]] || { echo "error: some account sync steps failed; see the warnings above" >&2; exit 1; }
+[[ $FAILED -eq 0 ]] || { echo "error: some account or backup steps failed; see the warnings above" >&2; exit 1; }
