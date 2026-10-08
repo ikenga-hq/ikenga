@@ -57,7 +57,7 @@ UPDATE_RETRY_COOLDOWN="${UPDATE_RETRY_COOLDOWN:-3600}"
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
 
 case "${1:-}" in
-  upgrade|check-update|apply-request|install-update-units|sync-accounts) ACTION="$1"; shift ;;
+  upgrade|check-update|apply-request|install-update-units|install-agent-cli-updates|sync-accounts) ACTION="$1"; shift ;;
 esac
 
 while [[ $# -gt 0 ]]; do
@@ -89,10 +89,11 @@ while [[ $# -gt 0 ]]; do
         exit 0
       fi
       if [[ "$ACTION" != "provision" ]]; then
-        printf 'Usage: %s check-update | apply-request | install-update-units | sync-accounts [--profile <file>] [--dry-run]\n\n' "${BASH_SOURCE[0]}"
+        printf 'Usage: %s check-update | apply-request | install-update-units | install-agent-cli-updates | sync-accounts [--profile <file>] [--dry-run]\n\n' "${BASH_SOURCE[0]}"
         printf '  check-update          read the release manifest and write %s/available.json (installs nothing)\n' "$STATE_DIR"
         printf '  apply-request         claim and apply an admin update request (run by ikenga-update.service)\n'
         printf '  install-update-units  install %s and the update timer, path and service units\n' "$STABLE_COPY"
+        printf '  install-agent-cli-updates  install the daily npm update timer for the profile'"'"'s AGENT_CLIS\n'
         printf '  sync-accounts         converge shared project mirrors, per-account clones and scoped secrets\n'
         printf '                        (run it after creating or removing accounts; the full provision run does it too)\n'
         exit 0
@@ -1630,6 +1631,72 @@ ProtectHome=read-only
   fi
 }
 
+# The npm package behind each npm-installed AGENT_CLI (agy uses its own
+# installer and is not updated here).
+agent_cli_npm_pkg() {
+  case "$1" in
+    claude) echo @anthropic-ai/claude-code ;;
+    codex) echo @openai/codex ;;
+    opencode) echo opencode-ai ;;
+    pi) echo @earendil-works/pi-coding-agent ;;
+  esac
+}
+
+# A daily timer that keeps the npm-installed agent CLIs current. They are
+# installed system-wide as root, so a principal's own CLI cannot self-update
+# (claude shows "Auto-update failed" in every terminal). Running sessions keep
+# their binary; new ones get the update. Idempotent.
+install_agent_cli_updates() {
+  local cli pkg pkgs=()
+  for cli in "${AGENT_CLIS[@]}"; do
+    pkg="$(agent_cli_npm_pkg "$cli")"
+    [[ -n "$pkg" ]] && pkgs+=("$pkg@latest")
+  done
+  [[ ${#pkgs[@]} -gt 0 ]] || return 0
+  log "Agent CLI updates (daily npm update: ${pkgs[*]})"
+  [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo); dry runs may be unprivileged"
+  local npm any=0
+  npm="$(command -v npm || echo /usr/bin/npm)"
+
+  write_unit ikenga-agent-cli-update.service "[Unit]
+Description=Ikenga: update the system-wide agent CLIs (${AGENT_CLIS[*]})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$npm install -g --no-fund --no-audit ${pkgs[*]}
+TimeoutStartSec=15min
+Nice=10
+CacheDirectory=ikenga-npm
+Environment=npm_config_cache=/var/cache/ikenga-npm
+NoNewPrivileges=true
+PrivateTmp=true
+" && any=1
+  write_unit ikenga-agent-cli-update.timer "[Unit]
+Description=Ikenga: daily agent CLI update
+
+[Timer]
+OnBootSec=20min
+OnCalendar=daily
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+" && any=1
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    note "[dry-run] systemctl daemon-reload; enable --now ikenga-agent-cli-update.timer"
+    return 0
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    [[ $any -eq 1 ]] && systemctl daemon-reload
+    systemctl enable --now ikenga-agent-cli-update.timer >/dev/null 2>&1 \
+      || note "WARNING: could not enable ikenga-agent-cli-update.timer (see systemctl status ikenga-agent-cli-update.timer)"
+  fi
+}
+
 # ------------------------------------------- accounts: projects and secrets
 #
 # Under T1 every person and every agent is a separate Unix account (ik-<name>),
@@ -2311,6 +2378,9 @@ case "$ACTION" in
   check-update) do_check_update; exit 0 ;;
   apply-request) do_apply_request; exit 0 ;;
   install-update-units) install_update_units; summary; exit 0 ;;
+  install-agent-cli-updates)
+    [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || die "install-agent-cli-updates needs a profile: pass --profile <file> (or provision once so $INSTALL_DIR/.profile.env exists)"
+    validate_profile; install_agent_cli_updates; summary; exit 0 ;;
   sync-accounts)
     [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || die "sync-accounts needs a profile: pass --profile <file> (or provision once so $INSTALL_DIR/.profile.env exists)"
     validate_accounts_profile
@@ -2336,6 +2406,7 @@ if [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" && $DRY_RUN -eq 0 ]]; then
 fi
 install_service
 install_update_units
+install_agent_cli_updates
 firewall
 verify
 sync_accounts
