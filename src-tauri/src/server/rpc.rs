@@ -813,6 +813,11 @@ pub async fn rpc_handler(
         "fs_mime" => rpc_files::fs_mime(&state, &payload.args),
         "fs_search" => rpc_files::fs_search(&state, &payload.args).await,
         "fs_rename" => rpc_files::fs_rename(&state, &payload.args).await,
+        "viewer_serve" => {
+            let pid = ctx.as_ref().map(|c| *c.principal_id.as_uuid());
+            rpc_files::viewer_serve(&state, &payload.args, pid).await
+        }
+        "viewer_stop" => rpc_files::viewer_stop(&state, &payload.args).await,
         "actions_read_files" => rpc_files::actions_read_files(&state, &payload.args).await,
         "actions_write" => rpc_files::actions_write(&state, &payload.args).await,
         "keybindings_write" => rpc_files::keybindings_write(&state, &payload.args).await,

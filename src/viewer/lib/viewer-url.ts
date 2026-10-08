@@ -25,11 +25,13 @@ export function isHtmlArtifactPath(path: string): boolean {
 }
 
 export async function resolveHtmlViewerUrl(path: string): Promise<string> {
-	// The URL below would point at the browser's own localhost (gap audit rank 8).
-	if (isRemoteWebSession()) throw new Error('Preview not available in the browser yet');
 	const res = await fsRead(path);
 	const html = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(res.bytes));
 	const { root, file } = pickViewerRoot(path, html);
-	const [handle, port] = await Promise.all([viewerServe(root), viewerPort()]);
+	const handle = await viewerServe(root);
+	if (isRemoteWebSession()) {
+		return `${window.location.origin}${handle.url}${file}`;
+	}
+	const port = await viewerPort();
 	return `http://localhost:${port ?? FALLBACK_PORT}${handle.url}${file}`;
 }

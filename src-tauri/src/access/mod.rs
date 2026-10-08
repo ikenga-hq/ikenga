@@ -575,6 +575,8 @@ pub fn route_requirement(path: &str) -> Option<Requirement> {
         Some(Requirement::owner(&[]))
     } else if path.starts_with("/pkgs/") || path == "/pkgs" {
         Some(Requirement::shared(&[Cap::Files]))
+    } else if path.starts_with("/__viewer/") || path == "/__viewer" {
+        Some(Requirement::shared(&[Cap::Files]))
     } else if path == crate::server::push::outbox::EVENTS_PATH
         || path == audit::child::EVENTS_PATH
     {
@@ -852,6 +854,10 @@ mod tests {
         );
         assert_eq!(
             route_requirement("/pkgs/x/index.html").unwrap().class,
+            ArmClass::Shared
+        );
+        assert_eq!(
+            route_requirement("/__viewer/tok/index.html").unwrap().class,
             ArmClass::Shared
         );
         assert!(route_requirement("/api/rpc").is_none());

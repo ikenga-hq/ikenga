@@ -25,7 +25,6 @@ import { useEffectiveMenu } from '@/lib/actions/store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { resolveMenuItems } from '@/shell/menu/resolve';
 import { pickViewerRoot } from '../lib/relative-root';
-import { PreviewUnavailable } from './preview-unavailable';
 import { PinComposer, type PickResult } from '@/shell/artifact-studio/pin-composer';
 import * as M from '@/lib/artifact/bridge-messages';
 import { wrapHostMessage } from '@/lib/artifact/bridge-messages';
@@ -69,9 +68,6 @@ interface HtmlFrameProps {
 // External script loads are blocked by the CSP header injected on every
 // response from the viewer server.
 export function HtmlFrame(props: HtmlFrameProps) {
-	// The viewer server is desktop-only (gap audit rank 8): its localhost URL
-	// would point at the browser's own machine.
-	if (isRemoteWebSession()) return <PreviewUnavailable name={props.path.split('/').pop()} />;
 	return <LocalHtmlFrame {...props} />;
 }
 
@@ -93,6 +89,9 @@ function LocalHtmlFrame({ path, paneId }: HtmlFrameProps) {
 			.then((res) => {
 				const html = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(res.bytes));
 				const { root, file } = pickViewerRoot(path, html);
+				if (isRemoteWebSession()) {
+					return viewerServe(root).then((h) => ({ h, file, port: null }));
+				}
 				return Promise.all([viewerServe(root), viewerPort()]).then(([h, port]) => ({
 					h,
 					file,
@@ -113,8 +112,9 @@ function LocalHtmlFrame({ path, paneId }: HtmlFrameProps) {
 				// it cannot reach `window.parent`. `h.url` is a path relative to the
 				// viewer server's mount root; we prefix the bound viewer port so
 				// the child can fetch its own assets.
-				const port_ = port ?? 47821;
-				const src = `http://localhost:${port_}${h.url}${file}`;
+				const src = isRemoteWebSession()
+					? `${window.location.origin}${h.url}${file}`
+					: `http://localhost:${port ?? 47821}${h.url}${file}`;
 				setState({ kind: 'ready', src, handle: h });
 			})
 			.catch((err) => {

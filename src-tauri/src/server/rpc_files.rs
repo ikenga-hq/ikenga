@@ -292,6 +292,40 @@ pub(super) async fn fs_rename(state: &AppState, args: &Value) -> RpcResponse {
     respond("fs_rename", r)
 }
 
+/// Register an allowlisted directory as an authenticated viewer mount root (gap audit rank 8).
+pub(super) async fn viewer_serve(
+    state: &AppState,
+    args: &Value,
+    principal_id: Option<uuid::Uuid>,
+) -> RpcResponse {
+    let r = async {
+        let root_dir: String = targ(args, &["rootDir", "root_dir"])?;
+        state.path_guard.ready()?;
+        let canonical = state.path_guard.resolve_deep(&root_dir)?;
+        if !canonical.is_dir() {
+            return Err(format!("not a directory: {}", canonical.display()));
+        }
+        let (url, token) = state.viewer.register(canonical, principal_id);
+        Ok(serde_json::json!({
+            "url": url,
+            "token": token,
+        }))
+    }
+    .await;
+    respond("viewer_serve", r)
+}
+
+/// Unregister a viewer mount (gap audit rank 8).
+pub(super) async fn viewer_stop(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let token: String = targ(args, &["token"])?;
+        state.viewer.unregister(&token);
+        Ok(serde_json::json!(()))
+    }
+    .await;
+    respond("viewer_stop", r)
+}
+
 // ─── actions / keybindings ───────────────────────────────────────────────────
 
 /// The daemon's `ActionsManager`: the desktop's, with no notifier (no

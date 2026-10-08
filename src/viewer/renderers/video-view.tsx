@@ -1,8 +1,7 @@
 import { useEffect, useState } from 'react';
 import { AlertCircle, Loader2 } from 'lucide-react';
-import { isRemoteWebSession, viewerServe, viewerStop, type ViewerHandle } from '@/lib/tauri-cmd';
+import { viewerServe, viewerStop, type ViewerHandle } from '@/lib/tauri-cmd';
 import { basename, dirname } from '../lib/path';
-import { PreviewUnavailable } from './preview-unavailable';
 
 interface VideoViewProps {
 	path: string;
@@ -12,8 +11,6 @@ interface VideoViewProps {
 // loading the whole file into memory like a Blob URL would. Same security
 // model as the HTML frame: token-scoped origin, allowlisted root.
 export function VideoView(props: VideoViewProps) {
-	// No viewer server in a browser session (gap audit rank 8).
-	if (isRemoteWebSession()) return <PreviewUnavailable name={basename(props.path)} />;
 	return <LocalVideoView {...props} />;
 }
 

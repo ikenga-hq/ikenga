@@ -6,10 +6,9 @@
 import { isRemoteWebSession } from '@/lib/tauri-cmd';
 import type { ResolvedMenuRow } from '@/shell/menu/resolve';
 
-export const REMOTE_HIDDEN_PANE_ROWS: ReadonlySet<string> = new Set([
-	'viewer.open-in-browser',
-	'viewer.copy-url',
-]);
+// Formerly hid viewer.open-in-browser / viewer.copy-url (gap audit rank 8).
+// Restored now that the daemon serves an authenticated viewer route.
+export const REMOTE_HIDDEN_PANE_ROWS: ReadonlySet<string> = new Set([]);
 
 /** In a browser session: drop `REMOTE_HIDDEN_PANE_ROWS` and any separator they
  *  leave leading, trailing or doubled. Desktop: the rows, untouched. */

@@ -445,15 +445,8 @@ reason = "Helper solely for the spike_grant_fs_read debug harness (module doc: '
 
 [viewer_port]
 tag = "WP-19"
-reason = "The daemon runs no viewer server: ViewerServerManager is constructed only in desktop lib.rs, and ViewerServerManager::start needs a Tauri AppHandle for app.asset_resolver() (its fallback route). Served now it would answer None forever. Needs the viewer routes nested into the daemon router and an AppState field first."
+reason = "The daemon runs no separate viewer server: viewer routes are served directly on the daemon's main HTTP server at /__viewer/... ."
 
-[viewer_serve]
-tag = "WP-19"
-reason = "The daemon runs no viewer server (ViewerServerManager is desktop lib.rs-only; ViewerServerManager::start needs AppHandle's asset_resolver), so a served register() would hand back a {url, token} for a mount nothing answers: every /__viewer URL 404s against the SPA fallback. rootDir confinement is not the blocker (resolve_allowlisted maps onto PathGuard). Needs the viewer routes nested into the daemon router and an AppState field first."
-
-[viewer_stop]
-tag = "WP-19"
-reason = "The daemon runs no viewer server (ViewerServerManager is desktop lib.rs-only; ViewerServerManager::start needs AppHandle's asset_resolver), so there is no mount registry to unregister from. Trivial (a DashMap remove) once the viewer routes and an AppState field exist."
 
 [window_close]
 tag = "desktop-only-forever"

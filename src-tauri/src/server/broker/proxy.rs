@@ -682,6 +682,85 @@ pub async fn pkgs_proxy(
     .await
 }
 
+/// `GET /__viewer/*` → the principal's child (its viewer server).
+pub async fn viewer_proxy(
+    State(state): State<Arc<BrokerState>>,
+    req: Request,
+) -> Response {
+    let (parts, _body) = req.into_parts();
+    if !matches!(parts.method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    if parts.method == Method::OPTIONS {
+        return Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(axum::http::header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+            .header(axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS, "*")
+            .body(Body::empty())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    let Some(pq) = path_and_query(&parts.uri) else {
+        return bad_path();
+    };
+
+    let token = parts
+        .uri
+        .path()
+        .strip_prefix("/__viewer/")
+        .and_then(|tail| tail.split('/').next());
+    let Some(token) = token else {
+        return bad_path();
+    };
+
+    let token_pid = token
+        .split('_')
+        .next()
+        .and_then(|prefix| prefix.parse::<crate::executor::PrincipalId>().ok());
+
+    // If caller has an active session, verify it matches
+    let session_ctx = parts.extensions.get::<PrincipalCtx>().cloned();
+    let principal = match (session_ctx, token_pid) {
+        (Some(s), Some(pid)) => {
+            if s.principal.id != pid {
+                return (StatusCode::FORBIDDEN, "forbidden: token principal mismatch").into_response();
+            }
+            s.principal
+        }
+        (Some(s), None) => s.principal,
+        (None, Some(pid)) => {
+            // Capability access: token bears principal ID
+            let mut conn = match state.pool.acquire().await {
+                Ok(c) => c,
+                Err(e) => return child_unavailable(&anyhow::Error::from(e)),
+            };
+            match crate::server::operator::accounts::by_id(&mut conn, pid).await {
+                Ok(Some(a)) if !a.is_disabled() => a.principal(),
+                _ => return StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+        (None, None) => {
+            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        }
+    };
+
+    let ctx = PrincipalCtx {
+        principal,
+        via: crate::server::auth::Credential::OperatorBearer,
+    };
+    let narrowing = Narrowing::default();
+    forward(
+        &state,
+        &narrowing,
+        &ctx,
+        parts.method.clone(),
+        &pq,
+        &parts.headers,
+        Bytes::new(),
+    )
+    .await
+}
+
 /// How long the broker waits for a child to accept a WebSocket handshake.
 pub const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 

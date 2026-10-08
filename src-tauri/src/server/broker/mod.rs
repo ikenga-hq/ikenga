@@ -219,7 +219,7 @@ pub fn router(
     let public = Router::new()
         .route("/api/health", get(health::health_handler))
         .route("/auth/login", post(auth_mod::routes::login))
-        .with_state(state)
+        .with_state(state.clone())
         .merge(extensions.public.into_router());
 
     let spa = SpaStaticService::new(static_dir);
@@ -232,8 +232,13 @@ pub fn router(
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any);
 
+    let viewer_routes = Router::new()
+        .route("/__viewer/*rest", any(proxy::viewer_proxy))
+        .with_state(state.clone());
+
     Router::new()
         .merge(public)
+        .merge(viewer_routes)
         .merge(protected)
         // With the request headers, so the broker gzips like the T0 daemon
         // and refuses a non-`/sw.js` service-worker install the same way.
