@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
 use super::{AuditVia, Event};
+#[cfg(target_os = "linux")]
 use crate::access::AccessStore;
 use crate::executor::PrincipalId;
 
@@ -341,7 +342,9 @@ fn build_event(
 }
 
 /// Start the broker's reconcile loop (once, after the access store exists):
-/// one long-poll task per running principal child.
+/// one long-poll task per running principal child. Linux-only, like the
+/// broker it serves (`server::broker` is `#[cfg(target_os = "linux")]`).
+#[cfg(target_os = "linux")]
 pub fn spawn(children: Arc<crate::server::broker::children::Children>, store: AccessStore) {
     use crate::server::broker::children::ChildEndpoint;
     const RECONCILE_EVERY: Duration = Duration::from_secs(5);
