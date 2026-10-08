@@ -379,6 +379,40 @@ t_readme() {
 }
 check "(f) README says what disable removes and documents the layout" t_readme
 
+# ------------------------------------------- (g) the backup user cannot block or hang root
+
+t_disable_not_blockable() {   # a planted symlink must not keep timers/units/connection strings alive
+  local f=0
+  ENABLED=1 write_profile; prov
+  as_bu ln -s /etc/passwd $PRIV/gcloud/planted-link 2>/dev/null || as_bu sh -c "mkdir -p $PRIV/gcloud && ln -s /etc/passwd $PRIV/gcloud/planted-link"
+  ENABLED=0 write_profile; prov
+  ls $UNITS/ikenga-backup-*.timer >/dev/null 2>&1 && { echo "timers survived a disable blocked by a planted symlink"; f=1; }
+  [[ -e $SVC ]] && { echo "service unit survived a blocked disable"; f=1; }
+  [[ -e /etc/ikenga-backup/connections.env ]] && { echo "connections.env survived a blocked disable"; f=1; }
+  [[ $RC -ne 0 ]] || { echo "disable with a planted symlink should still report the refusal (rc 0)"; f=1; }
+  rm -f $PRIV/gcloud/planted-link; ENABLED=1 write_profile; prov
+  [[ $RC -eq 0 ]] || { echo "re-enable after removing the link failed (rc $RC)"; f=1; }
+  return $f
+}
+check "(g1) a planted symlink cannot block disabling: timers, unit and connection strings are still removed" t_disable_not_blockable
+
+t_no_user_jq_or_hang() {   # ~/.jq is not loaded; FIFOs where root's tools read cannot hang provisioning
+  local f=0 t0 t1
+  as_bu sh -c "printf 'def from_entries: error(\"JQHOOK-RAN\");\n' > $PRIV/.jq"
+  ENABLED=1 write_profile; prov
+  grep -q 'JQHOOK-RAN' "$OUT" && { echo "the backup user's ~/.jq ran inside provisioning"; f=1; }
+  as_bu rm -f $PRIV/.jq
+  as_bu mkfifo $PRIV/.jq 2>/dev/null || true
+  as_bu sh -c "rm -f $STATE/status/.status.lock; mkfifo $STATE/status/.status.lock" 2>/dev/null || true
+  t0=$(date +%s); BACKUP_AS_USER_TIMEOUT=8 ENABLED=0 write_profile; BACKUP_AS_USER_TIMEOUT=8 prov; t1=$(date +%s)
+  (( t1 - t0 < 120 )) || { echo "provisioning hung on a planted FIFO ($((t1 - t0)) s)"; f=1; }
+  as_bu rm -f $PRIV/.jq $STATE/status/.status.lock 2>/dev/null || true
+  ENABLED=1 write_profile; prov
+  [[ $RC -eq 0 ]] || { echo "re-enable after removing the FIFOs failed (rc $RC)"; f=1; }
+  return $f
+}
+check "(g2) the backup user's ~/.jq never runs, and a planted FIFO cannot hang provisioning" t_no_user_jq_or_hang
+
 # ---------------------------------------------------------------- summary
 echo
 echo "==> [Hardening] $PASSN passed, $FAILN failed"

@@ -2707,9 +2707,14 @@ backup_ensure_user() {
 # environment: how the service runs. This is how root touches anything INSIDE
 # status/ or private/: those directories belong to the backup user, so a path
 # in them can be swapped for a symlink at any moment, and root must not follow it.
+# HOME is a path the backup user does not control (and that does not exist),
+# so tools root runs as that user never load user-supplied startup files (jq
+# reads ~/.jq). Every call is time-limited, so a FIFO the user plants where one
+# of these tools reads cannot hang provisioning.
 as_backup() {
-  ( cd / && exec setpriv --reuid="$BK_UID" --regid="$BK_GID" --clear-groups \
-      env -i HOME="$BACKUP_PRIV_DIR" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 "$@" )
+  ( cd / && exec timeout --kill-after=5 "${BACKUP_AS_USER_TIMEOUT:-120}" \
+      setpriv --reuid="$BK_UID" --regid="$BK_GID" --clear-groups \
+      env -i HOME=/nonexistent PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 "$@" )
 }
 
 # Sets BK_UID/BK_GID/BK_GROUP for a user that already exists (the disabled path
@@ -3055,7 +3060,9 @@ sync_backups_disabled() {
   backups_installed || [[ -d "$BACKUP_ETC_DIR" || -d "$BACKUP_STATE_DIR" ]] || return 0
   log "Database backups (disabled: timers and credentials removed, state and logs kept)"
   [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo)"
-  backup_refuse_symlinks
+  # Root-owned things go FIRST, before any check the backup user can influence:
+  # a symlink planted in its own tree must not be able to keep the timers
+  # running or the connection strings on disk by making disable refuse.
   backup_remove_units
   # connections.env is root's. The key, the gcloud credentials and the status
   # file are in the backup user's directories, so they are removed / edited AS the
@@ -3064,6 +3071,7 @@ sync_backups_disabled() {
     if [[ $DRY_RUN -eq 0 ]]; then backup_secret_file "$BACKUP_ENV_DST"; rm -f -- "$BACKUP_ENV_DST"; fi
     changed "$(basename -- "$BACKUP_ENV_DST") removed (credentials are not kept while backups are disabled)"
   fi
+  backup_refuse_symlinks
   if backup_load_ids; then
     if as_backup test -e "$BACKUP_KEY_DST"; then
       run as_backup rm -f -- "$BACKUP_KEY_DST"
