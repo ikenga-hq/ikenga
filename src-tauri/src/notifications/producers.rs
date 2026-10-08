@@ -7,7 +7,7 @@
 //!
 //! | kind | builder | wired at |
 //! |---|---|---|
-//! | `permission` | [`permission_from_hook_gate`] | `iyke::hooks::post_hook_event` (held `PreToolUse`) |
+//! | `permission` | [`permission_from_hook_gate`] (in `server::shared::notifications::hook_ask`) | `iyke::hooks::post_hook_event` (held `PreToolUse`), and the daemon's `server::term_hooks` for a daemon terminal |
 //! | `permission` | [`permission_from_hook_request`] | `iyke::hooks::post_hook_event` (`PermissionRequest` hook) |
 //! | `permission` | [`permission_from_engine`] | `engines::claude_code::server::spawn_permission_round_trip` |
 //! | `run_finished` / `run_failed` | [`run_terminal_with_artifacts`] (in `server::shared::notifications::run`) | `server::shared::chi_exec::cache_update_done` |
@@ -45,7 +45,12 @@ use sha2::{Digest, Sha256};
 use super::{Coalesce, NewNotification, NotificationKind};
 use crate::engines::claude_code::notify::short_summary_of_input;
 
-pub const SOURCE_HOOKS: &str = "iyke.hooks";
+// The held-hooks-gate builder and the ask attribution moved to the ungated
+// `server::shared::notifications::hook_ask`: the headless daemon's terminals
+// record the same row for a held `PreToolUse` the desktop does.
+pub use crate::server::shared::notifications::hook_ask::{
+    ask_facts, attribution, hook_gate_key, permission_from_hook_gate, AskFacts, SOURCE_HOOKS,
+};
 pub const SOURCE_ENGINE_CLAUDE: &str = "engine.claude-code";
 pub const SOURCE_PKG_PERMISSIONS: &str = "pkg.permissions_check";
 pub use crate::server::shared::notifications::run::{
@@ -67,12 +72,6 @@ use crate::server::shared::notifications::run::{
 };
 
 // ─── permission ─────────────────────────────────────────────────────────────
-
-/// Dedupe key of a held hooks-gate request. Resolved (marked read) by
-/// `post_hook_event` once the human decides or the gate times out.
-pub fn hook_gate_key(request_id: &str) -> String {
-    format!("permission:hook:{request_id}")
-}
 
 /// Dedupe key of an ACP-engine permission round-trip. Resolved when the
 /// round-trip completes (answered, cancelled or timed out). Scoped by thread:
@@ -242,36 +241,6 @@ pub fn terminal_permission_keys(
     keys
 }
 
-/// A `PreToolUse` hook held by the permission-inbox gate: the tool call is
-/// blocked until someone answers, so the row carries Allow / Deny.
-pub fn permission_from_hook_gate(
-    tool_name: Option<&str>,
-    tool_input: Option<&Value>,
-    terminal_id: Option<&str>,
-    cwd: Option<&str>,
-    request_id: &str,
-) -> NewNotification {
-    let tool = tool_name.filter(|t| !t.is_empty()).unwrap_or("a tool");
-    NewNotification {
-        kind: NotificationKind::Permission,
-        title: truncate(&format!("Claude wants to use {tool}"), TITLE_MAX),
-        body: join_parts(&[
-            Some(short_summary_of_input(tool_input)),
-            terminal_id.map(|t| format!("terminal {}", short_id(t))),
-            cwd.map(|c| basename(c).to_string()),
-        ]),
-        action: Some(json!({
-            "kind": "permission.decide",
-            "via": "hooks",
-            "requestId": request_id,
-            "terminalId": terminal_id,
-        })),
-        source: SOURCE_HOOKS.into(),
-        dedupe_key: Some(hook_gate_key(request_id)),
-        coalesce: Coalesce::Once,
-    }
-}
-
 /// Claude Code's own `PermissionRequest` hook in an Ikenga terminal: Claude is
 /// showing its permission prompt in the terminal. The answer happens there,
 /// so the action opens the terminal. Repeats in one terminal fold into one
@@ -337,57 +306,6 @@ pub fn permission_from_engine(
 }
 
 // ─── permission attribution (G-ACCESS §5.3, §5.7; WP-75) ────────────────────
-
-/// What a permission producer knows about the ask, for its attribution
-/// columns (`shell_notifications.{requested_by, project_id, sensitive}`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct AskFacts {
-    pub tool_name: String,
-    pub tool_input: Value,
-    /// The asking session's working directory: the project it belongs to,
-    /// and the root §5.3 rule 2 classifies against.
-    pub cwd: Option<String>,
-    /// Claude Code's own terminal prompt (§5.3 rule 1: shell exec).
-    pub terminal: bool,
-}
-
-pub fn ask_facts(
-    tool_name: Option<&str>,
-    tool_input: Option<&Value>,
-    cwd: Option<&str>,
-    terminal: bool,
-) -> AskFacts {
-    AskFacts {
-        tool_name: tool_name.unwrap_or_default().to_string(),
-        tool_input: tool_input.cloned().unwrap_or(Value::Null),
-        cwd: cwd.filter(|c| !c.is_empty()).map(str::to_string),
-        terminal,
-    }
-}
-
-/// The attribution a desktop ask is recorded with. `project` is the
-/// `(id, root_path)` the cwd resolved to; the root classifies, else the cwd
-/// itself. The desktop's asks are always the Owner's own work, so
-/// `requested_by` is `None` (§5.7).
-pub fn attribution(
-    facts: &AskFacts,
-    project: Option<&(String, String)>,
-) -> crate::server::shared::notifications::routing::Attribution {
-    use crate::server::shared::notifications::routing::{classify, classify_terminal, Attribution};
-    let root = project
-        .map(|(_, root)| root.as_str())
-        .or(facts.cwd.as_deref());
-    let sensitivity = if facts.terminal {
-        classify_terminal(&facts.tool_name, &facts.tool_input, root)
-    } else {
-        classify(&facts.tool_name, &facts.tool_input, root)
-    };
-    Attribution {
-        requested_by: None,
-        project_id: project.map(|(id, _)| id.clone()),
-        sensitivity,
-    }
-}
 
 // ─── violation ──────────────────────────────────────────────────────────────
 

@@ -205,12 +205,20 @@ async fn post_json(
 }
 
 async fn connect(addr: SocketAddr) -> Client {
+    connect_as(addr, &[]).await
+}
+
+/// [`connect`] with the headers a broker relays to a principal child.
+async fn connect_as(addr: SocketAddr, headers: &[(&'static str, String)]) -> Client {
     use tungstenite::client::IntoClientRequest;
     let mut req = format!("ws://{addr}/ws/events")
         .into_client_request()
         .unwrap();
     req.headers_mut()
         .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+    for (k, v) in headers {
+        req.headers_mut().insert(*k, v.parse().unwrap());
+    }
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     let ready = next_json(&mut ws, Duration::from_secs(5)).await.unwrap();
     assert_eq!(ready["type"], "ready", "{ready}");
@@ -945,4 +953,1164 @@ fn the_arms_carry_the_requirements_the_gate_depends_on() {
         assert_eq!(r.class, ArmClass::Owner, "{arm}");
         assert!(r.caps.contains(Cap::Sessions), "{arm}");
     }
+}
+
+// ─── the ask's notification row and audit trail (daemon asks) ───────────────
+//
+// A held gate is the desktop's `permission` row, answerable through the shared
+// decide core, resolved by every way it can end, and audited where its tier
+// audits. T0 audits into its access store; a T1 principal child queues for the
+// broker, whose `accept` is run here against a real store.
+
+use crate::access::audit::child as audit_child;
+use crate::access::{AccessStore, DaemonAccess};
+use crate::executor::PrincipalId;
+use crate::server::shared::notifications as notes;
+
+const OWN_CAPS: &str = "files,sessions,dispatch,approve,install,settings,secrets";
+
+/// One caller of a daemon: the T0 operator bearer, or what a T1 broker relays
+/// to a principal child (the per-child token, `X-Ikenga-Principal`, caps and,
+/// for a share member, the `X-Ikenga-Share-*` set).
+#[derive(Clone)]
+struct Caller {
+    router: Router,
+    headers: Vec<(&'static str, String)>,
+}
+
+impl Caller {
+    async fn raw(&self, cmd: &str, args: Value) -> Value {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/api/rpc")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/json");
+        for (k, v) in &self.headers {
+            req = req.header(*k, v);
+        }
+        let res = self
+            .router
+            .clone()
+            .oneshot(
+                req.body(Body::from(json!({ "cmd": cmd, "args": args }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn ok(&self, cmd: &str, args: Value) -> Value {
+        let res = self.raw(cmd, args.clone()).await;
+        assert_eq!(res["ok"], true, "{cmd} {args} → {res}");
+        res.get("data").cloned().unwrap_or(Value::Null)
+    }
+
+    /// The error text of a refused call.
+    async fn err(&self, cmd: &str, args: Value) -> String {
+        let res = self.raw(cmd, args.clone()).await;
+        assert_eq!(res["ok"], false, "{cmd} {args} should be refused: {res}");
+        res["error"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// Every `permission` row this caller can see.
+    async fn permission_rows(&self) -> Vec<Value> {
+        self.ok("notifications_list", json!({ "kinds": ["permission"] }))
+            .await
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+struct Asks {
+    d: Daemon,
+    db: Arc<PaDb>,
+    /// The T0 daemon's access store (`None` for a principal child).
+    store: Option<AccessStore>,
+    /// A principal child's audit queue (what its broker would drain).
+    outbox: Option<Arc<audit_child::Outbox>>,
+    operator: Caller,
+}
+
+async fn asks_on(
+    access: Arc<DaemonAccess>,
+    store: Option<AccessStore>,
+    outbox: Option<Arc<audit_child::Outbox>>,
+    path_guard: Option<crate::server::rpc_shell::PathGuard>,
+) -> Asks {
+    crate::server::hook_asks::TEST_OUTBOX.with(|t| *t.borrow_mut() = outbox.clone());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let (data, home) = (root.join("data"), root.join("home"));
+    for d in [&data, &home] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let db = Arc::new(PaDb::new(data.join("ikenga.db")));
+    db.ensure_pool().await.unwrap();
+    let router = crate::server::build_router(
+        config(Some(data.clone()), PORT),
+        Arc::new(PtyManager::new()),
+        Arc::new(EngineRegistry::new()),
+        Some(db.clone()),
+        None,
+        Some(home),
+        path_guard.unwrap_or_else(crate::server::rpc_shell::PathGuard::allowlist),
+        None,
+        access,
+        None,
+        crate::server::UpdateSource::Default,
+    );
+    crate::server::hook_asks::TEST_OUTBOX.with(|t| *t.borrow_mut() = None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = router.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            served.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
+    });
+    let d = Daemon {
+        _tmp: tmp,
+        data,
+        router: router.clone(),
+        addr,
+    };
+    Asks {
+        operator: Caller {
+            router,
+            headers: vec![],
+        },
+        d,
+        db,
+        store,
+        outbox,
+    }
+}
+
+/// A T0 daemon with an access store, so decisions have a chain to land in.
+async fn t0() -> Asks {
+    let store = AccessStore::memory_t0().await;
+    asks_on(
+        DaemonAccess::with_store(store.clone()),
+        Some(store),
+        None,
+        None,
+    )
+    .await
+}
+
+/// A T1 principal child (no store of its own), and the principal it serves.
+async fn child() -> (Asks, PrincipalId) {
+    child_with(None).await
+}
+
+async fn child_with(
+    path_guard: Option<crate::server::rpc_shell::PathGuard>,
+) -> (Asks, PrincipalId) {
+    child_on(Arc::new(audit_child::Outbox::new()), path_guard).await
+}
+
+async fn child_on(
+    outbox: Arc<audit_child::Outbox>,
+    path_guard: Option<crate::server::rpc_shell::PathGuard>,
+) -> (Asks, PrincipalId) {
+    let a = asks_on(
+        DaemonAccess::principal_child(Default::default()),
+        None,
+        Some(outbox),
+        path_guard,
+    )
+    .await;
+    (a, PrincipalId::new_v7())
+}
+
+impl Asks {
+    /// The principal's own request as the broker relays it.
+    fn principal(&self, id: PrincipalId) -> Caller {
+        Caller {
+            router: self.d.router.clone(),
+            headers: vec![
+                ("x-ikenga-principal", id.to_string()),
+                ("x-ikenga-caps", OWN_CAPS.into()),
+            ],
+        }
+    }
+
+    /// A share member's request, relayed into the owner's child.
+    fn member(&self, owner: PrincipalId, member: PrincipalId, project: &str) -> Caller {
+        Caller {
+            router: self.d.router.clone(),
+            headers: vec![
+                ("x-ikenga-principal", owner.to_string()),
+                ("x-ikenga-caps", "files,sessions,dispatch,approve".into()),
+                ("x-ikenga-share-project", project.into()),
+                ("x-ikenga-share-principal", member.to_string()),
+                ("x-ikenga-share-device", "-".into()),
+                ("x-ikenga-share-role", "operator".into()),
+            ],
+        }
+    }
+
+    /// `audit_events` rows of the T0 store: `(kind, principal, via, target, detail)`.
+    async fn audit(&self) -> Vec<(String, Option<String>, String, Option<String>, Value)> {
+        let rows: Vec<(String, Option<String>, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT kind, principal_id, via, target, detail FROM audit_events \
+                 WHERE category = 'permission' ORDER BY seq",
+        )
+        .fetch_all(self.store.as_ref().expect("a T0 store").pool())
+        .await
+        .unwrap();
+        rows.into_iter()
+            .map(|(k, p, v, t, d)| (k, p, v, t, serde_json::from_str(&d).unwrap()))
+            .collect()
+    }
+}
+
+/// Poll until `f` yields a value (5 s).
+async fn until<T, Fut: std::future::Future<Output = Option<T>>>(mut f: impl FnMut() -> Fut) -> T {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(v) = f().await {
+            return v;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition not met within 5 s"
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+}
+
+/// A gate that is parked, with its request id and a live bus socket.
+struct Parked {
+    request_id: String,
+    call: tokio::task::JoinHandle<(StatusCode, Value)>,
+    /// Held open so the bus keeps a subscriber for the ask's whole life.
+    _ws: Client,
+}
+
+async fn park_on(
+    a: &Asks,
+    caller: &Caller,
+    term: &str,
+    secs: u32,
+    tool: &str,
+    cwd: Option<&str>,
+) -> Parked {
+    park_with(
+        a,
+        caller,
+        term,
+        secs,
+        tool,
+        json!({ "command": "rm -rf /tmp/x" }),
+        cwd,
+    )
+    .await
+}
+
+async fn park_with(
+    a: &Asks,
+    caller: &Caller,
+    term: &str,
+    secs: u32,
+    tool: &str,
+    input: Value,
+    cwd: Option<&str>,
+) -> Parked {
+    // The terminal is spawned as `caller` (a child only takes what its broker
+    // relays), then its hook secret is read from the header file.
+    let cmd = sleeper(secs);
+    let spawned = caller
+        .ok(
+            "pty_spawn",
+            json!({
+                "terminalId": term,
+                "cwd": "/",
+                "cmd": cmd,
+                "rows": 24,
+                "cols": 80,
+                "settingsPath": settings_path(&a.d, term),
+            }),
+        )
+        .await;
+    assert!(spawned["pty_id"].is_string(), "{spawned}");
+    let secret = secret_of(&a.d, term);
+    caller
+        .ok(
+            "settings_set",
+            json!({ "key": format!("permissions.hold_terminal_{term}"), "value": "true" }),
+        )
+        .await;
+    let mut ws = connect_as(a.d.addr, &caller.headers).await;
+    let (router, term_s, secret_s, tool_s, cwd_s) = (
+        a.d.router.clone(),
+        term.to_string(),
+        secret,
+        tool.to_string(),
+        cwd.map(str::to_string),
+    );
+    let call = tokio::spawn(async move {
+        post_json(
+            &router,
+            EVENT_PATH,
+            &term_s,
+            &secret_s,
+            json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool_s,
+                "tool_input": input,
+                "tool_use_id": "tu-gate",
+                "cwd": cwd_s,
+            }),
+        )
+        .await
+    });
+    let held = event(&mut ws, "hooks://event").await;
+    Parked {
+        request_id: held["request_id"].as_str().unwrap().to_string(),
+        call,
+        _ws: ws,
+    }
+}
+
+/// The open row for `request_id` as `caller` sees it.
+async fn row_of(caller: &Caller, request_id: &str) -> Value {
+    let key = format!("permission:hook:{request_id}");
+    until(|| {
+        let key = key.clone();
+        async move {
+            caller
+                .permission_rows()
+                .await
+                .into_iter()
+                .find(|r| r["dedupeKey"] == key)
+        }
+    })
+    .await
+}
+
+async fn row_resolved(caller: &Caller, request_id: &str) -> Value {
+    let key = format!("permission:hook:{request_id}");
+    until(|| {
+        let key = key.clone();
+        async move {
+            caller
+                .permission_rows()
+                .await
+                .into_iter()
+                .find(|r| r["dedupeKey"] == key && !r["resolvedAt"].is_null())
+        }
+    })
+    .await
+}
+
+fn decision_of(body: &Value) -> &str {
+    body["hookSpecificOutput"]["permissionDecision"]
+        .as_str()
+        .unwrap_or("?")
+}
+
+#[tokio::test]
+async fn a_held_gate_records_the_desktops_row_and_announces_it() {
+    let a = t0().await;
+    let mut changes = notes::subscribe();
+    let p = park_on(&a, &a.operator, "t-row", 30, "Bash", Some("/")).await;
+
+    let row = row_of(&a.operator, &p.request_id).await;
+    assert_eq!(row["kind"], "permission");
+    assert_eq!(row["title"], "Claude wants to use Bash");
+    assert_eq!(row["source"], "iyke.hooks", "the desktop's own source");
+    assert_eq!(row["action"]["kind"], "permission.decide");
+    assert_eq!(row["action"]["via"], "hooks");
+    assert_eq!(row["action"]["requestId"], p.request_id);
+    assert_eq!(row["action"]["terminalId"], "t-row");
+    assert!(row["resolvedAt"].is_null(), "pending while held");
+    assert_eq!(
+        row["can_decide"], true,
+        "the read model offers Allow / Deny"
+    );
+    // Bash is shell exec: sensitive (§5.3 rule 1), so a member could not
+    // answer it under owner-approval; here the Owner can.
+    assert_eq!(row["action"]["routing"]["sensitive"], 1);
+    let expires = row["action"]["expiresAtMs"].as_i64().unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    assert!(
+        expires > now && expires <= now + 31_000,
+        "{expires} vs {now}"
+    );
+
+    // Exactly one row for the one ask, and the bell's count includes it.
+    assert_eq!(a.operator.permission_rows().await.len(), 1);
+    let count = a.operator.ok("notifications_unread_count", json!({})).await;
+    assert_eq!(count["pendingPermissions"], 1);
+
+    // `notifications://changed` carried it on the process channel (the event
+    // bus relays that to /ws/events), and Web Push's producer turns that very
+    // event into a permission push whose TTL is the hold.
+    let created = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), changes.recv())
+            .await
+            .expect("a created event")
+            .unwrap();
+        if ev
+            .notification
+            .as_ref()
+            .and_then(|n| n.dedupe_key.as_deref())
+            == Some(&format!("permission:hook:{}", p.request_id))
+        {
+            break ev;
+        }
+    };
+    let push = crate::server::push::events::from_event(&created, now).expect("a permission push");
+    assert_eq!(push.kind, crate::server::push::PushKind::Permission);
+    assert_eq!(push.r, format!("n:{}", row["id"]));
+    assert!((1..=30).contains(&push.ttl()), "ttl {}", push.ttl());
+
+    p.call.abort();
+}
+
+#[tokio::test]
+async fn the_row_reaches_a_browsers_event_socket() {
+    let a = t0().await;
+    let mut ws = {
+        use tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://{}/ws/events", a.d.addr)
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        next_json(&mut ws, Duration::from_secs(5)).await.unwrap();
+        ws.send(tungstenite::Message::Text(
+            json!({
+                "type": "subscribe",
+                "events": ["notifications://changed", "hooks://event"],
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        ws
+    };
+    let secret = live(&a.d, "t-ws", 30).await;
+    a.operator
+        .ok(
+            "settings_set",
+            json!({ "key": "permissions.hold_terminal_t-ws", "value": "true" }),
+        )
+        .await;
+    let call = gated_call(&a.d, "t-ws", &secret);
+    let held = event(&mut ws, "hooks://event").await;
+    let key = format!("permission:hook:{}", held["request_id"].as_str().unwrap());
+    // The created row arrives as a `notifications://changed` frame.
+    let created = loop {
+        let p = event(&mut ws, "notifications://changed").await;
+        if p["notification"]["dedupeKey"] == key {
+            break p;
+        }
+    };
+    assert_eq!(created["reason"], "created");
+    assert_eq!(created["notification"]["kind"], "permission");
+    call.abort();
+}
+
+#[tokio::test]
+async fn answering_through_the_row_resolves_the_held_hook_exactly_once() {
+    let a = t0().await;
+    let p = park_on(&a, &a.operator, "t-bell", 30, "Bash", Some("/")).await;
+    let row = row_of(&a.operator, &p.request_id).await;
+    let id = row["id"].as_i64().unwrap();
+
+    let res = a
+        .operator
+        .ok(
+            "permission_decide",
+            json!({ "notificationId": id, "decision": "allow_once" }),
+        )
+        .await;
+    assert_eq!(res, json!({ "resolved": true }));
+
+    let (status, body) = p.call.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(decision_of(&body), "allow", "the SAME held request");
+    assert_eq!(body["request_id"], p.request_id);
+
+    // The row flipped, attributed to the operator on this host.
+    let done = row_resolved(&a.operator, &p.request_id).await;
+    assert!(done["can_decide"] == false || done["can_decide"].is_null());
+    let (by, via): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT decided_by, decided_via FROM shell_notifications WHERE id = ?")
+            .bind(id)
+            .fetch_one(&a.db.ensure_pool().await.unwrap())
+            .await
+            .unwrap();
+    assert_eq!(via.as_deref(), Some("operator"));
+    assert!(by.is_some());
+
+    // Single use, through every door: the row (conflict), the legacy arm
+    // (gated:false), and a deny after an allow.
+    for decision in ["allow_once", "deny"] {
+        let e = a
+            .operator
+            .err(
+                "permission_decide",
+                json!({ "notificationId": id, "decision": decision }),
+            )
+            .await;
+        assert!(e.contains("conflict"), "{e}");
+    }
+    for decision in ["approved", "denied"] {
+        let r = a
+            .operator
+            .ok(
+                "term_hooks_decide",
+                json!({ "requestId": p.request_id, "decision": decision }),
+            )
+            .await;
+        assert_eq!(r["gated"], false, "{decision}");
+    }
+
+    // One decision, one chain row, with the facts the desktop records.
+    let audit = a.audit().await;
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    let (kind, principal, via, target, detail) = &audit[0];
+    assert_eq!(kind, "permission.decided");
+    assert_eq!(via, "operator");
+    assert!(principal.is_some());
+    assert_eq!(target.as_deref(), Some("Claude wants to use Bash"));
+    assert_eq!(detail["decision"], "allow_once");
+    assert_eq!(detail["sensitive"], 1);
+}
+
+#[tokio::test]
+async fn a_deny_through_the_row_blocks_the_tool_and_is_audited() {
+    let a = t0().await;
+    let p = park_on(&a, &a.operator, "t-nope", 30, "Bash", Some("/")).await;
+    let id = row_of(&a.operator, &p.request_id).await["id"]
+        .as_i64()
+        .unwrap();
+    a.operator
+        .ok(
+            "permission_decide",
+            json!({ "notificationId": id, "decision": "deny" }),
+        )
+        .await;
+    let (_, body) = p.call.await.unwrap();
+    assert_eq!(decision_of(&body), "deny");
+    assert_eq!(body["continue"], true, "the session goes on");
+    let audit = a.audit().await;
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].4["decision"], "deny");
+    // The hook gate has no "always for this project" (§5.5).
+    let p2 = park_on(&a, &a.operator, "t-nope2", 30, "Bash", Some("/")).await;
+    let id2 = row_of(&a.operator, &p2.request_id).await["id"]
+        .as_i64()
+        .unwrap();
+    let e = a
+        .operator
+        .err(
+            "permission_decide",
+            json!({ "notificationId": id2, "decision": "allow_always_project" }),
+        )
+        .await;
+    assert!(e.contains("invalid_request"), "{e}");
+    assert!(
+        !p2.call.is_finished(),
+        "a refused decision leaves the ask held"
+    );
+    p2.call.abort();
+}
+
+#[tokio::test]
+async fn the_legacy_arm_answers_through_the_row_when_there_is_one() {
+    let a = t0().await;
+    let p = park_on(&a, &a.operator, "t-arm", 30, "Bash", Some("/")).await;
+    row_of(&a.operator, &p.request_id).await;
+    let r = a
+        .operator
+        .ok(
+            "term_hooks_decide",
+            json!({ "requestId": p.request_id, "decision": "approved" }),
+        )
+        .await;
+    assert_eq!(r, json!({ "recorded": true, "gated": true }));
+    let (_, body) = p.call.await.unwrap();
+    assert_eq!(decision_of(&body), "allow");
+    let done = row_resolved(&a.operator, &p.request_id).await;
+    assert!(!done["resolvedAt"].is_null());
+    let audit = a.audit().await;
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    assert_eq!(audit[0].0, "permission.decided");
+    assert_eq!(audit[0].4["decision"], "allow_once");
+}
+
+#[tokio::test]
+async fn a_timeout_resolves_the_row_denies_and_is_audited() {
+    TEST_HOLD.with(|h| h.set(Some(Duration::from_millis(700))));
+    let a = t0().await;
+    TEST_HOLD.with(|h| h.set(None));
+    let p = park_on(&a, &a.operator, "t-slow", 30, "Bash", Some("/")).await;
+    let id = row_of(&a.operator, &p.request_id).await["id"]
+        .as_i64()
+        .unwrap();
+
+    let (_, body) = p.call.await.unwrap();
+    assert_eq!(decision_of(&body), "deny");
+    row_resolved(&a.operator, &p.request_id).await;
+
+    // A late answer, through either door, takes nothing.
+    let e = a
+        .operator
+        .err(
+            "permission_decide",
+            json!({ "notificationId": id, "decision": "allow_once" }),
+        )
+        .await;
+    assert!(e.contains("conflict"), "{e}");
+    let r = a
+        .operator
+        .ok(
+            "term_hooks_decide",
+            json!({ "requestId": p.request_id, "decision": "approved" }),
+        )
+        .await;
+    assert_eq!(r["gated"], false);
+
+    // The deny the gate gave on its own is on the chain, as the system's.
+    let audit = until(|| async {
+        let rows = a.audit().await;
+        (!rows.is_empty()).then_some(rows)
+    })
+    .await;
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    let (kind, principal, via, target, detail) = &audit[0];
+    assert_eq!(kind, "permission.decided");
+    assert_eq!(via, "system");
+    assert!(principal.is_some());
+    assert_eq!(target.as_deref(), Some("Claude wants to use Bash"));
+    assert_eq!(detail["decision"], "deny");
+    assert_eq!(detail["outcome"], "timed_out");
+}
+
+#[tokio::test]
+async fn a_terminal_that_dies_resolves_its_row_and_is_audited() {
+    let a = t0().await;
+    // A 2 s shell: the PTY exits with the ask still parked.
+    let p = park_on(&a, &a.operator, "t-gone", 2, "Bash", Some("/")).await;
+    row_of(&a.operator, &p.request_id).await;
+    let row = row_resolved(&a.operator, &p.request_id).await;
+    assert!(!row["resolvedAt"].is_null());
+    // Nothing is left looking pending.
+    assert_eq!(
+        a.operator.ok("notifications_unread_count", json!({})).await["pendingPermissions"],
+        0
+    );
+    let audit = until(|| async {
+        let rows = a.audit().await;
+        (!rows.is_empty()).then_some(rows)
+    })
+    .await;
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    assert_eq!(audit[0].0, "permission.refused");
+    assert_eq!(audit[0].4["reason"], "hook_disconnected");
+    assert_eq!(audit[0].4["outcome"], "terminal_ended");
+    let e = a
+        .operator
+        .ok(
+            "term_hooks_decide",
+            json!({ "requestId": p.request_id, "decision": "approved" }),
+        )
+        .await;
+    assert_eq!(e["gated"], false);
+}
+
+#[tokio::test]
+async fn a_hook_that_hangs_up_resolves_its_row_and_is_audited() {
+    let a = t0().await;
+    let p = park_on(&a, &a.operator, "t-hang", 30, "Bash", Some("/")).await;
+    row_of(&a.operator, &p.request_id).await;
+    p.call.abort();
+    let _ = p.call.await;
+    row_resolved(&a.operator, &p.request_id).await;
+    let audit = until(|| async {
+        let rows = a.audit().await;
+        (!rows.is_empty()).then_some(rows)
+    })
+    .await;
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    assert_eq!(audit[0].0, "permission.refused");
+    assert_eq!(audit[0].4["outcome"], "hook_disconnected");
+}
+
+/// An ask that ends before its row is even written must not leave the row
+/// pending: the end waits for the write, then flips it.
+#[tokio::test]
+async fn an_ask_that_ends_instantly_never_leaves_a_pending_row() {
+    let a = t0().await;
+    let secret = live(&a.d, "t-fast", 30).await;
+    a.operator
+        .ok(
+            "settings_set",
+            json!({ "key": "permissions.hold_terminal_t-fast", "value": "true" }),
+        )
+        .await;
+    let mut ws = connect(a.d.addr).await;
+    for _ in 0..6 {
+        let call = gated_call(&a.d, "t-fast", &secret);
+        let held = event(&mut ws, "hooks://event").await;
+        // Answered through the legacy arm the moment it is parked — possibly
+        // before the row exists, so the arm cannot find it to claim.
+        a.operator
+            .raw(
+                "term_hooks_decide",
+                json!({ "requestId": held["request_id"], "decision": "approved" }),
+            )
+            .await;
+        let _ = call.await;
+    }
+    until(|| async {
+        let c = a.operator.ok("notifications_unread_count", json!({})).await;
+        (c["pendingPermissions"] == 0).then_some(())
+    })
+    .await;
+    let rows = a.operator.permission_rows().await;
+    assert!(rows.iter().all(|r| !r["resolvedAt"].is_null()), "{rows:?}");
+}
+
+/// A daemon that crashed with an ask held leaves a row nothing can answer.
+#[tokio::test]
+async fn a_row_left_open_by_an_earlier_run_is_closed_at_boot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().canonicalize().unwrap().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let db = Arc::new(PaDb::new(data.join("ikenga.db")));
+    let pool = db.ensure_pool().await.unwrap();
+    let stale = notes::hook_ask::permission_from_hook_gate(
+        Some("Bash"),
+        None,
+        Some("t-old"),
+        None,
+        "perm-from-a-dead-run",
+    );
+    notes::record(&pool, stale).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let _router = crate::server::build_router(
+        config(Some(data.clone()), PORT),
+        Arc::new(PtyManager::new()),
+        Arc::new(EngineRegistry::new()),
+        Some(db.clone()),
+        None,
+        None,
+        crate::server::rpc_shell::PathGuard::allowlist(),
+        None,
+        DaemonAccess::unavailable(),
+        None,
+        crate::server::UpdateSource::Default,
+    );
+    until(|| async {
+        let open: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shell_notifications WHERE kind = 'permission' AND resolved_at IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        (open == 0).then_some(())
+    })
+    .await;
+}
+
+// ─── principals ──────────────────────────────────────────────────────────────
+
+/// Two principals' children are two databases and two held tables: B sees
+/// nothing of A's ask, B's `permission_decide` on A's row id lands on B's OWN
+/// row of that number, and B's `term_hooks_decide` on A's request id takes
+/// nothing — A's hook stays held until A answers it.
+#[tokio::test]
+async fn principal_b_cannot_see_or_answer_principal_as_ask() {
+    let (alice, alice_id) = child().await;
+    let (bob, bob_id) = child().await;
+    let (a, b) = (alice.principal(alice_id), bob.principal(bob_id));
+    let pa = park_on(&alice, &a, "t-same", 30, "Bash", Some("/")).await;
+    let pb = park_on(&bob, &b, "t-same", 30, "Bash", Some("/")).await;
+    let row_a = row_of(&a, &pa.request_id).await;
+    let row_b = row_of(&b, &pb.request_id).await;
+    assert_eq!(
+        row_a["id"], row_b["id"],
+        "both are row 1 of their own database: an id is no capability"
+    );
+
+    // Neither list holds the other's row.
+    assert!(b
+        .permission_rows()
+        .await
+        .iter()
+        .all(|r| r["action"]["requestId"] != pa.request_id));
+    assert!(a
+        .permission_rows()
+        .await
+        .iter()
+        .all(|r| r["action"]["requestId"] != pb.request_id));
+
+    // B names A's request id: nothing is held under it in B's child.
+    let r = b
+        .ok(
+            "term_hooks_decide",
+            json!({ "requestId": pa.request_id, "decision": "approved" }),
+        )
+        .await;
+    assert_eq!(r["gated"], false);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!pa.call.is_finished(), "A's hook is still held");
+    assert!(!pb.call.is_finished(), "and B's");
+
+    // B's decide on "row 1" answers B's own ask, never A's.
+    b.ok(
+        "permission_decide",
+        json!({ "notificationId": row_a["id"], "decision": "allow_once" }),
+    )
+    .await;
+    let (_, body_b) = pb.call.await.unwrap();
+    assert_eq!(decision_of(&body_b), "allow");
+    assert!(!pa.call.is_finished(), "still A's to answer");
+
+    // A answers its own.
+    a.ok(
+        "permission_decide",
+        json!({ "notificationId": row_a["id"], "decision": "deny" }),
+    )
+    .await;
+    let (_, body_a) = pa.call.await.unwrap();
+    assert_eq!(decision_of(&body_a), "deny");
+}
+
+/// A share member sees and answers only asks of the shared project, and what
+/// the member decides is attributed to the member.
+#[tokio::test]
+async fn a_share_member_answers_only_the_shared_projects_asks() {
+    // The shared projects live under one allowlisted root.
+    let root = tempfile::tempdir().unwrap();
+    let work = root.path().canonicalize().unwrap().join("work");
+    let (site, other) = (work.join("site"), work.join("other"));
+    for dir in [&site, &other] {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+    }
+    let roots = crate::fs_roots::FsRoots::load_seeded(
+        root.path().join("fs_roots.json"),
+        vec![work.to_string_lossy().into_owned()],
+    )
+    .unwrap();
+    let guard = crate::server::rpc_shell::PathGuard::roots(Arc::new(roots));
+    let (a, owner) = child_with(Some(guard)).await;
+    let owner_c = a.principal(owner);
+    let pool = a.db.ensure_pool().await.unwrap();
+    for (id, dir) in [("site", &site), ("other", &other)] {
+        sqlx::query(
+            "INSERT INTO projects (id, display_name, root_path, created_at) VALUES (?, ?, ?, 0)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(dir.to_string_lossy().as_ref())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let in_site = site.join("src").to_string_lossy().into_owned();
+    let in_other = other.join("src").to_string_lossy().into_owned();
+    // Reads inside their own project: not sensitive (§5.3), so a member may
+    // answer them under any policy.
+    let read = |dir: &std::path::Path| json!({ "file_path": dir.join("src/a.rs") });
+    let p_site = park_with(
+        &a,
+        &owner_c,
+        "t-site",
+        30,
+        "Read",
+        read(&site),
+        Some(&in_site),
+    )
+    .await;
+    let p_other = park_with(
+        &a,
+        &owner_c,
+        "t-other",
+        30,
+        "Read",
+        read(&other),
+        Some(&in_other),
+    )
+    .await;
+    let row_site = row_of(&owner_c, &p_site.request_id).await;
+    let row_other = row_of(&owner_c, &p_other.request_id).await;
+    assert_eq!(row_site["action"]["routing"]["projectId"], "site");
+    assert_eq!(row_other["action"]["routing"]["projectId"], "other");
+
+    let member_id = PrincipalId::new_v7();
+    let member = a.member(owner, member_id, "site");
+    // The member's list is the shared project's asks, no others.
+    let seen = member.permission_rows().await;
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0]["action"]["requestId"], p_site.request_id);
+    // The other project's ask does not exist for the member.
+    let e = member
+        .err(
+            "permission_decide",
+            json!({ "notificationId": row_other["id"], "decision": "allow_once" }),
+        )
+        .await;
+    assert!(e.contains("not_found"), "{e}");
+    assert!(!p_other.call.is_finished(), "left held");
+
+    // The shared project's is theirs to answer.
+    member
+        .ok(
+            "permission_decide",
+            json!({ "notificationId": row_site["id"], "decision": "allow_once" }),
+        )
+        .await;
+    let (_, body) = p_site.call.await.unwrap();
+    assert_eq!(decision_of(&body), "allow");
+    // What the member decided is the member's, on the note the broker will
+    // chain — not the Owner's.
+    let notes_out = a
+        .outbox
+        .as_ref()
+        .unwrap()
+        .take(Duration::from_millis(200))
+        .await
+        .notes;
+    let note = notes_out
+        .iter()
+        .find(|n| n.kind == Some(audit_child::NoteKind::Decided))
+        .unwrap_or_else(|| panic!("no decided note in {notes_out:?}"));
+    assert_eq!(
+        note.by.as_ref().and_then(|b| b.principal_id.clone()),
+        Some(member_id.to_string())
+    );
+    assert_eq!(
+        note.project_key.as_deref(),
+        Some(format!("{owner}/site").as_str())
+    );
+    // And the legacy arm is the Owner's alone: a member is refused outright.
+    let e = member
+        .err(
+            "term_hooks_decide",
+            json!({ "requestId": p_other.request_id, "decision": "approved" }),
+        )
+        .await;
+    assert!(e.contains("owner"), "{e}");
+    assert!(!p_other.call.is_finished());
+    p_other.call.abort();
+}
+
+/// Under T1 the chain row is written by the broker from the child's note: run
+/// the child's real queue through `accept` against a real store, and check it
+/// is the same row T0 writes for the same decision.
+#[tokio::test]
+async fn a_child_decision_reaches_the_chain_through_the_brokers_accept() {
+    let tool = format!("Probe{}", uuid::Uuid::new_v4().simple());
+    let (a, owner) = child().await;
+    let outbox = a.outbox.clone().unwrap();
+    let c = a.principal(owner);
+    let p = park_on(&a, &c, "t-aud", 30, &tool, Some("/")).await;
+    let id = row_of(&c, &p.request_id).await["id"].as_i64().unwrap();
+    c.ok(
+        "permission_decide",
+        json!({ "notificationId": id, "decision": "allow_once" }),
+    )
+    .await;
+    let _ = p.call.await.unwrap();
+
+    let title = format!("Claude wants to use {tool}");
+    let note = until(|| {
+        let outbox = outbox.clone();
+        let title = title.clone();
+        async move {
+            outbox
+                .take(Duration::from_millis(50))
+                .await
+                .notes
+                .into_iter()
+                .find(|n| n.target.as_deref() == Some(title.as_str()))
+        }
+    })
+    .await;
+    assert_eq!(note.kind, Some(audit_child::NoteKind::Decided));
+    assert_eq!(note.decision.as_deref(), Some("allow_once"));
+    assert_eq!(
+        note.by.as_ref().and_then(|b| b.principal_id.clone()),
+        Some(owner.to_string()),
+        "the credential the broker handed the child"
+    );
+
+    // The broker's side: validate, attribute to this child's principal, append.
+    let store = AccessStore::memory_t0().await;
+    let ev = audit_child::accept(&store, owner, &note)
+        .await
+        .expect("accepted");
+    crate::server::shared::notifications::routing::append_audit(&store, &ev).await;
+    let rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT kind, principal_id, detail FROM audit_events WHERE category = 'permission'",
+    )
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "permission.decided");
+    assert_eq!(rows[0].1.as_deref(), Some(owner.to_string().as_str()));
+    let detail: Value = serde_json::from_str(&rows[0].2).unwrap();
+
+    // The same decision on T0 writes the same facts.
+    let t = t0().await;
+    let p0 = park_on(&t, &t.operator, "t-aud0", 30, &tool, Some("/")).await;
+    let id0 = row_of(&t.operator, &p0.request_id).await["id"]
+        .as_i64()
+        .unwrap();
+    t.operator
+        .ok(
+            "permission_decide",
+            json!({ "notificationId": id0, "decision": "allow_once" }),
+        )
+        .await;
+    let _ = p0.call.await.unwrap();
+    assert_eq!(t.audit().await[0].4, detail, "one shape on both tiers");
+}
+
+#[tokio::test]
+async fn a_child_timeout_is_a_note_for_the_broker_not_a_claimed_row() {
+    TEST_HOLD.with(|h| h.set(Some(Duration::from_millis(500))));
+    let (a, owner) = child().await;
+    TEST_HOLD.with(|h| h.set(None));
+    let outbox = a.outbox.clone().unwrap();
+    let tool = format!("Slow{}", uuid::Uuid::new_v4().simple());
+    let c = a.principal(owner);
+    let p = park_on(&a, &c, "t-cto", 30, &tool, Some("/")).await;
+    let (_, body) = p.call.await.unwrap();
+    assert_eq!(decision_of(&body), "deny");
+    row_resolved(&c, &p.request_id).await;
+
+    let title = format!("Claude wants to use {tool}");
+    let note = until(|| {
+        let outbox = outbox.clone();
+        let title = title.clone();
+        async move {
+            outbox
+                .take(Duration::from_millis(50))
+                .await
+                .notes
+                .into_iter()
+                .find(|n| n.target.as_deref() == Some(title.as_str()))
+        }
+    })
+    .await;
+    assert_eq!(note.outcome.as_deref(), Some("timed_out"));
+    assert_eq!(note.decision.as_deref(), Some("deny"));
+    assert!(note.by.is_none(), "nobody decided it");
+    let store = AccessStore::memory_t0().await;
+    let ev = audit_child::accept(&store, owner, &note).await.unwrap();
+    assert_eq!(ev.principal_id.as_deref(), Some(owner.to_string().as_str()));
+    assert_eq!(ev.detail["outcome"], "timed_out");
+}
+
+#[tokio::test]
+async fn a_full_held_table_denies_unparked_and_still_records_the_deny() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(PaDb::new(tmp.path().join("ikenga.db")));
+    db.ensure_pool().await.unwrap();
+    let outbox = Arc::new(audit_child::Outbox::new());
+    let asks =
+        crate::server::hook_asks::HookAsks::with_outbox(db, PrincipalId::new_v7(), outbox.clone());
+    asks.refused_unparked(
+        Some("Bash"),
+        Some(&json!({"command": "ls"})),
+        "t-full",
+        Some("/"),
+    );
+    let notes_out = until(|| {
+        let outbox = outbox.clone();
+        async move {
+            let b = outbox.take(Duration::from_millis(50)).await;
+            (!b.notes.is_empty()).then_some(b.notes)
+        }
+    })
+    .await;
+    assert_eq!(notes_out.len(), 1);
+    assert_eq!(notes_out[0].outcome.as_deref(), Some("held_table_full"));
+    assert_eq!(notes_out[0].decision.as_deref(), Some("deny"));
+    assert_eq!(notes_out[0].kind, Some(audit_child::NoteKind::Decided));
+}
+
+/// The route the broker long-polls is `internal`: a principal's own relayed
+/// request is refused, and only the broker's call (the internal-call header,
+/// no caps) is served what the child queued.
+#[tokio::test]
+async fn the_brokers_audit_poll_is_internal_and_serves_the_childs_queue() {
+    // The route reads the process-global outbox a principal child installs at
+    // boot; only this test points a gate at it.
+    audit_child::install_outbox(Arc::new(audit_child::Outbox::new()));
+    let outbox = audit_child::outbox().unwrap();
+    let (a, owner) = child_on(outbox, None).await;
+    let c = a.principal(owner);
+    let p = park_on(&a, &c, "t-poll", 30, "Bash", Some("/")).await;
+    let id = row_of(&c, &p.request_id).await["id"].as_i64().unwrap();
+    c.ok(
+        "permission_decide",
+        json!({ "notificationId": id, "decision": "deny" }),
+    )
+    .await;
+    let _ = p.call.await;
+
+    let get = |headers: &[(&str, &str)]| {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri(format!("{}?waitMs=0", audit_child::EVENTS_PATH))
+            .header("authorization", format!("Bearer {TOKEN}"));
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let router = a.d.router.clone();
+        async move {
+            let res = router
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, bytes)
+        }
+    };
+    // A principal's request, relayed with its caps: not the broker.
+    let owner_id = owner.to_string();
+    let (status, _) = get(&[
+        ("x-ikenga-principal", owner_id.as_str()),
+        ("x-ikenga-caps", OWN_CAPS),
+    ])
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Nor a bare bearer with neither.
+    let (status, _) = get(&[]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // The broker's own call.
+    let (status, bytes) = get(&[
+        ("x-ikenga-principal", owner_id.as_str()),
+        ("x-ikenga-internal-call", "1"),
+    ])
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let batch: Value = serde_json::from_slice(&bytes).unwrap();
+    let notes = batch["notes"].as_array().unwrap();
+    assert_eq!(notes.len(), 1, "{batch}");
+    assert_eq!(notes[0]["kind"], "permission.decided");
+    assert_eq!(notes[0]["decision"], "deny");
+    assert_eq!(batch["dropped"], 0);
 }

@@ -575,7 +575,9 @@ pub fn route_requirement(path: &str) -> Option<Requirement> {
         Some(Requirement::owner(&[]))
     } else if path.starts_with("/pkgs/") || path == "/pkgs" {
         Some(Requirement::shared(&[Cap::Files]))
-    } else if path == crate::server::push::outbox::EVENTS_PATH {
+    } else if path == crate::server::push::outbox::EVENTS_PATH
+        || path == audit::child::EVENTS_PATH
+    {
         // plans/pwa S2 §10: the broker's push long-poll, broker → child only.
         Some(Requirement::internal())
     } else {

@@ -62,10 +62,21 @@
 //! desktop's exact response, never allow. `term_hooks_decide` needs `approve`
 //! on an `owner`-class credential, so the routing preference (G-ACCESS §5.1)
 //! and shares apply as they do to `permission_decide`.
+//!
+//! # The notification row and the audit trail
+//!
+//! A held ask also writes the desktop's `permission` row, and every way it can
+//! end flips that row and is audited: see [`super::hook_asks`]. The invariant
+//! this file keeps for it is **one remover**: whoever takes a request out of
+//! the held table ([`TermHooks::take`]) owns how it ended — a decision
+//! ([`TermHooks::decide_held_record`]), the hold running out
+//! ([`TermHooks::expire`]), the PTY exiting ([`TermHooks::revoke`]) or the
+//! hook's connection dropping ([`HeldGuard`]) — so a row is flipped and an
+//! outcome audited exactly once, and never left looking pending.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -81,6 +92,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use super::events::{EventBus, Topic};
+use super::hook_asks::{AskRecord, HookAsks, Outcome};
 use super::rpc::RpcResponse;
 use super::shared::hook_settings::{self as settings_doc, Auth, Wiring, GATE_HOLD_SECS};
 use super::{ct_eq, AppState, ServerConfig};
@@ -166,6 +178,8 @@ pub struct HookDecision {
 struct Held {
     terminal_id: String,
     tx: oneshot::Sender<HookDecision>,
+    /// The ask's row machinery (`None` without a database).
+    record: Option<Arc<AskRecord>>,
 }
 
 /// See the module doc. One per router, i.e. per daemon process — under T1,
@@ -182,6 +196,9 @@ pub struct TermHooks {
     held: Mutex<HashMap<String, Held>>,
     /// terminal id → its latest statusline snapshot.
     snapshots: Mutex<HashMap<String, Value>>,
+    /// The row-and-audit machinery for held asks, attached by the router once
+    /// it knows its database and access state.
+    asks: RwLock<Option<Arc<HookAsks>>>,
 }
 
 impl TermHooks {
@@ -203,7 +220,26 @@ impl TermHooks {
             terminals: Mutex::new(HashMap::new()),
             held: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(HashMap::new()),
+            asks: RwLock::new(None),
         })
+    }
+
+    /// Give held asks their notification row and audit trail.
+    pub(super) fn attach_asks(&self, asks: Arc<HookAsks>) {
+        if let Ok(mut slot) = self.asks.write() {
+            *slot = Some(asks);
+        }
+    }
+
+    pub(super) fn asks(&self) -> Option<Arc<HookAsks>> {
+        self.asks.read().ok().and_then(|a| a.clone())
+    }
+
+    /// The ask is over by `outcome`: flip its row, audit what nobody decided.
+    fn conclude(&self, record: Option<Arc<AskRecord>>, outcome: Outcome) {
+        if let Some(asks) = self.asks() {
+            asks.conclude(record, outcome);
+        }
     }
 
     /// Where the hooks POST, or why the server cannot take them.
@@ -335,22 +371,23 @@ impl TermHooks {
             return;
         }
         // Parked hooks of a dead terminal: dropping them denies them, and the
-        // inbox is told, as for any ask that ends unanswered.
-        let orphaned: Vec<String> = match self.held.lock() {
+        // inbox is told, as for any ask that ends unanswered. This is their
+        // remover, so it owns the outcome: their rows are flipped now, not
+        // when the (possibly already gone) hook connection notices.
+        let orphaned: Vec<(String, Held)> = match self.held.lock() {
             Ok(mut h) => {
                 let ids: Vec<String> = h
                     .iter()
                     .filter(|(_, held)| held.terminal_id == grant.terminal_id)
                     .map(|(id, _)| id.clone())
                     .collect();
-                for id in &ids {
-                    h.remove(id);
-                }
-                ids
+                ids.into_iter()
+                    .filter_map(|id| h.remove(&id).map(|held| (id, held)))
+                    .collect()
             }
             Err(_) => Vec::new(),
         };
-        for request_id in orphaned {
+        for (request_id, held) in orphaned {
             self.events.publish(
                 Topic::HooksDecision,
                 HookDecision {
@@ -358,6 +395,7 @@ impl TermHooks {
                     decision: "denied".into(),
                 },
             );
+            self.conclude(held.record, Outcome::TerminalEnded);
         }
         if let Some(dir) = &self.dir {
             let _ = std::fs::remove_file(dir.join(terminal_file_name(&grant.terminal_id)));
@@ -380,24 +418,72 @@ impl TermHooks {
         json!(map)
     }
 
-    /// Answer a parked gate. `true` only if a request was parked under
-    /// `request_id` and took the answer; the request is removed first, so a
-    /// second answer (a replay, or a late one after the timeout) is `false`.
-    pub fn decide(&self, request_id: &str, approved: bool) -> bool {
-        let held = self.held.lock().ok().and_then(|mut h| h.remove(request_id));
-        let Some(held) = held else { return false };
+    /// Take a parked request out of the table. The caller is its remover and
+    /// owns how it ended (see the module doc).
+    fn take(&self, request_id: &str) -> Option<Held> {
+        self.held.lock().ok().and_then(|mut h| h.remove(request_id))
+    }
+
+    /// Answer a parked gate. `Some` (the ask's record, if it has one) only if
+    /// a request was parked under `request_id` and took the answer; the
+    /// request is removed first, so a second answer (a replay, or a late one
+    /// after the timeout) is `None`.
+    pub(super) fn decide_held_record(
+        &self,
+        request_id: &str,
+        approved: bool,
+    ) -> Option<Option<Arc<AskRecord>>> {
+        let held = self.take(request_id)?;
         let decision = HookDecision {
             request_id: request_id.to_string(),
             decision: if approved { "approved" } else { "denied" }.into(),
         };
-        let delivered = held.tx.send(decision.clone()).is_ok();
-        if delivered {
+        if held.tx.send(decision.clone()).is_ok() {
             self.events.publish(Topic::HooksDecision, &decision);
+            self.conclude(held.record.clone(), Outcome::Answered);
+            return Some(held.record);
         }
-        delivered
+        // The hook stopped waiting between our take and the send: it timed
+        // out under the decider. Nothing was delivered; the inbox is told.
+        self.events.publish(
+            Topic::HooksDecision,
+            HookDecision {
+                request_id: request_id.to_string(),
+                decision: "denied".into(),
+            },
+        );
+        self.conclude(held.record, Outcome::TimedOut);
+        None
     }
 
-    fn park(&self, request_id: &str, terminal_id: &str) -> Option<oneshot::Receiver<HookDecision>> {
+    /// [`decide_held_record`](Self::decide_held_record) for a caller that only
+    /// needs to know whether the gate took the answer.
+    pub(super) fn decide_held(&self, request_id: &str, approved: bool) -> bool {
+        self.decide_held_record(request_id, approved).is_some()
+    }
+
+    /// The hold ran out with nobody answering: the gate denied. A no-op if an
+    /// answer took the request first.
+    fn expire(&self, request_id: &str) {
+        let Some(held) = self.take(request_id) else {
+            return;
+        };
+        self.events.publish(
+            Topic::HooksDecision,
+            HookDecision {
+                request_id: request_id.to_string(),
+                decision: "denied".into(),
+            },
+        );
+        self.conclude(held.record, Outcome::TimedOut);
+    }
+
+    fn park(
+        &self,
+        request_id: &str,
+        terminal_id: &str,
+        record: Option<Arc<AskRecord>>,
+    ) -> Option<oneshot::Receiver<HookDecision>> {
         let (tx, rx) = oneshot::channel();
         let mut held = self.held.lock().ok()?;
         if held.len() >= MAX_HELD {
@@ -408,6 +494,7 @@ impl TermHooks {
             Held {
                 terminal_id: terminal_id.to_string(),
                 tx,
+                record,
             },
         );
         Some(rx)
@@ -432,8 +519,9 @@ impl TermHooks {
 }
 
 /// Removes the parked request when its hook response ends. If nobody answered
-/// (timeout, or the hook's connection dropped and this future with it) the
-/// inbox is told it was denied, as on the desktop.
+/// and nothing else took it — the hook's connection dropped, and this future
+/// with it — the inbox is told it was denied, as on the desktop, and the ask's
+/// row is flipped.
 struct HeldGuard {
     hooks: Arc<TermHooks>,
     request_id: String,
@@ -441,13 +529,9 @@ struct HeldGuard {
 
 impl Drop for HeldGuard {
     fn drop(&mut self) {
-        let still_parked = self
-            .hooks
-            .held
-            .lock()
-            .map(|mut h| h.remove(&self.request_id).is_some())
-            .unwrap_or(false);
-        if still_parked {
+        // Still parked here means this future ended without an answer, a
+        // timeout or a revoke taking the request: the hook hung up.
+        if let Some(held) = self.hooks.take(&self.request_id) {
             self.hooks.events.publish(
                 Topic::HooksDecision,
                 HookDecision {
@@ -455,6 +539,7 @@ impl Drop for HeldGuard {
                     decision: "denied".into(),
                 },
             );
+            self.hooks.conclude(held.record, Outcome::HookDisconnected);
         }
     }
 }
@@ -580,6 +665,8 @@ struct HookIn {
     tool_input: Option<Value>,
     tool_use_id: Option<String>,
     prompt: Option<String>,
+    /// The session's working directory: the project the ask belongs to.
+    cwd: Option<String>,
 }
 
 /// Whether `hooks://event` carries this event (see the module doc).
@@ -608,6 +695,7 @@ fn event_payload(terminal: &str, h: &HookIn, request_id: Option<&str>) -> Value 
         "tool_name": h.tool_name,
         "tool_input": h.tool_input,
         "tool_use_id": h.tool_use_id,
+        "cwd": h.cwd,
         "prompt": if keeps_prompt { json!(h.prompt) } else { Value::Null },
     });
     if let Some(id) = request_id {
@@ -667,8 +755,27 @@ async fn hook_event(
 
     if event == "PreToolUse" && gate_enabled(&state, &terminal).await {
         let request_id = mint_request_id();
-        let Some(rx) = hooks.park(&request_id, &terminal) else {
+        let asks = hooks.asks();
+        let record = asks.as_ref().map(|_| {
+            AskRecord::new(
+                &request_id,
+                &terminal,
+                h.tool_name.as_deref(),
+                h.tool_input.as_ref(),
+                h.cwd.as_deref(),
+                hooks.hold,
+            )
+        });
+        let Some(rx) = hooks.park(&request_id, &terminal, record.clone()) else {
             warn!("term-hooks: {MAX_HELD} asks already held; denying a new one");
+            if let Some(asks) = &asks {
+                asks.refused_unparked(
+                    h.tool_name.as_deref(),
+                    h.tool_input.as_ref(),
+                    &terminal,
+                    h.cwd.as_deref(),
+                );
+            }
             return gate_response(false, &request_id);
         };
         // Armed before the event goes out: whatever ends this future from
@@ -681,13 +788,26 @@ async fn hook_event(
             Topic::HooksEvent,
             event_payload(&terminal, &h, Some(&request_id)),
         );
-        // The inbox answers through `term_hooks_decide`. Bounded by the hold,
-        // which must stay below curl's --max-time and the hook timeout the
-        // settings file declares (`shared::hook_settings`).
-        let allowed = matches!(
-            tokio::time::timeout(hooks.hold, rx).await,
-            Ok(Ok(HookDecision { decision, .. })) if decision == "approved"
-        );
+        // The row is written AFTER the request is parked (so an answer to it
+        // always finds a request) and off this path (a busy DB write must
+        // never eat the hold's margin under curl's --max-time).
+        if let (Some(asks), Some(record)) = (&asks, &record) {
+            asks.raise(record);
+        }
+        // The inbox answers through `permission_decide` on the ask's row, or
+        // `term_hooks_decide`. Bounded by the hold, which must stay below
+        // curl's --max-time and the hook timeout the settings file declares
+        // (`shared::hook_settings`).
+        let allowed = match tokio::time::timeout(hooks.hold, rx).await {
+            Ok(Ok(HookDecision { decision, .. })) => decision == "approved",
+            // The sender was dropped: the terminal's PTY exited (`revoke`
+            // took the request and owns the outcome).
+            Ok(Err(_)) => false,
+            Err(_) => {
+                hooks.expire(&request_id);
+                false
+            }
+        };
         return gate_response(allowed, &request_id);
     }
 
@@ -732,6 +852,9 @@ async fn statusline_event(
 }
 
 // ─── the rpc arms ────────────────────────────────────────────────────────────
+//
+// `term_hooks_decide` lives in `hook_asks` with `permission_decide`: it
+// answers through the ask's row when there is one.
 
 pub(super) fn info_arm(state: &AppState) -> RpcResponse {
     RpcResponse::success(state.term_hooks.info(&state.config))
@@ -739,29 +862,6 @@ pub(super) fn info_arm(state: &AppState) -> RpcResponse {
 
 pub(super) fn snapshot_arm(state: &AppState) -> RpcResponse {
     RpcResponse::success(state.term_hooks.snapshots())
-}
-
-/// `term_hooks_decide {requestId, decision: "approved" | "denied"}`.
-pub(super) fn decide_arm(state: &AppState, args: &Value) -> RpcResponse {
-    let request_id = args
-        .get("requestId")
-        .or_else(|| args.get("request_id"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty());
-    let approved = match args.get("decision").and_then(Value::as_str) {
-        Some("approved") => true,
-        Some("denied") => false,
-        _ => {
-            return RpcResponse::error(
-                "term_hooks_decide: `decision` must be \"approved\" or \"denied\"",
-            )
-        }
-    };
-    let Some(request_id) = request_id else {
-        return RpcResponse::error("term_hooks_decide: `requestId` is required");
-    };
-    let gated = state.term_hooks.decide(request_id, approved);
-    RpcResponse::success(json!({ "recorded": true, "gated": gated }))
 }
 
 #[cfg(test)]
