@@ -22,6 +22,7 @@ vi.mock('@/lib/transport/shims', () => ({
 	sendNotification: vi.fn(),
 }));
 
+import { hostRefusalCode } from '@ikenga/contract/rpc';
 import { dbQuery, pkgKernelStatus, pkgPreviewManifest } from '@/lib/tauri-cmd';
 import { sendNotification } from '@/lib/transport/shims';
 import { dispatchHostCall } from './pkg-iframe-host';
@@ -70,15 +71,38 @@ describe('capability checks: denied vs unavailable', () => {
 		expect(query).not.toHaveBeenCalled();
 	});
 
-	it('a real denial keeps the existing message and envelope (no reason field)', async () => {
+	it('a real denial keeps the existing message and adds the contract reason scope-denied', async () => {
 		installed();
 		previewManifest.mockResolvedValue({ capabilities: {}, permissions: {} } as never);
 
 		const res = await dispatchHostCall(PKG, 'host.dbQuery', { sql: 'SELECT * FROM tasks' });
 
 		const msg = "host.dbQuery: pkg lacks the 'sqlite' capability";
-		expect(res.structuredContent).toEqual({ ok: false, error: msg });
+		expect(res.structuredContent).toEqual({ ok: false, error: msg, reason: 'scope-denied' });
 		expect((res.content[0] as { text: string }).text).toBe(msg);
+		expect(hostRefusalCode(res.structuredContent)).toBe('scope_denied');
+	});
+
+	it('a table outside the declared sqlite.tables is a scope-denied refusal', async () => {
+		installed();
+		previewManifest.mockResolvedValue({
+			capabilities: { sqlite: true },
+			permissions: { 'sqlite.tables': ['notes'] },
+		} as never);
+
+		const res = await dispatchHostCall(PKG, 'host.dbQuery', { sql: 'SELECT * FROM tasks' });
+
+		expect(res.isError).toBe(true);
+		expect(hostRefusalCode(res.structuredContent)).toBe('scope_denied');
+		expect(vi.mocked(dbQuery)).not.toHaveBeenCalled();
+	});
+
+	it('pkgs can map a check that could not run to scope_check_unavailable', async () => {
+		kernelStatus.mockRejectedValue(new Error('ipc closed'));
+
+		const res = await dispatchHostCall(PKG, 'host.dbQuery', { sql: 'SELECT * FROM tasks' });
+
+		expect(hostRefusalCode(res.structuredContent)).toBe('scope_check_unavailable');
 	});
 
 	it('host.notify: unavailable is not reported as scope-denied', async () => {

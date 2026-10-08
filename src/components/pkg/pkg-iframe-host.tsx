@@ -40,6 +40,7 @@
 // run; no useRef-mount-guard + cancelled-flag combination.
 
 import type { OperatorIdentity } from '@ikenga/contract/host-context';
+import type { HostRefusalReason } from '@ikenga/contract/rpc';
 import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/app-bridge';
 import { useEffect, useRef, useState } from 'react';
 import { hostDownloadFile, hostOpenLink } from './host-mediated';
@@ -191,9 +192,11 @@ interface HostCallResult {
 // Every check below is tri-state: `granted`, `denied` (the manifest was read
 // and doesn't declare it), or `unavailable` (the kernel / manifest read
 // failed, so we couldn't tell). Both non-granted outcomes refuse the call,
-// still fail-closed, but an `unavailable` refusal says so and carries
-// `reason: 'check-unavailable'`, so a pkg isn't told "scope not declared"
-// because of a transient kernel error. See `capRefusal`.
+// still fail-closed, and both carry a `HostRefusalReason` from
+// `@ikenga/contract/rpc`: `'scope-denied'` for a confirmed denial and
+// `'check-unavailable'` when the check couldn't run, so a pkg isn't told
+// "scope not declared" because of a transient kernel error. Pkgs map either
+// to its RPC code with `hostRefusalCode()`. See `capRefusal`.
 export type CapCheck = { kind: 'granted' } | { kind: 'denied' } | { kind: 'unavailable'; detail: string };
 
 const GRANTED: CapCheck = { kind: 'granted' };
@@ -234,14 +237,25 @@ function capUnavailableText(verb: string, detail: string): string {
 	return `${verb}: couldn't check the pkg's declared capabilities (${detail}). This is not a denial; try again`;
 }
 
-/** The refusal for a non-granted check. `denied` keeps each verb's existing
- *  message and envelope unchanged (pkgs match on them); `unavailable` adds
- *  `reason: 'check-unavailable'` to the structured content. */
+/** The refusal for a non-granted check. Each verb keeps its existing message
+ *  text (older pkgs match on it); the structured content carries the
+ *  contract's `reason` — `'scope-denied'` or `'check-unavailable'`. */
 function capRefusal(verb: string, check: CapCheck, deniedText: string): HostCallResult {
 	if (check.kind === 'unavailable') {
 		return errResult(capUnavailableText(verb, check.detail), 'check-unavailable');
 	}
-	return errResult(`${verb}: ${deniedText}`);
+	return errResult(`${verb}: ${deniedText}`, 'scope-denied');
+}
+
+/** A confirmed scope denial for the verbs whose envelope has always been
+ *  `{ ok: false, reason }` with no `error` field (`host.notify`,
+ *  `host.sendToActiveSession`, the draft verbs). */
+function scopeDeniedResult(text: string): HostCallResult {
+	return {
+		content: [{ type: 'text', text }],
+		isError: true,
+		structuredContent: { ok: false, reason: 'scope-denied' satisfies HostRefusalReason },
+	};
 }
 
 // Per-pkg rate limit for `host.notify` (WP-26). An OS notification reaches
@@ -422,7 +436,10 @@ async function checkSqliteTableScope(
 	}
 	for (const t of targets) {
 		if (!allowed.includes(t)) {
-			return errResult(`${verb}: table '${t}' not in the pkg's declared sqlite.tables`);
+			return errResult(
+				`${verb}: table '${t}' not in the pkg's declared sqlite.tables`,
+				'scope-denied'
+			);
 		}
 	}
 	return null;
@@ -775,11 +792,7 @@ export async function dispatchHostCall(
 			return capRefusal('host.notify', notifyScope, '');
 		}
 		if (notifyScope.kind === 'denied') {
-			return {
-				content: [{ type: 'text', text: "host.notify: pkg lacks the 'notify:send' scope" }],
-				isError: true,
-				structuredContent: { ok: false, reason: 'scope-denied' },
-			};
+			return scopeDeniedResult("host.notify: pkg lacks the 'notify:send' scope");
 		}
 		if (notifyRateLimited(pkgId)) {
 			return {
@@ -831,13 +844,7 @@ export async function dispatchHostCall(
 			return capRefusal('host.sendToActiveSession', engineScope, '');
 		}
 		if (engineScope.kind === 'denied') {
-			return {
-				content: [
-					{ type: 'text', text: "host.sendToActiveSession: pkg lacks the 'engine:invoke' scope" },
-				],
-				isError: true,
-				structuredContent: { ok: false, reason: 'scope-denied' },
-			};
+			return scopeDeniedResult("host.sendToActiveSession: pkg lacks the 'engine:invoke' scope");
 		}
 
 		try {
@@ -921,11 +928,7 @@ export async function dispatchHostCall(
 			return capRefusal(name, engineScope, '');
 		}
 		if (engineScope.kind === 'denied') {
-			return {
-				content: [{ type: 'text', text: `${name}: pkg lacks the 'engine:invoke' scope` }],
-				isError: true,
-				structuredContent: { ok: false, reason: 'scope-denied' },
-			};
+			return scopeDeniedResult(`${name}: pkg lacks the 'engine:invoke' scope`);
 		}
 		try {
 			if (verb === 'commit') {
@@ -1237,9 +1240,9 @@ function isStringRecord(v: unknown): v is Record<string, string> {
 	return Object.values(v as Record<string, unknown>).every((x) => typeof x === 'string');
 }
 
-/** `reason` is additive: set only where it distinguishes a case (today
- *  `'check-unavailable'`); existing results keep their exact shape. */
-function errResult(message: string, reason?: string): HostCallResult {
+/** `reason` is additive: set only on capability refusals (the contract's
+ *  `HostRefusalReason`); other failures keep their exact shape. */
+function errResult(message: string, reason?: HostRefusalReason): HostCallResult {
 	return {
 		content: [{ type: 'text', text: message }],
 		isError: true,
