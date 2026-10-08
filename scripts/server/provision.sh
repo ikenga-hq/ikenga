@@ -57,7 +57,7 @@ UPDATE_RETRY_COOLDOWN="${UPDATE_RETRY_COOLDOWN:-3600}"
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
 
 case "${1:-}" in
-  upgrade|check-update|apply-request|install-update-units) ACTION="$1"; shift ;;
+  upgrade|check-update|apply-request|install-update-units|sync-accounts) ACTION="$1"; shift ;;
 esac
 
 while [[ $# -gt 0 ]]; do
@@ -89,10 +89,12 @@ while [[ $# -gt 0 ]]; do
         exit 0
       fi
       if [[ "$ACTION" != "provision" ]]; then
-        printf 'Usage: %s check-update | apply-request | install-update-units [--dry-run]\n\n' "${BASH_SOURCE[0]}"
+        printf 'Usage: %s check-update | apply-request | install-update-units | sync-accounts [--profile <file>] [--dry-run]\n\n' "${BASH_SOURCE[0]}"
         printf '  check-update          read the release manifest and write %s/available.json (installs nothing)\n' "$STATE_DIR"
         printf '  apply-request         claim and apply an admin update request (run by ikenga-update.service)\n'
         printf '  install-update-units  install %s and the update timer, path and service units\n' "$STABLE_COPY"
+        printf '  sync-accounts         converge shared project mirrors, per-account clones and scoped secrets\n'
+        printf '                        (run it after creating or removing accounts; the full provision run does it too)\n'
         exit 0
       fi
       sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -158,6 +160,19 @@ LIBS=()
 AGENT_CLIS=()
 FS_ROOTS=()
 SECRETS_FROM=""
+# Shared project clones and scoped secrets (D-B2, D-B3). See README "Shared
+# projects and scoped secrets". Accounts are created by `ikenga-server accounts
+# create`, not by this script; these keys only name them.
+ACCOUNTS=()            # login names (unix user = ik-<name>); empty = every ik-* user in UID_RANGE
+AGENT_ACCOUNTS=()      # the accounts a secret scoped `agents` goes to (also managed)
+UID_RANGE="20000-29999"
+PROJECTS_DIR="/srv/ikenga/projects"
+PROJECTS_READ="members"     # who can read the root-owned mirrors: members (read-only ACLs) | world
+PROJECTS_MEMBERS=()    # empty = every managed account
+PROJECTS=()            # name=git-url[#branch]
+PROJECTS_BRANCH_PREFIX=""   # each account's branch = <prefix><account>/main
+PROJECTS_TOKEN_SECRET=""    # NAME of a SECRETS_FILE entry: https deploy token for private repos
+SECRETS_FILE=""             # root-only scoped secrets (format in README)
 
 if [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]]; then
   # shellcheck disable=SC1090
@@ -197,6 +212,7 @@ validate_profile() {
   # (re-run, or a perimeter switch) does not need one. tailnet_join enforces it.
   [[ -z "$TS_AUTHKEY_FILE" || -f "$TS_AUTHKEY_FILE" ]] || die "TS_AUTHKEY_FILE '$TS_AUTHKEY_FILE' does not exist"
   [[ -z "$SECRETS_FROM" || -f "$SECRETS_FROM" ]] || die "SECRETS_FROM '$SECRETS_FROM' does not exist"
+  validate_accounts_profile
 }
 
 # --------------------------------------------------------------- preflight
@@ -692,6 +708,10 @@ summary() {
   log "Summary"
   if [[ ${#CHANGES[@]} -eq 0 ]]; then note "no changes: the host already matches this profile"; return; fi
   printf '    - %s\n' "${CHANGES[@]}"
+  if [[ "$ACTION" == sync-accounts ]]; then
+    note "Secrets are listed by name only (+ added, ~ value changed, - removed). Per-account files: $SECRETS_DIR (root-owned, 0640)."
+    return
+  fi
   note "Variables are listed by name only. Secrets are in $ENV_FILE (root:root 600)."
   if [[ "$TIER" == t1 && "$PERIMETER" == public-https ]]; then
     note "Public host: the daemon sees the proxy's address for every client until WP-P4 (trusted-proxy) lands."
@@ -1610,6 +1630,675 @@ ProtectHome=read-only
   fi
 }
 
+# ------------------------------------------- accounts: projects and secrets
+#
+# Under T1 every person and every agent is a separate Unix account (ik-<name>),
+# created by `ikenga-server accounts create`, never by this script. Two things
+# are shared between them and converged here (founder decisions D-B2, D-B3):
+#
+#   * ONE download per project: a root-owned, read-only bare mirror in
+#     PROJECTS_DIR. Every account has its OWN clone of it (objects shared
+#     through git alternates), on its OWN branch. Nobody but root can write
+#     the mirror, and no account can touch another's clone, hooks or config.
+#   * Scoped secrets: one root-only SECRETS_FILE, each secret tagged for
+#     `everyone`, `agents`, or named accounts; each account gets only its own.
+#
+# A daemon session runs as the account's uid with NO supplementary groups
+# (src-tauri/src/executor/t1.rs:3-4 and verify_dropped(), which fails the spawn
+# if getgroups() is non-empty). So a group cannot grant a terminal or Chi run
+# anything. Read access to a non-world-readable mirror is therefore a READ-ONLY
+# POSIX ACL entry per member (matched on the uid, which survives the group
+# drop). There is no group and no ACL that grants write anywhere. Every command
+# run on an account's behalf below goes through `setpriv --clear-groups`, so it
+# sees exactly what the daemon's sessions see.
+#
+# The summary lists secret NAMES only. Values live in shell variables and are
+# written with the printf builtin: never argv, never the log, never `eval`.
+
+SECRETS_DIR="/etc/ikenga/secrets"
+SECRETS_BACKUP_DIR="/etc/ikenga/secrets-backup"   # root-only: a backup the account could read would undo a narrowing
+SECRETS_LOADER="/etc/profile.d/ikenga-secrets.sh"
+GITCONFIG_SYSTEM="/etc/gitconfig"
+BASH_BASHRC="/etc/bash.bashrc"
+FAILED=0
+GIT_HOME=""; ASKPASS_FILE=""; MIRROR_UMASK=077     # git_root's scratch dir, askpass, umask (see sync_projects)
+soft_fail() { printf 'warning: %s\n' "$*" >&2; FAILED=1; }
+
+declare -A ACCT_UID=() ACCT_GID=() ACCT_HOME=()
+ACCT_LOGINS=()
+MEMBERS=()
+
+# Names a secret may not take: they would change how the shell or git behaves,
+# or collide with the daemon's own variables.
+secret_name_ok() {
+  [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+  case "$1" in
+    IKENGA_*|LD_*|DYLD_*|BASH_*|PATH|HOME|USER|LOGNAME|SHELL|IFS|ENV|PS1|PS2|PS4|PROMPT_COMMAND|CDPATH|GLOBIGNORE|SHELLOPTS|TMPDIR|TERM|PWD|OLDPWD) return 1 ;;
+    GIT_ASKPASS|GIT_SSH|GIT_SSH_COMMAND|GIT_PROXY_COMMAND|GIT_EXEC_PATH|GIT_DIR|GIT_WORK_TREE|GIT_CONFIG*) return 1 ;;
+  esac
+}
+
+is_reserved_scope() { [[ "$1" == everyone || "$1" == agents || "$1" == root ]]; }
+
+validate_accounts_profile() {
+  local a e name rest
+  for a in "${ACCOUNTS[@]}" "${AGENT_ACCOUNTS[@]}"; do
+    [[ "$a" =~ ^[a-z][a-z0-9_-]{0,30}$ ]] || die "account '$a' is not a valid login name (lowercase letters, digits, - and _; the unix user is ik-<name>)"
+    is_reserved_scope "$a" && die "account name '$a' is reserved (everyone, agents and root are secret scopes)"
+  done
+  [[ "$UID_RANGE" =~ ^[0-9]+-[0-9]+$ ]] || die "UID_RANGE must look like 20000-29999 (got '$UID_RANGE')"
+  [[ "$PROJECTS_DIR" =~ ^/[A-Za-z0-9._/-]*[A-Za-z0-9._-]$ && "$PROJECTS_DIR" != *..* ]] || die "PROJECTS_DIR must be an absolute path without spaces or '..' (got '$PROJECTS_DIR')"
+  [[ "$PROJECTS_READ" == members || "$PROJECTS_READ" == world ]] || die "PROJECTS_READ must be 'members' or 'world' (got '$PROJECTS_READ')"
+  [[ "$PROJECTS_BRANCH_PREFIX" =~ ^[A-Za-z0-9._/-]*$ ]] || die "PROJECTS_BRANCH_PREFIX has characters git branch names should not"
+  local seen=" "
+  for e in "${PROJECTS[@]}"; do
+    name="${e%%=*}"; rest="${e#*=}"
+    [[ "$e" == *=* && -n "$rest" ]] || die "PROJECTS entry '$e' must look like name=git-url[#branch]"
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && "$name" != *.git ]] || die "PROJECTS name '$name' is not a plain directory name"
+    [[ "$seen" != *" $name "* ]] || die "PROJECTS names '$name' twice"
+    seen+="$name "
+    # The URL becomes git's argument: no option look-alikes, and only the
+    # transports git_root knows how to restrict. A credential in it would show
+    # in argv; private repos use PROJECTS_TOKEN_SECRET instead.
+    [[ "${rest%%#*}" =~ ^(https?://|ssh://|file://|/|[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:) ]] \
+      || die "PROJECTS '$name': the URL must be https://, http://, ssh://, file://, an absolute path, or user@host:path"
+    if [[ "$rest" == *"#"* ]]; then
+      [[ "${rest#*#}" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die "PROJECTS '$name': the #branch '${rest#*#}' is not a plain branch name"
+    fi
+    if [[ "${rest%%#*}" =~ ^https?://[^/]*@ ]]; then
+      die "PROJECTS '$name': the URL carries credentials; remove them and set PROJECTS_TOKEN_SECRET (a secret in SECRETS_FILE)"
+    fi
+  done
+  [[ -z "$PROJECTS_TOKEN_SECRET" || -n "$SECRETS_FILE" ]] || die "PROJECTS_TOKEN_SECRET needs SECRETS_FILE"
+  [[ -z "$PROJECTS_TOKEN_SECRET" ]] || secret_name_ok "$PROJECTS_TOKEN_SECRET" || die "PROJECTS_TOKEN_SECRET '$PROJECTS_TOKEN_SECRET' is not a usable secret name"
+  [[ -z "$SECRETS_FILE" || -f "$SECRETS_FILE" ]] || die "SECRETS_FILE '$SECRETS_FILE' does not exist"
+}
+
+# ---- who the accounts are
+
+# ACCOUNTS (+ AGENT_ACCOUNTS) are the managed set. With ACCOUNTS empty, every
+# ik-* user whose uid lies in UID_RANGE joins it too. A name with no passwd
+# entry yet is "pending": it keeps its place in scopes, and is skipped until
+# `accounts create` makes it.
+resolve_accounts() {
+  ACCT_LOGINS=(); ACCT_UID=(); ACCT_GID=(); ACCT_HOME=()
+  local seen=" " a line lo hi name uid gid home
+  add_login() { [[ "$seen" == *" $1 "* ]] || { seen+="$1 "; ACCT_LOGINS+=("$1"); }; }
+  for a in "${ACCOUNTS[@]}" "${AGENT_ACCOUNTS[@]}"; do add_login "$a"; done
+  if [[ ${#ACCOUNTS[@]} -eq 0 ]]; then
+    lo="${UID_RANGE%-*}"; hi="${UID_RANGE#*-}"
+    while IFS=: read -r name _ uid _; do
+      [[ "$name" == ik-?* && "$uid" =~ ^[0-9]+$ ]] && (( uid >= lo && uid < hi )) && add_login "${name#ik-}"
+    done < <(getent passwd)
+  fi
+  for a in "${ACCT_LOGINS[@]}"; do
+    line="$(getent passwd "ik-$a" || true)"
+    if [[ -z "$line" ]]; then
+      note "ik-$a: not created yet (accounts create $a); skipped until it exists"
+      continue
+    fi
+    IFS=: read -r _ _ uid gid _ home _ <<<"$line"
+    (( uid > 0 )) || die "ik-$a has uid 0"
+    ACCT_UID[$a]="$uid"; ACCT_GID[$a]="$gid"; ACCT_HOME[$a]="$home"
+  done
+  MEMBERS=()
+  if [[ ${#PROJECTS_MEMBERS[@]} -eq 0 ]]; then
+    MEMBERS=("${ACCT_LOGINS[@]}")
+  else
+    for a in "${PROJECTS_MEMBERS[@]}"; do
+      [[ "$seen" == *" $a "* ]] || die "PROJECTS_MEMBERS names '$a', which is not a managed account (add it to ACCOUNTS)"
+      MEMBERS+=("$a")
+    done
+  fi
+  note "managed accounts: ${ACCT_LOGINS[*]:-none}"
+}
+
+has_account() { [[ -n "${ACCT_UID[$1]:-}" ]]; }
+
+# Run a command AS an account the way the daemon's sessions run: its uid and
+# private gid, no supplementary groups, a minimal environment.
+as_account() {
+  local a="$1"; shift
+  ( cd / && umask 0002 && exec setpriv --reuid="${ACCT_UID[$a]}" --regid="${ACCT_GID[$a]}" --clear-groups \
+      env -i HOME="${ACCT_HOME[$a]}" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 GIT_TERMINAL_PROMPT=0 "$@" )
+}
+
+# ---- managed blocks
+
+# managed_block <file> <tag> <top|bottom> <content>
+# Keeps one `# ikenga: <tag> begin|end` block in <file>; empty content removes
+# it. Returns 0 when it changed the file, 1 when nothing differed. Every change
+# to an existing file leaves a .bak-<time> beside it; the last five are kept.
+managed_block() {
+  local f="$1" tag="$2" pos="$3" content="$4"
+  local b="# ikenga: $tag begin" e="# ikenga: $tag end" have=0 cur=""
+  if grep -qxF "$b" "$f" 2>/dev/null; then
+    have=1
+    cur="$(awk -v b="$b" -v e="$e" '$0==b{s=1;next} $0==e{s=0;next} s' "$f")"
+  fi
+  if [[ -z "$content" ]]; then [[ $have -eq 1 ]] || return 1
+  elif [[ $have -eq 1 && "$cur" == "$content" ]]; then return 1
+  fi
+  [[ $DRY_RUN -eq 1 ]] && return 0
+  local tmp; tmp="$(mktemp)"
+  { [[ "$pos" == top && -n "$content" ]] && printf '%s\n%s\n%s\n' "$b" "$content" "$e"
+    [[ -f "$f" ]] && awk -v b="$b" -v e="$e" '$0==b{s=1;next} $0==e{s=0;next} !s' "$f"
+    [[ "$pos" == bottom && -n "$content" ]] && printf '%s\n%s\n%s\n' "$b" "$content" "$e"
+    true
+  } > "$tmp"
+  if [[ -f "$f" ]]; then
+    cp -a "$f" "$f.bak-$(date +%Y%m%d-%H%M%S)"
+    # Keep the last five backups (their names sort by time).
+    find "$(dirname -- "$f")" -maxdepth 1 -name "$(basename -- "$f").bak-*" | sort | head -n -5 | xargs -r rm -f --
+    cat "$tmp" > "$f"                      # keeps the file's owner and mode
+  else
+    install -m 0644 -o root -g root "$tmp" "$f"
+  fi
+  rm -f "$tmp"
+  return 0
+}
+
+# ---- shared project mirrors (D-B2)
+#
+# One read-only bare MIRROR per project, owned by root, that nobody but root
+# can write: no group write, no ACL write, nothing a member could plant in it
+# (config, hooks/, refs, objects). Each account has its OWN ordinary clone at
+# ~/projects/<name>, made as that user with `git clone --reference <mirror>`
+# (objects/info/alternates -> the mirror), origin = the mirror path. Its hooks,
+# config, refs and index are its own, so one account can never run code as, or
+# change the work of, another. Mirrors are never gc'd or pruned: the accounts'
+# alternates depend on their objects staying put.
+#
+# Root's own git never trusts a repo's config or a member's environment: see
+# git_root. Nothing root writes lands in a member-writable directory.
+
+# git_root <url|none> <git args...>: git run as root with nothing inherited.
+#  - env -i, HOME in a root-only scratch dir, system + global config off, cwd
+#    in that scratch dir (never a directory a member can write);
+#  - hooks, fsmonitor, credential helpers, redirects, gc and maintenance off;
+#  - only the protocol the profile's URL uses is allowed;
+#  - the deploy token, for an http(s) URL only, reaches git through GIT_ASKPASS
+#    (an askpass script reading a 0600 file in the scratch dir): never argv,
+#    never a repo config.
+git_root() {
+  local url="$1"; shift
+  local proto=none
+  case "$url" in
+    https://*) proto=https ;;
+    http://*) proto=http ;;
+    ssh://*|[A-Za-z0-9._-]*@*:*) proto=ssh ;;
+    file://*|/*) proto=file ;;
+  esac
+  local -a e=(PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 HOME="$GIT_HOME"
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
+    GIT_ALLOW_PROTOCOL="$proto" GIT_SSH_COMMAND="ssh -o BatchMode=yes")
+  if [[ -n "$ASKPASS_FILE" && ( "$proto" == https || "$proto" == http ) ]]; then
+    e+=(GIT_ASKPASS="$ASKPASS_FILE" IKENGA_TOKEN_FILE="$GIT_HOME/token")
+  fi
+  ( umask "$MIRROR_UMASK"; cd "$GIT_HOME" && exec env -i "${e[@]}" git \
+      -c core.hooksPath=/dev/null -c core.fsmonitor=false -c credential.helper= \
+      -c http.followRedirects=false -c gc.auto=0 -c maintenance.auto=false "$@" )
+}
+
+# Named-user ACL entries (on the directory itself) as "ik-ada ik-grace".
+acl_users() { getfacl -cp -- "$1" 2>/dev/null | sed -n 's/^user:\(ik-[^:]*\):.*/\1/p'; }
+acl_has_r() { getfacl -cp -- "$1" 2>/dev/null | grep -q "^user:$2:r-x"; }
+
+# Make a mirror (or PROJECTS_DIR) exactly: root-owned, nobody can write,
+# nothing setuid/setgid, no symlinks, no hooks, no foreign alternates. Read
+# access: world (PROJECTS_READ=world) or per-member READ-ONLY ACL entries
+# (PROJECTS_READ=members; matched on the uid, so they hold for daemon sessions
+# that run with no supplementary groups). Reports a change only when it
+# actually had to repair something (and not at all with a second argument).
+lock_mirror() {
+  local repo="$1" quiet="${2:-}" a u want="" fixed=0 bad
+  # Debris an older (group-writable) layout, or a member, could have left.
+  if [[ -e "$repo/hooks" || -e "$repo/worktrees" || -e "$repo/.fetch.err" \
+        || -e "$repo/objects/info/alternates" || -e "$repo/objects/info/http-alternates" ]]; then
+    fixed=1
+    [[ $DRY_RUN -eq 1 ]] || rm -rf -- "$repo/hooks" "$repo/worktrees" "$repo/.fetch.err" \
+      "$repo/objects/info/alternates" "$repo/objects/info/http-alternates"
+  fi
+  if [[ "$PROJECTS_READ" == world ]]; then
+    bad="$(find "$repo" \( ! -user root -o ! -group root -o -type l -o -perm /6022 -o ! -perm -004 -o \( -type d ! -perm -005 \) \) -print -quit 2>/dev/null)"
+  else
+    bad="$(find "$repo" \( ! -user root -o ! -group root -o -type l -o -perm /6027 -o \( -type d ! -perm -050 \) \) -print -quit 2>/dev/null)"
+  fi
+  [[ -z "$bad" ]] || fixed=1
+  if [[ $DRY_RUN -eq 0 ]]; then
+    find "$repo" -type l -delete
+    chown -R root:root -- "$repo"
+    if [[ "$PROJECTS_READ" == world ]]; then chmod -R u=rwX,go=rX,u-s,g-s -- "$repo"
+    else chmod -R u=rwX,g=rX,o=,u-s,g-s -- "$repo"; fi
+  fi
+  if [[ "$PROJECTS_READ" == world ]]; then
+    if [[ -n "$(acl_users "$repo")" ]]; then
+      fixed=1; [[ $DRY_RUN -eq 1 ]] || setfacl -R -b -- "$repo"
+    fi
+  else
+    for a in "${MEMBERS[@]}"; do has_account "$a" && want+=" ik-$a"; done
+    for u in $want; do
+      acl_has_r "$repo" "$u" || fixed=1
+      [[ $DRY_RUN -eq 1 ]] || setfacl -R -m "u:$u:rX" -- "$repo" \
+        || soft_fail "setfacl failed on $repo: this filesystem may not support ACLs, so daemon sessions (no supplementary groups) cannot read the mirror"
+    done
+    for u in $(acl_users "$repo"); do
+      [[ " $want " == *" $u "* ]] && continue
+      fixed=1; [[ $DRY_RUN -eq 1 ]] || setfacl -R -x "u:$u" -- "$repo"
+    done
+  fi
+  [[ $fixed -eq 0 || -n "$quiet" ]] || changed "mirror $repo locked down (root-owned, read-only for everyone else)"
+}
+
+# The only config a mirror ever has, written by root. Anything else in an
+# existing mirror's config (a legacy shared-group setting, a remote, a planted
+# key) is replaced.
+write_mirror_config() {
+  local repo="$1" tmp="$GIT_HOME/mirror.config"
+  printf '%s\n' '[core]' '	repositoryformatversion = 0' '	filemode = true' '	bare = true' \
+    '[gc]' '	auto = 0' '[ikenga]' '	mirror = true' > "$tmp"
+  if ! cmp -s "$tmp" "$repo/config" 2>/dev/null; then
+    [[ $DRY_RUN -eq 1 ]] || install -m 0644 -o root -g root "$tmp" "$repo/config"
+    return 0
+  fi
+  return 1
+}
+
+sync_projects() {
+  log "Shared project mirrors ($PROJECTS_DIR, read: $PROJECTS_READ)"
+  apt_install git acl
+  case "$PROJECTS_READ" in world) MIRROR_UMASK=022 ;; *) MIRROR_UMASK=077 ;; esac
+
+  # Root writes under PROJECTS_DIR, so no other user may be able to create or
+  # swap anything on the path to it: every existing ancestor must be a real
+  # directory, root-owned, not writable by group or others. Refuse rather than
+  # adopt a PROJECTS_DIR that is a symlink or not root-owned.
+  [[ "$PROJECTS_DIR" == /* && "$PROJECTS_DIR" != *"/../"* && "$PROJECTS_DIR" != *"/.." ]] \
+    || die "PROJECTS_DIR must be an absolute path without '..' (got '$PROJECTS_DIR')"
+  local anc="$PROJECTS_DIR" ao am
+  while :; do
+    anc="$(dirname "$anc")"
+    if [[ -e "$anc" || -L "$anc" ]]; then
+      [[ -L "$anc" ]] && die "PROJECTS_DIR ancestor $anc is a symlink; refusing (another user could redirect root's writes)"
+      read -r ao am < <(stat -c '%u %a' -- "$anc")
+      [[ "$ao" == 0 ]] || die "PROJECTS_DIR ancestor $anc is not owned by root; refusing"
+      (( (8#$am & 8#022) == 0 )) || die "PROJECTS_DIR ancestor $anc is writable by group or others (mode $am); refusing"
+    fi
+    [[ "$anc" == / ]] && break
+  done
+  if [[ -L "$PROJECTS_DIR" ]]; then die "PROJECTS_DIR $PROJECTS_DIR is a symlink; refusing"; fi
+  if [[ -d "$PROJECTS_DIR" && "$(stat -c '%u' -- "$PROJECTS_DIR")" != 0 ]]; then
+    die "PROJECTS_DIR $PROJECTS_DIR exists but is not owned by root; refusing to adopt it"
+  fi
+
+  local parent; parent="$(dirname "$PROJECTS_DIR")"
+  if [[ ! -d "$PROJECTS_DIR" ]]; then
+    if [[ $DRY_RUN -eq 0 ]]; then
+      [[ -d "$parent" ]] || install -d -m 0755 -o root -g root "$parent"
+      install -d -m 0755 -o root -g root "$PROJECTS_DIR"
+    fi
+    changed "$PROJECTS_DIR created (root:root 0755: nobody else can add or change a mirror)"
+  else
+    local o g m; read -r o g m < <(stat -c '%U %G %a' -- "$PROJECTS_DIR")
+    if [[ "$o" != root || "$g" != root || "$m" != 755 ]] || getfacl -cp -- "$PROJECTS_DIR" 2>/dev/null | grep -q '^\(default:\)\?user:[^:]'; then
+      if [[ $DRY_RUN -eq 0 ]]; then
+        chown root:root "$PROJECTS_DIR"; chmod 0755 "$PROJECTS_DIR"; setfacl -b -- "$PROJECTS_DIR"
+      fi
+      changed "$PROJECTS_DIR reset to root:root 0755 (was $o:$g $m)"
+    fi
+    [[ $DRY_RUN -eq 1 ]] || rm -rf -- "$PROJECTS_DIR"/.new-*      # an interrupted earlier run
+  fi
+
+  # safe.directory for exactly the mirrors: git refuses to fetch or clone from
+  # a repo owned by another uid otherwise. Not '*', and not a wildcard: git
+  # before 2.46 only understands a lone '*'. (/etc/gitconfig is root-only.)
+  local e name block=""
+  for e in "${PROJECTS[@]}"; do
+    name="${e%%=*}"
+    block+="[safe]
+	directory = $PROJECTS_DIR/$name.git
+"
+  done
+  if managed_block "$GITCONFIG_SYSTEM" "projects safe.directory" bottom "${block%$'\n'}"; then
+    changed "safe.directory for the shared mirrors in $GITCONFIG_SYSTEM"
+  fi
+
+  # Root-only scratch dir: git's HOME and cwd, and the deploy token's askpass.
+  ASKPASS_FILE=""
+  GIT_HOME="$(mktemp -d)"; chmod 0700 "$GIT_HOME"
+  trap 'rm -rf -- "${GIT_HOME:-/nonexistent}"' EXIT
+  local PROJ_TOKEN=""
+  if [[ -n "$PROJECTS_TOKEN_SECRET" ]]; then
+    [[ "${ROOT_COUNT[$PROJECTS_TOKEN_SECRET]:-0}" -eq 1 ]] \
+      || { [[ $SECRETS_UNREADABLE -eq 1 ]] || die "PROJECTS_TOKEN_SECRET '$PROJECTS_TOKEN_SECRET' must appear exactly once in SECRETS_FILE (found ${ROOT_COUNT[$PROJECTS_TOKEN_SECRET]:-0})"; }
+    PROJ_TOKEN="${ROOT_VALUE[$PROJECTS_TOKEN_SECRET]:-}"
+    if [[ -n "${ROOT_SCOPE[$PROJECTS_TOKEN_SECRET]:-}" && "${ROOT_SCOPE[$PROJECTS_TOKEN_SECRET]}" != root ]]; then
+      note "WARNING: $PROJECTS_TOKEN_SECRET is the deploy token and is scoped '${ROOT_SCOPE[$PROJECTS_TOKEN_SECRET]}', so those accounts get it too. Scope it 'root' to keep it provisioner-only."
+    fi
+    if [[ -n "$PROJ_TOKEN" && $DRY_RUN -eq 0 ]]; then
+      ( umask 077
+        printf '%s\n' "$PROJ_TOKEN" > "$GIT_HOME/token"
+        printf '%s\n' '#!/bin/sh' 'case "$1" in *sername*) echo x-access-token ;; *) cat "$IKENGA_TOKEN_FILE" ;; esac' > "$GIT_HOME/askpass"
+        chmod 0700 "$GIT_HOME/askpass" )
+      ASKPASS_FILE="$GIT_HOME/askpass"
+    fi
+  fi
+  PROJ_TOKEN=""
+
+  for e in "${PROJECTS[@]}"; do ensure_mirror "${e%%=*}" "${e#*=}"; done
+  local a
+  for a in "${MEMBERS[@]}"; do
+    has_account "$a" || continue
+    for e in "${PROJECTS[@]}"; do ensure_account_clone "$a" "${e%%=*}"; done
+  done
+  rm -rf -- "$GIT_HOME"; GIT_HOME=""; ASKPASS_FILE=""
+}
+
+ensure_mirror() {
+  local name="$1" spec="$2" url branch repo work before after def cur first out rc=0 new=0
+  url="${spec%%#*}"; branch=""; [[ "$spec" == *"#"* ]] && branch="${spec#*#}"
+  repo="$PROJECTS_DIR/$name.git"
+  if [[ -L "$repo" ]] || { [[ -e "$repo" ]] && [[ "$(stat -c '%u' -- "$repo")" != 0 ]]; }; then
+    soft_fail "project $name: $repo is a symlink or not owned by root; refusing to use it"; return
+  fi
+  if [[ ! -d "$repo" ]]; then
+    if [[ $DRY_RUN -eq 1 ]]; then changed "project $name mirrored from $url"; return; fi
+    new=1
+    work="$(mktemp -d "$PROJECTS_DIR/.new-$name.XXXXXX")"
+    git_root none init --bare -q --template= -- "$work" || { soft_fail "project $name: git init failed"; rm -rf -- "$work"; return; }
+    write_mirror_config "$work" || true
+  else
+    work="$repo"
+    if [[ $DRY_RUN -eq 1 ]]; then
+      lock_mirror "$repo"
+      write_mirror_config "$work" && changed "mirror $name: config reset to the canonical one"
+      note "[dry-run] fetch $name from $url"; return
+    fi
+    # Lock FIRST: on a mirror left group-writable by an older layout, a member
+    # could swap in a config between our write and the lock.
+    lock_mirror "$repo"
+    write_mirror_config "$work" && changed "mirror $name: config reset to the canonical one"
+  fi
+
+  # The fetch URL is the PROFILE's. The mirror's own config names no remote
+  # and is not consulted; the refspecs make it an exact copy of the remote's
+  # branches and tags. --prune drops refs only; no object is ever deleted.
+  digest() { git_root none --git-dir "$work" for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags | sha256sum; }
+  before="$(digest)"
+  out="$(git_root "$url" --git-dir "$work" fetch --quiet --prune --no-write-fetch-head -- "$url" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*' 2>&1)" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    if [[ $new -eq 1 ]]; then
+      soft_fail "project $name: cannot fetch $url: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"
+      rm -rf -- "$work"; return
+    fi
+    soft_fail "project $name: fetch from $url failed (mirror left as it was): $(tr '\n' ' ' <<<"$out" | cut -c1-200)"
+  fi
+  after="$(digest)"
+
+  # Default branch: the profile's #branch, else keep the mirror's HEAD while it
+  # resolves, else ask the remote. The name is checked before it is used.
+  def="$branch"
+  if [[ -z "$def" ]]; then
+    cur="$(git_root none --git-dir "$work" symbolic-ref -q --short HEAD || true)"
+    if [[ -n "$cur" ]] && git_root none --git-dir "$work" show-ref --verify --quiet "refs/heads/$cur"; then def="$cur"
+    else
+      def="$(git_root "$url" ls-remote --symref -- "$url" HEAD 2>/dev/null | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}')"
+      if [[ -z "$def" ]]; then
+        first="$(git_root none --git-dir "$work" for-each-ref --format='%(refname:strip=2)' refs/heads | head -1)"
+        def="$first"
+      fi
+    fi
+  fi
+  if [[ -n "$def" ]] && git_root none check-ref-format --branch "$def" >/dev/null 2>&1; then
+    cur="$(git_root none --git-dir "$work" symbolic-ref -q HEAD || true)"
+    [[ "$cur" == "refs/heads/$def" ]] || git_root none --git-dir "$work" symbolic-ref HEAD "refs/heads/$def"
+  else
+    def=""
+  fi
+
+  if [[ $new -eq 1 ]]; then
+    mv -T -- "$work" "$repo" || { soft_fail "project $name: cannot move the new mirror into place"; rm -rf -- "$work"; return; }
+    lock_mirror "$repo" quiet
+    changed "project $name mirrored from $url (default branch ${def:-none yet})"
+    return
+  fi
+  lock_mirror "$repo" quiet            # what the fetch just wrote gets the same modes
+  [[ "$before" == "$after" ]] || changed "project $name fetched new commits"
+}
+
+# An account's own clone: created once, as the account, and then never touched.
+ensure_account_clone() {
+  local a="$1" name="$2" repo wt branch def home out
+  repo="$PROJECTS_DIR/$name.git"; home="${ACCT_HOME[$a]}"; wt="$home/projects/$name"
+  branch="${PROJECTS_BRANCH_PREFIX}${a}/main"
+  [[ ! -e "$wt" && ! -L "$wt" ]] || return 0           # never touch an existing clone
+  if [[ $DRY_RUN -eq 1 ]]; then
+    [[ -d "$repo" ]] && changed "clone ik-$a:$name on $branch" || changed "clone ik-$a:$name on $branch (after the mirror)"
+    return
+  fi
+  [[ -d "$repo" ]] || return 0
+  def="$(git_root none --git-dir "$repo" symbolic-ref -q --short HEAD || true)"
+  if [[ -z "$def" ]] || ! git_root none --git-dir "$repo" show-ref --verify --quiet "refs/heads/$def"; then
+    note "ik-$a:$name: the mirror has no commits on '${def:-?}' yet; no clone"
+    return
+  fi
+  [[ "$(stat -c %u -- "$home" 2>/dev/null)" == "${ACCT_UID[$a]}" ]] || { soft_fail "ik-$a: home $home is not owned by the account; no clone"; return; }
+  as_account "$a" mkdir -p -- "$home/projects" || { soft_fail "ik-$a: cannot create $home/projects"; return; }
+  # --no-local: transfer through upload-pack, never hard-link or copy from the
+  # root-owned mirror. --reference: the account's objects/info/alternates point
+  # at the mirror, so the project is stored once.
+  if ! out="$(as_account "$a" git clone --quiet --no-local --no-checkout --reference "$repo" -- "$repo" "$wt" 2>&1)"; then
+    soft_fail "ik-$a:$name: git clone failed: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"; return
+  fi
+  if ! out="$(as_account "$a" git -C "$wt" checkout --quiet --no-track -b "$branch" "refs/remotes/origin/$def" 2>&1)"; then
+    soft_fail "ik-$a:$name: cannot create $branch: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"; return
+  fi
+  changed "clone ik-$a:$name on $branch"
+}
+
+# ---- scoped secrets (D-B3)
+#
+# SECRETS_FILE, one secret per line, the scope in front so the value is
+# everything after the first '=' and is never parsed:
+#
+#   [everyone]       NAME=value
+#   [agents]         NAME=value        # the accounts in AGENT_ACCOUNTS
+#   [rex]            NAME=value        # one account (login name, not ik-rex)
+#   [ada,grace]      NAME=value        # several
+#   [root]           NAME=value        # provisioner only, delivered to nobody
+#
+# Blank lines and lines starting with # are skipped. A secret with no scope is
+# an error: there is no default audience.
+
+declare -A ROOT_VALUE=() ROOT_COUNT=() ROOT_SCOPE=() SEC_BODY=() SEC_SEEN=()
+SECRETS_UNREADABLE=0
+
+secrets_file_ok() {
+  local f="$1" owner mode dir dmode
+  [[ -f "$f" && ! -L "$f" ]] || die "SECRETS_FILE $f must be a regular file, not a symlink"
+  read -r owner mode < <(stat -c '%u %a' -- "$f")
+  [[ "$owner" == 0 ]] || die "SECRETS_FILE $f must be owned by root"
+  (( (8#$mode & 8#077) == 0 )) || die "SECRETS_FILE $f has mode $mode; it must be 0600 (root-only). Refusing to read it. Fix: chmod 600 $f"
+  dir="$(dirname -- "$f")"
+  read -r owner dmode < <(stat -c '%u %a' -- "$dir")
+  [[ "$owner" == 0 ]] && (( (8#$dmode & 8#022) == 0 )) \
+    || die "the directory $dir holding SECRETS_FILE must be owned by root and not writable by anyone else"
+}
+
+load_secrets() {
+  SEC_BODY=(); SEC_SEEN=(); ROOT_VALUE=(); ROOT_COUNT=(); ROOT_SCOPE=(); SECRETS_UNREADABLE=0
+  [[ -n "$SECRETS_FILE" ]] || return 0
+  if [[ ! -r "$SECRETS_FILE" ]]; then
+    [[ $DRY_RUN -eq 1 ]] || die "cannot read SECRETS_FILE $SECRETS_FILE"
+    SECRETS_UNREADABLE=1; note "WARNING: $SECRETS_FILE is not readable by this user; the secrets plan is skipped (run the dry run as root)"
+    return 0
+  fi
+  secrets_file_ok "$SECRETS_FILE"
+  local re='^\[([^]]+)\][[:space:]]+([A-Za-z_][A-Za-z0-9_]*)=(.*)$'
+  local n=0 line scope name value tok a toks targets declared
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n+1))
+    [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    # Never echo the line: it holds the value.
+    [[ "$line" =~ $re ]] || die "$SECRETS_FILE line $n: expected '[scope] NAME=value'"
+    scope="${BASH_REMATCH[1]}"; name="${BASH_REMATCH[2]}"; value="${BASH_REMATCH[3]}"
+    secret_name_ok "$name" || die "$SECRETS_FILE line $n: '$name' is not an allowed secret name (reserved or shell-sensitive)"
+    [[ -n "$value" ]] || die "$SECRETS_FILE line $n: $name has an empty value"
+    [[ "$value" != *$'\r'* ]] || die "$SECRETS_FILE line $n: carriage return in the value of $name (CRLF file?)"
+
+    targets=" "; declared=" "
+    IFS=',' read -ra toks <<<"$scope"
+    for tok in "${toks[@]}"; do
+      tok="${tok//[[:space:]]/}"
+      [[ -n "$tok" ]] || die "$SECRETS_FILE line $n: empty scope entry"
+      [[ "$declared" != *" $tok "* ]] || die "$SECRETS_FILE line $n: scope names '$tok' twice"
+      declared+="$tok "
+      case "$tok" in
+        everyone) for a in "${ACCT_LOGINS[@]}"; do [[ "$targets" == *" $a "* ]] || targets+="$a "; done ;;
+        agents)
+          [[ ${#AGENT_ACCOUNTS[@]} -gt 0 ]] || die "$SECRETS_FILE line $n: scope 'agents' but AGENT_ACCOUNTS is empty"
+          for a in "${AGENT_ACCOUNTS[@]}"; do [[ "$targets" == *" $a "* ]] || targets+="$a "; done ;;
+        root) ;;
+        *)
+          [[ " ${ACCT_LOGINS[*]} " == *" $tok "* ]] || die "$SECRETS_FILE line $n: scope names '$tok', which is not a managed account (typo? or add it to ACCOUNTS)"
+          [[ "$targets" == *" $tok "* ]] || targets+="$tok " ;;
+      esac
+    done
+    ROOT_VALUE[$name]="$value"; ROOT_COUNT[$name]=$(( ${ROOT_COUNT[$name]:-0} + 1 )); ROOT_SCOPE[$name]="$scope"
+    for a in $targets; do
+      [[ -z "${SEC_SEEN[$a|$name]:-}" ]] || die "$SECRETS_FILE line $n: $name is already set for $a by an earlier line (overlapping scopes)"
+      SEC_SEEN[$a|$name]=1
+      SEC_BODY[$a]+="$name=$value"$'\n'
+    done
+  done < "$SECRETS_FILE"
+}
+
+# Parse "NAME=value" lines of $1 into the global assoc named by $2.
+parse_kv() {
+  local -n _kv="$2"; _kv=()
+  local l
+  while IFS= read -r l; do
+    [[ -z "$l" || "$l" == '#'* ]] && continue
+    _kv["${l%%=*}"]="${l#*=}"
+  done <<<"$1"
+}
+declare -A OLD_KV=() NEW_KV=()
+
+backup_secret_file() {
+  local f="$1" base; base="$(basename -- "$f")"
+  install -d -m 0700 -o root -g root "$SECRETS_BACKUP_DIR"
+  install -m 0600 -o root -g root "$f" "$SECRETS_BACKUP_DIR/$base.bak-$(date +%Y%m%d-%H%M%S).$$"
+  # Keep the last five per account.
+  local old; old="$(ls -1t "$SECRETS_BACKUP_DIR/$base".bak-* 2>/dev/null | tail -n +6 || true)"
+  [[ -z "$old" ]] || printf '%s\n' "$old" | xargs -r rm -f --
+}
+
+LOADER_BODY='# ikenga: managed by provision.sh. Exports the secrets the provisioner granted this
+# account, from a root-owned file only this account can read. Parsed line by
+# line and exported with `export "NAME=value"`: never evaluated.
+_ik_f="/etc/ikenga/secrets/$(id -un 2>/dev/null).env"
+if [ -r "$_ik_f" ]; then
+  while IFS= read -r _ik_l || [ -n "$_ik_l" ]; do
+    case "$_ik_l" in ""|"#"*) continue ;; esac
+    case "$_ik_l" in *=*) ;; *) continue ;; esac
+    _ik_n=${_ik_l%%=*}; _ik_v=${_ik_l#*=}
+    case "$_ik_n" in ""|[0-9]*|*[!A-Za-z0-9_]*) continue ;; esac
+    export "$_ik_n=$_ik_v"
+  done < "$_ik_f"
+fi
+unset _ik_f _ik_l _ik_n _ik_v'
+
+sync_secrets() {
+  log "Scoped secrets ($SECRETS_DIR)"
+  local a f gid desired cur k line
+
+  # Delivery: a root-owned 0640 file per account (group = the account's own
+  # private group), loaded by shells. The daemon has no per-principal secret
+  # injection from the root side yet, so this reaches login shells and
+  # interactive bash only (README "Where the secrets reach").
+  if [[ ! -d "$SECRETS_DIR" ]]; then
+    if [[ $DRY_RUN -eq 0 ]]; then
+      install -d -m 0755 -o root -g root "$(dirname "$SECRETS_DIR")"
+      install -d -m 0711 -o root -g root "$SECRETS_DIR"
+    fi
+    changed "$SECRETS_DIR created"
+  fi
+  if [[ "$(cat "$SECRETS_LOADER" 2>/dev/null || true)" != "$LOADER_BODY" ]]; then
+    if [[ $DRY_RUN -eq 0 ]]; then
+      [[ -f "$SECRETS_LOADER" ]] && cp -a "$SECRETS_LOADER" "$SECRETS_LOADER.bak-$(date +%Y%m%d-%H%M%S)"
+      printf '%s\n' "$LOADER_BODY" > "$SECRETS_LOADER"; chmod 0644 "$SECRETS_LOADER"
+    fi
+    changed "$SECRETS_LOADER installed"
+  fi
+  if managed_block "$BASH_BASHRC" "secrets loader" top "[ -r $SECRETS_LOADER ] && . $SECRETS_LOADER"; then
+    changed "secrets loader hooked into $BASH_BASHRC"
+  fi
+
+  if [[ $SECRETS_UNREADABLE -eq 1 ]]; then note "secrets plan skipped (SECRETS_FILE not readable)"; return; fi
+
+  for a in "${ACCT_LOGINS[@]}"; do
+    has_account "$a" || continue
+    f="$SECRETS_DIR/ik-$a.env"; gid="${ACCT_GID[$a]}"
+    desired="${SEC_BODY[$a]:-}"
+    cur=""; [[ ! -f "$f" ]] || cur="$(cat -- "$f" 2>/dev/null || true)"
+    parse_kv "$cur" OLD_KV
+    parse_kv "$desired" NEW_KV
+    local diff=""
+    for k in $(printf '%s\n' "${!NEW_KV[@]}" | sort); do
+      if [[ -z "${OLD_KV[$k]+x}" ]]; then diff+=" +$k"
+      elif [[ "${OLD_KV[$k]}" != "${NEW_KV[$k]}" ]]; then diff+=" ~$k"; fi
+    done
+    for k in $(printf '%s\n' "${!OLD_KV[@]}" | sort); do
+      [[ -n "${NEW_KV[$k]+x}" ]] || diff+=" -$k"
+    done
+
+    if [[ -z "$desired" ]]; then
+      [[ -f "$f" ]] || continue
+      [[ $DRY_RUN -eq 1 ]] || { backup_secret_file "$f"; rm -f -- "$f"; }
+      changed "secrets ik-$a:${diff:- (file removed)}"
+      continue
+    fi
+    if [[ -n "$diff" ]]; then
+      if [[ $DRY_RUN -eq 0 ]]; then
+        [[ -f "$f" ]] && backup_secret_file "$f"
+        local tmp; tmp="$(mktemp "$SECRETS_DIR/.tmp.XXXXXX")"
+        { printf '%s\n' "# ikenga: managed by provision.sh from SECRETS_FILE; edits are overwritten"; printf '%s' "$desired"; } > "$tmp"
+        chown "0:$gid" "$tmp"; chmod 0640 "$tmp"; mv -f -- "$tmp" "$f"
+      fi
+      changed "secrets ik-$a:$diff"
+    else
+      local o g m; read -r o g m < <(stat -c '%u %g %a' -- "$f")
+      if [[ "$o" != 0 || "$g" != "$gid" || "$m" != 640 ]]; then
+        run chown "0:$gid" "$f"; run chmod 0640 "$f"; changed "secrets ik-$a: file owner/mode restored"
+      fi
+    fi
+  done
+
+  # Files for accounts that are no longer managed (or no longer exist).
+  if [[ -d "$SECRETS_DIR" ]]; then
+    for f in "$SECRETS_DIR"/ik-*.env; do
+      [[ -e "$f" ]] || continue
+      line="$(basename -- "$f" .env)"; a="${line#ik-}"
+      if [[ " ${ACCT_LOGINS[*]} " == *" $a "* ]] && has_account "$a"; then continue; fi
+      [[ $DRY_RUN -eq 1 ]] || { backup_secret_file "$f"; rm -f -- "$f"; }
+      changed "secrets ik-$a: file removed (account no longer managed)"
+    done
+  fi
+}
+
+sync_accounts() {
+  if [[ ${#PROJECTS[@]} -eq 0 && -z "$SECRETS_FILE" ]]; then
+    [[ "$ACTION" != sync-accounts ]] || note "nothing to do: the profile sets no PROJECTS and no SECRETS_FILE"
+    return 0
+  fi
+  log "Accounts: shared projects and scoped secrets"
+  [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo)"
+  resolve_accounts
+  load_secrets
+  [[ ${#PROJECTS[@]} -eq 0 ]] || sync_projects
+  [[ -z "$SECRETS_FILE" ]] || sync_secrets
+}
+
 # ------------------------------------------------------------------ main
 
 case "$ACTION" in
@@ -1622,6 +2311,13 @@ case "$ACTION" in
   check-update) do_check_update; exit 0 ;;
   apply-request) do_apply_request; exit 0 ;;
   install-update-units) install_update_units; summary; exit 0 ;;
+  sync-accounts)
+    [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || die "sync-accounts needs a profile: pass --profile <file> (or provision once so $INSTALL_DIR/.profile.env exists)"
+    validate_accounts_profile
+    sync_accounts
+    summary
+    [[ $FAILED -eq 0 ]] || { echo "error: some account sync steps failed; see the warnings above" >&2; exit 1; }
+    exit 0 ;;
 esac
 
 validate_profile
@@ -1642,4 +2338,6 @@ install_service
 install_update_units
 firewall
 verify
+sync_accounts
 summary
+[[ $FAILED -eq 0 ]] || { echo "error: some account sync steps failed; see the warnings above" >&2; exit 1; }
