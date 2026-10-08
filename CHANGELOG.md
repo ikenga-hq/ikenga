@@ -1,5 +1,32 @@
 # ikenga-desktop
 
+## 0.24.0
+
+### Minor Changes
+
+- 3664127: `provision.sh backups`: Postgres backups as hardened system jobs on a server box — a dedicated `ikenga-backup` user (connection strings from a reserved `backup` secrets scope, GCS service-account key), `pg_dump` 17 from PGDG and `gcloud storage`, per-schedule systemd timers (4-hourly / daily / weekly, UTC), dump → verify → upload to `gs://<bucket>/<db>/<YYYY>/<MM>/`, and a secret-free `status.json` for alerting. Root never follows or writes through a path the backup user controls; disabling removes timers, connection strings and cached credentials.
+
+### Patch Changes
+
+- b35c077: Pkg capability refusals now follow `@ikenga/contract` 0.23.0: every confirmed denial on a `host.*` verb carries `reason: 'scope-denied'`, and a check the shell couldn't run carries `reason: 'check-unavailable'`, so pkgs can map either to its RPC code with `hostRefusalCode()` instead of matching message text. Message text is unchanged.
+- 8fa53fc: Permission asks from a terminal on a server now show up where the desktop's do. When a Claude terminal on an Ikenga server holds a tool call for approval, the server records the same notification the desktop does, so the bell, the Companion cards, the home "Waiting on you" tile and Web Push all see it, and answering Allow or Deny from any of them in a browser answers that very request, once. The notification closes itself when the ask is answered, times out (denied), its terminal exits, or the hook gives up, so a dead ask is never left looking pending. On a shared server each person's asks live in their own account: nobody else sees or can answer them, and a project member can only answer asks that belong to the project they were invited to.
+  
+  Each of those outcomes is also recorded in the access audit log, best effort: who allowed or denied the ask, or that the server denied it on a timeout, or that the terminal ended or the hook gave up with the ask still waiting. A decision that did not take effect is never recorded as one. On a multi-account server each account's process hands its audit records to the server's main process, which writes them; if that process stops before the hand-off, that one record is lost.
+- e9e774e: Server provisioning now keeps the agent CLIs current. `provision.sh` installs a daily `ikenga-agent-cli-update.timer` that runs `npm install -g <pkg>@latest` as root for each npm-installed CLI in the profile's `AGENT_CLIS` (claude, codex, opencode, pi). They are installed system-wide, so a person's own `claude` could not self-update and showed "Auto-update failed" in every terminal. Existing servers can add it with `provision.sh install-agent-cli-updates`.
+- 994e250: Remote small fixes:
+  - Ngwa Health trust card: shows "not available on this server" in the subtitle when trust sources are unserved on the daemon, instead of "unsigned".
+  - Ngwa Store: Install and Update buttons in browser remote sessions now honestly state "Not available on this server yet" (via `NOT_AVAILABLE_ON_SERVER_YET`) when actions are unavailable.
+  - Terminal hooks: `term_hooks_statusline_snapshot` on a daemon without `--data-dir` reports an honest reason why it is unavailable, which is displayed in CostHud.
+  - Artifact comments routing: migration 0071 widens the `artifact_comments.sink` CHECK constraint to allow `'clipboard'` and `'chi'`, preventing routing audit failures after delivery on desktop and daemon.
+- 5befed6: Honest failure states: a check that couldn't run no longer shows up as a confident "no".
+  
+  - Settings › Engines: if your saved custom shells can't be read, Ikenga says so and pauses adding/removing them, instead of showing none and then overwriting the saved list on the next add. If the saved value is corrupt (rather than temporarily unreadable), "Reset custom shells" copies it to a backup setting (`terminal.custom_shell_profiles.corrupt-<time>`), then starts an empty list so you can add shells again; it reads the value again first and leaves it alone if it has been fixed in the meantime. The "Resume terminals on start" setting shows a read error instead of an unchecked box. If your default shell or custom shells can't be read, Settings and the new-tab menu say which shell is being used as a fallback instead of silently opening a different one.
+  - Explorer: Todos, Automations and Sessions show a short error row with the reason when their data can't be loaded, instead of an empty state. A package whose manifest can't be read is listed as unreadable, and an unreadable saved terminal list pauses saving (with a workspace banner) until you choose Resume saving, so it isn't overwritten. Resume saving first copies the unreadable list to `terminal.tabs.unreadable-<time>` next to it and tells you where; if that copy can't be made, saving stays paused. If the list reads fine by the time you press Resume saving (the first read only failed briefly), its terminals are restored instead.
+  - Chi target picker: when engine detection fails it says "Couldn't check installed engines" with a Retry, instead of "No engine installed". The signed-out copy no longer guesses the cause.
+  - Onboarding: an engine whose sign-in check was inconclusive shows "sign-in unknown" with the reason.
+  - Pkg iframes: when the shell can't read a pkg's manifest to check a capability, the call is still refused but reports `reason: "check-unavailable"` instead of "pkg lacks the capability". Denials are unchanged.
+  - Remote pairing: a temporarily unavailable sign-in check on the computer is its own outcome, not "This browser didn't keep the pairing". If the cookie check gets an unexpected answer (for example a proxy's 502), pairing is still allowed, but the page shows "couldn't confirm the pairing cookie" with the reason and waits for you to click "Open your workspace" instead of continuing on its own.
+
 ## 0.23.0
 
 ### Minor Changes
