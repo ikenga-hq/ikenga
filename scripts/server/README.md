@@ -220,6 +220,7 @@ Mirrors refresh only when `sync-accounts` runs (put it on a timer if you want th
 [rex]          MM_BOT_TOKEN=...               # one account (login name)
 [ada,grace]    SOME_KEY=...                   # several
 [root]         GIT_DEPLOY_TOKEN=...           # provisioner only, delivered to nobody
+[backup]       ORDERS_DB_CONNECTION_STRING=...   # the backup user only (see Database backups)
 ```
 
 There is no default scope: a line without one is an error, as is a scope naming an account that is not managed (a typo), an empty or multi-line value, a name that would change how a shell or git behaves (`PATH`, `LD_*`, `BASH_*`, `IKENGA_*`, `GIT_ASKPASS`, ...), or the same name reaching one account from two lines. Values are single-line and kept byte for byte.
@@ -237,6 +238,133 @@ The daemon has no way for the root side to inject a per-account environment: a p
 - **Not reached:** a process the daemon execs directly, with no shell in front: an engine CLI started as the terminal's own command, a Chi run, a pkg sidecar, and a non-login `sh` (the default account shell is `/bin/sh`, dash).
 
 The fix for the second group belongs in the daemon: `T1Launcher::host_env()` reading the root-owned `/etc/ikenga/secrets/<unix_name>.env` and adding its entries to the child's environment, under names the PTY denylist does not match, would carry them into every PTY and Chi run. The file format is a plain `NAME=value` list so that change needs nothing new from the provisioner. Until then, treat agent-account secrets delivered this way as available to shell-launched work only.
+
+## Database backups
+
+Postgres backups run **on this box**, as system jobs, by a dedicated user that holds only the database connection strings and the GCS credentials (decision D-B10; they moved here from rex-vps). Rex's alerts only *read* a status file the jobs leave behind. `sudo ikenga-provision backups` (or the full provision run) converges all of it from the profile; `--dry-run` prints the plan by secret and file **name**, never a value.
+
+```bash
+BACKUPS_ENABLED=1
+BACKUP_CONFIG=/root/provision/backup-config.json      # which databases, see below
+BACKUP_GCS_KEY_SECRET=GCS_BACKUP_KEY_B64              # NAME of a SECRETS_FILE entry
+SECRETS_FILE=/root/provision/secrets.scoped           # holds the [backup] connection strings and the key
+# optional:
+BACKUP_USER=ikenga-backup                             # default
+BACKUP_SCHEDULES=("daily=*-*-* 03:30:00 UTC")         # name=OnCalendar; overrides or adds a schedule
+BACKUP_PG_MAJOR=17                                    # postgresql-client-<n> from PGDG
+BACKUP_TIMEOUT_SEC=10800                              # a run is killed after this (keep it under the shortest interval)
+BACKUP_GCLOUD_KEY_FPRS=()                             # extra accepted Google apt signing-key fingerprints
+```
+
+| Key | Default | |
+|-----|---------|--|
+| `BACKUPS_ENABLED` | `0` | `1` installs and starts the timers. Back to `0` removes them (see "Converge" below). |
+| `BACKUP_USER` | `ikenga-backup` | A plain system user: no login shell, no supplementary groups, no home except its `0700` private state directory. Not an Ikenga principal: `root`, the admin, the T0 `ikenga` user, any `ik-*` name and any uid inside `UID_RANGE` are refused. |
+| `BACKUP_CONFIG` | none (required) | Path to a **JSON file** (not an inline list: it is data, it is reviewed on its own, and the same file is installed for the job). Shape = rex-vps's `backup-config.json`; an example with the nine Royalti databases is `scripts/server/backup/backup-config.example.json`. Only `databases[]` is read. |
+| `BACKUP_GCS_KEY_SECRET` | none (required) | The **name** of the `SECRETS_FILE` entry holding the service-account key. |
+| `BACKUP_SCHEDULES` | see below | `name=OnCalendar` entries that override or add schedules. |
+| `BACKUP_PG_MAJOR` | `17` | The `postgresql-client-<n>` to install. **Values below 17 are refused**: the servers are PostgreSQL 17 and an older `pg_dump` refuses to dump a newer server, so every backup would fail. |
+
+`BACKUP_CONFIG` per database: `name` (also the object folder: letters, digits, `. _ -`), `connection_secret` (the **name** of a `[backup]` secret), `schedule` (a schedule name), `gcs_bucket`, `enabled`. **A database is backed up only with `"enabled": true`**; one without the field (or `false`) is skipped, as on rex-vps, and the run names the databases it skipped. A config where none is enabled is refused. It holds names only, never a value, and is installed (`0640`, `root:<backup group>`) as `/etc/ikenga-backup/backup-config.json`. A schedule name with no calendar, a duplicate `name`, a bad bucket, or a secret name that is reserved is refused with the entry number.
+
+**Schedules.** One systemd timer per schedule that some enabled database uses. Defaults match rex-vps's crontab, in **UTC**:
+
+| Schedule | OnCalendar | rex-vps cron |
+|----------|------------|--------------|
+| `4hourly` | `*-*-* 00/4:00:00 UTC` | `0 */4 * * *` |
+| `daily` | `*-*-* 02:00:00 UTC` | `0 2 * * *` |
+| `weekly` | `Sun *-*-* 03:00:00 UTC` | `0 3 * * 0` |
+| `6hourly`, `12hourly`, `monthly` | `00/6`, `00/12`, `*-*-01 04:00` | (defined in the old config, unused) |
+
+Every timer has `Persistent=true` (a run missed while the box was down fires at boot) and `RandomizedDelaySec=120`. `BACKUP_SCHEDULES` expressions are checked with `systemd-analyze calendar` and may contain only what a calendar expression needs. The `schedules` cron table in an old config file is ignored.
+
+### Secrets
+
+The connection strings are `SECRETS_FILE` lines with the new scope **`backup`**:
+
+```
+[backup]  ROYALTIO_PROD_DB_CONNECTION_STRING=postgres://user:p%40ss@host:5432/db?sslmode=require
+[root]    GCS_BACKUP_KEY_B64=<base64 of the service-account key JSON, on one line>
+```
+
+- `backup` is the backup user's alone. It **cannot be combined** with another scope, `everyone` and `agents` never include it, and the run refuses if a secret of the same name is also delivered to an account, or if a database's connection secret is in the file under any other scope. `backup` is now a reserved name (no account may be called that).
+- **The key** is a multi-line JSON file and the secrets format is one line per value, so it is stored **base64-encoded**: `base64 -w0 key.json`. Scope it `[root]` (nobody gets it but the provisioner) or `[backup]`. It is decoded and checked (`type: service_account`, `private_key`, `client_email`) without printing anything; scoping it any other way is refused.
+- **Connection strings** are `postgres://` or `postgresql://` URLs with the user and password percent-encoded. Supported query parameters: `sslmode`, `sslrootcert`, `connect_timeout`, `channel_binding`, `application_name`; anything else makes that database fail with `bad-connection-string` (a name, never the URL).
+- Where they land: the strings in `/etc/ikenga-backup/connections.env` (`root:<backup group>`, `0640`, only the strings some enabled database uses, parsed line by line, never `source`d); the key in `/var/lib/ikenga-backup/private/gcs-key.json` (`ikenga-backup`, `0600`, written by the backup user from stdin, never by root). Nowhere else: not argv, not a unit file, not the journal, not `status.json`. Backup-scoped secrets that no database refers to are named in the output and not written. A replaced env file is first copied to `/etc/ikenga/secrets-backup/` (root-only, last five).
+- **How the job keeps them out of argv:** `pg_dump` is not given the URL. `run-backup.sh` parses it and passes `PGHOST`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, ... in the `pg_dump` process's environment (only the owner and root can read `/proc/<pid>/environ`; anyone can read `/proc/<pid>/cmdline`). `gcloud` is only ever given the key *path*.
+
+### What is installed
+
+| Path | Owner / mode | |
+|------|--------------|--|
+| `/usr/local/lib/ikenga-backup/run-backup.sh`, `verify-backup.sh` | `root:root` `0755` | Copied from `scripts/server/backup/` next to `provision.sh`. A copy of `provision.sh` run from elsewhere (the stable `/usr/local/sbin/ikenga-provision`) keeps the installed scripts. |
+| `/etc/ikenga-backup/` | `root:<group>` `0750` | `backup-config.json` (names), `connections.env` (secrets). Ikenga accounts cannot even list it. |
+| `/var/lib/ikenga-backup/` | `root:root` `0755` | **Root's alone**: the backup user cannot create, rename or replace anything directly in it. It holds `status/`, `private/`, and `status.json`, a root-made symlink to `status/status.json`, so the documented path still works. |
+| `/var/lib/ikenga-backup/status/` | `ikenga-backup` `0755` | **`status/status.json`** (`0644`, readable by everyone, no secrets) and its lock file. The only thing the backup user writes that the world reads. |
+| `/var/lib/ikenga-backup/private/` | `ikenga-backup` `0700` | The user's home: `gcs-key.json`, `gcloud/<schedule>/` (one `CLOUDSDK_CONFIG` per schedule), `work/` (scratch), `errors/last-error-<db>.log` (raw tool output, `0600`, connection strings scrubbed; for the operator, not for the journal). |
+| `ikenga-backup@.service`, `ikenga-backup-<schedule>.timer` | `root` | One oneshot service template (`%i` = the schedule) and one timer per schedule. |
+
+**The service** runs as `ikenga-backup` with `NoNewPrivileges`, `ProtectSystem=strict` and `ReadWritePaths` = only `/var/lib/ikenga-backup/status` and `/var/lib/ikenga-backup/private`, `PrivateTmp`, `PrivateDevices`, `ProtectHome`, `ProtectProc=invisible`, kernel/clock/hostname/cgroup protection, `RestrictNamespaces`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK`, an empty capability set, `SystemCallFilter=@system-service`, and `InaccessiblePaths` for `/etc/ikenga` (account secrets), `/opt/ikenga` (daemon vault key) and `/srv/ikenga` (project mirrors). It is `Nice=10`, idle I/O, and killed after `BACKUP_TIMEOUT_SEC`. `MemoryDenyWriteExecute` is not set (gcloud is Python).
+
+**Tools.** `pg_dump` comes from **`postgresql-client-17` in the PGDG apt repository** (`apt.postgresql.org`, `<codename>-pgdg`), because the production servers are PostgreSQL 17 and a `pg_dump` older than its server refuses to dump it; Ubuntu 24.04's own archive stops at 16. The repository's signing key is downloaded over https and **must have exactly the fingerprint `B97B 0AFC AA1A 47F0 44F2 44A0 7FCC 7D46 ACCC 4CF8`** (every key in the file must be a pinned one) before it becomes `/usr/share/keyrings/ikenga-pgdg.gpg`, which `signed-by` ties to this one repository; a mismatch stops the run with nothing installed. The job picks the highest installed `/usr/lib/postgresql/<n>/bin/pg_dump` and refuses anything below `BACKUP_PG_MAJOR`.
+
+Uploads use **`gcloud storage cp`** (package `google-cloud-cli`, Google's apt repo `packages.cloud.google.com`, key pinned the same way to `35BA A0B3 3E9E B396 F59C A838 C0BA 5CE6 DC63 15A3`, "Artifact Registry Repository Signer", observed 2026-10-08), not `gsutil` (what rex-vps used): Google has put `gsutil` in maintenance and `gcloud storage` is the supported, faster replacement in the same package, with one authentication model. If Google rotates the key, provisioning stops naming the new fingerprint; confirm it against Google's install docs and add it to `BACKUP_GCLOUD_KEY_FPRS`. A `gcloud` already on the host is used as it is and nothing is installed. **Authentication** is the service-account key, activated on every run into `CLOUDSDK_CONFIG=/var/lib/ikenga-backup/private/gcloud`: the credentials never touch any other user's `~/.config/gcloud`, and rotating the secret needs nothing but a re-run of `backups`.
+
+### What a run does
+
+For each enabled database of the schedule, **in isolation** (one failing never stops the others; the run exits non-zero if any failed):
+
+1. `pg_dump -w` (plain format, v17+) streamed straight into `gzip` (no uncompressed copy on disk; both halves' exit codes are checked);
+2. `verify-backup.sh`: size, gzip integrity, the pg_dump header **and** the completion marker (so a dump cut short is rejected);
+3. `gcloud storage cp` to `gs://<gcs_bucket>/<db>/<YYYY>/<MM>/<db>-<YYYYMMDD-HHMMSS>.sql.gz` (UTC; the database's own bucket);
+4. the dump is deleted and `status.json` is updated.
+
+The journal (`journalctl -u 'ikenga-backup@*'`) gets one line per database: `db=<name> status=ok bytes=N` or `db=<name> status=FAILED kind=<kind>`. **Names and kinds only.**
+
+### `status.json` (what Rex reads)
+
+```json
+{
+  "schema": 1, "enabled": true, "updated": "2026-10-08T02:00:41Z",
+  "databases": {
+    "royalti-prod-db": {
+      "schedule": "4hourly",
+      "last_attempt": "2026-10-08T00:00:12Z", "last_attempt_ok": true,
+      "last_success": "2026-10-08T00:00:12Z",
+      "last_error_kind": null, "last_error_at": null,
+      "object": "gs://db-backups-archive/royalti-prod-db/2026/10/royalti-prod-db-20261008-000012.sql.gz",
+      "bytes": 48211934, "duration_s": 31
+    }
+  },
+  "schedules": { "4hourly": { "last_run": "...", "last_run_ok": true, "succeeded": 1, "failed": [] } }
+}
+```
+
+`last_error_kind` is null after a successful attempt and otherwise one of `bad-config`, `no-secret`, `bad-connection-string`, `no-pg-dump`, `gcs-auth` (the key was rejected: nothing is dumped), `dump-failed`, `verify-failed`, `upload-failed`. `object` and `last_success` always describe the last **successful** upload; a failure never erases them. The file lists every enabled database from the moment of provisioning (a never-run one has nulls), and it is rewritten atomically after each database. `enabled` is `false` when backups are disabled.
+
+**The alert contract for Rex's box-alerts schedule** (replaces `cron-alert.sh` and the fleet-audit log greps): read `/var/lib/ikenga-backup/status.json` and alert when `enabled` is false or the file is missing or older than a day; or for any database `last_attempt_ok == false`, or `last_success` is null or older than twice its schedule's interval (suggested: `4hourly` 9 h, `daily` 26 h, `weekly` 8 d, `monthly` 32 d). Also alert on `systemctl is-failed 'ikenga-backup@*'` and on a missing timer (`systemctl list-timers 'ikenga-backup-*'`). Nothing in the file is secret; the alert text can name the database and the kind.
+
+### Converge
+
+`sudo ikenga-provision backups` is idempotent: a rerun reports `no changes` and touches no unit. A changed `BACKUP_SCHEDULES` or config rewrites only the affected timers (and restarts those); a schedule no enabled database uses loses its timer and its status entries; a changed or removed `[backup]` secret updates `connections.env` (reported as `+NAME` / `~NAME` / `-NAME`); a rotated key is replaced. **Symlinks.** The two directories the backup user owns (`status/`, `private/`) hang off a root-owned parent, so the user cannot swap either for a symlink; everything root does *inside* them (read the status, compare or install the key, remove credentials, mark the status disabled) it does **as the backup user**, never through a path the user controls. A symlink found at the state, status, private, key, status file, lock, `errors`, `work` or `gcloud` path is **refused**, not adopted (the run stops before changing anything, names the path, and leaves what it points at alone). An install from the earlier layout (a backup-user-owned `/var/lib/ikenga-backup`) is refused the same way: inspect it and fix the ownership by hand. A connection secret missing from `SECRETS_FILE` is reported by database and name and makes the run exit non-zero, after everything else converged (that database reports `no-secret` until it is added).
+
+**Disabling** (`BACKUPS_ENABLED=0`) removes the timers and the service unit **and every copy of the credentials**: the env file, the key file, **and the gcloud config tree** (`private/gcloud/`). That last one matters: `gcloud auth activate-service-account` copies the service-account key into `credentials.db` and `legacy_credentials/` (plus `access_tokens.db` and `configurations/`) under `CLOUDSDK_CONFIG`, so deleting the key file alone leaves the key on disk. A root-only copy of the env file stays in `/etc/ikenga/secrets-backup/`. It keeps the user, the scripts, `status.json` (marked `enabled: false`) and the error logs. A **rotated key** removes the old key's gcloud config tree the same way. The next run re-activates into a fresh one. Enabling again restores timers and credentials from `SECRETS_FILE` and carries the history on.
+
+### First run on the real box
+
+The container test cannot run systemd's sandbox, so watch the first real run:
+
+```bash
+sudo ikenga-provision backups --profile <profile> --dry-run     # read the plan
+sudo ikenga-provision backups --profile <profile>
+systemd-analyze security ikenga-backup@daily.service            # exposure score
+sudo systemctl start ikenga-backup@daily.service                # one real run
+journalctl -u ikenga-backup@daily.service -n 30
+cat /var/lib/ikenga-backup/status.json | jq .databases
+sudo ls /var/lib/ikenga-backup/private/errors/                  # raw errors, if a database failed
+```
+
+If the sandbox blocks something (a `gcloud` that needs a path or a syscall outside the list), the journal says so; loosen that one directive in `backup_service_unit` rather than dropping the sandbox. **Not handled here:** restore drills (a periodic restore of the newest dump into a scratch database), bucket retention/lifecycle rules (objects are never deleted), a free-disk guard before a large dump, and the Rex side of the alert contract above. Schedules that start together (a `Persistent` catch-up after downtime fires them all at once) each use their own `CLOUDSDK_CONFIG` (`private/gcloud/<schedule>`), so they never contend for gcloud's sqlite files. Also note that `gcloud auth activate-service-account` needs to reach `oauth2.googleapis.com` (it refreshes a token at activation), so a run with no outbound network reports `gcs-auth` for every database and dumps nothing.
 
 ## T0 → T1: `accounts adopt-t0`
 

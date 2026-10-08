@@ -1,0 +1,14 @@
+{
+  "description": "Postgres backups to Google Cloud Storage (provision.sh BACKUP_CONFIG). Holds secret NAMES only, never values: each connection_secret names a `[backup]` line in the provisioner's SECRETS_FILE. A database is backed up only with \"enabled\": true (missing or false = skipped).",
+  "databases": [
+    { "name": "royalti-prod-db",    "connection_secret": "ROYALTIO_PROD_DB_CONNECTION_STRING",    "schedule": "4hourly", "gcs_bucket": "db-backups-archive", "enabled": true },
+    { "name": "royalti-website-db", "connection_secret": "ROYALTIO_WEBSITE_DB_CONNECTION_STRING", "schedule": "daily",   "gcs_bucket": "db-backups-archive", "enabled": true },
+    { "name": "dixtrit-db",         "connection_secret": "DIXRIT_DB_CONNECTION_STRING",           "schedule": "daily",   "gcs_bucket": "db-backups-archive", "enabled": true },
+    { "name": "twenty-crm-db",      "connection_secret": "TWENTY_CRM_DB_CONNECTION_STRING",       "schedule": "daily",   "gcs_bucket": "db-backups-archive", "enabled": true },
+    { "name": "chatwoot-db",        "connection_secret": "CHATWOOT_DB_CONNECTION_STRING",         "schedule": "daily",   "gcs_bucket": "db-backups-archive", "enabled": true },
+    { "name": "mattermost-db",      "connection_secret": "MATTERMOST_DB_CONNECTION_STRING",       "schedule": "daily",   "gcs_bucket": "db-backups-archive", "enabled": true },
+    { "name": "listmonk-db",        "connection_secret": "LISTMONK_DB_CONNECTION_STRING",         "schedule": "daily",   "gcs_bucket": "db-backups-archive", "enabled": true },
+    { "name": "devotee-db",         "connection_secret": "DEVOTEE_DB_CONNECTION_STRING",          "schedule": "daily",   "gcs_bucket": "db-backups-archive", "enabled": true },
+    { "name": "metadatacms-db",     "connection_secret": "METADATACMS_DB_CONNECTION_STRING",      "schedule": "weekly",  "gcs_bucket": "db-backups-archive", "enabled": true }
+  ]
+}
