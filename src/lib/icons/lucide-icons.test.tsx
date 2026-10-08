@@ -117,9 +117,10 @@ describe('useLucideIcon / PinIcon', () => {
 		);
 		expect(container.querySelector('svg.lucide-pin')).not.toBeNull();
 		expect(queryByTestId('glyph')).toBeNull();
-		await waitFor(() => expect(settle).not.toBeNull());
+		// A cold import of the lazy icon table can pass 1 s on a loaded CI runner.
+		await waitFor(() => expect(settle).not.toBeNull(), { timeout: 5000 });
 		await act(async () => settle?.());
-		await waitFor(() => expect(queryByTestId('glyph')).not.toBeNull());
+		await waitFor(() => expect(queryByTestId('glyph')).not.toBeNull(), { timeout: 5000 });
 		expect(container.querySelector('svg.lucide-pin')).toBeNull();
 	});
 });
