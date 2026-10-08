@@ -2401,9 +2401,21 @@ sync_accounts() {
 #   /usr/local/lib/ikenga-backup/   run-backup.sh, verify-backup.sh   root:root 0755
 #   /etc/ikenga-backup/             backup-config.json (names only)    root:<group> 0750 / 0640
 #                                   connections.env    (secrets)       root:<group> 0640
-#   /var/lib/ikenga-backup/         status.json (everyone can read)    <user> 0755 / 0644
-#     private/                      the user's home: key, gcloud config,
-#                                   scratch space, raw tool errors     <user> 0700
+#   /var/lib/ikenga-backup/         root:root 0755. Root's, and ONLY root's: the
+#                                   backup user cannot create, rename or replace
+#                                   anything directly in it.
+#     status.json                   symlink -> status/status.json (root-made)
+#     status/                       status.json + its lock (everyone reads)  <user> 0755
+#     private/                      the user's home: key, gcloud config
+#                                   (gcloud/<schedule>), scratch space, raw
+#                                   tool errors                              <user> 0700
+#
+# Root never follows or writes through a path the backup user controls: the two
+# directories the user owns (status/, private/) hang off a root-owned parent, so
+# they cannot be swapped for symlinks; everything root does INSIDE them (reading
+# the status, installing or comparing the key, removing credentials, marking the
+# status disabled) is done AS the backup user (as_backup); and a symlink found at
+# any of those paths is refused, never adopted.
 #
 # The connection strings come from SECRETS_FILE lines scoped `backup`; that
 # scope can't be combined with another and is never delivered to an account.
@@ -2413,7 +2425,9 @@ sync_accounts() {
 BACKUP_LIB_DIR="/usr/local/lib/ikenga-backup"
 BACKUP_ETC_DIR="/etc/ikenga-backup"
 BACKUP_STATE_DIR="/var/lib/ikenga-backup"
+BACKUP_STATUS_DIR="$BACKUP_STATE_DIR/status"
 BACKUP_PRIV_DIR="$BACKUP_STATE_DIR/private"
+BACKUP_GCLOUD_DIR="$BACKUP_PRIV_DIR/gcloud"
 BACKUP_CONFIG_DST="$BACKUP_ETC_DIR/backup-config.json"
 BACKUP_ENV_DST="$BACKUP_ETC_DIR/connections.env"
 BACKUP_KEY_DST="$BACKUP_PRIV_DIR/gcs-key.json"
@@ -2445,6 +2459,9 @@ validate_backups_profile() {
     root|ikenga|nobody|postgres|"$ADMIN_USER"|ik-*) die "BACKUP_USER '$BACKUP_USER' is not allowed: it must be its own plain system user (not root, the admin, the T0 'ikenga' user, or an ik-* Ikenga account)" ;;
   esac
   [[ "$BACKUP_PG_MAJOR" =~ ^[0-9]{2}$ ]] || die "BACKUP_PG_MAJOR must be two digits, e.g. 17 (got '$BACKUP_PG_MAJOR')"
+  # The servers are PostgreSQL 17 and a pg_dump older than its server refuses to
+  # dump it, so every run would end in dump-failed: refuse that at provision time.
+  (( 10#$BACKUP_PG_MAJOR >= 17 )) || die "BACKUP_PG_MAJOR $BACKUP_PG_MAJOR is older than the servers (PostgreSQL 17): pg_dump refuses to dump a newer server, so every backup would fail. Use 17 or newer"
   [[ "$BACKUP_TIMEOUT_SEC" =~ ^[0-9]{3,6}$ ]] || die "BACKUP_TIMEOUT_SEC must be a number of seconds (got '$BACKUP_TIMEOUT_SEC')"
   local e name cal
   for e in "${BACKUP_SCHEDULES[@]}"; do
@@ -2601,8 +2618,12 @@ backup_load_config() {
     [[ -n "${BK_CAL[$sched]:-}" ]] || die "BACKUP_CONFIG: database '$name' uses schedule '$sched', which has no calendar (defaults: ${!BK_CAL[*]}; add one with BACKUP_SCHEDULES=(\"$sched=<OnCalendar>\"))"
     BK_NAMES+=("$name"); BK_SECRET[$name]="$secret"; BK_SCHED[$name]="$sched"
     [[ "$seen" == *" $sched "* ]] || { seen+="$sched "; BK_SCHEDS_USED+=("$sched"); }
-  done < <(jq -r '.databases[] | select(.enabled != false) | [.name, .connection_secret, .schedule] | @tsv' "$BACKUP_CONFIG")
-  [[ ${#BK_NAMES[@]} -gt 0 ]] || die "BACKUP_CONFIG has no enabled database"
+  done < <(jq -r '.databases[] | select(.enabled == true) | [.name, .connection_secret, .schedule] | @tsv' "$BACKUP_CONFIG")
+  [[ ${#BK_NAMES[@]} -gt 0 ]] || die "BACKUP_CONFIG has no enabled database (a database is backed up only with \"enabled\": true)"
+  # A database without "enabled": true is skipped, as on rex-vps. Say so by name, so
+  # a forgotten field is visible rather than a silent gap in the backups.
+  local skipped; skipped="$(jq -r '[.databases[] | select(.enabled != true) | .name] | join(" ")' "$BACKUP_CONFIG")"
+  [[ -z "$skipped" ]] || note "databases not backed up (\"enabled\" is not true): $skipped"
   return 0
 }
 
@@ -2683,10 +2704,83 @@ backup_ensure_user() {
 }
 
 # Run a command as the backup user, with no supplementary groups and a clean
-# environment: how the service runs.
+# environment: how the service runs. This is how root touches anything INSIDE
+# status/ or private/: those directories belong to the backup user, so a path
+# in them can be swapped for a symlink at any moment, and root must not follow it.
 as_backup() {
   ( cd / && exec setpriv --reuid="$BK_UID" --regid="$BK_GID" --clear-groups \
       env -i HOME="$BACKUP_PRIV_DIR" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 "$@" )
+}
+
+# Sets BK_UID/BK_GID/BK_GROUP for a user that already exists (the disabled path
+# never creates one). Returns 1 when there is no such user.
+backup_load_ids() {
+  [[ $EUID -eq 0 ]] || return 1          # an unprivileged dry run cannot look inside the user's directories
+  id "$BACKUP_USER" >/dev/null 2>&1 || return 1
+  BK_UID="$(id -u "$BACKUP_USER")"; BK_GID="$(id -g "$BACKUP_USER")"; BK_GROUP="$(id -gn "$BACKUP_USER")"
+}
+
+# ---- paths the backup user controls
+
+# backup_safe_dir <mode> <owner> <group> <expected owner uid> <path>
+# Creates the directory, or fixes the owner/mode of an existing one, but never
+# through a symlink and never one somebody else owns: a symlink, a non-directory
+# or a directory owned by an unexpected uid is REFUSED, not adopted. The parent
+# must be root's (the caller guarantees it), so nothing can be swapped between
+# the check and the chown/chmod. (stat without -L is an lstat.)
+backup_safe_dir() {
+  local mode="$1" owner="$2" group="$3" want_uid="$4" d="$5" kind cur
+  kind="$(stat -c '%F' -- "$d" 2>/dev/null || true)"
+  if [[ -z "$kind" ]]; then
+    run install -d -m "$mode" -o "$owner" -g "$group" "$d"
+    changed "$d created ($owner:$group $mode)"
+    return 0
+  fi
+  [[ "$kind" != "symbolic link" ]] || die "$d is a symbolic link. Refusing to follow it: root would chown/chmod whatever it points at. Inspect it, remove it by hand, and run again."
+  [[ "$kind" == directory ]] || die "$d exists and is a $kind, not a directory; refusing to touch it. Inspect it, move it away, and run again."
+  cur="$(stat -c '%u %a %U %G' -- "$d")"
+  [[ "${cur%% *}" == "$want_uid" ]] || die "$d is owned by uid ${cur%% *}, not $want_uid. Refusing to adopt it (an earlier layout, or tampering): inspect it, fix or remove it by hand, and run again."
+  cur="${cur#* }"
+  [[ "$cur" == "${mode#0} $owner $group" ]] && return 0
+  run chown -h "$owner:$group" "$d"; run chmod "$mode" "$d"
+  changed "$d: owner/mode set to $owner:$group $mode"
+}
+
+# The three directories, in order. STATE is root's alone; status/ and private/
+# are the backup user's, and live directly under it.
+backup_ensure_dirs() {
+  backup_safe_dir 0755 root root 0 "$BACKUP_STATE_DIR"
+  backup_safe_dir 0755 "$BACKUP_USER" "$BK_GROUP" "$BK_UID" "$BACKUP_STATUS_DIR"
+  backup_safe_dir 0700 "$BACKUP_USER" "$BK_GROUP" "$BK_UID" "$BACKUP_PRIV_DIR"
+  # status.json at the old, documented path is a root-made symlink into status/
+  # (the user can't create files in STATE, so it can't atomically replace the
+  # status file there; in status/ it can).
+  local link="$BACKUP_STATE_DIR/status.json" kind
+  kind="$(stat -c '%F' -- "$link" 2>/dev/null || true)"
+  if [[ "$kind" == "symbolic link" && "$(readlink -- "$link")" == status/status.json ]]; then return 0; fi
+  [[ "$kind" != directory ]] || die "$link is a directory; refusing to touch it. Move it away and run again."
+  run ln -sfn status/status.json "$link"
+  changed "$link -> status/status.json"
+}
+
+# Refuses a symlink at any path of the backup user's trees. Root's own lstat on
+# the two directories, everything inside them looked at AS the backup user.
+backup_refuse_symlinks() {
+  local d p
+  for d in "$BACKUP_STATE_DIR" "$BACKUP_STATUS_DIR" "$BACKUP_PRIV_DIR"; do
+    [[ "$(stat -c '%F' -- "$d" 2>/dev/null || true)" != "symbolic link" ]] \
+      || die "$d is a symbolic link. Refusing to follow it: root would chown/chmod whatever it points at. Inspect it, remove it by hand, and run again."
+  done
+  backup_load_ids || return 0
+  for p in "$BACKUP_STATUS_DIR/status.json" "$BACKUP_STATUS_DIR/.status.lock" "$BACKUP_KEY_DST" \
+           "$BACKUP_PRIV_DIR/errors" "$BACKUP_PRIV_DIR/work" "$BACKUP_GCLOUD_DIR"; do
+    if as_backup test -L "$p"; then
+      die "$p is a symbolic link (the backup user made it, or tampering). Refusing to follow it. Inspect it, remove it by hand, and run again."
+    fi
+  done
+  if [[ -n "$(as_backup find "$BACKUP_GCLOUD_DIR/" -mindepth 1 -maxdepth 1 -type l -print -quit 2>/dev/null || true)" ]]; then
+    die "$BACKUP_GCLOUD_DIR holds a symbolic link. Refusing to follow it. Inspect it, remove it by hand, and run again."
+  fi
 }
 
 # ---- the units
@@ -2717,14 +2811,14 @@ Environment=HOME=$BACKUP_PRIV_DIR
 Environment=PATH=$path
 Environment=LANG=C.UTF-8
 Environment=BACKUP_PG_MIN_MAJOR=$BACKUP_PG_MAJOR
-Environment=CLOUDSDK_CONFIG=$BACKUP_PRIV_DIR/gcloud
+Environment=CLOUDSDK_CONFIG=$BACKUP_GCLOUD_DIR/%i
 # Sandbox: the job writes only its state directory; it cannot see the Ikenga
 # daemon's data, the account secrets or the project mirrors.
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
-ReadWritePaths=$BACKUP_STATE_DIR
+ReadWritePaths=$BACKUP_STATUS_DIR $BACKUP_PRIV_DIR
 InaccessiblePaths=-/etc/ikenga -/opt/ikenga -/srv/ikenga -/root
 ProtectHome=true
 ProtectProc=invisible
@@ -2814,24 +2908,39 @@ backup_remove_units() {
   [[ $any -eq 0 || $DRY_RUN -eq 1 ]] || sc daemon-reload
 }
 
+# gcloud copies the service-account key into its config directory when it
+# activates it (credentials.db, legacy_credentials/, access_tokens.db,
+# configurations/). Removing the key file alone leaves that copy behind, so the
+# whole per-schedule config tree goes: on disable, and when the key is rotated.
+# Removed AS the backup user (its directory). The next run re-activates.
+backup_remove_gcloud_creds() {   # reason
+  backup_load_ids || return 0
+  as_backup test -e "$BACKUP_GCLOUD_DIR" || return 0
+  run as_backup rm -rf -- "$BACKUP_GCLOUD_DIR"
+  changed "gcloud credentials removed ($BACKUP_GCLOUD_DIR: $1)"
+}
+
 # ---- the status file
 
 # status.json lists, per database, the schedule it is on; it must match the
 # config. (run-backup.sh --init-status does the writing, as the backup user.)
 backup_status_matches() {
-  local f="$BACKUP_STATE_DIR/status.json" have want
-  [[ -s "$f" ]] || return 1
-  have="$(jq -c '[.enabled, (.databases // {} | to_entries | map("\(.key):\(.value.schedule)") | sort)]' "$f" 2>/dev/null)" || return 1
+  local f="$BACKUP_STATUS_DIR/status.json" have want
+  # Read AS the backup user: status/ is its directory, and root must not follow
+  # whatever it has put there.
+  backup_load_ids || return 1
+  as_backup test -s "$f" || return 1
+  have="$(as_backup jq -c '[.enabled, (.databases // {} | to_entries | map("\(.key):\(.value.schedule)") | sort)]' "$f" 2>/dev/null)" || return 1
   want="$(printf '%s\n' "${BK_NAMES[@]}" | while read -r n; do printf '%s:%s\n' "$n" "${BK_SCHED[$n]}"; done | LC_ALL=C sort | jq -R . | jq -sc '[true, .]')"
   [[ "$have" == "$want" ]]
 }
 
 backup_seed_status() {
   if backup_status_matches; then return 0; fi
-  if [[ $DRY_RUN -eq 1 ]]; then changed "status file $BACKUP_STATE_DIR/status.json initialised for ${#BK_NAMES[@]} database(s)"; return 0; fi
+  if [[ $DRY_RUN -eq 1 ]]; then changed "status file $BACKUP_STATUS_DIR/status.json initialised for ${#BK_NAMES[@]} database(s)"; return 0; fi
   as_backup BACKUP_CONFIG_FILE="$BACKUP_CONFIG_DST" BACKUP_STATE_DIR="$BACKUP_STATE_DIR" "$BACKUP_LIB_DIR/run-backup.sh" --init-status >/dev/null \
-    || { soft_fail "could not initialise $BACKUP_STATE_DIR/status.json"; return 0; }
-  changed "status file $BACKUP_STATE_DIR/status.json initialised for ${#BK_NAMES[@]} database(s)"
+    || { soft_fail "could not initialise $BACKUP_STATUS_DIR/status.json"; return 0; }
+  changed "status file $BACKUP_STATUS_DIR/status.json initialised for ${#BK_NAMES[@]} database(s)"
 }
 
 # ---- converge
@@ -2870,11 +2979,13 @@ sync_backups_enabled() {
     backup_apt_install google-cloud-cli
   fi
 
+  # Refuse a symlink anywhere in the backup user's trees BEFORE anything is
+  # changed (the user is the one who could have put it there).
+  backup_refuse_symlinks
   backup_ensure_user
   ensure_dir 0755 root root "$BACKUP_LIB_DIR"
   ensure_dir 0750 root "$BK_GROUP" "$BACKUP_ETC_DIR"
-  ensure_dir 0755 "$BACKUP_USER" "$BK_GROUP" "$BACKUP_STATE_DIR"
-  ensure_dir 0700 "$BACKUP_USER" "$BK_GROUP" "$BACKUP_PRIV_DIR"
+  backup_ensure_dirs
 
   if [[ -n "$src" ]]; then
     for f in run-backup.sh verify-backup.sh; do install_file 0755 root root "$src/$f" "$BACKUP_LIB_DIR/$f" || true; done
@@ -2906,17 +3017,30 @@ sync_backups_enabled() {
       fi
     fi
     # The GCS key: a 0600 file owned by the backup user, in its private directory.
-    if [[ -f "$BACKUP_KEY_DST" ]] && [[ "$(cat -- "$BACKUP_KEY_DST")" == "$BK_KEY_JSON" ]]; then
-      local ko kg km; read -r ko kg km < <(stat -c '%u %g %a' -- "$BACKUP_KEY_DST")
-      if [[ "$ko" != "$BK_UID" || "$kg" != "$BK_GID" || "$km" != 600 ]]; then
-        run chown "$BK_UID:$BK_GID" "$BACKUP_KEY_DST"; run chmod 0600 "$BACKUP_KEY_DST"; changed "GCS key file owner/mode restored"
+    # private/ is the user's, so everything here is done AS the user: the file is
+    # compared, its mode checked and the new one written by the user, from stdin
+    # (the key is never in argv).
+    local have_key=0 same_key=0 km
+    if [[ $DRY_RUN -eq 0 || -d "$BACKUP_PRIV_DIR" ]] && backup_load_ids && as_backup test -f "$BACKUP_KEY_DST"; then
+      have_key=1
+      [[ "$(as_backup cat -- "$BACKUP_KEY_DST" 2>/dev/null || true)" == "$BK_KEY_JSON" ]] && same_key=1
+    fi
+    if [[ $same_key -eq 1 ]]; then
+      km="$(as_backup stat -c '%a' -- "$BACKUP_KEY_DST")"
+      if [[ "$km" != 600 ]]; then
+        run as_backup chmod 0600 "$BACKUP_KEY_DST"; changed "GCS key file mode restored"
       fi
     else
       if [[ $DRY_RUN -eq 0 ]]; then
-        local ktmp; ktmp="$(mktemp "$BACKUP_PRIV_DIR/.key.XXXXXX")"
-        printf '%s\n' "$BK_KEY_JSON" > "$ktmp"; chown "$BK_UID:$BK_GID" "$ktmp"; chmod 0600 "$ktmp"; mv -f -- "$ktmp" "$BACKUP_KEY_DST"
+        printf '%s\n' "$BK_KEY_JSON" | as_backup BACKUP_STATE_DIR="$BACKUP_STATE_DIR" "$BACKUP_LIB_DIR/run-backup.sh" --install-key \
+          || die "could not install the GCS key file $BACKUP_KEY_DST"
       fi
       changed "GCS key file ($BACKUP_GCS_KEY_SECRET -> $BACKUP_KEY_DST)"
+      if [[ $have_key -eq 1 ]]; then
+        # A rotated key: the gcloud credentials the old one left behind (the
+        # service-account key is copied into CLOUDSDK_CONFIG) go with it.
+        backup_remove_gcloud_creds "old key replaced"
+      fi
     fi
     if [[ ${#BK_MISSING[@]} -gt 0 ]]; then
       soft_fail "no [backup] line in SECRETS_FILE for: ${BK_MISSING[*]} (database:secret). Those databases will report no-secret until it is added"
@@ -2931,24 +3055,27 @@ sync_backups_disabled() {
   backups_installed || [[ -d "$BACKUP_ETC_DIR" || -d "$BACKUP_STATE_DIR" ]] || return 0
   log "Database backups (disabled: timers and credentials removed, state and logs kept)"
   [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo)"
+  backup_refuse_symlinks
   backup_remove_units
-  local f
-  for f in "$BACKUP_ENV_DST" "$BACKUP_KEY_DST"; do
-    [[ -f "$f" ]] || continue
-    if [[ $DRY_RUN -eq 0 ]]; then
-      if [[ "$f" == "$BACKUP_ENV_DST" ]]; then backup_secret_file "$f"; fi
-      rm -f -- "$f"
+  # connections.env is root's. The key, the gcloud credentials and the status
+  # file are in the backup user's directories, so they are removed / edited AS the
+  # user, never by root through a path the user could have swapped.
+  if [[ -f "$BACKUP_ENV_DST" ]]; then
+    if [[ $DRY_RUN -eq 0 ]]; then backup_secret_file "$BACKUP_ENV_DST"; rm -f -- "$BACKUP_ENV_DST"; fi
+    changed "$(basename -- "$BACKUP_ENV_DST") removed (credentials are not kept while backups are disabled)"
+  fi
+  if backup_load_ids; then
+    if as_backup test -e "$BACKUP_KEY_DST"; then
+      run as_backup rm -f -- "$BACKUP_KEY_DST"
+      changed "$(basename -- "$BACKUP_KEY_DST") removed (credentials are not kept while backups are disabled)"
     fi
-    changed "$(basename -- "$f") removed (credentials are not kept while backups are disabled)"
-  done
-  local stfile="$BACKUP_STATE_DIR/status.json" tmp
-  if [[ -s "$stfile" ]] && jq -e '.enabled == true' "$stfile" >/dev/null 2>&1; then
-    if [[ $DRY_RUN -eq 0 ]]; then
-      tmp="$(mktemp "$BACKUP_STATE_DIR/.status.XXXXXX")"
-      jq --arg now "$(now_iso)" '.enabled = false | .updated = $now' "$stfile" > "$tmp"
-      chmod 0644 "$tmp"; chown --reference="$stfile" "$tmp"; mv -f -- "$tmp" "$stfile"
+    backup_remove_gcloud_creds "backups disabled"
+    local stfile="$BACKUP_STATUS_DIR/status.json"
+    if as_backup test -s "$stfile" && as_backup jq -e '.enabled == true' "$stfile" >/dev/null 2>&1; then
+      run as_backup BACKUP_STATE_DIR="$BACKUP_STATE_DIR" "$BACKUP_LIB_DIR/run-backup.sh" --mark-disabled \
+        || { soft_fail "could not mark $stfile disabled"; return 0; }
+      changed "status file marked enabled=false"
     fi
-    changed "status file marked enabled=false"
   fi
 }
 

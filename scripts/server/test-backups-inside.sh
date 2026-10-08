@@ -33,7 +33,8 @@ BU=ikenga-backup
 ETC=/etc/ikenga-backup
 STATE=/var/lib/ikenga-backup
 PRIV=$STATE/private
-STATUS=$STATE/status.json
+STATUS_DIR=$STATE/status
+STATUS=$STATUS_DIR/status.json
 UNITS=/etc/systemd/system
 FAKEGCS=/srv/fake-gcs
 JOURNAL=/var/log/mock-journal
@@ -130,10 +131,11 @@ write_config() {   # bucket for fake-weekly
   "description": "test fixture",
   "databases": [
     { "name": "fake-one",    "connection_secret": "FAKE_ONE_URL", "schedule": "daily",   "gcs_bucket": "bucket-a", "enabled": true },
-    { "name": "fake-two",    "connection_secret": "FAKE_TWO_URL", "schedule": "daily",   "gcs_bucket": "bucket-a" },
+    { "name": "fake-two",    "connection_secret": "FAKE_TWO_URL", "schedule": "daily",   "gcs_bucket": "bucket-a", "enabled": true },
     { "name": "fake-fast",   "connection_secret": "FAKE_ONE_URL", "schedule": "4hourly", "gcs_bucket": "bucket-b", "enabled": true },
     { "name": "fake-weekly", "connection_secret": "FAKE_TWO_URL", "schedule": "weekly",  "gcs_bucket": "${1:-bucket-a}", "enabled": true },
-    { "name": "fake-off",    "connection_secret": "FAKE_OFF_URL", "schedule": "daily",   "gcs_bucket": "bucket-a", "enabled": false }
+    { "name": "fake-off",    "connection_secret": "FAKE_OFF_URL", "schedule": "daily",   "gcs_bucket": "bucket-a", "enabled": false },
+    { "name": "fake-unset",  "connection_secret": "FAKE_ONE_URL", "schedule": "daily",   "gcs_bucket": "bucket-a" }
   ]
 }
 JSON
@@ -313,10 +315,12 @@ pass "both apt repositories: signed-by a dedicated keyring whose fingerprint is 
 [[ "$(stat -c '%a %U %G' $ETC)" == "750 root $BU" ]] || fail "$ETC: $(stat -c '%a %U %G' $ETC)"
 [[ "$(stat -c '%a %U %G' $ETC/connections.env)" == "640 root $BU" ]] || fail "connections.env: $(stat -c '%a %U %G' $ETC/connections.env)"
 [[ "$(stat -c '%a %U %G' $ETC/backup-config.json)" == "640 root $BU" ]] || fail "backup-config.json: $(stat -c '%a %U %G' $ETC/backup-config.json)"
-[[ "$(stat -c '%a %U %G' $STATE)" == "755 $BU $BU" ]] || fail "$STATE: $(stat -c '%a %U %G' $STATE)"
+[[ "$(stat -c '%a %U %G' $STATE)" == "755 root root" ]] || fail "$STATE is not root-only: $(stat -c '%a %U %G' $STATE)"
+[[ "$(stat -c '%a %U %G' $STATUS_DIR)" == "755 $BU $BU" ]] || fail "$STATUS_DIR: $(stat -c '%a %U %G' $STATUS_DIR)"
+[[ "$(stat -c '%F %N' $STATE/status.json)" == "symbolic link '$STATE/status.json' -> 'status/status.json'" ]] || fail "$STATE/status.json is not the root-made link: $(stat -c '%F %N' $STATE/status.json)"
 [[ "$(stat -c '%a %U %G' $PRIV)" == "700 $BU $BU" ]] || fail "$PRIV: $(stat -c '%a %U %G' $PRIV)"
 [[ "$(stat -c '%a %U %G' $PRIV/gcs-key.json)" == "600 $BU $BU" ]] || fail "gcs-key.json: $(stat -c '%a %U %G' $PRIV/gcs-key.json)"
-[[ "$(stat -c '%a %U %G' $STATE/status.json)" == "644 $BU $BU" ]] || fail "status.json: $(stat -c '%a %U %G' $STATE/status.json)"
+[[ "$(stat -c '%a %U %G' $STATUS)" == "644 $BU $BU" ]] || fail "status.json: $(stat -c '%a %U %G' $STATUS)"
 for f in run-backup.sh verify-backup.sh; do
   cmp -s /work/backup/$f /usr/local/lib/ikenga-backup/$f || fail "$f differs from the repo copy"
   [[ "$(stat -c '%a %U %G' /usr/local/lib/ikenga-backup/$f)" == "755 root root" ]] || fail "$f is not root-owned 0755"
@@ -343,8 +347,8 @@ for s in daily 4hourly weekly; do
     && grep -qxF "Unit=ikenga-backup@$s.service" $UNITS/ikenga-backup-$s.timer || fail "timer $s: Persistent/RandomizedDelaySec/Unit"
   [[ -e /var/lib/mock-systemctl/enabled/ikenga-backup-$s.timer && -e /var/lib/mock-systemctl/active/ikenga-backup-$s.timer ]] || fail "timer $s not enabled+started"
 done
-for want in "User=$BU" "Group=$BU" 'NoNewPrivileges=true' 'PrivateTmp=true' 'ProtectSystem=strict' "ReadWritePaths=$STATE" 'ProtectHome=true' 'CapabilityBoundingSet=' 'RestrictSUIDSGID=true' 'SystemCallFilter=@system-service' \
-            'ExecStart=/usr/local/lib/ikenga-backup/run-backup.sh --schedule %i' "Environment=CLOUDSDK_CONFIG=$PRIV/gcloud" 'Type=oneshot'; do
+for want in "User=$BU" "Group=$BU" 'NoNewPrivileges=true' 'PrivateTmp=true' 'ProtectSystem=strict' "ReadWritePaths=$STATUS_DIR $PRIV" 'ProtectHome=true' 'CapabilityBoundingSet=' 'RestrictSUIDSGID=true' 'SystemCallFilter=@system-service' \
+            'ExecStart=/usr/local/lib/ikenga-backup/run-backup.sh --schedule %i' "Environment=CLOUDSDK_CONFIG=$PRIV/gcloud/%i" 'Type=oneshot'; do
   grep -qxF -- "$want" $SVC || fail "service unit lacks: $want"
 done
 ! grep -qiE 'FAKE|PASSWORD|EnvironmentFile|postgres(ql)?://|private_key|GOOGLE_APPLICATION' $SVC $UNITS/ikenga-backup-*.timer || fail "a unit file mentions a secret, a password or a connection string"
@@ -440,14 +444,25 @@ done
 # The dump is real: restore it into a fresh database and count.
 f="$FAKEGCS/buckets/$(status_get '.databases["fake-one"].object' | sed 's#^gs://##')"
 su postgres -c "psql -p $PGPORT -qAt -c 'CREATE DATABASE restore_one'" >/dev/null
-gunzip -c "$f" | su postgres -c "psql -p $PGPORT -d restore_one -qAt -v ON_ERROR_STOP=0" >/dev/null 2>"$T/restore.err" || true
+# The restore stops at the first error (ON_ERROR_STOP=1): a dump that restores "mostly" is not a good dump.
+restore_dump() {   # file db: psql exit status, nothing on stderr
+  gunzip -c "$1" | su postgres -c "psql -p $PGPORT -d $2 -qAt -v ON_ERROR_STOP=1" >/dev/null 2>"$T/restore.err" && [[ ! -s "$T/restore.err" ]]
+}
+restore_dump "$f" restore_one || fail "the uploaded dump does not restore cleanly: $(head -3 "$T/restore.err")"
 [[ "$(su postgres -c "psql -p $PGPORT -d restore_one -qAt -c 'select count(*) from t'")" == 600000 ]] || fail "the uploaded dump does not restore to 600000 rows"
+# Control: the same check must catch a dump with one bad statement in it. (With ON_ERROR_STOP=0 psql
+# exits 0 on such a dump, which is why the old check could not fail on a restore error.)
+su postgres -c "psql -p $PGPORT -qAt -c 'CREATE DATABASE restore_bad'" >/dev/null
+{ gunzip -c "$f" | sed -n 1,40p; echo 'SELECT * FROM table_that_does_not_exist;'; gunzip -c "$f" | tail -n +41; } | gzip -c > "$T/broken.sql.gz"
+! restore_dump "$T/broken.sql.gz" restore_bad || fail "the restore check passed a dump that contains a failing statement"
+gunzip -c "$T/broken.sql.gz" | su postgres -c "psql -p $PGPORT -d restore_bad -qAt -v ON_ERROR_STOP=0" >/dev/null 2>&1 \
+  || fail "fixture: the control should show psql exiting 0 under ON_ERROR_STOP=0"
 pass "status.json: per db last attempt/success/error kind/object path/bytes; uploads exist, valid gzip, complete; the dump restores to the original 600000 rows"
 
 # gcloud saw the isolated config dir and the private key path, and no secret.
-grep -qF "auth activate-service-account --key-file=$PRIV/gcs-key.json -q | CLOUDSDK_CONFIG=$PRIV/gcloud uid=$(id -u $BU)" $FAKEGCS/calls.log || fail "gcloud auth call: $(head -3 $FAKEGCS/calls.log)"
+grep -qF "auth activate-service-account --key-file=$PRIV/gcs-key.json -q | CLOUDSDK_CONFIG=$PRIV/gcloud/daily uid=$(id -u $BU)" $FAKEGCS/calls.log || fail "gcloud auth call: $(head -3 $FAKEGCS/calls.log)"
 grep -q "^gcloud storage cp -q -- $PRIV/work/run-[A-Za-z0-9]*/fake-one-.*\.sql\.gz gs://bucket-a/fake-one/" $FAKEGCS/calls.log || fail "gcloud upload call"
-[[ -f $PRIV/gcloud/active-account ]] || fail "gcloud config was not written under the backup user's CLOUDSDK_CONFIG"
+[[ -f $PRIV/gcloud/daily/active-account ]] || fail "gcloud config was not written under the backup user's CLOUDSDK_CONFIG"
 no_canary_in "gcloud argv log" $FAKEGCS/calls.log
 no_canary_in "journal" $JOURNAL
 no_canary_in "status.json and the world-readable state dir" $STATE/status.json
@@ -610,6 +625,7 @@ done
 [[ ! -e $ETC/connections.env && ! -e $PRIV/gcs-key.json ]] || fail "credentials survived disabling"
 [[ -s $STATUS && "$(status_get '.enabled')" == false && "$(status_get '.databases["fake-one"].last_success')" != null ]] || fail "status.json was lost or not marked disabled"
 [[ -d $PRIV/errors && -f $PRIV/errors/last-error-fake-weekly.log ]] || fail "logs/state were removed"
+[[ ! -e $PRIV/gcloud ]] || fail "gcloud's config (a copy of the service-account credentials) survived disabling: $(ls -A $PRIV/gcloud)"
 getent passwd $BU >/dev/null && [[ -x /usr/local/lib/ikenga-backup/run-backup.sh ]] || fail "user or scripts removed"
 ls /etc/ikenga/secrets-backup/ | grep -q '^connections.env.bak-' || fail "no root-only copy of the removed env file"
 prov; grep -q 'no changes' "$OUT" || fail "disabled rerun reported changes: $(sed -n '/Summary/,$p' "$OUT")"

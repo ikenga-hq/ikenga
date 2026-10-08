@@ -3,6 +3,12 @@
 #
 #   run-backup.sh --schedule <name>     back up every enabled database of that schedule
 #   run-backup.sh --init-status         create/refresh status.json from the config (no dumps)
+#   run-backup.sh --install-key         write the GCS key (from stdin) to the key file, atomically, mode 0600
+#   run-backup.sh --mark-disabled       set enabled=false in status.json
+#
+# The last three are how provision.sh (root) touches the backup user's
+# directories: it runs this script AS the backup user, so root never follows a
+# symlink in a directory the user controls.
 #
 # Ported from the rex-vps db-backup scripts (D-B10) and installed by
 # `provision.sh backups` into /usr/local/lib/ikenga-backup. systemd runs it as
@@ -34,15 +40,15 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${BACKUP_CONFIG_FILE:-/etc/ikenga-backup/backup-config.json}"
 ENVFILE="${BACKUP_ENV_FILE:-/etc/ikenga-backup/connections.env}"
 STATE="${BACKUP_STATE_DIR:-/var/lib/ikenga-backup}"
+STATUS_DIR="${BACKUP_STATUS_DIR:-$STATE/status}"      # the backup user's; STATE itself is root's
 PRIV="${BACKUP_HOME:-$STATE/private}"
 KEY_FILE="${BACKUP_KEY_FILE:-$PRIV/gcs-key.json}"
 WORK_ROOT="${BACKUP_WORK_DIR:-$PRIV/work}"
 ERR_DIR="$PRIV/errors"
 DUMP_MIN_MAJOR="${BACKUP_PG_MIN_MAJOR:-17}"
 VERIFY="${BACKUP_VERIFY:-$SELF_DIR/verify-backup.sh}"
-STATUS="$STATE/status.json"
+STATUS="$STATUS_DIR/status.json"
 
-export CLOUDSDK_CONFIG="${CLOUDSDK_CONFIG:-$PRIV/gcloud}"
 export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 export CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true
 export CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=1
@@ -53,12 +59,20 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --schedule) SCHEDULE="${2:-}"; shift 2 ;;
     --init-status) MODE=init; shift ;;
+    --install-key) MODE=install-key; shift ;;
+    --mark-disabled) MODE=mark-disabled; shift ;;
     *) echo "ikenga-backup: unknown argument" >&2; exit 2 ;;
   esac
 done
 if [[ "$MODE" == run ]]; then
   [[ "$SCHEDULE" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || { echo "ikenga-backup: --schedule <name> is required (lowercase letters, digits, -)" >&2; exit 2; }
 fi
+
+# One gcloud config directory PER SCHEDULE (the unit sets it): gcloud keeps its
+# credentials in sqlite files there, and schedules that start together (a
+# Persistent timer catching up after downtime fires them all at once) must not
+# activate into the same one.
+export CLOUDSDK_CONFIG="${CLOUDSDK_CONFIG:-$PRIV/gcloud/${SCHEDULE:-default}}"
 
 say() { printf 'ikenga-backup: %s\n' "$*"; }
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -74,20 +88,20 @@ status_edit() {
     local cur='{}' tmp
     [[ -s "$STATUS" ]] && cur="$(cat -- "$STATUS" 2>/dev/null || true)"
     jq -e 'type == "object"' <<<"$cur" >/dev/null 2>&1 || cur='{}'
-    tmp="$(mktemp "$STATE/.status.XXXXXX")" || exit 1
+    tmp="$(mktemp "$STATUS_DIR/.status.XXXXXX")" || exit 1
     if jq "$@" "$filter" <<<"$cur" >"$tmp"; then
       chmod 0644 "$tmp"; mv -f -- "$tmp" "$STATUS"
     else
       rm -f -- "$tmp"; exit 1
     fi
-  ) 9>>"$STATE/.status.lock"
+  ) 9>>"$STATUS_DIR/.status.lock"
 }
 
 BLANK_DB='{schedule:null,last_attempt:null,last_attempt_ok:null,last_success:null,last_error_kind:null,last_error_at:null,object:null,bytes:null,duration_s:null}'
 
 # The databases this config would back up, as [{name,schedule}].
 config_dbs() {
-  jq -c '[.databases[] | select(.enabled != false) | {name, schedule}]' "$CONFIG"
+  jq -c '[.databases[] | select(.enabled == true) | {name, schedule}]' "$CONFIG"
 }
 
 init_status() {
@@ -285,17 +299,36 @@ backup_one() {
 
 # ------------------------------------------------------------------ main
 
+# Modes provision.sh runs as the backup user, before anything else is looked at.
+if [[ "$MODE" == install-key ]]; then
+  umask 0077
+  [[ -d "$PRIV" && ! -L "$PRIV" ]] || { say "no private directory"; exit 1; }
+  { [[ ! -e "$KEY_FILE" && ! -L "$KEY_FILE" ]] || [[ -f "$KEY_FILE" && ! -L "$KEY_FILE" ]]; } || { say "the key path is not a regular file"; exit 1; }
+  ktmp="$(mktemp "$PRIV/.key.XXXXXX")" || exit 1
+  if cat >"$ktmp" && [[ -s "$ktmp" ]] && chmod 0600 "$ktmp" && mv -f -- "$ktmp" "$KEY_FILE"; then
+    say "key file written"; exit 0
+  fi
+  rm -f -- "$ktmp"; say "could not write the key file"; exit 1
+fi
+if [[ "$MODE" == mark-disabled ]]; then
+  [[ -d "$STATUS_DIR" && -w "$STATUS_DIR" ]] || { say "status directory is not writable"; exit 1; }
+  umask 0077
+  status_edit '.enabled = false | .updated = $now' --arg now "$(now)" || { say "could not write the status file"; exit 1; }
+  say "status marked disabled"; exit 0
+fi
+
 [[ -r "$CONFIG" ]] || { say "cannot read the config"; exit 1; }
 jq -e '.databases | type == "array"' "$CONFIG" >/dev/null 2>&1 || { say "the config is not valid (no databases array)"; exit 1; }
-[[ -d "$STATE" && -w "$STATE" ]] || { say "state directory is not writable"; exit 1; }
+[[ -d "$STATUS_DIR" && -w "$STATUS_DIR" ]] || { say "status directory is not writable"; exit 1; }
 umask 0077
-mkdir -p -- "$PRIV" "$WORK_ROOT" "$ERR_DIR" "$CLOUDSDK_CONFIG"
 
 if [[ "$MODE" == init ]]; then
   init_status || { say "could not write the status file"; exit 1; }
   say "status file initialised"
   exit 0
 fi
+
+mkdir -p -- "$PRIV" "$WORK_ROOT" "$ERR_DIR" "$CLOUDSDK_CONFIG"
 
 init_status || say "WARNING: could not refresh the status file"
 
@@ -336,7 +369,7 @@ while IFS= read -r db_json; do
     say "db=$name status=FAILED kind=$KIND"
     record_db "$name" "$SCHEDULE" false "$KIND" "" 0 $((SECONDS - t0)) || say "WARNING: could not update the status file"
   fi
-done < <(jq -c --arg s "$SCHEDULE" '.databases[] | select(.enabled != false and .schedule == $s)' "$CONFIG")
+done < <(jq -c --arg s "$SCHEDULE" '.databases[] | select(.enabled == true and .schedule == $s)' "$CONFIG")
 
 failed_json="$(printf '%s\n' "${FAILED_NAMES[@]:-}" | jq -R . | jq -sc 'map(select(. != ""))')"
 record_schedule "$SCHEDULE" "$SUCCEEDED" "$failed_json" || say "WARNING: could not update the status file"

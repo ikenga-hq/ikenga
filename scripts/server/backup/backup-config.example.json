@@ -1,5 +1,5 @@
 {
-  "description": "Postgres backups to Google Cloud Storage (provision.sh BACKUP_CONFIG). Holds secret NAMES only, never values: each connection_secret names a `[backup]` line in the provisioner's SECRETS_FILE.",
+  "description": "Postgres backups to Google Cloud Storage (provision.sh BACKUP_CONFIG). Holds secret NAMES only, never values: each connection_secret names a `[backup]` line in the provisioner's SECRETS_FILE. A database is backed up only with \"enabled\": true (missing or false = skipped).",
   "databases": [
     { "name": "royalti-prod-db",    "connection_secret": "ROYALTIO_PROD_DB_CONNECTION_STRING",    "schedule": "4hourly", "gcs_bucket": "db-backups-archive", "enabled": true },
     { "name": "royalti-website-db", "connection_secret": "ROYALTIO_WEBSITE_DB_CONNECTION_STRING", "schedule": "daily",   "gcs_bucket": "db-backups-archive", "enabled": true },
