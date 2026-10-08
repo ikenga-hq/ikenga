@@ -861,7 +861,12 @@ pub(super) fn info_arm(state: &AppState) -> RpcResponse {
 }
 
 pub(super) fn snapshot_arm(state: &AppState) -> RpcResponse {
-    RpcResponse::success(state.term_hooks.snapshots())
+    match TermHooks::base_url(&state.config)
+        .and_then(|_| state.term_hooks.dir_or_reason().map(|_| ()))
+    {
+        Ok(()) => RpcResponse::success(state.term_hooks.snapshots()),
+        Err(reason) => RpcResponse::error(reason),
+    }
 }
 
 #[cfg(test)]

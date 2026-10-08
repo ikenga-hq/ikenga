@@ -600,8 +600,10 @@ describe('/ngwa/health — a remote web session on the headless daemon', () => {
 		mount();
 		await waitFor(() => expect(document.querySelector('[data-unsigned-unavailable]')).not.toBeNull());
 		expect(document.querySelector('[data-unsigned-unknown]')).toBeNull();
-		expect(document.querySelector('[data-unsigned]')).toBeNull();
-		expect(document.querySelector('[data-unsignedn]')?.textContent).toContain('—');
+		expect(document.querySelector('[data-unsignedn]')?.textContent).toContain(
+			'not available on this server'
+		);
+		expect(document.querySelector('[data-unsignedn]')?.textContent).not.toContain('unsigned');
 		expect(panel('trust').textContent).toContain(TRUST);
 		await waitFor(() =>
 			expect(document.querySelector('[data-audit-unavailable]')?.textContent).toContain('sidecar supervisor')

@@ -1192,8 +1192,15 @@ export function NgwaHealthSurface({
 					<h3>
 						<Shield className="h-3.5 w-3.5" />
 						<span>Trust</span>
-						<span className="n warn" data-unsignedn>
-							{snapshotReady && trustDown.length === 0 ? unsigned.length : '—'} unsigned
+						<span
+							className={`n ${trustNotServed ? '' : unsigned.length > 0 && snapshotReady && trustDown.length === 0 ? 'warn' : ''}`}
+							data-unsignedn
+						>
+							{trustNotServed
+								? NOT_AVAILABLE_ON_SERVER_LABEL.toLowerCase()
+								: snapshotReady && trustDown.length === 0
+									? `${unsigned.length} unsigned`
+									: '—'}
 						</span>
 					</h3>
 					<div className="hrow" data-row="unsigned">

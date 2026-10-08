@@ -460,7 +460,9 @@ describe('NgwaStoreSurface', () => {
 
 		reject(new Error('npm warn tar TAR_ENTRY_ERROR ENOSPC: no space left on device, write'));
 		const alert = await within(foot).findByRole('alert');
-		expect(alert.textContent).toMatch(/^Not enough disk space to install .+\. Free some space and try again\.$/);
+		expect(alert.textContent).toMatch(
+			/^Not enough disk space to install .+\. Free some space and try again\.$/
+		);
 		expect(within(foot).queryByRole('progressbar')).toBeNull();
 
 		// The raw log sits behind Show details.
@@ -708,7 +710,9 @@ describe('NgwaStoreSurface — snapshot failure is not a registry outage', () =>
 				onRetry={onRetry}
 			/>
 		);
-		const state = container.querySelector('[data-state="ngwa-store-snapshot-error"]') as HTMLElement;
+		const state = container.querySelector(
+			'[data-state="ngwa-store-snapshot-error"]'
+		) as HTMLElement;
 		expect(state).not.toBeNull();
 		expect(state.textContent).toContain("Can't read installed packages");
 		expect(state.textContent).toContain("Command 'ngwa_snapshot' failed: boom");
@@ -719,15 +723,45 @@ describe('NgwaStoreSurface — snapshot failure is not a registry outage', () =>
 
 	it('"Registry unreachable" is kept for a catalog that failed (catalogStatus error) only', () => {
 		const { container } = renderWithClient(
-			<NgwaStoreSurface
-				catalog={mockCatalog}
-				catalogStatus="error"
-				catalogError="fetch failed"
-			/>
+			<NgwaStoreSurface catalog={mockCatalog} catalogStatus="error" catalogError="fetch failed" />
 		);
 		const notice = container.querySelector('[data-catalog-unavailable]') as HTMLElement;
 		expect(notice.textContent).toContain('Registry unreachable');
 		expect(notice.textContent).toContain('fetch failed');
 		expect(container.querySelector('[data-state="ngwa-store-snapshot-error"]')).toBeNull();
+	});
+});
+
+describe('NgwaStoreSurface — disabledReason (WP-S)', () => {
+	it('uses disabledReason for update button title when onUpdate is undefined', () => {
+		const { container } = renderWithClient(
+			<NgwaStoreSurface catalog={mockCatalog} disabledReason="Not available on this server yet" />
+		);
+		const updateBtn = container.querySelector<HTMLButtonElement>(
+			'.srow[data-id="@ikenga/pkg-tasks"] button.btn'
+		);
+		expect(updateBtn).not.toBeNull();
+		expect(updateBtn?.disabled).toBe(true);
+		expect(updateBtn?.title).toBe('Not available on this server yet');
+	});
+
+	it('uses disabledReason for install button in sheet when onInstall is undefined', async () => {
+		const loadDetail = vi
+			.fn()
+			.mockResolvedValue(detailVersion({ id: 'skill-groundwork', name: 'skill-groundwork' }));
+		renderWithClient(
+			<NgwaStoreSurface
+				catalog={mockCatalog}
+				initialSelectedId="skill-groundwork"
+				loadDetail={loadDetail}
+				disabledReason="Not available on this server yet"
+			/>
+		);
+		const sheet = document.querySelector('[data-storesheet]');
+		expect(sheet).not.toBeNull();
+		await waitFor(() => {
+			const blocked = sheet?.querySelector('[data-install-blocked]');
+			expect(blocked?.textContent).toBe('Not available on this server yet');
+		});
 	});
 });

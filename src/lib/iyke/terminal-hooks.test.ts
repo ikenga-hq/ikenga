@@ -45,6 +45,12 @@ describe('statusline snapshots', () => {
 		expect(await fetchStatuslineSnapshots()).toBeNull();
 	});
 
+	it('publishes reason if snapshot rejected with honest reason and info was not set', async () => {
+		h.snaps.mockRejectedValue(new Error('Not available on this server: no data folder'));
+		expect(await fetchStatuslineSnapshots()).toBeNull();
+		expect(claudeHooksUnavailableReason()).toBe('Not available on this server: no data folder');
+	});
+
 	it('come from the bridge on the desktop', async () => {
 		h.remote = false;
 		h.iykeFetch.mockResolvedValue({ ok: true, json: async () => ({ t2: {} }) });
