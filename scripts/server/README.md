@@ -239,6 +239,32 @@ The daemon has no way for the root side to inject a per-account environment: a p
 
 The fix for the second group belongs in the daemon: `T1Launcher::host_env()` reading the root-owned `/etc/ikenga/secrets/<unix_name>.env` and adding its entries to the child's environment, under names the PTY denylist does not match, would carry them into every PTY and Chi run. The file format is a plain `NAME=value` list so that change needs nothing new from the provisioner. Until then, treat agent-account secrets delivered this way as available to shell-launched work only.
 
+## Swap
+
+A small box with several agent sessions open (a 3.8 GB host with three people each running a ~280 MB `claude` session plus agents) runs out of memory without swap, and the OOM killer then ends a session. The provisioner gives the box a swap file, as part of the full run (it goes **first**, before the apt installs) or on its own with `sudo ikenga-provision swap` (`--dry-run` prints the plan).
+
+```bash
+SWAP_SIZE=auto        # auto | 2G | 4096M | off | 0        (default auto)
+SWAPPINESS=10         # vm.swappiness, 0-100: swap is overflow, not eager paging   (default 10)
+SWAP_FILE=/swapfile   # absolute path on a local ext4/xfs/f2fs filesystem          (default /swapfile)
+```
+
+`auto` is 4G for a box with up to 8 GB of RAM (RAM is rounded up to whole GiB, so a "4 GB" host that reports a little under counts as 4) and 2G above that. An explicit size is `<n>M` or `<n>G`, between 64M and 64G. `off` and `0` mean "manage nothing, and take away what a previous run made".
+
+What a run owns, and nothing else: the `SWAP_FILE` itself (root:root, 0600), **one** `/etc/fstab` line ending in `# ikenga-swap`, and `/etc/sysctl.d/90-ikenga-swap.conf` (`vm.swappiness`, applied with `sysctl -p` on that file). The fstab line is the ownership marker: a swap file without it is never touched, and fstab is backed up (`/etc/fstab.bak-<time>`, last five kept) before every change and never gets a second line.
+
+| State | What the run does |
+|-------|-------------------|
+| Any **other** swap is active (a partition, `/swap.img`, another file, zram, or an active `SWAP_FILE` with no ikenga marker) | Nothing. It reports the swap it found and exits 0. Swappiness is left alone too. |
+| No swap file yet | Checks the target, then builds `SWAP_FILE.ikenga-new` (`fallocate`; `dd` if the filesystem refuses it), `mkswap`, renames it into place, adds the fstab line, `swapon`, writes the sysctl file. `SWAP_FILE` is never a half-written file. |
+| Managed file, right size | "no changes". It repairs a missing or duplicated fstab line and a wrong mode, turns the file back on if it is off, and re-applies `vm.swappiness` if the live value drifted. |
+| Managed file, different size | `swapoff`, replace, `swapon`. It **refuses** (exit 1, nothing changed) unless the swap in use plus 256 MiB fits in `MemAvailable`. The new size is also checked against the free disk first. |
+| `SWAP_SIZE=off` | `swapoff` (same memory check), then removes the file, the fstab line and the sysctl file. The live `vm.swappiness` stays until the next reboot. Nothing managed = "nothing to remove". |
+
+Refused before anything changes (exit 1, with the reason): `SWAP_FILE` is a symlink or sits behind one; its directory is missing; it is on btrfs (needs a `nodatacow` file from `btrfs filesystem mkswapfile`, not done here), on tmpfs, overlayfs, NFS, FUSE or anything else that is not ext2/3/4, xfs or f2fs; creating it would leave less than 10% of that filesystem free; the file already exists and is not managed by ikenga; fstab already has a swap line for that path that ikenga did not write; or the managed file lives at a different path than `SWAP_FILE` now says (set it back, or `SWAP_SIZE=off` first).
+
+Tests: `scripts/server/test-swap-container.sh` (loop-mounted ext4 in a privileged container, real `swapon`; the swap table and `vm.swappiness` are kernel-global, so it restores both on exit).
+
 ## SSH tunnels
 
 A tunnel is a systemd unit that keeps `ssh -N -L 127.0.0.1:<port>:<host>:<port>` up to a remote host, as an unprivileged user, with a **pinned host key**. The backups use one to reach a database that only listens on its own machine. `sudo ikenga-provision tunnels` (or the full provision run, which does it **before** backups) converges all of it from the profile; `--dry-run` prints the plan.
