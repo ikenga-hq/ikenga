@@ -3387,6 +3387,9 @@ tunnel_unit() {   # name
     "User=$TUNNEL_USER" \
     "Group=$TUNNEL_USER"
   printf 'ExecStart=/usr/bin/ssh -NT \\\n'
+  # -F none: never read ~/.ssh/config, so nothing in the tunnel user's home can
+  # add a ProxyCommand, a GlobalKnownHostsFile or an extra forward.
+  printf '  -F none \\\n'
   printf '  -i %s \\\n' "$TUNNEL_KEY"
   printf '  -o UserKnownHostsFile=%s \\\n' "$TUNNEL_KH"
   printf '  -o %s \\\n' StrictHostKeyChecking=yes IdentitiesOnly=yes ExitOnForwardFailure=yes ServerAliveInterval=30 ServerAliveCountMax=3 BatchMode=yes
@@ -3513,11 +3516,13 @@ sync_tunnels() {
 
   # Root-owned things go first, before any check the tunnel user can influence:
   # a symlink planted in its own tree must not keep a removed tunnel running.
+  # Profile-only checks first: a malformed pinned host key must stop the run
+  # before anything (including stale-unit removal) changes on the host.
+  backup_apt_install openssh-client util-linux iproute2
+  if [[ ${#TN_NAMES[@]} -gt 0 ]]; then tunnel_check_host_keys; fi
   tunnel_remove_stale
   if [[ ${#TN_NAMES[@]} -eq 0 ]]; then return 0; fi
 
-  backup_apt_install openssh-client util-linux iproute2
-  tunnel_check_host_keys
   tunnel_refuse_symlinks
   tunnel_ensure_user
   backup_safe_dir 0700 "$TUNNEL_USER" "$TUNNEL_USER" "${TN_UID:-0}" "$TUNNEL_HOME"

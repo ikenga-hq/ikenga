@@ -435,6 +435,7 @@ Wants=network-online.target
 User=ikenga-tunnel
 Group=ikenga-tunnel
 ExecStart=/usr/bin/ssh -NT \
+  -F none \
   -i /var/lib/ikenga-tunnel/.ssh/id_ed25519 \
   -o UserKnownHostsFile=/var/lib/ikenga-tunnel/.ssh/known_hosts \
   -o StrictHostKeyChecking=yes \
@@ -475,7 +476,7 @@ prov
 [[ "$(cut -d' ' -f3 $KEY.pub)" == "ikenga-tunnel@royalti-box" ]] || fail "the key comment changed"
 [[ "$(systemctl show -p InvocationID --value devotee-db-tunnel.service)" == "$INVB" ]] || fail "adoption restarted the tunnel"
 ok "the adopted tunnel still works" reach 5544 55432
-out_has "$(cut -d' ' -f2 $KEY.pub)" || fail "the authorized_keys line should print the adopted key"
+grep -qF -- "$(cut -d' ' -f2 $KEY.pub)" "$OUT" || fail "the authorized_keys line should print the adopted key"
 # Only cosmetics differ: a comment and a Description are not a change either.
 sed -i '1i # hand-edited note' "$UNITS/devotee-db-tunnel.service"; sed -i 's/^Description=.*/Description=renamed/' "$UNITS/devotee-db-tunnel.service"
 prov; { [[ $RC -eq 0 ]] && out_has 'no changes'; } || fail "comment/Description edits should not count as a change"
@@ -487,5 +488,21 @@ prov
 wait_for 20 listening 5544 || fail "tunnel not up again"
 ok "tunnel up again" reach 5544 55432
 pass "adopt-existing: the box's hand-made user, key, known_hosts and unit are taken over with no change"
+
+# ------------------------------------------------- 12. verifier follow-ups
+# a) ~/.ssh/config planted by the tunnel user is ignored (-F none). The unit's
+# sandbox hides any file a ProxyCommand could write, so plant one that FAILS:
+# if the config were read, the tunnel could not come up.
+std_profile; prov
+as_tun sh -c "printf 'Host *\n  ProxyCommand /bin/false\n' > $SSHDIR/config"
+systemctl restart devotee-db-tunnel.service
+wait_for 20 reach 5544 55432 || fail "the tunnel user's ~/.ssh/config was read (ProxyCommand /bin/false broke the tunnel): -F none missing"
+as_tun rm -f "$SSHDIR/config"
+# b) a malformed pinned host key stops the run BEFORE a stale unit is removed.
+profile "TUNNEL_FROM=127.0.0.1" "TUNNEL_KNOWN_HOSTS=(\"127.0.0.1 ssh-rsa ${HKEY#* }\")" "TUNNELS=(\"$T1\")"; prov
+[[ $RC -ne 0 ]] || fail "a mislabelled pinned key should be refused"
+[[ -e "$UNITS/alt-db-tunnel.service" ]] || fail "a refused profile removed a stale unit before refusing"
+std_profile; prov
+pass "verifier follow-ups: ~/.ssh/config is ignored; a bad pinned key refuses before anything is removed"
 
 echo "==> [Container] ALL TUNNEL CHECKS PASSED ($CHECKS assertions)"
