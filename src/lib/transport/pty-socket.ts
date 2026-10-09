@@ -28,6 +28,29 @@ export function createDaemonPtySocketOpener(wsUrl: string, token?: string): Open
 	};
 }
 
+/**
+ * Open PTY sockets that can carry input, by PTY id.
+ *
+ * The daemon writes every binary frame a client sends on `/ws/pty/:id` to
+ * the PTY, under the same `dispatch` check as the `pty_write` RPC. Typing
+ * through the socket keeps keystrokes in order — one stream — where one HTTP
+ * request per key does not: on a jittery link two requests on different
+ * connections overtake each other and the shell receives `teh` for `the`.
+ */
+const inputSinks = new Map<string, Set<(bytes: Uint8Array) => boolean>>();
+
+/**
+ * Send `data` to PTY `id` over an open socket. False when none is open (not
+ * attached yet, or reconnecting); the caller then falls back to the RPC.
+ */
+export function sendPtyInput(id: string, data: string): boolean {
+	const sinks = inputSinks.get(id);
+	if (!sinks) return false;
+	const bytes = new TextEncoder().encode(data);
+	for (const send of sinks) if (send(bytes)) return true;
+	return false;
+}
+
 interface SnapshotControl {
 	type: 'ikenga.snapshot';
 	end_offset: number;
@@ -286,12 +309,29 @@ export function attachRemotePty(
 		reconnectTimer = setTimeout(connect, delay);
 	};
 
+	// Binary, never text: the daemon tries a text frame as a JSON control
+	// message first, and typed text must not be able to spell one.
+	const sink = (bytes: Uint8Array): boolean => {
+		if (closedByCaller || !ws || ws.readyState !== WebSocket.OPEN) return false;
+		ws.send(bytes);
+		return true;
+	};
+	let sinks = inputSinks.get(id);
+	if (!sinks) {
+		sinks = new Set();
+		inputSinks.set(id, sinks);
+	}
+	sinks.add(sink);
+
 	connect();
 
 	return () => {
 		closedByCaller = true;
 		if (reconnectTimer) clearTimeout(reconnectTimer);
 		connectionStateStore.terminalClosed(id);
+		const own = inputSinks.get(id);
+		own?.delete(sink);
+		if (own && own.size === 0) inputSinks.delete(id);
 		if (ws) ws.close();
 	};
 }
