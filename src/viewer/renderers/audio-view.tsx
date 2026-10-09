@@ -29,7 +29,7 @@ function LocalAudioView({ path }: AudioViewProps) {
 		let handle: ViewerHandle | null = null;
 		setState({ kind: 'loading' });
 
-		viewerServe(dirname(path))
+		viewerServe(dirname(path), path)
 			.then((h) => {
 				handle = h;
 				if (cancelled) {

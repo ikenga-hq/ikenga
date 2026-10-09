@@ -1208,8 +1208,14 @@ export interface ViewerHandle {
 	token: string;
 }
 
-export async function viewerServe(rootDir: string): Promise<ViewerHandle> {
-	return invoke('viewer_serve', { rootDir });
+/**
+ * Mount `rootDir` for previewing `filePath`. The browser daemon needs the page:
+ * it refuses a root above the page's project (or, for a page in no project,
+ * above its own directory), because the root is derived from the page's own
+ * markup. The desktop command takes no such argument, so it is not sent there.
+ */
+export async function viewerServe(rootDir: string, filePath: string): Promise<ViewerHandle> {
+	return invoke('viewer_serve', isRemoteWebSession() ? { rootDir, filePath } : { rootDir });
 }
 
 export async function viewerStop(token: string): Promise<void> {

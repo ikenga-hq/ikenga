@@ -24,7 +24,7 @@ import {
 import { useEffectiveMenu } from '@/lib/actions/store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { resolveMenuItems } from '@/shell/menu/resolve';
-import { pickViewerRoot } from '../lib/relative-root';
+import { resolveViewerRoot } from '../lib/viewer-root';
 import { PinComposer, type PickResult } from '@/shell/artifact-studio/pin-composer';
 import * as M from '@/lib/artifact/bridge-messages';
 import { wrapHostMessage } from '@/lib/artifact/bridge-messages';
@@ -86,13 +86,13 @@ function LocalHtmlFrame({ path, paneId }: HtmlFrameProps) {
 		setState({ kind: 'loading' });
 
 		fsRead(path)
-			.then((res) => {
+			.then(async (res) => {
 				const html = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(res.bytes));
-				const { root, file } = pickViewerRoot(path, html);
+				const { root, file } = await resolveViewerRoot(path, html);
 				if (isRemoteWebSession()) {
-					return viewerServe(root).then((h) => ({ h, file, port: null }));
+					return viewerServe(root, path).then((h) => ({ h, file, port: null }));
 				}
-				return Promise.all([viewerServe(root), viewerPort()]).then(([h, port]) => ({
+				return Promise.all([viewerServe(root, path), viewerPort()]).then(([h, port]) => ({
 					h,
 					file,
 					port,
