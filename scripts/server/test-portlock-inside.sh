@@ -27,6 +27,26 @@ T2='alt-db=pgtunnel2@127.0.0.1:2222 5545:127.0.0.1:55433'
 SQ=/var/lib/pl-squat
 CHECKS=0
 
+# The AF_SMC probes autoload the host's smc module (a container shares the host kernel).
+# Put the host back the way it was: unload it again if this run is what loaded it.
+SMC_PRELOADED=0; [[ -d /sys/module/smc ]] && SMC_PRELOADED=1
+smc_restore() {
+  [[ $SMC_PRELOADED -eq 0 && -d /sys/module/smc ]] || return 0
+  local i
+  for i in 1 2 3 4 5 6; do
+    python3 - <<'PY' 2>/dev/null || true
+import ctypes, os
+libc = ctypes.CDLL(None, use_errno=True)
+for m in (b"smc_diag", b"smc"):
+    libc.syscall(176, m, os.O_NONBLOCK)   # delete_module(name, O_NONBLOCK): never waits, fails if in use
+PY
+    [[ -d /sys/module/smc ]] || return 0
+    sleep 1   # (a closing SMC socket may still hold it for a moment)
+  done
+  return 0
+}
+trap smc_restore EXIT
+
 fail() {
   echo "FAIL: $*" >&2
   { echo "--- listeners ---"; ss -ltn; echo "--- tunnel units ---"; systemctl is-active devotee-db-tunnel.service alt-db-tunnel.service $LOCKUNIT 2>&1
@@ -69,7 +89,44 @@ printf 'ping\n' >&9
 read -t 5 -u 9 r || exit 1
 [[ "$b" == "fake-postgres-$3" && "$r" == ping ]]
 EOF
-chmod 0755 /usr/local/bin/pl-connect /usr/local/bin/pl-reach
+# The AF_SMC route: SMC connects through a kernel-internal TCP socket that has no owning file,
+# which a `meta skuid != {..}` rule does not match. <backend> "-" = connect only.
+# Exit 0 connected (and the backend answered), 1 the connect was refused, 2 connected but wrong answer, 3 AF_SMC unavailable.
+cat > /usr/local/bin/pl-smc <<'SMCEOF'
+#!/usr/bin/python3
+import ctypes, errno, os, signal, socket, struct, sys
+host, port, backend = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+signal.alarm(8)
+try:
+    s = socket.socket(43, socket.SOCK_STREAM, 0)   # AF_SMC
+except OSError as e:
+    print("AF_SMC unavailable: %s" % e); sys.exit(3)
+libc = ctypes.CDLL(None, use_errno=True)
+addr = struct.pack("=H", socket.AF_INET) + struct.pack("!H", port) + socket.inet_aton(host) + b"\0" * 8
+if libc.connect(s.fileno(), addr, len(addr)) != 0:
+    e = ctypes.get_errno()
+    if e in (errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT, errno.ESOCKTNOSUPPORT):
+        print("AF_SMC unusable: %s" % errno.errorcode.get(e, e)); sys.exit(3)
+    print("connect: %s" % errno.errorcode.get(e, e)); sys.exit(1)
+def line():
+    b = b""
+    while not b.endswith(b"\n"):
+        c = os.read(s.fileno(), 1)
+        if not c: sys.exit(2)
+        b += c
+    return b.decode().strip()
+if backend == "-":
+    print("connected"); sys.exit(0)
+try:
+    banner = line()
+    os.write(s.fileno(), b"ping\n")
+    ok = banner == "fake-postgres-" + backend and line() == "ping"
+except OSError as e:
+    print("after connect: %s" % e); sys.exit(2)
+print("reached" if ok else "wrong banner: %r" % banner)
+sys.exit(0 if ok else 2)
+SMCEOF
+chmod 0755 /usr/local/bin/pl-connect /usr/local/bin/pl-reach /usr/local/bin/pl-smc
 reaches() { as_user "$1" timeout 10 pl-reach "${4:-127.0.0.1}" "$2" "$3"; }          # user port backend [host]
 # Rejected: the connect fails, and fast (a reset from the rule, not a hang until a timeout).
 rejected() {   # user port [host]
@@ -77,10 +134,18 @@ rejected() {   # user port [host]
   as_user "$1" timeout 8 pl-connect "${3:-127.0.0.1}" "$2" 2>/dev/null || rc=$?
   [[ $rc -ne 0 && $((SECONDS - t0)) -le 3 ]]
 }
+smc_reaches() { as_user "$1" timeout 10 pl-smc 127.0.0.1 "$2" "$3"; }          # user port backend
+smc_rejected() {   # user port: AF_SMC refused (rc 1), and fast
+  local t0=$SECONDS rc=0 o
+  o="$(as_user "$1" timeout 8 pl-smc 127.0.0.1 "$2" - 2>&1)" || rc=$?
+  [[ $rc -ne 3 ]] || { echo "AF_SMC is not available in this kernel, so the SMC bypass cannot be tested: $o" >&2; return 1; }
+  [[ $rc -eq 1 && $((SECONDS - t0)) -le 3 ]]
+}
 counters() { nft list table inet "$TABLE" 2>/dev/null | grep -oE 'packets [0-9]+' | awk '{s+=$2} END{print s+0}'; }
-lock_rules() { nft list table inet "$TABLE" 2>/dev/null; }
-# The uids the first rule lets through, e.g. "0,995" (nft prints a one-element set without braces).
-lock_uidset() { lock_rules | grep -m1 'skuid' | sed -E 's/.*skuid != (.*) counter .*/\1/' | tr -d '{} '; }
+# (captured first, then printed: a `grep -q` that quits early must not SIGPIPE nft and fail the pipeline under pipefail)
+lock_rules() { local o; o="$(nft list table inet "$TABLE" 2>/dev/null)" || return 1; printf '%s\n' "$o"; }
+# The uids the first (allow) rule lets through, e.g. "0,995" (nft prints a one-element set without braces).
+lock_uidset() { lock_rules | grep -m1 'skuid' | sed -E 's/.*skuid (.*) accept .*/\1/' | tr -d '{} '; }
 
 # ------------------------------------------------------------------- fixture
 
@@ -150,6 +215,7 @@ check_matrix() {   # [allowed users, space separated; root is implied]
         ok "$u reaches 127.0.0.1:$port" reaches "$u" "$port" "$be"
       else
         ok "$u is REJECTED on 127.0.0.1:$port" rejected "$u" "$port"
+        ok "$u is REJECTED on 127.0.0.1:$port over AF_SMC (a socket with no owner)" smc_rejected "$u" "$port"
       fi
     done
   done
@@ -173,6 +239,12 @@ refuse "TUNNEL_ALLOW_USERS a bad name" 'TUNNEL_ALLOW_USERS entry 1' "TUNNEL_FROM
 refuse "TUNNEL_ALLOW_USERS a scalar" 'TUNNEL_ALLOW_USERS must be a bash array' "TUNNEL_FROM=127.0.0.1" "$KHP" "TUNNEL_ALLOW_USERS=ik-ada" "TUNNELS=(\"$T1\")"
 refuse "TUNNEL_ALLOW_USERS a user that does not exist" "names 'nosuchuser'" "TUNNEL_FROM=127.0.0.1" "$KHP" "TUNNEL_ALLOW_USERS=(nosuchuser)" "TUNNELS=(\"$T1\")"
 [[ ! -e /tmp/pwned ]] || fail "a TUNNEL_ALLOW_USERS value reached a shell"
+# a dry run gives the same refusal as the real run (and changes nothing)
+profile "TUNNEL_FROM=127.0.0.1" "$KHP" "TUNNEL_ALLOW_USERS=(nosuchuser)" "TUNNELS=(\"$T1\")"
+prov --dry-run
+{ [[ $RC -ne 0 ]] && out_has "names 'nosuchuser'"; } || fail "a dry run should refuse an unknown TUNNEL_ALLOW_USERS name like the real run (rc=$RC)"
+{ ! compgen -G "$UNITS/*-tunnel.service" >/dev/null && [[ ! -e $LOCKFILE && ! -e $UNITS/$LOCKUNIT && ! -e /etc/modprobe.d/ikenga-no-smc.conf ]]; } || fail "the refused dry run changed the host"
+CHECKS=$((CHECKS + 1))
 pass "TUNNEL_ALLOW_USERS is validated before anything changes (bad name, scalar, unknown user)"
 
 # ------------------------------------------------------ 2. dry run, fresh host
@@ -206,10 +278,22 @@ nft list table inet $TABLE >/dev/null || fail "the table is not loaded"
 # Only root is allowed: the backup user does not exist yet, so { 0 }.
 [[ "$(lock_uidset)" == 0 ]] || fail "expected only uid 0 while the backup user does not exist: $(lock_rules)"
 for p in 5544 5545; do
-  for fam in ip ip6; do lock_rules | grep -qE "$fam daddr [0-9a-f:.]+ tcp dport $p meta skuid != .* counter packets [0-9]+ bytes [0-9]+ reject with tcp reset comment \"ikenga:lock:[a-z-]+:$fam:$p:0\"" || fail "no $fam rule for port $p"; done
+  for fam in ip ip6; do
+    # Fail closed: an allow rule on the allowed uids, directly followed by a reject for every other socket
+    # (a `skuid !=` reject would not match a socket without an owner).
+    lock_rules | grep -qE "$fam daddr [0-9a-f:.]+ tcp dport $p meta skuid 0 accept comment \"ikenga:lock:[a-z-]+:$fam:$p:allow:0\"" || fail "no $fam allow rule for port $p"
+    lock_rules | grep -qE "$fam daddr [0-9a-f:.]+ tcp dport $p counter packets [0-9]+ bytes [0-9]+ reject with tcp reset comment \"ikenga:lock:[a-z-]+:$fam:$p:deny\"" || fail "no $fam deny rule for port $p"
+    [[ "$(lock_rules | grep -A1 "$fam daddr [0-9a-f:.]* tcp dport $p meta skuid" | tail -1)" == *"reject with tcp reset"* ]] || fail "the $fam deny rule for port $p does not directly follow its allow rule"
+  done
 done
-# Exactly this: one table, one base chain, 4 port rules, accept policy. Nothing else is touched.
-[[ "$(lock_rules | grep -c 'dport')" == 4 ]] || fail "expected 4 port rules"
+if lock_rules | grep -q 'skuid !='; then fail "a skuid != rule is back (it does not match ownerless sockets)"; fi
+# Exactly this: one table, one base chain, 8 port rules (allow + deny, 2 families, 2 ports), accept policy. Nothing else is touched.
+[[ "$(lock_rules | grep -c 'dport')" == 8 ]] || fail "expected 8 port rules"
+# The smc modules cannot be loaded, whatever the kernel would autoload.
+[[ "$(stat -c '%a %U %G' /etc/modprobe.d/ikenga-no-smc.conf)" == "644 root root" ]] || fail "the no-smc modprobe file is missing or has the wrong mode"
+grep -qxF 'install smc /bin/false' /etc/modprobe.d/ikenga-no-smc.conf && grep -qxF 'install smc_diag /bin/false' /etc/modprobe.d/ikenga-no-smc.conf || fail "the no-smc modprobe file lacks the install lines"
+if command -v modprobe >/dev/null 2>&1; then modprobe -n -v smc 2>&1 | grep -q '/bin/false' || fail "modprobe does not see the smc blacklist"; fi
+out_has 'ikenga-no-smc.conf written' || fail "the no-smc file was not reported"
 lock_rules | grep -qE 'type filter hook output priority (filter|0); policy accept;' || fail "chain is not an accept-policy output hook"
 authorise_remote
 systemctl restart devotee-db-tunnel.service alt-db-tunnel.service
@@ -234,9 +318,11 @@ check_matrix "$BU"
 # Positive control: it is the table that blocks them. Take it away and ik-ada gets in.
 nft delete table inet $TABLE
 ok "control: with the table gone ik-ada reaches the port" reaches ik-ada 5544 55432
+ok "control: with the table gone ik-ada reaches the port over AF_SMC too (the SMC probe works)" smc_reaches ik-ada 5544 55432
 prov
 { [[ $RC -eq 0 ]] && out_has 'port lock reloaded \(the live table had drifted\)'; } || fail "a deleted table should be restored by a rerun"
 ok "ik-ada is rejected again" rejected ik-ada 5544
+ok "ik-ada is rejected again over AF_SMC" smc_rejected ik-ada 5544
 # IPv6 loopback and an unlocked port.
 ip -6 addr show dev lo 2>/dev/null | grep -q '::1' || { sysctl -qw net.ipv6.conf.lo.disable_ipv6=0 2>/dev/null || true; }
 if ip -6 addr show dev lo | grep -q '::1'; then
@@ -253,6 +339,7 @@ fi
 systemd-run --quiet --unit=pl-fake-open --collect socat "TCP-LISTEN:5599,bind=127.0.0.1,fork,reuseaddr" "SYSTEM:echo fake-postgres-5599; cat" >/dev/null
 wait_for 10 listening 5599
 ok "a port that is not a tunnel port stays open to everyone (ik-ada, 5599)" reaches ik-ada 5599 5599
+ok "...also over AF_SMC (control: the probe reaches an unlocked port)" smc_reaches ik-ada 5599 5599
 systemctl stop pl-fake-open
 pass "the matrix: root and the backup user reach 127.0.0.1 and ::1; ik-ada, ik-agent, a plain user and the tunnel user are rejected; only tunnel ports are affected"
 
@@ -263,11 +350,11 @@ INV2="$(systemctl show -p InvocationID --value alt-db-tunnel.service)"
 LOCKTS="$(systemctl show -p ActiveEnterTimestampMonotonic --value $LOCKUNIT)"
 reaches ik-ada 5544 55432 >/dev/null 2>&1 || true   # (rejected; also bumps the counter)
 C1="$(counters)"
-SUM1="$(sha256sum $LOCKFILE $UNITS/$LOCKUNIT $UNITS/*-tunnel.service.d/10-ikenga-lock.conf | sha256sum)"
+SUM1="$(sha256sum $LOCKFILE /etc/modprobe.d/ikenga-no-smc.conf $UNITS/$LOCKUNIT $UNITS/*-tunnel.service.d/10-ikenga-lock.conf | sha256sum)"
 prov
 { [[ $RC -eq 0 ]] && out_has 'no changes: the host already matches this profile'; } || fail "rerun should report no changes"
 [[ "$(counters)" -ge "$C1" && "$C1" -gt 0 ]] || fail "rerun reloaded the table (its counters were reset)"
-[[ "$(sha256sum $LOCKFILE $UNITS/$LOCKUNIT $UNITS/*-tunnel.service.d/10-ikenga-lock.conf | sha256sum)" == "$SUM1" ]] || fail "rerun rewrote the lock files"
+[[ "$(sha256sum $LOCKFILE /etc/modprobe.d/ikenga-no-smc.conf $UNITS/$LOCKUNIT $UNITS/*-tunnel.service.d/10-ikenga-lock.conf | sha256sum)" == "$SUM1" ]] || fail "rerun rewrote the lock files"
 [[ "$(systemctl show -p InvocationID --value devotee-db-tunnel.service)" == "$INV1" ]] || fail "rerun restarted devotee-db"
 [[ "$(systemctl show -p InvocationID --value alt-db-tunnel.service)" == "$INV2" ]] || fail "rerun restarted alt-db"
 [[ "$(systemctl show -p ActiveEnterTimestampMonotonic --value $LOCKUNIT)" == "$LOCKTS" ]] || fail "rerun restarted the lock unit"
@@ -301,12 +388,27 @@ ok "control: with the extra accept rule ik-ada gets in" reaches ik-ada 5544 5543
 prov
 { [[ $RC -eq 0 ]] && out_has 'port lock reloaded \(the live table had drifted\)'; } || fail "an extra rule is drift and should be reloaded away"
 ok "ik-ada rejected again after the repair" rejected ik-ada 5544
-h="$(nft -a list table inet $TABLE | grep 'ip6 daddr ::1 tcp dport 5545' | grep -oE 'handle [0-9]+' | awk '{print $2}')"
+h="$(nft -a list table inet $TABLE | grep 'ip6 daddr ::1 tcp dport 5545' | grep ' reject ' | grep -oE 'handle [0-9]+' | awk '{print $2}')"
 nft delete rule inet $TABLE output handle "$h"
 prov
-{ [[ $RC -eq 0 ]] && out_has 'drifted'; } || fail "a missing rule is drift and should be restored"
-[[ "$(lock_rules | grep -c dport)" == 4 ]] || fail "the table was not restored to 4 rules"
-pass "drift (extra accept rule, deleted rule, deleted table) is detected and repaired by a rerun"
+{ [[ $RC -eq 0 ]] && out_has 'drifted'; } || fail "a missing deny rule is drift and should be restored"
+[[ "$(lock_rules | grep -c dport)" == 8 ]] || fail "the table was not restored to 8 rules"
+h="$(nft -a list table inet $TABLE | grep 'ip daddr 127.0.0.1 tcp dport 5544' | grep 'accept' | grep -oE 'handle [0-9]+' | awk '{print $2}')"
+nft delete rule inet $TABLE output handle "$h"
+ok "control: without its allow rule the backup user is locked out" rejected "$BU" 5544
+prov
+{ [[ $RC -eq 0 ]] && out_has 'drifted'; } || fail "a missing allow rule is drift and should be restored"
+ok "the backup user is let in again" reaches "$BU" 5544 55432
+# the deny rule moved behind the others: same rules, different order
+h="$(nft -a list table inet $TABLE | grep 'ip daddr 127.0.0.1 tcp dport 5544' | grep ' reject ' | grep -oE 'handle [0-9]+' | awk '{print $2}')"
+nft delete rule inet $TABLE output handle "$h"
+nft add rule inet $TABLE output ip daddr 127.0.0.1 tcp dport 5544 counter reject with tcp reset comment '"ikenga:lock:devotee-db:ip:5544:deny"'
+prov
+{ [[ $RC -eq 0 ]] && out_has 'drifted'; } || fail "a reordered rule is drift and should be restored"
+[[ "$(lock_rules | grep -c dport)" == 8 ]] || fail "the table was not restored to 8 rules after the reorder"
+ok "ik-ada is rejected after the repairs" rejected ik-ada 5544
+ok "ik-ada is rejected over AF_SMC after the repairs" smc_rejected ik-ada 5544
+pass "drift (extra accept rule, deleted deny rule, deleted allow rule, reordered rule, deleted table) is detected and repaired by a rerun"
 
 # `nft flush ruleset` (the stock nftables.service does this at load) then the unit's reload path: equal to what boot does
 nft flush ruleset      # (also drops ufw's chains: exactly why the lock does not live in nftables.service)
@@ -368,6 +470,26 @@ prov
 [[ "$(cat /root/sensitive)" == SENSITIVE ]] || fail "root wrote through the rules-file symlink"
 rm -f $LOCKFILE; cp -p $T/lock.real $LOCKFILE
 std_profile; prov; { [[ $RC -eq 0 ]] && out_has 'no changes'; } || fail "state not clean after the symlink check"
+# the lock DIRECTORY as a symlink (root would write lock.nft through it), for a real run and a dry run, and for removal
+mkdir -p /root/symdir; mv /etc/ikenga-tunnels /root/ikenga-tunnels.real; ln -s /root/symdir /etc/ikenga-tunnels
+std_profile "TUNNEL_ALLOW_USERS=(ik-ada)"
+for m in "" --dry-run; do
+  prov $m
+  { [[ $RC -ne 0 ]] && out_has 'symbolic link'; } || fail "a symlinked lock directory should be refused ($m)"
+  [[ -z "$(ls -A /root/symdir)" ]] || fail "root wrote through the lock-directory symlink ($m): $(ls /root/symdir)"
+done
+profile "TUNNELS=()"; prov
+{ [[ $RC -ne 0 ]] && out_has 'symbolic link'; } || fail "removal through a symlinked lock directory should be refused"
+[[ -e /root/ikenga-tunnels.real/lock.nft && -z "$(ls -A /root/symdir)" ]] || fail "removal touched the symlink's target"
+rm -f /etc/ikenga-tunnels; mv /root/ikenga-tunnels.real /etc/ikenga-tunnels; rmdir /root/symdir
+# the modprobe file as a symlink
+cp -p /etc/modprobe.d/ikenga-no-smc.conf $T/nosmc.real; rm -f /etc/modprobe.d/ikenga-no-smc.conf; ln -s /root/sensitive /etc/modprobe.d/ikenga-no-smc.conf
+std_profile "TUNNEL_ALLOW_USERS=(ik-ada)"; prov
+{ [[ $RC -ne 0 ]] && out_has 'symbolic link'; } || fail "a symlinked no-smc modprobe file should be refused"
+[[ "$(cat /root/sensitive)" == SENSITIVE ]] || fail "root wrote through the modprobe symlink"
+rm -f /etc/modprobe.d/ikenga-no-smc.conf; cp -p $T/nosmc.real /etc/modprobe.d/ikenga-no-smc.conf
+std_profile; prov; { [[ $RC -eq 0 ]] && out_has 'no changes'; } || fail "state not clean after the lock-directory/modprobe symlink checks"
+if [[ -d /sys/module/smc ]]; then out_has 'smc kernel module is already loaded' || fail "a loaded smc module (the probes autoloaded it) is not reported"; fi
 pass "TUNNEL_ALLOW_USERS: a list, (), duplicates/root folded, back to the default; a symlinked rules file is refused"
 
 # --------------------------------------------- 9. a tunnel removed loses its rules
@@ -375,7 +497,7 @@ pass "TUNNEL_ALLOW_USERS: a list, (), duplicates/root folded, back to the defaul
 profile "TUNNEL_FROM=127.0.0.1" "BACKUPS_ENABLED=1" "$KHP" "TUNNELS=(\"$T1\")"
 prov
 { [[ $RC -eq 0 ]] && out_has 'unit alt-db-tunnel.service stopped, disabled and removed' && out_has 'port lock reloaded \(rules changed\)'; } || fail "removing a tunnel should say so and reload the lock"
-[[ "$(lock_rules | grep -c dport)" == 2 ]] || fail "alt-db's rules are still there: $(lock_rules)"
+[[ "$(lock_rules | grep -c dport)" == 4 ]] || fail "alt-db's rules are still there: $(lock_rules)"
 no "5545 is no longer in the table" bash -c "nft list table inet $TABLE | grep -q 5545"
 [[ ! -e "$UNITS/alt-db-tunnel.service.d/10-ikenga-lock.conf" && ! -d "$UNITS/alt-db-tunnel.service.d" ]] || fail "alt-db's drop-in was left behind"
 ok "devotee-db is still locked" rejected ik-ada 5544
@@ -383,7 +505,7 @@ profile "TUNNEL_FROM=127.0.0.1" "$KHP"; prov    # TUNNELS not mentioned: hands o
 { [[ $RC -eq 0 ]] && out_has 'does not define TUNNELS'; } || fail "no TUNNELS should be a no-op"
 ok "hands off: the lock is untouched" lock_rules
 std_profile; prov; [[ $RC -eq 0 ]] || fail "re-adding the second tunnel failed"
-[[ "$(lock_rules | grep -c dport)" == 4 ]] || fail "alt-db's rules did not come back"
+[[ "$(lock_rules | grep -c dport)" == 8 ]] || fail "alt-db's rules did not come back"
 authorise_remote; systemctl restart alt-db-tunnel.service; wait_for 25 listening 5545 || fail "alt-db did not come back"
 check_matrix "$BU"
 pass "removing a tunnel removes its rules and drop-in; no TUNNELS in the profile leaves the lock alone"
@@ -522,7 +644,7 @@ fi
 ok "the lock unit is enabled" systemctl is-enabled --quiet $LOCKUNIT
 [[ "$(unit_state $LOCKUNIT)" == active ]] || fail "the lock unit is not active after boot"
 ok "the table was loaded at boot" lock_rules
-[[ "$(lock_rules | grep -c dport)" == 4 ]] || fail "expected 4 port rules after boot: $(lock_rules)"
+[[ "$(lock_rules | grep -c dport)" == 8 ]] || fail "expected 8 port rules after boot: $(lock_rules)"
 BUID="$(id -u $BU)"
 [[ "$(lock_uidset)" == "0,$BUID" ]] || fail "wrong uid set after boot"
 ufw status | grep -q '^Status: active' || fail "ufw is not active after boot"
@@ -563,6 +685,7 @@ prov
 { [[ $RC -eq 0 ]] && out_has 'unit ikenga-tunnel-lock.service stopped, disabled and removed'; } || fail "TUNNELS=() should remove the lock"
 no "table gone" lock_rules
 [[ ! -e $LOCKFILE && ! -e $UNITS/$LOCKUNIT ]] || fail "lock file/unit left behind"
+[[ ! -e /etc/modprobe.d/ikenga-no-smc.conf ]] || fail "the no-smc modprobe file was left behind"
 compgen -G "$UNITS/*-tunnel.service.d/*" >/dev/null && fail "a drop-in was left behind"
 compgen -G "$UNITS/*-tunnel.service" >/dev/null && fail "a tunnel unit was left behind"
 if systemctl is-enabled --quiet $LOCKUNIT 2>/dev/null; then fail "the lock unit is still enabled"; fi

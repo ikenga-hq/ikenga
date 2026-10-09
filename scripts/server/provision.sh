@@ -3583,9 +3583,13 @@ tunnel_print_remote_lines() {
 # the remote database, and while the tunnel is down any of them could bind the
 # port and receive the backup job's connection, login included. So the connect
 # side is locked to uids: an nftables table of its own, `inet ikenga_tunnels`,
-# with an output-chain rule per tunnel port (per family: 127.0.0.1 and ::1) that
-# rejects `tcp dport <port>` from every uid except root and TN_ALLOW
-# (TUNNEL_ALLOW_USERS, default the backup user).
+# with, per tunnel port and per family (127.0.0.1 and ::1), an ALLOW rule for the
+# uids of root and TN_ALLOW (TUNNEL_ALLOW_USERS, default the backup user) followed
+# by a REJECT rule for everybody else. Fail closed on purpose: the obvious
+# `meta skuid != { allowed } reject` does not match a socket that has no owning
+# file (AF_SMC connects through a kernel-internal TCP socket of that kind), so
+# such a socket would walk straight through; "accept the allowed uids, reject
+# whatever is left" cannot be bypassed that way.
 #
 # Why a table of its own and not ufw: ufw cannot match on the local user, and
 # `ufw --force reset` (the perimeter step does it) rebuilds ufw's own chains only,
@@ -3612,11 +3616,15 @@ TUNNEL_LOCK_DIR="/etc/ikenga-tunnels"
 TUNNEL_LOCK_FILE="$TUNNEL_LOCK_DIR/lock.nft"
 TUNNEL_LOCK_TABLE="ikenga_tunnels"
 TUNNEL_LOCK_DROPIN="10-ikenga-lock.conf"
+# Defence in depth for the AF_SMC route (see above): the smc modules cannot be loaded.
+# An unprivileged socket(AF_SMC) autoloads them on a stock Ubuntu kernel.
+TUNNEL_NOSMC_FILE="/etc/modprobe.d/ikenga-no-smc.conf"
 TL_UIDS=(0); TL_DESC="root(0)"; TL_PENDING=()
 
-# Names -> uids. An allowed user that does not exist is an error, except the
-# backup user while backups are enabled (the backups phase creates it, after this
-# one, and the lock is converged again once it exists) and any user in a dry run.
+# Names -> uids. An allowed user that does not exist is an error (a dry run
+# reports the same refusal as the real run), except the backup user while
+# backups are enabled (the backups phase creates it, after this one, and the lock
+# is converged again once it exists).
 tunnel_lock_resolve() {
   local n line uid
   TL_UIDS=(0); TL_DESC="root(0)"; TL_PENDING=()
@@ -3627,7 +3635,7 @@ tunnel_lock_resolve() {
       (( uid > 0 )) || continue
       [[ " ${TL_UIDS[*]} " == *" $uid "* ]] && continue
       TL_UIDS+=("$uid"); TL_DESC+=", $n($uid)"
-    elif [[ ( "$n" == "$BACKUP_USER" && "$BACKUPS_ENABLED" == 1 ) || $DRY_RUN -eq 1 ]]; then
+    elif [[ "$n" == "$BACKUP_USER" && "$BACKUPS_ENABLED" == 1 ]]; then
       TL_PENDING+=("$n")
     else
       die "TUNNEL_ALLOW_USERS names '$n', which is not a user on this host. Create it first, or remove it from the list"
@@ -3636,12 +3644,14 @@ tunnel_lock_resolve() {
   mapfile -t TL_UIDS < <(printf '%s\n' "${TL_UIDS[@]}" | sort -n)
 }
 
-# The nft file for the current profile.
+# The nft file for the current profile. Per tunnel port and family: accept the
+# allowed uids, then reject everything else (the reject carries the counter).
 tunnel_lock_rules() {
-  local n p fam addr set
+  local n p fam addr set ids
   set="$(printf '%s, ' "${TL_UIDS[@]}")"; set="${set%, }"
+  ids="${set//[ ]/}"
   printf '%s\n' "# Managed by ikenga provision.sh (tunnels): change TUNNELS / TUNNEL_ALLOW_USERS in the profile, not this file." \
-    "# Connections to a tunnel's local port are accepted from: ${TL_DESC}. Only this table is replaced; ufw's rules are not touched." \
+    "# Connections to a tunnel's local port are accepted from: ${TL_DESC}; everything else is rejected (so a socket without an owner is rejected too). Only this table is replaced; ufw's rules are not touched." \
     "table inet $TUNNEL_LOCK_TABLE" \
     "delete table inet $TUNNEL_LOCK_TABLE" \
     "table inet $TUNNEL_LOCK_TABLE {" \
@@ -3651,11 +3661,52 @@ tunnel_lock_rules() {
     p="${TN_LPORT[$n]}"
     for fam in ip ip6; do
       if [[ $fam == ip ]]; then addr="127.0.0.1"; else addr="::1"; fi
-      printf '    %s daddr %s tcp dport %s meta skuid != { %s } counter reject with tcp reset comment "ikenga:lock:%s:%s:%s:%s"\n' \
-        "$fam" "$addr" "$p" "$set" "$n" "$fam" "$p" "${set//[ ]/}"
+      printf '    %s daddr %s tcp dport %s meta skuid { %s } accept comment "ikenga:lock:%s:%s:%s:allow:%s"\n' \
+        "$fam" "$addr" "$p" "$set" "$n" "$fam" "$p" "$ids"
+      printf '    %s daddr %s tcp dport %s counter reject with tcp reset comment "ikenga:lock:%s:%s:%s:deny"\n' \
+        "$fam" "$addr" "$p" "$n" "$fam" "$p"
     done
   done
   printf '%s\n' "  }" "}"
+}
+
+# One line per rule, in order: "<verb> <comment>". Works on both our own text and
+# on `nft list table` output, which words the same rule differently (counter
+# values, set braces) but keeps the verb, the comment and the order.
+tunnel_lock_signature() {
+  awk '/^[[:space:]]*(#|table |delete table |chain |type |\}|$)/ { next }
+       { v = "other"; if ($0 ~ / reject /) v = "reject"; else if ($0 ~ / accept( |$)/) v = "accept"
+         c = ""; if (match($0, /ikenga:lock:[^"]+/)) c = substr($0, RSTART, RLENGTH)
+         print v, c }'
+}
+
+# The smc modules cannot be loaded (see the head of this section).
+tunnel_nosmc_text() {
+  printf '%s\n' "# Managed by ikenga provision.sh (tunnels): the tunnel port lock cannot be bypassed through AF_SMC." \
+    "# Removed again when the profile has no TUNNELS." \
+    "install smc /bin/false" \
+    "install smc_diag /bin/false"
+}
+
+# Written only when the lock is enabled. A module that is already loaded is not
+# unloaded by this (it may be in use); the port rules do not depend on it.
+sync_tunnel_nosmc() {
+  if [[ $DRY_RUN -eq 0 && ! -d /etc/modprobe.d ]]; then install -d -m 0755 -o root -g root -- /etc/modprobe.d; fi
+  if tl_write "$TUNNEL_NOSMC_FILE" 0644 "$(tunnel_nosmc_text)"; then
+    changed "$TUNNEL_NOSMC_FILE written (the smc kernel modules cannot be loaded)"
+  fi
+  if [[ -d /sys/module/smc ]]; then
+    note "the smc kernel module is already loaded; it is not unloaded automatically. Unload it ('rmmod smc_diag smc') or reboot; the port-lock rules hold either way"
+  fi
+}
+
+# Refuse a symlink anywhere root is about to write the lock, before writing any of it.
+tunnel_lock_refuse_symlinks() {
+  local f
+  for f in "$TUNNEL_LOCK_DIR" "$TUNNEL_LOCK_FILE" "$TUNNEL_NOSMC_FILE" "$SYSTEMD_DIR/$TUNNEL_LOCK_UNIT"; do
+    [[ ! -L "$f" ]] || die "$f is a symbolic link. Refusing to write through it. Inspect it, remove it by hand, and run again."
+  done
+  [[ ! -e "$TUNNEL_LOCK_DIR" || -d "$TUNNEL_LOCK_DIR" ]] || die "$TUNNEL_LOCK_DIR exists and is not a directory; refusing to touch it"
 }
 
 tunnel_lock_unit_text() {
@@ -3716,23 +3767,29 @@ tl_write() {
   return 0
 }
 
-# Is the live table exactly the wanted one? Compared by the rule comments (each
-# names tunnel, family, port and uids) and the number of port rules, so a
-# deleted, edited, extra or stale-uid rule all read as drift.
+# Is the live table exactly the wanted one? Compared rule by rule and in order by
+# verb and comment (each comment names tunnel, family, port and, on an allow rule,
+# the uids), so a deleted, edited, extra, reordered or stale-uid rule all read as
+# drift. A reject that comes before its allow would lock everybody out.
 tunnel_lock_live_ok() {   # rules-text
   local have got want
   command -v nft >/dev/null 2>&1 || return 1
   have="$(nft list table inet "$TUNNEL_LOCK_TABLE" 2>/dev/null)" || return 1
-  got="$(grep -oE 'ikenga:lock:[^"]+' <<<"$have" | sort || true)"
-  want="$(grep -oE 'ikenga:lock:[^"]+' <<<"$1" | sort || true)"
-  [[ "$got" == "$want" ]] || return 1
-  [[ "$(grep -c 'dport' <<<"$have" || true)" == "$(grep -c ' dport ' <<<"$1" || true)" ]]
+  got="$(tunnel_lock_signature <<<"$have")"
+  want="$(tunnel_lock_signature <<<"$1")"
+  [[ -n "$want" && "$got" == "$want" ]]
 }
 
 tunnel_lock_dropin_path() { printf '%s/%s.d/%s' "$SYSTEMD_DIR" "$(tunnel_unit_name "$1")" "$TUNNEL_LOCK_DROPIN"; }
 
 tunnel_lock_remove() {
   local any=0 f lu="${SYSTEMD_DIR:?}/${TUNNEL_LOCK_UNIT:?}" lf="${TUNNEL_LOCK_FILE:?}"
+  [[ ! -L "$TUNNEL_LOCK_DIR" ]] || die "$TUNNEL_LOCK_DIR is a symbolic link. Refusing to touch it."
+  if [[ -e "$TUNNEL_NOSMC_FILE" || -L "$TUNNEL_NOSMC_FILE" ]]; then
+    [[ ! -L "$TUNNEL_NOSMC_FILE" ]] || die "$TUNNEL_NOSMC_FILE is a symbolic link. Refusing to touch it."
+    if [[ $DRY_RUN -eq 0 ]]; then rm -f -- "$TUNNEL_NOSMC_FILE"; fi
+    changed "$TUNNEL_NOSMC_FILE removed"; any=1
+  fi
   if [[ -e "$lu" || -L "$lu" ]]; then
     [[ ! -L "$lu" ]] || die "$lu is a symbolic link. Refusing to touch it."
     if [[ $DRY_RUN -eq 0 ]]; then sc disable --now "$TUNNEL_LOCK_UNIT" >/dev/null 2>&1 || true; rm -f -- "$lu"; fi
@@ -3759,7 +3816,7 @@ tunnel_lock_remove() {
 sync_tunnel_lock() {
   [[ $TUNNELS_DEFINED -eq 1 ]] || return 0
   if [[ ${#TN_NAMES[@]} -eq 0 ]]; then
-    if [[ -e "$SYSTEMD_DIR/$TUNNEL_LOCK_UNIT" || -L "$SYSTEMD_DIR/$TUNNEL_LOCK_UNIT" || -e "$TUNNEL_LOCK_FILE" || -L "$TUNNEL_LOCK_FILE" ]]; then
+    if [[ -e "$SYSTEMD_DIR/$TUNNEL_LOCK_UNIT" || -L "$SYSTEMD_DIR/$TUNNEL_LOCK_UNIT" || -e "$TUNNEL_LOCK_FILE" || -L "$TUNNEL_LOCK_FILE" || -L "$TUNNEL_LOCK_DIR" || -e "$TUNNEL_NOSMC_FILE" || -L "$TUNNEL_NOSMC_FILE" ]]; then
       [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo)"
       tunnel_lock_remove
     fi
@@ -3768,6 +3825,7 @@ sync_tunnel_lock() {
   [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo)"
   local n f st rules reload_unit=0 file_changed=0 unit_changed=0 tmp
   tunnel_lock_resolve
+  tunnel_lock_refuse_symlinks
   [[ ${#TL_PENDING[@]} -eq 0 ]] || note "port lock: ${TL_PENDING[*]} does not exist yet; it is allowed once it does (the backups phase creates it, then this converges again)"
   backup_apt_install nftables
   rules="$(tunnel_lock_rules)"
@@ -3787,6 +3845,7 @@ sync_tunnel_lock() {
   if tl_write "$SYSTEMD_DIR/$TUNNEL_LOCK_UNIT" 0644 "$(tunnel_lock_unit_text)"; then
     unit_changed=1; reload_unit=1; changed "unit $TUNNEL_LOCK_UNIT installed"
   fi
+  sync_tunnel_nosmc
   for n in "${TN_NAMES[@]}"; do
     f="$(tunnel_lock_dropin_path "$n")"
     if [[ $DRY_RUN -eq 0 ]]; then
@@ -3834,6 +3893,8 @@ sync_tunnels() {
   fi
   log "SSH tunnels (user $TUNNEL_USER; ${#TN_NAMES[@]} tunnel(s))"
   [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo)"
+  # A symlink where the lock is written is refused before anything (a stale tunnel included) changes.
+  tunnel_lock_refuse_symlinks
 
   # Root-owned things go first, before any check the tunnel user can influence:
   # a symlink planted in its own tree must not keep a removed tunnel running.
