@@ -39,7 +39,7 @@ struct Seen {
 }
 
 /// Serves a fake child per launch on 127.0.0.1:0: `/api/rpc` and `/pkgs/*`
-/// echo what they received; `/ws/*` echoes frames.
+/// `/__viewer/*` echo what they received; `/ws/*` echoes frames.
 #[derive(Default)]
 struct FakeLauncher {
     launches: AtomicUsize,
@@ -91,7 +91,7 @@ impl ChildLauncher for FakeLauncher {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             let requests = Arc::new(Mutex::new(Vec::new()));
-            let (r1, r2) = (requests.clone(), requests.clone());
+            let (r1, r2, r3) = (requests.clone(), requests.clone(), requests.clone());
             let (open, open_delay) = (self.open_terminals.clone(), self.open_delay_ms.clone());
             let app = Router::new()
                 .route(
@@ -128,6 +128,10 @@ impl ChildLauncher for FakeLauncher {
                 .route(
                     "/pkgs/*rest",
                     get(move |req: Request<Body>| echo_http(r2.clone(), req)),
+                )
+                .route(
+                    "/__viewer/*rest",
+                    any(move |req: Request<Body>| echo_http(r3.clone(), req)),
                 )
                 .route(
                     "/ws/*rest",
@@ -1750,6 +1754,175 @@ async fn running_endpoints_never_launches() {
     let (eps, partial) = h.state.children.running_endpoints();
     assert_eq!((eps.len(), partial), (1, false));
     assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 1);
+}
+
+// ─── /__viewer/* (capability-token previews) ──────────────────────────────
+
+/// What a principal's child mints: `<uuid, simple form>_<random hex>`.
+fn viewer_token_for(id: PrincipalId) -> String {
+    format!("{}_{}", id.as_uuid().simple(), "ab".repeat(24))
+}
+
+#[test]
+fn viewer_token_principal_parses_the_simple_form_only() {
+    let id = PrincipalId::new_v7();
+    let tok = viewer_token_for(id);
+    assert_eq!(proxy::viewer_token_principal(&tok), Some(id));
+    // Hyphenated, no separator, empty random part, junk, a v4 uuid.
+    assert_eq!(proxy::viewer_token_principal(&format!("{id}_ab")), None);
+    assert_eq!(
+        proxy::viewer_token_principal(&id.as_uuid().simple().to_string()),
+        None
+    );
+    assert_eq!(
+        proxy::viewer_token_principal(&format!("{}_", id.as_uuid().simple())),
+        None
+    );
+    assert_eq!(proxy::viewer_token_principal("deadbeef_ab"), None);
+    assert_eq!(
+        proxy::viewer_token_principal(&format!("{}_ab", uuid::Uuid::new_v4().simple())),
+        None
+    );
+}
+
+/// The mount lives in the child, and a sandboxed page sends no session
+/// cookie: the token's principal prefix routes the request, to a RUNNING
+/// child only, and with no cookie it never launches one.
+#[tokio::test]
+async fn viewer_token_routes_to_the_running_child_without_a_cookie_and_never_launches() {
+    let h = harness().await;
+    let ada = insert_account(&h.pool, "ada", 20_001, false).await;
+    let bob = insert_account(&h.pool, "bob", 20_002, false).await;
+    let (ada_tok, bob_tok) = (viewer_token_for(ada), viewer_token_for(bob));
+
+    // No child running: nothing to launch, nothing to serve.
+    for tok in [&ada_tok, &bob_tok] {
+        let (status, _, _) = send(
+            &h.app,
+            request("GET", &format!("/__viewer/{tok}/index.html"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 0);
+
+    // Malformed / hyphenated / unknown-principal prefixes: 404, no launch.
+    for tok in [
+        format!("{ada}_ab"),
+        "nope".to_string(),
+        viewer_token_for(PrincipalId::new_v7()),
+    ] {
+        let (status, _, _) = send(
+            &h.app,
+            request("GET", &format!("/__viewer/{tok}/x"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{tok}");
+    }
+    assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 0);
+
+    // Ada's child comes up through her authenticated session...
+    let ada_cookie = login_cookie(&h.app, "ada").await;
+    assert_eq!(
+        rpc(&h.app, Some(&ada_cookie), json!({"cmd":"pty_list"}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 1);
+
+    // ...and her token now reaches it with NO cookie, as her child's bearer.
+    let (status, _, body) = send(
+        &h.app,
+        request("GET", &format!("/__viewer/{ada_tok}/sub/a%2520b.css?x=1"))
+            .header("range", "bytes=0-9")
+            .header("cookie", "ikenga_session=junk")
+            .header("origin", "null")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["data"]["path"],
+        format!("/__viewer/{ada_tok}/sub/a%2520b.css")
+    );
+    let seen = h.launcher.seen_for(ada);
+    let (uri, headers, _) = seen.requests.lock().unwrap().last().unwrap().clone();
+    assert_eq!(uri, format!("/__viewer/{ada_tok}/sub/a%2520b.css?x=1"));
+    assert_eq!(
+        headers.get("authorization").unwrap(),
+        &format!("Bearer {}", seen.token)
+    );
+    assert_eq!(headers.get("x-ikenga-principal").unwrap(), &ada.to_string());
+    assert!(headers.get("cookie").is_none() && headers.get("origin").is_none());
+    assert_eq!(headers.get("range").unwrap(), "bytes=0-9");
+    assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 1);
+
+    // Bob's token while only Ada's child runs: still no launch.
+    let (status, _, _) = send(
+        &h.app,
+        request("GET", &format!("/__viewer/{bob_tok}/x"))
+            .header("cookie", &ada_cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 1);
+
+    // With both children up, a token reaches ITS principal's child whatever
+    // session cookie rides along, and never the other's.
+    let bob_cookie = login_cookie(&h.app, "bob").await;
+    assert_eq!(
+        rpc(&h.app, Some(&bob_cookie), json!({"cmd":"pty_list"}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let ada_before = h.launcher.seen_for(ada).requests.lock().unwrap().len();
+    let (status, _, _) = send(
+        &h.app,
+        request("GET", &format!("/__viewer/{bob_tok}/x"))
+            .header("cookie", &ada_cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        h.launcher.seen_for(ada).requests.lock().unwrap().len(),
+        ada_before,
+        "bob's token must not reach ada's child"
+    );
+    let bob_seen = h.launcher.seen_for(bob);
+    let (uri, _, _) = bob_seen.requests.lock().unwrap().last().unwrap().clone();
+    assert_eq!(uri, format!("/__viewer/{bob_tok}/x"));
+
+    // Dot segments and non-read methods are refused at the broker.
+    for path in [
+        format!("/__viewer/{ada_tok}/../api/rpc"),
+        format!("/__viewer/{ada_tok}/%2e%2e/api/rpc"),
+    ] {
+        let (status, _, _) = send(
+            &h.app,
+            request("GET", &path).body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+    }
+    let (status, _, _) = send(
+        &h.app,
+        request("POST", &format!("/__viewer/{ada_tok}/x"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
 }
 
 /// `/ws/events` under T1 (principal isolation through the proxy).

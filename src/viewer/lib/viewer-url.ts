@@ -25,13 +25,15 @@ export function isHtmlArtifactPath(path: string): boolean {
 }
 
 export async function resolveHtmlViewerUrl(path: string): Promise<string> {
+	// In-app previews only in a browser session (founder decision, gap audit
+	// rank 8): the menu rows are hidden, and a URL minted here would register a
+	// mount no pane ever stops. Refuse rather than leak one.
+	if (isRemoteWebSession()) {
+		throw new Error('Not available on this server: viewer URLs are only offered in the desktop app');
+	}
 	const res = await fsRead(path);
 	const html = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(res.bytes));
 	const { root, file } = pickViewerRoot(path, html);
-	const handle = await viewerServe(root);
-	if (isRemoteWebSession()) {
-		return `${window.location.origin}${handle.url}${file}`;
-	}
-	const port = await viewerPort();
+	const [handle, port] = await Promise.all([viewerServe(root), viewerPort()]);
 	return `http://localhost:${port ?? FALLBACK_PORT}${handle.url}${file}`;
 }

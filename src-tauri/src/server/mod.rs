@@ -88,7 +88,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -404,8 +404,23 @@ async fn auth_middleware(
 ) -> Result<Response, Response> {
     use crate::access::{devices, DaemonAccess, DaemonMode, RequestMeta, StoreTier};
 
+    // `/__viewer/<token>/…` is authorized by its mount token: a sandboxed
+    // viewer page (opaque origin) cannot send the session cookie on its
+    // sub-resource requests, so the token — minted only by an authorized
+    // `viewer_serve`, idle-expiring, revoked by `viewer_stop` — is the
+    // credential. These are read-only GET/HEAD/OPTIONS routes whose answers
+    // carry `ACAO: *` and a `sandbox` CSP, so the browser `Origin` gate (which
+    // would reject the page's own `Origin: null`) does not apply to them.
     let is_viewer_path = req.uri().path().starts_with("/__viewer");
-    if !is_viewer_path && !origin_permitted(&req, &state) {
+    let viewer_token_ok = is_viewer_path
+        && matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS)
+        && req
+            .uri()
+            .path()
+            .strip_prefix("/__viewer/")
+            .and_then(|tail| tail.split('/').next())
+            .is_some_and(|token| state.viewer.has_token(token));
+    if !viewer_token_ok && !origin_permitted(&req, &state) {
         warn!(
             "Cross-origin request to {} rejected (origin: {:?})",
             req.uri().path(),
@@ -536,20 +551,11 @@ async fn auth_middleware(
         && pkg_cookie::presented_ok(req.headers(), &expected, now)
     {
         ctx = Some(access.operator_ctx(meta).await);
-    } else if ctx.is_none() && is_viewer_path {
-        let viewer_token = req
-            .uri()
-            .path()
-            .strip_prefix("/__viewer/")
-            .and_then(|tail| tail.split('/').next());
-        if let Some(token) = viewer_token {
-            if state.viewer.has_token(token) {
-                ctx = Some(match access.mode {
-                    DaemonMode::PrincipalChild => access.child_ctx(req.headers(), meta),
-                    DaemonMode::T0 => access.operator_ctx(meta).await,
-                });
-            }
-        }
+    } else if ctx.is_none() && viewer_token_ok {
+        ctx = Some(match access.mode {
+            DaemonMode::PrincipalChild => access.child_ctx(req.headers(), meta),
+            DaemonMode::T0 => access.operator_ctx(meta).await,
+        });
     }
 
     let with_cookie = |mut res: Response, cookie: &Option<String>| {
@@ -571,7 +577,11 @@ async fn auth_middleware(
     };
 
     // Non-RPC routes: their §1.6 requirement (RPCs are per command).
-    if let Some(requirement) = crate::access::route_requirement(req.uri().path()) {
+    // (A live viewer token already proved `Files` when `viewer_serve` minted it,
+    // and a principal child sees no caps header on a capability request.)
+    let requirement = crate::access::route_requirement(req.uri().path())
+        .filter(|_| !viewer_token_ok);
+    if let Some(requirement) = requirement {
         if let Err(e) = crate::access::check(&ctx, requirement) {
             return Err(with_cookie(forbidden(&e), &set_cookie));
         }

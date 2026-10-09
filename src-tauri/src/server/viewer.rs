@@ -3,24 +3,26 @@
 //! Mirrors desktop's `ViewerServerManager` (`src-tauri/src/viewer_server/mod.rs`),
 //! but integrates into the daemon's own HTTP server and permission system:
 //! - Mounts are registered via `viewer_serve` (behind session auth & path allowlist)
-//! - Paths are confined to `mount.root` via `safe_join` (no `..`, no symlinks escape)
+//! - Paths are confined to `mount.root` via `safe_join` (no `..`, no symlinks escape);
+//!   the file served is the checked canonical path itself (never re-resolved from a URI)
 //! - Paths are checked against the daemon's `PathGuard` allowlist and reserved directories
 //! - Content-Security-Policy enforces `sandbox allow-scripts;` (opaque origin, no cookies,
 //!   no /api/rpc access)
-//! - Supports HTTP Range requests (audio/video seeking) via `tower_http::services::ServeDir`
+//! - Supports HTTP Range requests (audio/video seeking) via `tower_http::services::ServeFile` on the already-checked canonical path
 //! - Injects artifact bridge, tokens stylesheet, and iyke bridge on `text/html` responses
 //! - Token-scoped URLs (`/__viewer/:token/*path`)
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use axum::body::{to_bytes, Body};
+use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use tower::util::ServiceExt;
-use tower_http::services::ServeDir;
+use tower_http::services::ServeFile;
 
 use super::AppState;
 
@@ -61,37 +63,93 @@ pub struct ViewerMount {
     pub root: PathBuf,
 }
 
-#[derive(Clone, Default)]
+/// A mount idle for this long is dropped (its URL stops working). Every served
+/// request refreshes it, so an open preview stays alive; a URL that was copied
+/// out of the app and never opened again does not stay valid forever.
+pub const MOUNT_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// At most this many live mounts; the least recently used is evicted first.
+const MAX_MOUNTS: usize = 256;
+
+struct MountEntry {
+    root: PathBuf,
+    last_used: Instant,
+}
+
+#[derive(Clone)]
 pub struct ViewerService {
-    mounts: Arc<DashMap<String, ViewerMount>>,
+    mounts: Arc<DashMap<String, MountEntry>>,
+    ttl: Duration,
+}
+
+impl Default for ViewerService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ViewerService {
     pub fn new() -> Self {
+        Self::with_ttl(MOUNT_IDLE_TTL)
+    }
+
+    pub fn with_ttl(ttl: Duration) -> Self {
         Self {
             mounts: Arc::new(DashMap::new()),
+            ttl,
         }
     }
 
-    /// Register a mount root. Under multi-user (T1), `principal_id` is encoded
-    /// in the token prefix (`<principal_uuid>_<random_hex>`) so the broker can
-    /// route subresource requests to the principal's child even when cookies
-    /// are omitted by the sandboxed iframe. Under T0, a 32-byte hex token is minted.
+    /// Register a mount root. The URL token is the *only* credential a
+    /// sandboxed viewer page can present (an opaque-origin document sends no
+    /// `SameSite` session cookie on its sub-resource requests), so it is a
+    /// bearer capability: 192+ bits of randomness, minted only by an
+    /// authorized `viewer_serve` call, idle-expiring ([`MOUNT_IDLE_TTL`]) and
+    /// revoked by `viewer_stop`. Under multi-user (T1), `principal_id` is
+    /// encoded in the token prefix (`<principal_uuid_simple>_<random_hex>`) so
+    /// the broker can route sub-resource requests to the principal's own
+    /// child; the broker never launches a child for it (a mount lives in the
+    /// child's memory, so no running child means no valid mount).
     pub fn register(&self, root: PathBuf, principal_id: Option<uuid::Uuid>) -> (String, String) {
+        self.sweep();
         let token = match principal_id {
             Some(pid) => format!("{}_{}", pid.simple(), random_token_hex(24)),
             None => random_token_hex(32),
         };
-        self.mounts
-            .insert(token.clone(), ViewerMount { root: root.clone() });
+        self.mounts.insert(
+            token.clone(),
+            MountEntry {
+                root: root.clone(),
+                last_used: Instant::now(),
+            },
+        );
         let url = format!("{VIEWER_PATH_PREFIX}/{token}/");
         tracing::info!(
             "viewer mount: registered {} at {} (token {})",
             root.display(),
-            url,
+            VIEWER_PATH_PREFIX,
             &token[..8]
         );
         (url, token)
+    }
+
+    /// Drop idle mounts, then the least recently used ones past the cap.
+    fn sweep(&self) {
+        let ttl = self.ttl;
+        self.mounts.retain(|_, m| m.last_used.elapsed() < ttl);
+        while self.mounts.len() >= MAX_MOUNTS {
+            let oldest = self
+                .mounts
+                .iter()
+                .min_by_key(|e| e.value().last_used)
+                .map(|e| e.key().clone());
+            match oldest {
+                Some(k) => {
+                    self.mounts.remove(&k);
+                }
+                None => break,
+            }
+        }
     }
 
     pub fn unregister(&self, token: &str) {
@@ -104,11 +162,33 @@ impl ViewerService {
     }
 
     pub fn has_token(&self, token: &str) -> bool {
-        self.mounts.contains_key(token)
+        let expired = match self.mounts.get(token) {
+            Some(m) => m.last_used.elapsed() >= self.ttl,
+            None => return false,
+        };
+        if expired {
+            self.mounts.remove(token);
+        }
+        !expired
     }
 
+    /// The mount behind `token`, refreshing its idle clock.
     pub fn get_mount(&self, token: &str) -> Option<ViewerMount> {
-        self.mounts.get(token).map(|m| m.clone())
+        let expired = {
+            let mut m = self.mounts.get_mut(token)?;
+            if m.last_used.elapsed() >= self.ttl {
+                true
+            } else {
+                m.last_used = Instant::now();
+                return Some(ViewerMount {
+                    root: m.root.clone(),
+                });
+            }
+        };
+        if expired {
+            self.mounts.remove(token);
+        }
+        None
     }
 }
 
@@ -245,6 +325,52 @@ pub async fn serve_viewer_root_handler(
     serve_mount_file(&state, &mount.root, "index.html", req).await
 }
 
+/// A plain refusal. The body never names a path or a reason: whoever holds a
+/// mount token must not learn the daemon's layout from an error.
+fn refuse(status: StatusCode) -> Response {
+    let body = if status == StatusCode::FORBIDDEN {
+        "forbidden"
+    } else {
+        "not found"
+    };
+    (status, body).into_response()
+}
+
+/// Keep only a `Range` header we can honour: one `bytes=a-b` / `bytes=a-` /
+/// `bytes=-n` range. Anything else (another unit, several ranges, garbage) is
+/// dropped so the response is a plain 200, which RFC 9110 §14.2 allows, rather
+/// than a 416 that a media element cannot recover from.
+fn sanitize_range(headers: &mut HeaderMap) {
+    let ok = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("bytes="))
+        .map(|spec| {
+            let spec = spec.trim();
+            match spec.split_once('-') {
+                Some((a, b)) => {
+                    let digits = |t: &str| t.bytes().all(|c| c.is_ascii_digit());
+                    digits(a) && digits(b) && !(a.is_empty() && b.is_empty())
+                }
+                None => false,
+            }
+        })
+        .unwrap_or(false);
+    if !ok {
+        headers.remove(header::RANGE);
+        headers.remove(header::IF_RANGE);
+    }
+}
+
+/// Whether `host` is safe to splice into a CSP source list.
+fn host_is_csp_safe(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 255
+        && host
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b':' | b'[' | b']'))
+}
+
 async fn serve_mount_file(
     state: &AppState,
     root: &PathBuf,
@@ -261,7 +387,8 @@ async fn serve_mount_file(
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
 
-    if req.method() != Method::GET && req.method() != Method::HEAD {
+    let is_head = req.method() == Method::HEAD;
+    if req.method() != Method::GET && !is_head {
         return (StatusCode::METHOD_NOT_ALLOWED, "method not allowed").into_response();
     }
 
@@ -269,43 +396,97 @@ async fn serve_mount_file(
         return (StatusCode::FORBIDDEN, "forbidden: service worker").into_response();
     }
 
-    // Path verification:
-    let Some(canonical) = safe_join(root, rel_path) else {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
+    // `rel_path` was percent-decoded exactly once, by the router. It is used
+    // verbatim from here on: the file that is served is the canonical path the
+    // checks below ran on, never a path re-derived from a URI (a second decode
+    // would turn `lea%256b` into `leak` after the symlink check had passed).
+    let Some(mut target) = safe_join(root, rel_path) else {
+        return refuse(StatusCode::NOT_FOUND);
     };
+    if target.is_dir() {
+        // `sub` -> `sub/`, keeping the `/__viewer/<token>` prefix, so relative
+        // assets of `sub/index.html` resolve against the directory.
+        let uri_path = req.uri().path();
+        if !uri_path.ends_with('/') {
+            let mut location = format!("{uri_path}/");
+            if let Some(q) = req.uri().query() {
+                location.push('?');
+                location.push_str(q);
+            }
+            return Response::builder()
+                .status(StatusCode::TEMPORARY_REDIRECT)
+                .header(header::LOCATION, location)
+                .body(Body::empty())
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+        let index = format!("{}/index.html", rel_path.trim_end_matches('/'));
+        let Some(idx) = safe_join(root, &index) else {
+            return refuse(StatusCode::NOT_FOUND);
+        };
+        target = idx;
+    }
+    if !target.is_file() {
+        return refuse(StatusCode::NOT_FOUND);
+    }
 
-    // Allowlist & reserved directory verification
-    if let Err(e) = state.path_guard.check(&canonical) {
-        tracing::warn!("viewer: path_guard check refused {}: {e}", canonical.display());
-        return (StatusCode::FORBIDDEN, format!("forbidden: {e}")).into_response();
+    // The same allowlist and reserved-directory gate `fs_read` applies,
+    // on every request (the mount root alone is not enough: the allowlist can
+    // shrink after `viewer_serve`, and the root may contain the daemon's dirs).
+    if let Err(e) = state.path_guard.check(&target) {
+        tracing::warn!(
+            "viewer: path_guard check refused {}: {e}",
+            target.display()
+        );
+        return refuse(StatusCode::FORBIDDEN);
     }
 
     let host = req
         .headers()
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
+        .filter(|h| host_is_csp_safe(h))
         .map(|h| h.to_string());
 
-    let uri_str = if rel_path.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", rel_path)
-    };
-    let new_uri = match uri_str.parse() {
-        Ok(u) => u,
-        Err(_) => return (StatusCode::BAD_REQUEST, "bad path").into_response(),
-    };
-    *req.uri_mut() = new_uri;
+    let is_html_file = mime_guess::from_path(&target)
+        .first()
+        .is_some_and(|m| m.essence_str() == "text/html");
 
-    let svc = ServeDir::new(root);
-    let resp = match svc.oneshot(req).await {
-        Ok(r) => r.into_response(),
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "serve failed").into_response(),
+    let resp: Response = 'serve: {
+        if is_html_file {
+            // HTML is always the injected document (200, never a byte range of
+            // the raw file), so GET and HEAD describe the same representation.
+            let too_big = tokio::fs::metadata(&target)
+                .await
+                .map(|m| m.len() as usize > HTML_INJECT_MAX_BYTES)
+                .unwrap_or(true);
+            if !too_big {
+                if let Ok(bytes) = tokio::fs::read(&target).await {
+                    let out = match std::str::from_utf8(&bytes) {
+                        Ok(html) => {
+                            inject_iyke_bridge(&inject_artifact_bridge(html)).into_bytes()
+                        }
+                        Err(_) => bytes,
+                    };
+                    let len = out.len();
+                    break 'serve Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                        .header(header::CONTENT_LENGTH, len)
+                        .body(if is_head { Body::empty() } else { Body::from(out) })
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                }
+            }
+        }
+        sanitize_range(req.headers_mut());
+        match ServeFile::new(&target).oneshot(req).await {
+            Ok(r) => r.into_response(),
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "serve failed").into_response(),
+        }
     };
 
     let (mut parts, body) = resp.into_parts();
 
-    // Headers common to all responses
+    // Headers common to all responses.
     parts
         .headers
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
@@ -319,46 +500,14 @@ async fn serve_mount_file(
         .headers
         .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
 
-    let csp_str = if let Some(h) = &host {
-        csp_for_host(VIEWER_CSP, h)
-    } else {
-        VIEWER_CSP.to_string()
-    };
-    if let Ok(csp_val) = HeaderValue::from_str(&csp_str) {
-        parts.headers.insert(header::CONTENT_SECURITY_POLICY, csp_val);
-    }
-
-    let is_html = parts
-        .headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_ascii_lowercase().starts_with("text/html"))
-        .unwrap_or(false);
-
-    // Only inject bridges on 200 OK HTML responses (not partial content / ranges)
-    if is_html && parts.status == StatusCode::OK {
-        let bytes = match to_bytes(body, HTML_INJECT_MAX_BYTES).await {
-            Ok(b) => b,
-            Err(_) => return Response::from_parts(parts, Body::empty()),
-        };
-        match std::str::from_utf8(&bytes) {
-            Ok(html) => {
-                let with_artifact = inject_artifact_bridge(html);
-                let with_all = inject_iyke_bridge(&with_artifact);
-                let new_bytes = with_all.into_bytes();
-                parts
-                    .headers
-                    .insert(header::CONTENT_LENGTH, HeaderValue::from(new_bytes.len()));
-                return Response::from_parts(parts, Body::from(new_bytes));
-            }
-            Err(_) => {
-                parts
-                    .headers
-                    .insert(header::CONTENT_LENGTH, HeaderValue::from(bytes.len()));
-                return Response::from_parts(parts, Body::from(bytes));
-            }
-        }
-    }
+    // The sandbox directive must never be absent: a host that cannot be
+    // spliced in safely just gets the base policy.
+    let csp = host
+        .as_deref()
+        .map(|h| csp_for_host(VIEWER_CSP, h))
+        .and_then(|c| HeaderValue::from_str(&c).ok())
+        .unwrap_or_else(|| HeaderValue::from_static(VIEWER_CSP));
+    parts.headers.insert(header::CONTENT_SECURITY_POLICY, csp);
 
     Response::from_parts(parts, body)
 }
@@ -423,151 +572,432 @@ mod tests {
         assert!(iyke.contains("iframe-bridge"));
     }
 
-    #[tokio::test]
-    async fn e2e_viewer_router_serving_and_auth() {
-        use axum::http::{header, Request, StatusCode};
-        use tower::ServiceExt;
-        use serde_json::json;
+    // ── router-level tests ──────────────────────────────────────────────────
 
+    use axum::http::{header, Request, StatusCode};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    struct Fixture {
+        /// Canonical temp root; the allowlist root and mount parent.
+        root: PathBuf,
+        _dir: tempfile::TempDir,
+        roots: Arc<crate::fs_roots::FsRoots>,
+        app: axum::Router,
+    }
+
+    /// A T0 router whose allowlist is `root` and whose data dir is `root/data`.
+    fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let sub = root.join("assets");
-        std::fs::create_dir_all(&sub).unwrap();
-
-        let html_content = "<!doctype html><html><head><title>T</title></head><body><h1>Hello</h1></body></html>";
-        std::fs::write(sub.join("index.html"), html_content).unwrap();
-        std::fs::write(sub.join("style.css"), "body { color: red; }").unwrap();
-        let audio_bytes = vec![0u8; 100];
-        std::fs::write(sub.join("test.mp3"), &audio_bytes).unwrap();
-
+        fs::create_dir_all(root.join("data")).unwrap();
         let roots_file = dir.path().join("roots.json");
-        std::fs::write(&roots_file, json!({ "roots": [root.to_string_lossy()] }).to_string()).unwrap();
-        let roots = crate::fs_roots::FsRoots::load(roots_file).unwrap();
-
+        fs::write(&roots_file, json!({ "roots": [root.to_string_lossy()] }).to_string()).unwrap();
+        let roots = Arc::new(crate::fs_roots::FsRoots::load(roots_file).unwrap());
         let config = crate::server::ServerConfig {
             host: "127.0.0.1".into(),
             port: 0,
             static_dir: dir.path().to_path_buf(),
             pkgs_dir: None,
-            data_dir: None,
+            data_dir: Some(root.join("data")),
             auth_token: Some("secret-token".into()),
             allowed_origins: vec![],
             idle_timeout_secs: None,
             executor_tier: crate::executor::ExecutorTier::T0,
         };
-
         let app = crate::server::build_router(
             config,
-            std::sync::Arc::new(crate::pty::PtyManager::new()),
-            std::sync::Arc::new(crate::engines::EngineRegistry::new()),
+            Arc::new(crate::pty::PtyManager::new()),
+            Arc::new(crate::engines::EngineRegistry::new()),
             None,
             None,
             None,
-            crate::server::rpc_shell::PathGuard::roots(std::sync::Arc::new(roots)),
+            crate::server::rpc_shell::PathGuard::roots(roots.clone()),
             None,
             crate::access::DaemonAccess::unavailable(),
             None,
             crate::server::UpdateSource::Default,
         );
+        Fixture {
+            root,
+            _dir: dir,
+            roots,
+            app,
+        }
+    }
 
-        // 1. Call viewer_serve RPC to mount directory
-        let rpc_req = Request::builder()
-            .method("POST")
-            .uri("/api/rpc")
-            .header(header::AUTHORIZATION, "Bearer secret-token")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(json!({
-                "cmd": "viewer_serve",
-                "args": { "rootDir": sub.to_string_lossy() }
-            }).to_string()))
-            .unwrap();
-        let rpc_resp = app.clone().oneshot(rpc_req).await.unwrap();
-        assert_eq!(rpc_resp.status(), StatusCode::OK);
-        let rpc_bytes = axum::body::to_bytes(rpc_resp.into_body(), 100_000).await.unwrap();
-        let val: serde_json::Value = serde_json::from_slice(&rpc_bytes).unwrap();
-        assert!(val["ok"].as_bool().unwrap_or(false), "RPC failed: {:?}", val["error"]);
-        let data = &val["data"];
-        let token = data["token"].as_str().unwrap().to_string();
-        let url = data["url"].as_str().unwrap().to_string();
-        assert_eq!(url, format!("/__viewer/{token}/"));
+    impl Fixture {
+        async fn rpc(&self, cmd: &str, args: serde_json::Value) -> serde_json::Value {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/api/rpc")
+                .header(header::AUTHORIZATION, "Bearer secret-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "cmd": cmd, "args": args }).to_string()))
+                .unwrap();
+            let resp = self.app.clone().oneshot(req).await.unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
 
-        // 2. Serve HTML: check 200 OK, CSP sandbox, bridge markers
-        let req = Request::builder()
-            .uri(format!("/__viewer/{token}/index.html"))
-            .header(header::HOST, "localhost:5173")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let csp = resp.headers().get(header::CONTENT_SECURITY_POLICY).unwrap().to_str().unwrap();
-        assert!(csp.contains("sandbox allow-scripts"));
+        /// Mount `dir` and return its token.
+        async fn mount(&self, dir: &Path) -> String {
+            let v = self
+                .rpc("viewer_serve", json!({ "rootDir": dir.to_string_lossy() }))
+                .await;
+            assert!(v["ok"].as_bool().unwrap_or(false), "viewer_serve: {v}");
+            v["data"]["token"].as_str().unwrap().to_string()
+        }
+
+        /// A credential-less request, as a sandboxed viewer page makes it.
+        async fn get(
+            &self,
+            method: &str,
+            uri: &str,
+            headers: &[(&str, &str)],
+        ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+            let mut b = Request::builder().method(method).uri(uri);
+            for (k, v) in headers {
+                b = b.header(*k, *v);
+            }
+            let resp = self.app.clone().oneshot(b.body(Body::empty()).unwrap()).await.unwrap();
+            let (status, h) = (resp.status(), resp.headers().clone());
+            let bytes = axum::body::to_bytes(resp.into_body(), 10_000_000).await.unwrap();
+            (status, h, bytes.to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn serves_html_css_media_with_sandbox_headers_and_auth() {
+        let f = fixture();
+        let sub = f.root.join("assets");
+        fs::create_dir_all(&sub).unwrap();
+        let html = "<!doctype html><html><head><title>T</title></head><body><h1>Hello</h1></body></html>";
+        fs::write(sub.join("index.html"), html).unwrap();
+        fs::write(sub.join("style.css"), "body { color: red; }").unwrap();
+        fs::write(sub.join("a.mp3"), vec![0u8; 100]).unwrap();
+        fs::write(sub.join("v.mp4"), vec![1u8; 64]).unwrap();
+        fs::write(sub.join("i.svg"), "<svg xmlns='http://www.w3.org/2000/svg'/>").unwrap();
+
+        let res = f
+            .rpc("viewer_serve", json!({ "rootDir": sub.to_string_lossy() }))
+            .await;
+        let token = res["data"]["token"].as_str().unwrap().to_string();
+        assert_eq!(res["data"]["url"], format!("/__viewer/{token}/"));
+        assert!(!token.contains(&sub.to_string_lossy().to_string()));
+
+        // HTML: injected, sandboxed, host spliced into the CSP.
+        let (st, h, body) = f
+            .get("GET", &format!("/__viewer/{token}/index.html"), &[("host", "localhost:5173")])
+            .await;
+        assert_eq!(st, StatusCode::OK);
+        let csp = h[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert!(csp.starts_with("sandbox allow-scripts;"), "{csp}");
         assert!(csp.contains("http://localhost:5173"));
-        let body_bytes = axum::body::to_bytes(resp.into_body(), 100_000).await.unwrap();
-        let body_str = std::str::from_utf8(&body_bytes).unwrap();
-        assert!(body_str.contains(ARTIFACT_INJECT_MARKER));
-        assert!(body_str.contains(IYKE_INJECT_MARKER));
+        assert!(!csp.contains("allow-same-origin"));
+        assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert!(h[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/html"));
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.contains(ARTIFACT_INJECT_MARKER) && body.contains(IYKE_INJECT_MARKER));
+        assert!(body.contains("<h1>Hello</h1>"));
 
-        // 3. Serve CSS: check 200 OK, no bridge injection, text/css
-        let req = Request::builder()
-            .uri(format!("/__viewer/{token}/style.css"))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "text/css");
-        let body_bytes = axum::body::to_bytes(resp.into_body(), 100_000).await.unwrap();
-        assert_eq!(&body_bytes[..], b"body { color: red; }");
+        // The bare mount URL serves index.html.
+        let (st, _, _) = f.get("GET", &format!("/__viewer/{token}/"), &[]).await;
+        assert_eq!(st, StatusCode::OK);
 
-        // 4. Serve Audio with Range request: check 206 Partial Content
-        let req = Request::builder()
-            .uri(format!("/__viewer/{token}/test.mp3"))
-            .header(header::RANGE, "bytes=0-9")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(resp.headers().get(header::CONTENT_RANGE).unwrap(), "bytes 0-9/100");
-        let body_bytes = axum::body::to_bytes(resp.into_body(), 100_000).await.unwrap();
-        assert_eq!(body_bytes.len(), 10);
+        // Content types; every kind of response carries the sandbox CSP + nosniff.
+        for (name, ct) in [
+            ("style.css", "text/css"),
+            ("a.mp3", "audio/mpeg"),
+            ("v.mp4", "video/mp4"),
+            ("i.svg", "image/svg+xml"),
+        ] {
+            let (st, h, _) = f.get("GET", &format!("/__viewer/{token}/{name}"), &[]).await;
+            assert_eq!(st, StatusCode::OK, "{name}");
+            assert!(
+                h[header::CONTENT_TYPE].to_str().unwrap().starts_with(ct),
+                "{name}: {:?}",
+                h[header::CONTENT_TYPE]
+            );
+            assert!(h[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .starts_with("sandbox allow-scripts;"));
+            assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{name}");
+        }
 
-        // 5. Refuse Service Worker request
-        let req = Request::builder()
-            .uri(format!("/__viewer/{token}/sw.js"))
-            .header("service-worker", "script")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // A service-worker script fetch is refused.
+        let (st, _, _) = f
+            .get("GET", &format!("/__viewer/{token}/sw.js"), &[("service-worker", "script")])
+            .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
 
-        // 6. Refuse path traversal
-        let req = Request::builder()
-            .uri(format!("/__viewer/{token}/../secret.txt"))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // `..` never reaches the route's file lookup.
+        let (st, _, _) = f.get("GET", &format!("/__viewer/{token}/../secret.txt"), &[]).await;
+        assert!(st == StatusCode::NOT_FOUND || st == StatusCode::BAD_REQUEST, "{st}");
+        let (st, _, _) = f.get("GET", &format!("/__viewer/{token}/%2e%2e/secret.txt"), &[]).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, _, _) = f.get("GET", &format!("/__viewer/{token}/..%2fsecret.txt"), &[]).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
 
-        // 7. Stop mount via viewer_stop RPC
-        let stop_req = Request::builder()
-            .method("POST")
-            .uri("/api/rpc")
-            .header(header::AUTHORIZATION, "Bearer secret-token")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(json!({
-                "cmd": "viewer_stop",
-                "args": { "token": token }
-            }).to_string()))
-            .unwrap();
-        let stop_resp = app.clone().oneshot(stop_req).await.unwrap();
-        assert_eq!(stop_resp.status(), StatusCode::OK);
+        // Credentials: the token is the credential; a wrong one, or a write
+        // method, is a 401 (no mount, or the normal auth wall).
+        let (st, _, _) = f.get("GET", "/__viewer/deadbeef/index.html", &[]).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (st, _, _) = f.get("POST", &format!("/__viewer/{token}/index.html"), &[]).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
 
-        // Mount is gone -> capability token no longer valid, auth middleware refuses with 401 Unauthorized
-        let req = Request::builder()
-            .uri(format!("/__viewer/{token}/index.html"))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // viewer_stop revokes it.
+        let v = f.rpc("viewer_stop", json!({ "token": token })).await;
+        assert!(v["ok"].as_bool().unwrap_or(false));
+        let (st, _, _) = f.get("GET", &format!("/__viewer/{token}/index.html"), &[]).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn viewer_serve_refuses_a_root_outside_the_allowlist() {
+        let f = fixture();
+        let v = f.rpc("viewer_serve", json!({ "rootDir": "/etc" })).await;
+        assert!(!v["ok"].as_bool().unwrap_or(true), "{v}");
+        // The daemon's own data dir is refused even though it sits inside the root.
+        let v = f
+            .rpc("viewer_serve", json!({ "rootDir": f.root.join("data").to_string_lossy() }))
+            .await;
+        assert!(!v["ok"].as_bool().unwrap_or(true), "{v}");
+    }
+
+    /// A mount of an allowlisted parent that contains the daemon's data dir
+    /// serves everything around it but not the data dir; and a file the
+    /// allowlist no longer covers is refused on the next request.
+    #[tokio::test]
+    async fn per_request_path_guard_refuses_reserved_and_dropped_roots() {
+        let f = fixture();
+        fs::write(f.root.join("data").join("fs_roots.json"), "{\"secret\":1}").unwrap();
+        fs::write(f.root.join("ok.txt"), "fine").unwrap();
+        let token = f.mount(&f.root).await;
+
+        let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/ok.txt"), &[]).await;
+        assert_eq!((st, &body[..]), (StatusCode::OK, &b"fine"[..]));
+
+        let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/data/fs_roots.json"), &[]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let body = String::from_utf8(body).unwrap();
+        assert_eq!(body, "forbidden", "a refusal names neither path nor reason");
+
+        // The double-encoded spelling of the same file is not a way around it.
+        let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/data/fs_roots%2ejson"), &[]).await;
+        assert_ne!(st, StatusCode::OK);
+        assert!(!String::from_utf8_lossy(&body).contains("secret"));
+
+        // Shrink the allowlist after the mount was made: the mount keeps its
+        // root but the file is now outside the allowlist.
+        let other = tempfile::tempdir().unwrap();
+        f.roots.add(&other.path().canonicalize().unwrap().to_string_lossy()).unwrap();
+        f.roots.remove(&f.root.to_string_lossy()).unwrap();
+        let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/ok.txt"), &[]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        assert_eq!(String::from_utf8(body).unwrap(), "forbidden");
+    }
+
+    /// Regression: the path was percent-decoded by the router and then again
+    /// by `ServeDir`, so `lea%256b` (a decoy file literally named `lea%6b`)
+    /// was checked as the decoy but served as the symlink `leak`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn double_encoded_decoy_cannot_reach_a_symlink_target() {
+        let f = fixture();
+        let www = f.root.join("www");
+        fs::create_dir_all(&www).unwrap();
+        // Outside the mount root (but inside the allowlist), and the data dir.
+        fs::write(f.root.join("outside.txt"), "TOPSECRET-outside-mount").unwrap();
+        fs::write(f.root.join("data").join("fs_roots.json"), "{\"secret\":1}").unwrap();
+        std::os::unix::fs::symlink(f.root.join("outside.txt"), www.join("leak")).unwrap();
+        std::os::unix::fs::symlink(f.root.join("data").join("fs_roots.json"), www.join("dbleak")).unwrap();
+        fs::write(www.join("lea%6b"), "decoy").unwrap();
+        fs::write(www.join("dble%61k"), "decoy2").unwrap();
+        let token = f.mount(&www).await;
+
+        // The symlinks themselves leave the mount root.
+        for name in ["leak", "lea%6b", "dbleak"] {
+            let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/{name}"), &[]).await;
+            // `lea%6b` decodes once to `leak` (the symlink): refused too.
+            assert_eq!(st, StatusCode::NOT_FOUND, "{name}");
+            assert!(!String::from_utf8_lossy(&body).contains("TOPSECRET"));
+        }
+        // `lea%256b` decodes once to the decoy's literal name and serves the decoy.
+        let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/lea%256b"), &[]).await;
+        assert_eq!((st, &body[..]), (StatusCode::OK, &b"decoy"[..]));
+        let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/dble%2561k"), &[]).await;
+        assert_eq!((st, &body[..]), (StatusCode::OK, &b"decoy2"[..]));
+        // A triple-encoded spelling is just another (missing) literal name.
+        let (st, _, _) = f.get("GET", &format!("/__viewer/{token}/lea%25256b"), &[]).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn range_requests_and_edge_cases() {
+        let f = fixture();
+        let sub = f.root.join("m");
+        fs::create_dir_all(&sub).unwrap();
+        let data: Vec<u8> = (0u8..100).collect();
+        fs::write(sub.join("a.mp3"), &data).unwrap();
+        let token = f.mount(&sub).await;
+        let uri = format!("/__viewer/{token}/a.mp3");
+
+        let range = |v: &'static str| {
+            let f = &f;
+            let uri = uri.clone();
+            async move { f.get("GET", &uri, &[("range", v)]).await }
+        };
+
+        let (st, h, body) = range("bytes=0-9").await;
+        assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(h[header::CONTENT_RANGE], "bytes 0-9/100");
+        assert_eq!(body, &data[0..10]);
+
+        let (st, h, body) = range("bytes=-10").await; // suffix
+        assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(h[header::CONTENT_RANGE], "bytes 90-99/100");
+        assert_eq!(body, &data[90..]);
+
+        let (st, h, body) = range("bytes=90-").await; // open-ended
+        assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(h[header::CONTENT_RANGE], "bytes 90-99/100");
+        assert_eq!(body, &data[90..]);
+
+        let (st, h, _) = range("bytes=95-500").await; // clamped past EOF
+        assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(h[header::CONTENT_RANGE], "bytes 95-99/100");
+
+        for unsatisfiable in ["bytes=100-", "bytes=200-300"] {
+            let (st, h, _) = range(unsatisfiable).await;
+            assert_eq!(st, StatusCode::RANGE_NOT_SATISFIABLE, "{unsatisfiable}");
+            assert_eq!(h[header::CONTENT_RANGE], "bytes */100");
+        }
+
+        // Malformed / unsupported / multi (overlapping) ranges are ignored: a
+        // full 200, never a 416 a media element cannot recover from.
+        for ignored in ["bytes=abc", "items=0-1", "bytes=0-1,5-9", "bytes=0-20,10-30", "bytes=-", "bytes=5"] {
+            let (st, _, body) = range(ignored).await;
+            assert_eq!(st, StatusCode::OK, "{ignored}");
+            assert_eq!(body, data, "{ignored}");
+        }
+
+        // HEAD describes the full representation.
+        let (st, h, body) = f.get("HEAD", &uri, &[]).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(h[header::CONTENT_LENGTH], "100");
+        assert!(body.is_empty());
+        assert_eq!(h[header::ACCEPT_RANGES], "bytes");
+    }
+
+    #[tokio::test]
+    async fn html_head_get_and_range_describe_the_same_representation() {
+        let f = fixture();
+        let sub = f.root.join("h");
+        fs::create_dir_all(sub.join("dir")).unwrap();
+        let html = "<!doctype html><html><head></head><body>0123456789</body></html>";
+        fs::write(sub.join("index.html"), html).unwrap();
+        fs::write(sub.join("dir").join("index.html"), "<html><head></head><body>d</body></html>").unwrap();
+        let token = f.mount(&sub).await;
+        let uri = format!("/__viewer/{token}/index.html");
+
+        let (st, h, body) = f.get("GET", &uri, &[]).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(h[header::CONTENT_LENGTH].to_str().unwrap(), body.len().to_string());
+
+        let (st, hh, hbody) = f.get("HEAD", &uri, &[]).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(hbody.is_empty());
+        assert_eq!(hh[header::CONTENT_LENGTH], h[header::CONTENT_LENGTH]);
+
+        // A Range on HTML is ignored: the same injected 200, not raw 206 bytes.
+        let (st, _, rbody) = f.get("GET", &uri, &[("range", "bytes=0-9")]).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(rbody, body);
+
+        // `dir` -> `dir/` keeps the `/__viewer/<token>` prefix; `dir/` serves its index.
+        let (st, h, _) = f.get("GET", &format!("/__viewer/{token}/dir"), &[]).await;
+        assert_eq!(st, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(h[header::LOCATION], format!("/__viewer/{token}/dir/"));
+        let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/dir/"), &[]).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(String::from_utf8(body).unwrap().contains(">d<"));
+    }
+
+    /// The CSP must never be dropped, whatever `Host` says.
+    #[tokio::test]
+    async fn hostile_host_header_cannot_weaken_the_csp() {
+        let f = fixture();
+        let sub = f.root.join("s");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("x.txt"), "x").unwrap();
+        let token = f.mount(&sub).await;
+        for host in ["evil.test; sandbox allow-same-origin allow-scripts", "a b", "h\u{e9}st"] {
+            let uri = format!("/__viewer/{token}/x.txt");
+            let req = Request::builder()
+                .uri(&uri)
+                .header(header::HOST, HeaderValue::from_bytes(host.as_bytes()).unwrap())
+                .body(Body::empty())
+                .unwrap();
+            let resp = f.app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{host}");
+            let csp = resp.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+            assert!(csp.starts_with("sandbox allow-scripts;"), "{host}: {csp}");
+            assert!(!csp.contains("allow-same-origin"), "{host}: {csp}");
+            assert!(!csp.contains("evil.test"), "{host}: {csp}");
+        }
+    }
+
+    #[test]
+    fn mounts_expire_when_idle_and_are_capped() {
+        let svc = ViewerService::with_ttl(Duration::from_millis(40));
+        let (_, t) = svc.register(PathBuf::from("/tmp"), None);
+        assert!(svc.has_token(&t) && svc.get_mount(&t).is_some());
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(!svc.has_token(&t), "idle mount survived its ttl");
+        assert!(svc.get_mount(&t).is_none());
+
+        // Use refreshes the clock.
+        let svc = ViewerService::with_ttl(Duration::from_millis(120));
+        let (_, t) = svc.register(PathBuf::from("/tmp"), None);
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(svc.get_mount(&t).is_some());
+        }
+
+        // Cap: the least recently used mount is evicted first.
+        let svc = ViewerService::new();
+        let (_, first) = svc.register(PathBuf::from("/tmp"), None);
+        for _ in 0..MAX_MOUNTS {
+            svc.register(PathBuf::from("/tmp"), None);
+        }
+        assert!(!svc.has_token(&first));
+        assert!(svc.mounts.len() <= MAX_MOUNTS);
+    }
+
+    #[test]
+    fn token_carries_principal_prefix_in_simple_form() {
+        let pid = uuid::Uuid::now_v7();
+        let svc = ViewerService::new();
+        let (url, token) = svc.register(PathBuf::from("/tmp"), Some(pid));
+        assert!(token.starts_with(&format!("{}_", pid.simple())));
+        assert_eq!(url, format!("/__viewer/{token}/"));
+    }
+
+    #[test]
+    fn range_sanitizer_keeps_only_a_single_bytes_range() {
+        let check = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::RANGE, HeaderValue::from_str(v).unwrap());
+            sanitize_range(&mut h);
+            h.contains_key(header::RANGE)
+        };
+        for ok in ["bytes=0-9", "bytes=5-", "bytes=-5", "bytes=0-0"] {
+            assert!(check(ok), "{ok}");
+        }
+        for bad in ["bytes=", "bytes=-", "bytes=a-b", "bytes=0-1,3-4", "items=0-1", "0-9", "bytes=1"] {
+            assert!(!check(bad), "{bad}");
+        }
     }
 }
-

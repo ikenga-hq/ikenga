@@ -1,14 +1,15 @@
-// Pane `⋯` rows that need the desktop's local viewer server. A browser session
-// has no such server (its `http://localhost:<port>` would be the browser's own
-// machine), so these rows are dropped instead of offered and failing — gap
-// audit rank 8. Remove once the daemon serves an authed viewer route.
+// Pane `⋯` rows that hand out a viewer URL. In a browser session the in-app
+// preview is served by the daemon's token-scoped `/__viewer/<token>/` route,
+// but a copied / opened URL would outlive its pane (founder decision, gap audit
+// rank 8: in-app previews only), so these rows stay hidden in remote sessions.
 
 import { isRemoteWebSession } from '@/lib/tauri-cmd';
 import type { ResolvedMenuRow } from '@/shell/menu/resolve';
 
-// Formerly hid viewer.open-in-browser / viewer.copy-url (gap audit rank 8).
-// Restored now that the daemon serves an authenticated viewer route.
-export const REMOTE_HIDDEN_PANE_ROWS: ReadonlySet<string> = new Set([]);
+export const REMOTE_HIDDEN_PANE_ROWS: ReadonlySet<string> = new Set([
+	'viewer.open-in-browser',
+	'viewer.copy-url',
+]);
 
 /** In a browser session: drop `REMOTE_HIDDEN_PANE_ROWS` and any separator they
  *  leave leading, trailing or doubled. Desktop: the rows, untouched. */

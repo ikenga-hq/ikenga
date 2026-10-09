@@ -445,7 +445,7 @@ reason = "Helper solely for the spike_grant_fs_read debug harness (module doc: '
 
 [viewer_port]
 tag = "WP-19"
-reason = "The daemon runs no separate viewer server: viewer routes are served directly on the daemon's main HTTP server at /__viewer/... ."
+reason = "The daemon runs no separate viewer server: viewer routes are served directly on the daemon's main HTTP server at /__viewer/<token>/..., so there is no second port to report. Browser sessions never call viewer_port (the pane builds a same-origin URL from the viewer_serve result)."
 
 
 [window_close]

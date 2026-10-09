@@ -64,17 +64,10 @@ describe('dropRemoteHiddenRows (gap rank 8)', () => {
 		item('pane.close'),
 	];
 
-	it('retains Open in browser / Copy viewer URL in remote sessions', () => {
+	it('hides Open in browser / Copy viewer URL and the separator they strand', () => {
 		h.remote = true;
 		const ids = dropRemoteHiddenRows(rows).map((r) => (r.kind === 'item' ? r.id : '—'));
-		expect(ids).toEqual([
-			'pane.back',
-			'—',
-			'viewer.open-in-browser',
-			'viewer.copy-url',
-			'—',
-			'pane.close',
-		]);
+		expect(ids).toEqual(['pane.back', '—', 'pane.close']);
 	});
 
 	it('leaves the desktop menu untouched', () => {
