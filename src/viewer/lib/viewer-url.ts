@@ -25,8 +25,12 @@ export function isHtmlArtifactPath(path: string): boolean {
 }
 
 export async function resolveHtmlViewerUrl(path: string): Promise<string> {
-	// The URL below would point at the browser's own localhost (gap audit rank 8).
-	if (isRemoteWebSession()) throw new Error('Preview not available in the browser yet');
+	// In-app previews only in a browser session (founder decision, gap audit
+	// rank 8): the menu rows are hidden, and a URL minted here would register a
+	// mount no pane ever stops. Refuse rather than leak one.
+	if (isRemoteWebSession()) {
+		throw new Error('Not available on this server: viewer URLs are only offered in the desktop app');
+	}
 	const res = await fsRead(path);
 	const html = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(res.bytes));
 	const { root, file } = pickViewerRoot(path, html);

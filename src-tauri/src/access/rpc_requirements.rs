@@ -65,6 +65,9 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("fs_roots_remove", req!(owner[Files, Settings])),
     ("fs_roots_reset", req!(owner[Files, Settings])),
     ("fs_home", req!(owner[Files])),
+    // Viewer mount management (gap audit rank 8).
+    ("viewer_serve", req!(shared[Files])),
+    ("viewer_stop", req!(shared[Files])),
     // ── fs write (P-2: files + dispatch) ──
     ("fs_write", req!(shared[Files, Dispatch])),
     ("fs_trash", req!(shared[Files, Dispatch])),

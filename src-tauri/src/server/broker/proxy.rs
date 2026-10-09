@@ -399,16 +399,55 @@ async fn forward(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Response {
+    let target = narrowing.target.as_ref().unwrap_or(&ctx.principal);
+    forward_to(
+        state,
+        Reach::Launch(target),
+        &narrowing.headers,
+        method,
+        path_and_query,
+        headers,
+        body,
+    )
+    .await
+}
+
+/// Which child a forwarded request goes to, and whether it may be started.
+enum Reach<'a> {
+    /// An authenticated principal's child, launched if it is not running.
+    Launch(&'a Principal),
+    /// A child that must already be running (capability-token requests).
+    RunningOnly(crate::executor::PrincipalId),
+}
+
+async fn forward_to(
+    state: &BrokerState,
+    reach: Reach<'_>,
+    extra_headers: &[(HeaderName, HeaderValue)],
+    method: Method,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Response {
     let mut headers = upstream_headers(headers);
-    for (name, value) in &narrowing.headers {
+    for (name, value) in extra_headers {
         headers.insert(name.clone(), value.clone());
     }
-    let target = narrowing.target.as_ref().unwrap_or(&ctx.principal);
-    let principal = target.id.to_string();
+    let target_id = match &reach {
+        Reach::Launch(p) => p.id,
+        Reach::RunningOnly(id) => *id,
+    };
+    let principal = target_id.to_string();
     for attempt in 0..2 {
-        let endpoint = match state.children.endpoint(target).await {
-            Ok(e) => e,
-            Err(e) => return child_unavailable(&e),
+        let endpoint = match &reach {
+            Reach::Launch(target) => match state.children.endpoint(target).await {
+                Ok(e) => e,
+                Err(e) => return child_unavailable(&e),
+            },
+            Reach::RunningOnly(id) => match state.children.running_endpoint(*id).await {
+                Some(e) => e,
+                None => return (StatusCode::NOT_FOUND, "not found").into_response(),
+            },
         };
         let sent = state
             .http
@@ -433,10 +472,10 @@ async fn forward(
                     .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
             }
             Err(e) if e.is_connect() && attempt == 0 => {
-                state.children.invalidate(target.id, &endpoint).await;
+                state.children.invalidate(target_id, &endpoint).await;
             }
             Err(e) => {
-                tracing::warn!("proxy to principal child {}: {e}", target.id);
+                tracing::warn!("proxy to principal child {target_id}: {e}");
                 return json_error(
                     StatusCode::BAD_GATEWAY,
                     "bad_gateway",
@@ -674,6 +713,57 @@ pub async fn pkgs_proxy(
         &state,
         &narrowing,
         &ctx,
+        parts.method.clone(),
+        &pq,
+        &parts.headers,
+        Bytes::new(),
+    )
+    .await
+}
+
+/// The principal a viewer mount token names: its child mints
+/// `<principal uuid, 32 hex (simple form)>_<random hex>`.
+pub fn viewer_token_principal(token: &str) -> Option<crate::executor::PrincipalId> {
+    let (prefix, rest) = token.split_once('_')?;
+    if prefix.len() != 32 || rest.is_empty() || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let uuid = uuid::Uuid::try_parse(prefix).ok()?;
+    // `PrincipalId::from_str` is the canonical (lowercase, hyphenated, v7) gate.
+    uuid.hyphenated().to_string().parse().ok()
+}
+
+/// `GET|HEAD|OPTIONS /__viewer/<token>/*` → the token's principal's child.
+///
+/// Deliberately outside `require_principal`: a viewer page is sandboxed to an
+/// opaque origin, so its sub-resource requests carry no session cookie. The
+/// URL token is the credential (see `ViewerService::register`). The broker
+/// therefore (1) routes by the principal prefix inside the token, (2) only
+/// ever to a child that is **already running** — it never launches one for a
+/// cookie-less request, and a mount lives in the child's memory, so no child
+/// means no valid token — and (3) lets the child validate the token itself.
+pub async fn viewer_proxy(State(state): State<Arc<BrokerState>>, req: Request) -> Response {
+    let (parts, _body) = req.into_parts();
+    if !matches!(parts.method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let Some(pq) = path_and_query(&parts.uri) else {
+        return bad_path();
+    };
+    let token = parts
+        .uri
+        .path()
+        .strip_prefix("/__viewer/")
+        .and_then(|tail| tail.split('/').next());
+    let Some(pid) = token.and_then(viewer_token_principal) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    // OPTIONS (CORS preflight from the sandboxed page) is answered by the
+    // child too, so one code path owns the viewer's headers.
+    forward_to(
+        &state,
+        Reach::RunningOnly(pid),
+        &[],
         parts.method.clone(),
         &pq,
         &parts.headers,

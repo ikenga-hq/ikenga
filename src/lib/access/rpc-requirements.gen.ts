@@ -241,4 +241,6 @@ export const RPC_REQUIREMENTS: Readonly<Record<string, ArmRequirement>> = {
 	term_hooks_info: { caps: ['sessions'], class: 'owner' },
 	term_hooks_statusline_snapshot: { caps: ['sessions'], class: 'owner' },
 	terminal_detect_shells: { caps: [], class: 'owner' },
+	viewer_serve: { caps: ['files'], class: 'shared' },
+	viewer_stop: { caps: ['files'], class: 'shared' },
 };

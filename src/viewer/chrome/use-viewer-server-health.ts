@@ -25,8 +25,8 @@ export interface ViewerServerHealth {
 }
 
 export function useViewerServerHealth(path: string): ViewerServerHealth {
-	// No viewer server in a browser session: nothing to have "stopped" (the pane
-	// shows its own preview-unavailable state).
+	// No separate viewer port in a browser session: the daemon serves
+	// `/__viewer/*` itself, so there is nothing to have "stopped".
 	const applies = isHtmlArtifactPath(path) && !isRemoteWebSession();
 	const [stopped, setStopped] = useState(false);
 
