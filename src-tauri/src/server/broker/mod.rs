@@ -24,6 +24,7 @@
 
 pub mod children;
 pub mod fs_roots_admin;
+pub mod health_probe;
 pub mod proxy;
 pub mod ws_registry;
 
@@ -397,6 +398,13 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
     )));
     broker_state.access_t1 = Some(access_t1.clone());
     let state = Arc::new(broker_state);
+    // The admin Server card (`server_health`): the disk figures describe the
+    // operator root's filesystem; per-account figures are asked of each
+    // running child.
+    crate::server::host_health::set_data_dir(root.root().to_path_buf());
+    crate::server::host_health::install_account_loads(Arc::new(
+        health_probe::BrokerAccountLoads::new(state.clone()),
+    ));
     if let Some(hub) = push_hub {
         crate::server::push::install_hub(hub);
         crate::server::push::pump::spawn(state.children.clone());

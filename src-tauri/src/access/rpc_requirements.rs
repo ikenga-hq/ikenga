@@ -307,6 +307,10 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("permission_decide", req!(shared[Approve])),
     ("notifications_record_access", req!(internal)),
     ("share_project_info", req!(internal)),
+    // Admin Server card. `access` class: the T1 broker serves it itself
+    // (`access::is_broker_arm`) and `server::host_health::authorize` is the
+    // admin rule (T1 admin / T0 owner, admin strength, never a share).
+    ("server_health", req!(access)),
     // WP-P9: the broker's cross-principal open-terminal count.
     ("server_open_terminals", req!(internal)),
     ("permission_relay_put", req!(operator)),

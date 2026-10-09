@@ -78,9 +78,18 @@ import {
 	installedEngines,
 	type ConfirmRequest,
 } from './ngwa-scopes-surface';
+import { mayMeasureConnection } from '@/lib/connection/rtt-monitor';
+import { ConnectionPanel } from '@/shell/connection/connection-panel';
 import './ngwa.css';
 
-export type HealthSection = 'violations' | 'sidecars' | 'cron' | 'data' | 'trust' | 'engines';
+export type HealthSection =
+	| 'connection'
+	| 'violations'
+	| 'sidecars'
+	| 'cron'
+	| 'data'
+	| 'trust'
+	| 'engines';
 
 export interface NgwaHealthSurfaceProps {
 	items: NgwaItem[];
@@ -91,6 +100,8 @@ export interface NgwaHealthSurfaceProps {
 	section?: HealthSection;
 	onOpenBackup: () => void;
 	onOpenStore: () => void;
+	/** Admin browser sessions: open the Server card (Settings › About). */
+	onOpenServer?: () => void;
 	/** Is this pkg id in the registry? Gates "Reinstall from registry". */
 	canReinstall?: (pkgId: string) => boolean;
 	/** D-02 "Reinstall from registry": open the pkg's Store sheet, where the
@@ -336,6 +347,7 @@ export function NgwaHealthSurface({
 	section,
 	onOpenBackup,
 	onOpenStore,
+	onOpenServer,
 	canReinstall,
 	onReinstall,
 	now = Date.now,
@@ -602,6 +614,12 @@ export function NgwaHealthSurface({
 			)}
 			<div className="hscroll sc" data-hscroll>
 			<div className="hgrid" data-hgrid>
+				{/* ── 0. Connection: this viewer's round trip to the server (browser only) ── */}
+				{mayMeasureConnection() && (
+					<section className="panel" {...panelProps('connection')} aria-label="Connection">
+						<ConnectionPanel onOpenServer={onOpenServer} />
+					</section>
+				)}
 				{/* ── 1. Violations ── */}
 				<section className="panel" {...panelProps('violations')} aria-label="Violations">
 					<h3>

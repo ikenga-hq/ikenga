@@ -954,6 +954,7 @@ pub async fn rpc_handler(
         | "access_push_unsubscribe"
         | "access_push_list"
         | "access_push_test"
+        | "server_health"
         | "permission_relay_put"
         | "permission_relay_take"
         | "permission_relay_resolve"
@@ -968,9 +969,22 @@ pub async fn rpc_handler(
         // `internal` (only the T1 broker's own call reaches it): how many
         // terminals a restart of this process would end. Served by T0 and
         // principal children alike; nothing else.
-        "server_open_terminals" => RpcResponse::success(serde_json::json!({
-            "open": state.pty_manager.active_session_count(),
-        })),
+        //
+        // The admin Server card (`server::host_health`) asks the same arm for
+        // `claude_procs`: how many processes of this child's own uid are a
+        // `claude` (a count — never a name, argument or another uid's).
+        "server_open_terminals" => {
+            let claude_procs = tokio::task::spawn_blocking(|| {
+                super::host_health::count_own_processes("claude")
+            })
+            .await
+            .ok()
+            .flatten();
+            RpcResponse::success(serde_json::json!({
+                "open": state.pty_manager.active_session_count(),
+                "claude_procs": claude_procs,
+            }))
+        }
 
         // --- Unknown Command Fallback ---
         other => {

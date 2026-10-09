@@ -93,7 +93,7 @@ pub async fn serve_daemon(
     let Some(access) = access else {
         return error_response(&AccessError::store_unavailable());
     };
-    if access.mode == DaemonMode::PrincipalChild && cmd.starts_with("access_") {
+    if access.mode == DaemonMode::PrincipalChild && super::is_broker_arm(cmd) {
         return error_response(&AccessError::new(
             Code::ServedByBroker,
             "access arms are served by the T1 broker",
@@ -170,6 +170,8 @@ pub async fn dispatch(
         | "access_push_unsubscribe"
         | "access_push_list"
         | "access_push_test" => crate::server::push::rpc::dispatch(env, ctx, cmd, args).await,
+        // Host health for the admin Server card (admin only).
+        "server_health" => crate::server::host_health::dispatch(env, ctx).await,
         other => Err(AccessError::new(
             Code::NotFound,
             format!("no access command `{other}`"),
