@@ -10,7 +10,7 @@
 // The monitor is shared: every `useConnectionRtt()` consumer retains it, the
 // last release stops it.
 
-import { useSyncExternalStore } from 'react';
+import { useCallback, useSyncExternalStore } from 'react';
 import { getTransport, isBrowserSession, WebRemoteTransport } from '@/lib/transport';
 import { PingError } from '@/lib/transport/events-socket';
 import { EMPTY_RTT, RTT_WINDOW, summarizeRtt, type RttSummary } from './rtt';
@@ -250,8 +250,12 @@ export function mayMeasureConnection(): boolean {
 export function useConnectionRtt(enabled = true): RttSummary {
 	const monitor = getRttMonitor();
 	const on = enabled && mayMeasureConnection();
-	return useSyncExternalStore(
-		(cb) => {
+	// Stable identity is load-bearing: useSyncExternalStore resubscribes
+	// whenever `subscribe` changes, and every resubscribe releases + retains the
+	// monitor, which stops it (clearing the samples) and probes again at once.
+	// An inline closure did that on every render: ~150 pings/s, no reading.
+	const subscribe = useCallback(
+		(cb: () => void) => {
 			if (!on) return () => {};
 			const release = monitor.retain();
 			const unsub = monitor.subscribe(cb);
@@ -260,6 +264,10 @@ export function useConnectionRtt(enabled = true): RttSummary {
 				release();
 			};
 		},
+		[monitor, on]
+	);
+	return useSyncExternalStore(
+		subscribe,
 		() => (on ? monitor.get() : EMPTY_RTT),
 		() => EMPTY_RTT
 	);

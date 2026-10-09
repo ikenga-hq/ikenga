@@ -709,10 +709,14 @@ fn read_units() -> Option<Vec<UnitState>> {
     };
     // Installed timers and tunnels (a stopped one still shows), plus the
     // backup run instances systemd currently holds as failed.
+    // `systemctl list-unit-files <patterns>` exits 1 when nothing matches, so a
+    // box with no backup timers or tunnels must read as "none installed", not
+    // as "not measurable".
     let files = list(
         &["list-unit-files"],
         &["ikenga-backup-*.timer", "*-tunnel.service"],
-    )?;
+    )
+    .unwrap_or_default();
     let failed = list(
         &["list-units", "--state=failed"],
         &["ikenga-backup@*.service"],
