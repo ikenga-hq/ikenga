@@ -200,7 +200,10 @@ BACKUP_GCLOUD_KEY_FPRS=()       # extra accepted fingerprints for the Google Clo
 TUNNEL_USER="ikenga-tunnel"     # a plain system user, NOT an Ikenga principal; owns the one key
 TUNNEL_FROM=""                  # the address printed in the authorized_keys from="" option (default: this box's public address)
 TUNNEL_KNOWN_HOSTS=()           # "<host> <keytype> <base64>": the pinned host keys; host is "name" or "[name]:port"
-unset TUNNELS
+# TUNNEL_ALLOW_USERS: who may connect to a tunnel's local port (root always may).
+# Like TUNNELS it is left UNSET here on purpose: unset = the backup user when
+# BACKUPS_ENABLED=1, else nobody but root; ( ) = root only; (a b) = root, a and b.
+unset TUNNELS TUNNEL_ALLOW_USERS
 
 # Swap (README "Swap"). A small box with several agent sessions needs some, or
 # the OOM killer ends a session. auto = 4G for RAM up to 8 GB, 2G above;
@@ -219,6 +222,13 @@ elif [[ "$ACTION" != "provision" ]]; then
   if [[ -f "$SYSTEMD_DIR/ikenga-server-t1.service" ]]; then TIER=t1
   elif [[ -f "$SYSTEMD_DIR/ikenga-server.service" ]]; then TIER=t0
   fi
+fi
+TUNNEL_ALLOW_DEFINED=0
+if declare -p TUNNEL_ALLOW_USERS >/dev/null 2>&1; then
+  [[ "$(declare -p TUNNEL_ALLOW_USERS)" == "declare -a"* ]] || { echo "error: TUNNEL_ALLOW_USERS must be a bash array: TUNNEL_ALLOW_USERS=( ikenga-backup )" >&2; exit 2; }
+  TUNNEL_ALLOW_DEFINED=1
+else
+  TUNNEL_ALLOW_USERS=()
 fi
 TUNNELS_DEFINED=0
 if declare -p TUNNELS >/dev/null 2>&1; then
@@ -2645,7 +2655,12 @@ backup_load_config() {
           ( if ($d.connection_secret | isstr("^[A-Za-z_][A-Za-z0-9_]*$")) then empty else "\($w): connection_secret must be a secret NAME like MY_DB_CONNECTION_STRING" end ),
           ( if ($d.schedule | isstr("^[a-z0-9][a-z0-9-]{0,31}$")) then empty else "\($w): schedule must be a name like daily" end ),
           ( if ($d.gcs_bucket | isstr("^[a-z0-9][a-z0-9._-]{1,220}$")) then empty else "\($w): gcs_bucket is not a bucket name" end ),
-          ( if ($d | has("enabled")) and (($d.enabled | type) != "boolean") then "\($w): enabled must be true or false" else empty end )
+          ( if ($d | has("enabled")) and (($d.enabled | type) != "boolean") then "\($w): enabled must be true or false" else empty end ),
+          ( if ($d | has("require_auth")) and ($d.require_auth != false)
+               and (($d.require_auth | type) != "string"
+                    or ($d.require_auth | test("^!?(password|md5|gss|sspi|scram-sha-256|none)(,!?(password|md5|gss|sspi|scram-sha-256|none))*$") | not)
+                    or ($d.require_auth | split(",") | map(startswith("!")) | unique | length) > 1)
+             then "\($w): require_auth must be false (opt out) or a libpq list such as scram-sha-256 (all negated with ! or none of them)" else empty end )
         end ),
     ( [.databases[] | select(type == "object") | .name] as $n
       | if ($n | length) != ($n | unique | length) then "duplicate database name" else empty end )
@@ -2664,6 +2679,43 @@ backup_load_config() {
   local skipped; skipped="$(jq -r '[.databases[] | select(.enabled != true) | .name] | join(" ")' "$BACKUP_CONFIG")"
   [[ -z "$skipped" ]] || note "databases not backed up (\"enabled\" is not true): $skipped"
   return 0
+}
+
+# The local ports of the SSH tunnels on this box, one per line. The profile's
+# TUNNELS when it defines them; otherwise (a profile that never mentions tunnels
+# leaves the host's alone) whatever the tunnel user's units forward.
+backup_tunnel_ports() {
+  local n f
+  if [[ $TUNNELS_DEFINED -eq 1 ]]; then
+    for n in "${TN_NAMES[@]}"; do printf '%s\n' "${TN_LPORT[$n]}"; done
+    return 0
+  fi
+  for f in "$SYSTEMD_DIR"/*-tunnel.service; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    grep -qFx "User=$TUNNEL_USER" "$f" 2>/dev/null || continue
+    grep -oE -- '-L 127\.0\.0\.1:[0-9]+:' "$f" 2>/dev/null | cut -d: -f2 || true
+  done
+}
+
+# Prints the path of the config to install. That is BACKUP_CONFIG itself, unless
+# this box has tunnels: then a temporary copy with "tunnel_ports": [..] added.
+# run-backup.sh uses it to default require_auth=scram-sha-256 for a database whose
+# connection string points at a tunnel's local end (the connection secrets are
+# never read or rewritten here, only the names-only config).
+backup_render_config() {
+  local ports out
+  ports="$(backup_tunnel_ports | LC_ALL=C sort -un | jq -Rsc 'split("\n") | map(select(length > 0) | tonumber)')" || ports='[]'
+  if [[ "$ports" != '[]' ]]; then
+    out="$(mktemp)"
+    jq --argjson p "$ports" '.tunnel_ports = $p' "$BACKUP_CONFIG" > "$out" || { rm -f -- "$out"; die "could not add tunnel_ports to a copy of BACKUP_CONFIG"; }
+    printf '%s' "$out"
+  elif jq -e 'has("tunnel_ports")' "$BACKUP_CONFIG" >/dev/null 2>&1; then
+    out="$(mktemp)"
+    jq 'del(.tunnel_ports)' "$BACKUP_CONFIG" > "$out" || { rm -f -- "$out"; die "could not drop tunnel_ports from a copy of BACKUP_CONFIG"; }
+    printf '%s' "$out"
+  else
+    printf '%s' "$BACKUP_CONFIG"
+  fi
 }
 
 # ---- the secrets plan (pure: reads SECRETS_FILE state, writes nothing)
@@ -3034,7 +3086,10 @@ sync_backups_enabled() {
   if [[ -n "$src" ]]; then
     for f in run-backup.sh verify-backup.sh; do install_file 0755 root root "$src/$f" "$BACKUP_LIB_DIR/$f" || true; done
   fi
-  install_file 0640 root "$BK_GROUP" "$BACKUP_CONFIG" "$BACKUP_CONFIG_DST" || true
+  # The installed config is the profile's file plus "tunnel_ports" (see backup_render_config).
+  local cfg_src; cfg_src="$(backup_render_config)"
+  install_file 0640 root "$BK_GROUP" "$cfg_src" "$BACKUP_CONFIG_DST" || true
+  [[ "$cfg_src" == "$BACKUP_CONFIG" ]] || rm -f -- "${cfg_src:?}"
 
   # The connection strings: root:<group> 0640, parsed by run-backup.sh.
   if [[ $SECRETS_UNREADABLE -eq 0 ]]; then
@@ -3161,6 +3216,7 @@ TN_KH_ALL=(); TN_KH_USED=()
 TN_UID=""; TN_GID=""; TN_HAVE_USER=0
 TN_PUBLINE=""            # "ssh-ed25519 AAAA... comment": the public half of the key, once it exists
 TN_KH_CHANGED=0
+TN_ALLOW=()              # the names that may connect to a tunnel's local port (root always may); see "Port lock"
 
 # The entry as it may be shown: quoted, truncated, no control characters.
 tn_show() { local q; q="$(printf '%q' "${1:0:80}")"; printf '%s' "$q"; }
@@ -3222,6 +3278,24 @@ validate_tunnels_profile() {
         break
       fi
     done
+  done
+
+  # Who may connect to a tunnel's local port (root always may). Unset: the
+  # backup user when backups are enabled, else nobody but root.
+  TN_ALLOW=()
+  local -a want_allow=(); local u seen_u=" "
+  if [[ $TUNNEL_ALLOW_DEFINED -eq 1 ]]; then
+    want_allow=("${TUNNEL_ALLOW_USERS[@]}")
+  elif [[ "$BACKUPS_ENABLED" == 1 ]]; then
+    want_allow=("$BACKUP_USER")
+  fi
+  n=0
+  for u in "${want_allow[@]}"; do
+    n=$((n + 1))
+    [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "TUNNEL_ALLOW_USERS entry $n ($(tn_show "$u")) is not a valid unix user name"
+    [[ "$u" != root ]] || continue          # root is always allowed
+    [[ "$seen_u" != *" $u "* ]] || continue
+    seen_u+="$u "; TN_ALLOW+=("$u")
   done
   return 0
 }
@@ -3480,7 +3554,11 @@ tunnel_remove_stale() {
   local u any=0
   while IFS= read -r u; do
     [[ -n "$u" ]] || continue
-    if [[ $DRY_RUN -eq 0 ]]; then sc disable --now "$u" >/dev/null 2>&1 || true; rm -f -- "$SYSTEMD_DIR/$u"; fi
+    if [[ $DRY_RUN -eq 0 ]]; then
+      sc disable --now "$u" >/dev/null 2>&1 || true
+      rm -f -- "${SYSTEMD_DIR:?}/${u:?}" "${SYSTEMD_DIR:?}/${u:?}.d/${TUNNEL_LOCK_DROPIN:?}"
+      rmdir -- "${SYSTEMD_DIR:?}/${u:?}.d" 2>/dev/null || true
+    fi
     changed "unit $u stopped, disabled and removed (not in TUNNELS; the key is kept)"; any=1
   done < <(tunnel_stale_units)
   [[ $any -eq 0 || $DRY_RUN -eq 1 ]] || sc daemon-reload
@@ -3513,6 +3591,306 @@ tunnel_print_remote_lines() {
   fi
 }
 
+# ---- the port lock
+#
+# A tunnel's local end is 127.0.0.1:<port>, and loopback is open to every local
+# account, people and agents alike: any of them could connect to it and talk to
+# the remote database, and while the tunnel is down any of them could bind the
+# port and receive the backup job's connection, login included. So the connect
+# side is locked to uids: an nftables table of its own, `inet ikenga_tunnels`,
+# with, per tunnel port and per family (127.0.0.1 and ::1), an ALLOW rule for the
+# uids of root and TN_ALLOW (TUNNEL_ALLOW_USERS, default the backup user) followed
+# by a REJECT rule for everybody else. Fail closed on purpose: the obvious
+# `meta skuid != { allowed } reject` does not match a socket that has no owning
+# file (AF_SMC connects through a kernel-internal TCP socket of that kind), so
+# such a socket would walk straight through; "accept the allowed uids, reject
+# whatever is left" cannot be bypassed that way.
+#
+# Why a table of its own and not ufw: ufw cannot match on the local user, and
+# `ufw --force reset` (the perimeter step does it) rebuilds ufw's own chains only,
+# so a separate nft table is never touched by it. Why not nftables.service and
+# /etc/nftables.conf: the stock file starts with `flush ruleset`, which would wipe
+# ufw's tables whenever it was restarted. So the table is loaded by its own
+# oneshot unit ($TUNNEL_LOCK_UNIT, WantedBy sysinit.target, Before
+# network-pre.target) from $TUNNEL_LOCK_FILE. That file is `table X` /
+# `delete table X` / `table X { ... }`: one nft transaction, so a reload swaps the
+# rules atomically and never opens a gap.
+#
+# Fail closed: every tunnel unit gets a drop-in that Requires and orders After the
+# lock unit, so a tunnel does not come up (and stops) without its lock. There is
+# deliberately no ConditionPathExists on the lock unit: a missing rules file must
+# fail it, not skip it.
+#
+# What this does NOT do: stop another account from BINDING the port while the
+# tunnel is down (nft has no say in bind). That is what require_auth in the backup
+# job is for (README "Squatting"). It also does not stop a process that runs as
+# root or as an allowed user.
+
+TUNNEL_LOCK_UNIT="ikenga-tunnel-lock.service"
+TUNNEL_LOCK_DIR="/etc/ikenga-tunnels"
+TUNNEL_LOCK_FILE="$TUNNEL_LOCK_DIR/lock.nft"
+TUNNEL_LOCK_TABLE="ikenga_tunnels"
+TUNNEL_LOCK_DROPIN="10-ikenga-lock.conf"
+# Defence in depth for the AF_SMC route (see above): the smc modules cannot be loaded.
+# An unprivileged socket(AF_SMC) autoloads them on a stock Ubuntu kernel.
+TUNNEL_NOSMC_FILE="/etc/modprobe.d/ikenga-no-smc.conf"
+TL_UIDS=(0); TL_DESC="root(0)"; TL_PENDING=()
+
+# Names -> uids. An allowed user that does not exist is an error (a dry run
+# reports the same refusal as the real run), except the backup user while
+# backups are enabled (the backups phase creates it, after this one, and the lock
+# is converged again once it exists).
+tunnel_lock_resolve() {
+  local n line uid
+  TL_UIDS=(0); TL_DESC="root(0)"; TL_PENDING=()
+  for n in "${TN_ALLOW[@]}"; do
+    if line="$(getent passwd "$n")"; then
+      uid="$(cut -d: -f3 <<<"$line")"
+      [[ "$uid" =~ ^[0-9]+$ ]] || die "TUNNEL_ALLOW_USERS: cannot read the uid of '$n'"
+      (( uid > 0 )) || continue
+      [[ " ${TL_UIDS[*]} " == *" $uid "* ]] && continue
+      TL_UIDS+=("$uid"); TL_DESC+=", $n($uid)"
+    elif [[ "$n" == "$BACKUP_USER" && "$BACKUPS_ENABLED" == 1 ]]; then
+      TL_PENDING+=("$n")
+    else
+      die "TUNNEL_ALLOW_USERS names '$n', which is not a user on this host. Create it first, or remove it from the list"
+    fi
+  done
+  mapfile -t TL_UIDS < <(printf '%s\n' "${TL_UIDS[@]}" | sort -n)
+}
+
+# The nft file for the current profile. Per tunnel port and family: accept the
+# allowed uids, then reject everything else (the reject carries the counter).
+tunnel_lock_rules() {
+  local n p fam addr set ids
+  set="$(printf '%s, ' "${TL_UIDS[@]}")"; set="${set%, }"
+  ids="${set//[ ]/}"
+  printf '%s\n' "# Managed by ikenga provision.sh (tunnels): change TUNNELS / TUNNEL_ALLOW_USERS in the profile, not this file." \
+    "# Connections to a tunnel's local port are accepted from: ${TL_DESC}; everything else is rejected (so a socket without an owner is rejected too). Only this table is replaced; ufw's rules are not touched." \
+    "table inet $TUNNEL_LOCK_TABLE" \
+    "delete table inet $TUNNEL_LOCK_TABLE" \
+    "table inet $TUNNEL_LOCK_TABLE {" \
+    "  chain output {" \
+    "    type filter hook output priority 0; policy accept;"
+  for n in "${TN_NAMES[@]}"; do
+    p="${TN_LPORT[$n]}"
+    for fam in ip ip6; do
+      if [[ $fam == ip ]]; then addr="127.0.0.1"; else addr="::1"; fi
+      printf '    %s daddr %s tcp dport %s meta skuid { %s } accept comment "ikenga:lock:%s:%s:%s:allow:%s"\n' \
+        "$fam" "$addr" "$p" "$set" "$n" "$fam" "$p" "$ids"
+      printf '    %s daddr %s tcp dport %s counter reject with tcp reset comment "ikenga:lock:%s:%s:%s:deny"\n' \
+        "$fam" "$addr" "$p" "$n" "$fam" "$p"
+    done
+  done
+  printf '%s\n' "  }" "}"
+}
+
+# One line per rule, in order: "<verb> <comment>". Works on both our own text and
+# on `nft list table` output, which words the same rule differently (counter
+# values, set braces) but keeps the verb, the comment and the order.
+tunnel_lock_signature() {
+  awk '/^[[:space:]]*(#|table |delete table |chain |type |\}|$)/ { next }
+       { v = "other"; if ($0 ~ / reject /) v = "reject"; else if ($0 ~ / accept( |$)/) v = "accept"
+         c = ""; if (match($0, /ikenga:lock:[^"]+/)) c = substr($0, RSTART, RLENGTH)
+         print v, c }'
+}
+
+# The smc modules cannot be loaded (see the head of this section).
+tunnel_nosmc_text() {
+  printf '%s\n' "# Managed by ikenga provision.sh (tunnels): the tunnel port lock cannot be bypassed through AF_SMC." \
+    "# Removed again when the profile has no TUNNELS." \
+    "install smc /bin/false" \
+    "install smc_diag /bin/false"
+}
+
+# Written only when the lock is enabled. A module that is already loaded is not
+# unloaded by this (it may be in use); the port rules do not depend on it.
+sync_tunnel_nosmc() {
+  if [[ $DRY_RUN -eq 0 && ! -d /etc/modprobe.d ]]; then install -d -m 0755 -o root -g root -- /etc/modprobe.d; fi
+  if tl_write "$TUNNEL_NOSMC_FILE" 0644 "$(tunnel_nosmc_text)"; then
+    changed "$TUNNEL_NOSMC_FILE written (the smc kernel modules cannot be loaded)"
+  fi
+  if [[ -d /sys/module/smc ]]; then
+    note "the smc kernel module is already loaded; it is not unloaded automatically. Unload it ('rmmod smc_diag smc') or reboot; the port-lock rules hold either way"
+  fi
+}
+
+# Refuse a symlink anywhere root is about to write the lock, before writing any of it.
+tunnel_lock_refuse_symlinks() {
+  local f
+  for f in "$TUNNEL_LOCK_DIR" "$TUNNEL_LOCK_FILE" "$TUNNEL_NOSMC_FILE" "$SYSTEMD_DIR/$TUNNEL_LOCK_UNIT"; do
+    [[ ! -L "$f" ]] || die "$f is a symbolic link. Refusing to write through it. Inspect it, remove it by hand, and run again."
+  done
+  [[ ! -e "$TUNNEL_LOCK_DIR" || -d "$TUNNEL_LOCK_DIR" ]] || die "$TUNNEL_LOCK_DIR exists and is not a directory; refusing to touch it"
+}
+
+tunnel_lock_unit_text() {
+  local nft; nft="$(command -v nft 2>/dev/null || true)"; nft="${nft:-/usr/sbin/nft}"
+  printf '%s\n' "# Managed by ikenga provision.sh (tunnels): change TUNNELS in the profile, not this file." \
+    "[Unit]" \
+    "Description=Ikenga: tunnel local ports reachable only by root and the allowed users (nftables table inet $TUNNEL_LOCK_TABLE)" \
+    "Documentation=https://github.com/ikenga-hq/ikenga/blob/main/scripts/server/README.md" \
+    "DefaultDependencies=no" \
+    "After=local-fs.target" \
+    "Before=network-pre.target shutdown.target" \
+    "Wants=network-pre.target" \
+    "Conflicts=shutdown.target" \
+    "" \
+    "[Service]" \
+    "Type=oneshot" \
+    "RemainAfterExit=yes" \
+    "ExecStart=$nft -f $TUNNEL_LOCK_FILE" \
+    "ExecReload=$nft -f $TUNNEL_LOCK_FILE" \
+    "ExecStop=-$nft delete table inet $TUNNEL_LOCK_TABLE" \
+    "" \
+    "[Install]" \
+    "WantedBy=sysinit.target"
+}
+
+tunnel_lock_dropin_text() {
+  printf '%s\n' "# Managed by ikenga provision.sh (tunnels): the tunnel does not run without its port lock." \
+    "[Unit]" \
+    "Requires=$TUNNEL_LOCK_UNIT" \
+    "After=$TUNNEL_LOCK_UNIT"
+}
+
+# tl_write <path> <mode> <content>: atomic write when the content or mode differs
+# (the old file is copied aside). Everything here is root's, in root-owned
+# directories. Returns 0 when it wrote.
+tl_write() {
+  local f="$1" mode="$2" want="$3" ts tmp
+  [[ ! -L "$f" ]] || die "$f is a symbolic link. Refusing to write through it. Inspect it, remove it by hand, and run again."
+  if [[ -e "$f" ]]; then
+    [[ -f "$f" ]] || die "$f exists and is not a regular file; refusing to touch it"
+    if [[ "$(cat -- "$f")" == "$want" ]]; then
+      if [[ "$(stat -c '%a %u %g' -- "$f")" != "${mode#0} 0 0" ]]; then
+        run chown 0:0 "$f"; run chmod "$mode" "$f"; changed "$f: owner/mode set to root $mode"
+      fi
+      return 1
+    fi
+    ts="$(date +%Y%m%d-%H%M%S)"
+    if [[ $DRY_RUN -eq 0 ]]; then cp -p -- "$f" "$f.bak-$ts"; fi
+    note "$f differs from the profile; the old one is kept as $(basename -- "$f").bak-$ts"
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf '    [dry-run] write %s:\n' "$f"
+    printf '%s\n' "$want" | sed 's/^/      | /'
+  else
+    tmp="$(mktemp "$(dirname -- "$f")/.tmp.XXXXXX")"
+    printf '%s\n' "$want" > "$tmp"; chown 0:0 "$tmp"; chmod "$mode" "$tmp"; mv -f -- "$tmp" "$f"
+  fi
+  return 0
+}
+
+# Is the live table exactly the wanted one? Compared rule by rule and in order by
+# verb and comment (each comment names tunnel, family, port and, on an allow rule,
+# the uids), so a deleted, edited, extra, reordered or stale-uid rule all read as
+# drift. A reject that comes before its allow would lock everybody out.
+tunnel_lock_live_ok() {   # rules-text
+  local have got want
+  command -v nft >/dev/null 2>&1 || return 1
+  have="$(nft list table inet "$TUNNEL_LOCK_TABLE" 2>/dev/null)" || return 1
+  got="$(tunnel_lock_signature <<<"$have")"
+  want="$(tunnel_lock_signature <<<"$1")"
+  [[ -n "$want" && "$got" == "$want" ]]
+}
+
+tunnel_lock_dropin_path() { printf '%s/%s.d/%s' "$SYSTEMD_DIR" "$(tunnel_unit_name "$1")" "$TUNNEL_LOCK_DROPIN"; }
+
+tunnel_lock_remove() {
+  local any=0 f lu="${SYSTEMD_DIR:?}/${TUNNEL_LOCK_UNIT:?}" lf="${TUNNEL_LOCK_FILE:?}"
+  [[ ! -L "$TUNNEL_LOCK_DIR" ]] || die "$TUNNEL_LOCK_DIR is a symbolic link. Refusing to touch it."
+  if [[ -e "$TUNNEL_NOSMC_FILE" || -L "$TUNNEL_NOSMC_FILE" ]]; then
+    [[ ! -L "$TUNNEL_NOSMC_FILE" ]] || die "$TUNNEL_NOSMC_FILE is a symbolic link. Refusing to touch it."
+    if [[ $DRY_RUN -eq 0 ]]; then rm -f -- "$TUNNEL_NOSMC_FILE"; fi
+    changed "$TUNNEL_NOSMC_FILE removed"; any=1
+  fi
+  if [[ -e "$lu" || -L "$lu" ]]; then
+    [[ ! -L "$lu" ]] || die "$lu is a symbolic link. Refusing to touch it."
+    if [[ $DRY_RUN -eq 0 ]]; then sc disable --now "$TUNNEL_LOCK_UNIT" >/dev/null 2>&1 || true; rm -f -- "$lu"; fi
+    changed "unit $TUNNEL_LOCK_UNIT stopped, disabled and removed (no tunnels in the profile)"; any=1
+  fi
+  if [[ -e "$lf" || -L "$lf" ]]; then
+    [[ ! -L "$lf" ]] || die "$lf is a symbolic link. Refusing to touch it."
+    if [[ $DRY_RUN -eq 0 ]]; then rm -f -- "$lf"; rmdir -- "${TUNNEL_LOCK_DIR:?}" 2>/dev/null || true; fi
+    changed "$lf removed"; any=1
+  fi
+  for f in "${SYSTEMD_DIR:?}"/*-tunnel.service.d/"${TUNNEL_LOCK_DROPIN:?}"; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    if [[ $DRY_RUN -eq 0 ]]; then rm -f -- "$f"; rmdir -- "$(dirname -- "$f")" 2>/dev/null || true; fi
+    any=1
+  done
+  # The table is also gone from the kernel (ExecStop); belt and braces for a unit that was already removed.
+  if [[ $DRY_RUN -eq 0 ]] && command -v nft >/dev/null 2>&1 && nft list table inet "$TUNNEL_LOCK_TABLE" >/dev/null 2>&1; then
+    nft delete table inet "$TUNNEL_LOCK_TABLE" 2>/dev/null || true
+  fi
+  [[ $any -eq 0 || $DRY_RUN -eq 1 ]] || sc daemon-reload
+  return 0
+}
+
+sync_tunnel_lock() {
+  [[ $TUNNELS_DEFINED -eq 1 ]] || return 0
+  if [[ ${#TN_NAMES[@]} -eq 0 ]]; then
+    if [[ -e "$SYSTEMD_DIR/$TUNNEL_LOCK_UNIT" || -L "$SYSTEMD_DIR/$TUNNEL_LOCK_UNIT" || -e "$TUNNEL_LOCK_FILE" || -L "$TUNNEL_LOCK_FILE" || -L "$TUNNEL_LOCK_DIR" || -e "$TUNNEL_NOSMC_FILE" || -L "$TUNNEL_NOSMC_FILE" ]]; then
+      [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo)"
+      tunnel_lock_remove
+    fi
+    return 0
+  fi
+  [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo)"
+  local n f st rules reload_unit=0 file_changed=0 unit_changed=0 tmp
+  tunnel_lock_resolve
+  tunnel_lock_refuse_symlinks
+  [[ ${#TL_PENDING[@]} -eq 0 ]] || note "port lock: ${TL_PENDING[*]} does not exist yet; it is allowed once it does (the backups phase creates it, then this converges again)"
+  backup_apt_install nftables
+  rules="$(tunnel_lock_rules)"
+
+  # Validation before change: the generated file must be accepted by nft itself.
+  if [[ $DRY_RUN -eq 0 ]] && command -v nft >/dev/null 2>&1; then
+    tmp="$(mktemp)"; printf '%s\n' "$rules" > "$tmp"
+    nft -c -f "$tmp" >/dev/null 2>&1 || { rm -f -- "$tmp"; die "nft rejected the generated port-lock rules (nothing was changed); is the nf_tables kernel module available?"; }
+    rm -f -- "$tmp"
+  fi
+
+  ensure_dir 0755 root root "$TUNNEL_LOCK_DIR"
+  if tl_write "$TUNNEL_LOCK_FILE" 0644 "$rules"; then
+    file_changed=1
+    changed "$TUNNEL_LOCK_FILE written (ports: $(for n in "${TN_NAMES[@]}"; do printf '%s ' "${TN_LPORT[$n]}"; done)/ allowed: $TL_DESC)"
+  fi
+  if tl_write "$SYSTEMD_DIR/$TUNNEL_LOCK_UNIT" 0644 "$(tunnel_lock_unit_text)"; then
+    unit_changed=1; reload_unit=1; changed "unit $TUNNEL_LOCK_UNIT installed"
+  fi
+  sync_tunnel_nosmc
+  for n in "${TN_NAMES[@]}"; do
+    f="$(tunnel_lock_dropin_path "$n")"
+    if [[ $DRY_RUN -eq 0 ]]; then
+      [[ ! -L "$(dirname -- "$f")" ]] || die "$(dirname -- "$f") is a symbolic link. Refusing to write through it."
+      [[ -d "$(dirname -- "$f")" ]] || install -d -m 0755 -o root -g root -- "$(dirname -- "$f")"
+    fi
+    if tl_write "$f" 0644 "$(tunnel_lock_dropin_text)"; then
+      reload_unit=1; changed "unit $(tunnel_unit_name "$n"): requires $TUNNEL_LOCK_UNIT (drop-in $TUNNEL_LOCK_DROPIN)"
+    fi
+  done
+  if [[ $DRY_RUN -eq 1 ]]; then
+    if [[ $file_changed -eq 1 || $unit_changed -eq 1 ]] || ! tunnel_lock_live_ok "$rules"; then
+      note "[dry-run] systemctl daemon-reload; enable --now $TUNNEL_LOCK_UNIT (loads nft table inet $TUNNEL_LOCK_TABLE)"
+    fi
+    return 0
+  fi
+  [[ $reload_unit -eq 0 ]] || sc daemon-reload
+  st="$(sc is-active "$TUNNEL_LOCK_UNIT" 2>/dev/null || true)"
+  if ! sc is-enabled --quiet "$TUNNEL_LOCK_UNIT" 2>/dev/null || [[ "$st" != active ]]; then
+    sc enable --now "$TUNNEL_LOCK_UNIT" >/dev/null 2>&1 || soft_fail "could not start $TUNNEL_LOCK_UNIT (see: systemctl status $TUNNEL_LOCK_UNIT). The tunnel units require it and will not run"
+    changed "unit $TUNNEL_LOCK_UNIT enabled and started (port lock loaded)"
+  elif [[ $file_changed -eq 1 ]] || ! tunnel_lock_live_ok "$rules"; then
+    # reload = nft -f again: the table is replaced in one transaction, so there is no gap.
+    sc reload "$TUNNEL_LOCK_UNIT" >/dev/null 2>&1 || soft_fail "could not reload $TUNNEL_LOCK_UNIT"
+    changed "port lock reloaded ($([[ $file_changed -eq 1 ]] && echo 'rules changed' || echo 'the live table had drifted'))"
+  fi
+  tunnel_lock_live_ok "$rules" || soft_fail "the port lock is not live: nft list table inet $TUNNEL_LOCK_TABLE does not match $TUNNEL_LOCK_FILE"
+  return 0
+}
+
 # ---- converge
 
 sync_tunnels() {
@@ -3523,11 +3901,15 @@ sync_tunnels() {
   local stale n u st unit_reload=0 started=" "
   stale="$(tunnel_stale_units)"
   if [[ ${#TN_NAMES[@]} -eq 0 && -z "$stale" ]]; then
-    [[ "$ACTION" != tunnels ]] || note "nothing to do: TUNNELS is empty and no tunnel unit of $TUNNEL_USER exists"
+    # No tunnel left to lock: a lock left behind by a tunnel that is gone is removed too.
+    sync_tunnel_lock
+    [[ "$ACTION" != tunnels || ${#CHANGES[@]} -gt 0 ]] || note "nothing to do: TUNNELS is empty and no tunnel unit of $TUNNEL_USER exists"
     return 0
   fi
   log "SSH tunnels (user $TUNNEL_USER; ${#TN_NAMES[@]} tunnel(s))"
   [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo)"
+  # A symlink where the lock is written is refused before anything (a stale tunnel included) changes.
+  tunnel_lock_refuse_symlinks
 
   # Root-owned things go first, before any check the tunnel user can influence:
   # a symlink planted in its own tree must not keep a removed tunnel running.
@@ -3535,8 +3917,11 @@ sync_tunnels() {
   # before anything (including stale-unit removal) changes on the host.
   backup_apt_install openssh-client util-linux iproute2
   if [[ ${#TN_NAMES[@]} -gt 0 ]]; then tunnel_check_host_keys; fi
+  # Who may connect is resolved (and an unknown TUNNEL_ALLOW_USERS name refused)
+  # before anything is changed.
+  if [[ ${#TN_NAMES[@]} -gt 0 ]]; then tunnel_lock_resolve; fi
   tunnel_remove_stale
-  if [[ ${#TN_NAMES[@]} -eq 0 ]]; then return 0; fi
+  if [[ ${#TN_NAMES[@]} -eq 0 ]]; then sync_tunnel_lock; return 0; fi
 
   tunnel_refuse_symlinks
   tunnel_ensure_user
@@ -3545,6 +3930,9 @@ sync_tunnels() {
   tunnel_ensure_ssh_dir
   tunnel_ensure_key
   tunnel_sync_known_hosts
+
+  # The port lock is in place (and the tunnels depend on it) before a tunnel starts.
+  sync_tunnel_lock
 
   for n in "${TN_NAMES[@]}"; do
     if tunnel_write_unit "$n"; then unit_reload=1; fi
@@ -3874,7 +4262,10 @@ case "$ACTION" in
     [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || die "backups needs a profile: pass --profile <file> (or provision once so $INSTALL_DIR/.profile.env exists)"
     validate_accounts_profile
     validate_backups_profile
+    validate_tunnels_profile
     sync_backups
+    # The backup user is allowed through the tunnel port lock; it exists now.
+    sync_tunnel_lock
     summary
     [[ $FAILED -eq 0 ]] || { echo "error: some backup steps failed; see the warnings above" >&2; exit 1; }
     exit 0 ;;
@@ -3903,5 +4294,6 @@ verify
 sync_accounts
 sync_tunnels
 sync_backups
+sync_tunnel_lock
 summary
 [[ $FAILED -eq 0 ]] || { echo "error: some swap, account, tunnel or backup steps failed; see the warnings above" >&2; exit 1; }

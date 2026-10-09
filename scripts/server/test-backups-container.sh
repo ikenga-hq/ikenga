@@ -31,7 +31,8 @@ if [[ -n "${APT_CACHE_DIR:-}" ]]; then
 fi
 
 echo "==> Running provision.sh backups test suite in ubuntu:24.04 container..."
-docker run --rm -i "${CACHE_ARGS[@]}" \
+# DEBIAN_FRONTEND: with a terminal on stdin, tzdata (pulled in by postgresql-17) would stop to ask for a timezone.
+docker run --rm -i -e DEBIAN_FRONTEND=noninteractive "${CACHE_ARGS[@]}" \
   -v "$SCRIPT_DIR:/work:ro" \
   ikenga-test-backups:24.04 /work/test-backups-inside.sh
 

@@ -642,4 +642,80 @@ units_start ikenga-backup@daily.service; [[ $RC -eq 0 ]] || fail "run after re-e
 "$PROVISION" --help | grep -q 'backups' || fail "--help does not mention backups"
 pass "re-enable restores timers, credentials and the status history; the job runs again"
 
+# ----------------------------------- 14. require_auth and the tunnel ports
+
+# A real PostgreSQL 17 server (SCRAM) and the real libpq: the per-database
+# "require_auth" is accepted, applied and refused as it should be; a connection
+# that ends at a tunnel's local port gets scram-sha-256 by default (the squatting
+# defence, tested against a fake server in test-portlock-*); bad values are refused.
+cfg_ra() {   # extra config members for every database of the daily schedule (fake-one, fake-two...), as JSON text ("" = none)
+  jq --argjson extra "{${1:-}}" '(.databases[] | select(.schedule == "daily")) += $extra' "$T/config.base" > "$CONFIG_SRC"; chmod 0600 "$CONFIG_SRC"
+}
+write_config; cp "$CONFIG_SRC" "$T/config.base"
+# (Run as the backup user: a container's root has no CAP_SYS_PTRACE, so it cannot read another uid's /proc/<pid>/environ.)
+sample_env() { ( while :; do as_bu grep -ahoE 'PGREQUIREAUT[H]=[a-z0-9,!-]+' /proc/[0-9]*/environ 2>/dev/null || true; done > "$1" ) & SAMPLER3=$!; }
+stop_env() { kill "$SAMPLER3" 2>/dev/null || true; wait "$SAMPLER3" 2>/dev/null || true; }
+run_daily_sampled() {   # output file for the PGREQUIREAUTH values libpq's process was given
+  sample_env "$1"; : > $JOURNAL/ikenga-backup@daily.service.log
+  units_start ikenga-backup@daily.service; stop_env
+}
+# 14a. refused at provision time, before anything changes
+for bad in 'true' '"bogus"' '"scram-sha-256,md5-ish"' '"scram-sha-256,!md5"' '"!md5,password"' '5'; do
+  cfg_ra "\"require_auth\": $bad"; prov --dry-run
+  [[ $RC -ne 0 ]] && grep -q 'require_auth must be false' "$OUT" || fail "require_auth $bad should be refused (rc=$RC)"
+done
+cfg_ra '"require_auth": "!md5,!password"'; prov --dry-run; [[ $RC -eq 0 ]] || fail "a negated list is valid: $(tail -5 "$OUT")"
+# 14b. no tunnel on this box, no field: nothing is added
+cp "$T/config.base" "$CONFIG_SRC"; prov
+run_daily_sampled "$T/env-none"
+[[ $RC -eq 0 ]] || fail "baseline run exited $RC"
+[[ ! -s "$T/env-none" ]] || fail "PGREQUIREAUTH was set with no tunnel and no config field: $(cat "$T/env-none")"
+! jq -e 'has("tunnel_ports")' $ETC/backup-config.json >/dev/null || fail "tunnel_ports without any tunnel"
+cmp -s <(jq -S . $ETC/backup-config.json) <(jq -S . "$CONFIG_SRC") || fail "the installed config differs from BACKUP_CONFIG although there is no tunnel"
+# 14c. the per-database field, against the real server
+cfg_ra '"require_auth": "scram-sha-256"'; prov
+[[ $RC -eq 0 ]] && jq -e '.databases[0].require_auth == "scram-sha-256"' $ETC/backup-config.json >/dev/null || fail "the require_auth field was not installed (rc=$RC)"
+run_daily_sampled "$T/env-ra"
+[[ $RC -eq 0 && "$(status_get '.databases["fake-one"].last_attempt_ok')" == true ]] || fail "scram-sha-256 against a SCRAM server should work (rc=$RC)"
+grep -qxF 'PGREQUIREAUTH=scram-sha-256' "$T/env-ra" || fail "libpq's process never had PGREQUIREAUTH=scram-sha-256 (saw: $(cat "$T/env-ra"))"
+cfg_ra '"require_auth": "md5"'; prov
+run_daily_sampled "$T/env-md5"
+[[ $RC -ne 0 ]] || fail "a server that speaks SCRAM must be refused when md5 is required"
+[[ "$(status_get '.databases["fake-one"].last_error_kind')" == auth-refused ]] || fail "md5 against SCRAM: kind is $(status_get '.databases["fake-one"].last_error_kind'), want auth-refused"
+grep -q 'db=fake-one status=FAILED kind=auth-refused' $JOURNAL/ikenga-backup@daily.service.log || fail "the journal lacks kind=auth-refused"
+grep -qF 'authentication method requirement' $PRIV/errors/last-error-fake-one.log || fail "the libpq refusal is not in the private error log"
+no_canary_in "journal/status after the refusal" $JOURNAL $STATUS $PRIV/errors
+# 14d. a tunnel on the box: tunnel_ports is added to the INSTALLED config, the default applies
+printf '%s\n' '[Service]' 'User=ikenga-tunnel' "ExecStart=/usr/bin/ssh -NT -F none -L 127.0.0.1:$PGPORT:127.0.0.1:5432 nobody@127.0.0.1" > $UNITS/legacy-tunnel.service
+cp "$T/config.base" "$CONFIG_SRC"; prov
+[[ $RC -eq 0 ]] && grep -q 'backup-config.json installed' "$OUT" || fail "the tunnel's port should change the installed config (rc=$RC)"
+[[ "$(jq -c .tunnel_ports $ETC/backup-config.json)" == "[$PGPORT]" ]] || fail "tunnel_ports is $(jq -c .tunnel_ports $ETC/backup-config.json)"
+cmp -s <(jq -S 'del(.tunnel_ports)' $ETC/backup-config.json) <(jq -S . "$CONFIG_SRC") || fail "anything beyond tunnel_ports differs from BACKUP_CONFIG"
+cmp -s <(jq -S . "$T/config.base") <(jq -S . "$CONFIG_SRC") || fail "(fixture) the source config changed"
+run_daily_sampled "$T/env-tunnel"
+[[ $RC -eq 0 ]] || fail "the default scram-sha-256 against a SCRAM server should work (rc=$RC)"
+grep -qxF 'PGREQUIREAUTH=scram-sha-256' "$T/env-tunnel" || fail "a connection to a tunnel port did not get require_auth=scram-sha-256 by default (saw: $(cat "$T/env-tunnel"))"
+prov; grep -q 'no changes' "$OUT" || fail "a rerun with a tunnel reported changes: $(sed -n '/Summary/,$p' "$OUT")"
+# opt out for one database
+cfg_ra '"require_auth": false'; prov
+run_daily_sampled "$T/env-off"
+[[ $RC -eq 0 && ! -s "$T/env-off" ]] || fail "\"require_auth\": false should leave PGREQUIREAUTH unset (saw: $(cat "$T/env-off"))"
+# a profile that lists TUNNELS: the backups action also plans the port lock, allowing the backup user
+cp "$T/config.base" "$CONFIG_SRC"
+cp "$PROFILE" "$T/profile.orig"
+{ cat "$T/profile.orig"; echo 'TUNNEL_FROM=127.0.0.1'
+  echo 'TUNNEL_KNOWN_HOSTS=("127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFA")'
+  echo "TUNNELS=(\"devotee-db=pgtunnel@127.0.0.1 $PGPORT:127.0.0.1:5432\")"; } > "$PROFILE"
+prov --dry-run
+[[ $RC -eq 0 ]] || fail "backups --dry-run with TUNNELS failed: $(tail -8 "$OUT")"
+grep -qE "would: /etc/ikenga-tunnels/lock.nft written \(ports: $PGPORT / allowed: root\(0\), $BU\($(id -u $BU)\)\)" "$OUT" || fail "the backups action should plan the port lock with the backup user allowed: $(grep -i 'lock' "$OUT")"
+cp "$T/profile.orig" "$PROFILE"
+# and with the tunnel gone the default goes with it
+rm -f "$UNITS/legacy-tunnel.service"
+cp "$T/config.base" "$CONFIG_SRC"; prov
+! jq -e 'has("tunnel_ports")' $ETC/backup-config.json >/dev/null || fail "tunnel_ports stayed after the tunnel was removed"
+run_daily_sampled "$T/env-gone"
+[[ $RC -eq 0 && ! -s "$T/env-gone" ]] || fail "the default outlived the tunnel (saw: $(cat "$T/env-gone"))"
+pass "require_auth: validated at provision time; applied per database; a real SCRAM server accepts scram-sha-256 and is refused (kind auth-refused) when md5 is required; connections to a tunnel port get scram-sha-256 by default, per-db false opts out; tunnel_ports lives only in the installed config; the backups action plans the port lock for the backup user"
+
 echo "==> [Container] ALL BACKUP TESTS PASSED"

@@ -467,10 +467,15 @@ snap() { local f; for f in "$KEY" "$KEY.pub" "$KH" "$UNITS/devotee-db-tunnel.ser
 SNAP1="$(snap)"; INVB="$(systemctl show -p InvocationID --value devotee-db-tunnel.service)"
 sleep 1
 profile "TUNNEL_FROM=127.0.0.1" "TUNNEL_KNOWN_HOSTS=(\"127.0.0.1 $HKEY\")" "TUNNELS=(\"$T1\")"
+# The port lock is new to this box: the dry run and the run plan/do ONLY the lock
+# (its file, its unit, the drop-in that makes the tunnel require it); the user,
+# key, known_hosts and the hand-made unit itself are not planned or touched.
 prov --dry-run
-{ [[ $RC -eq 0 ]] && out_has 'no changes: the host already matches this profile' && ! out_has 'would:'; } || fail "adopt (dry run) should plan nothing"
+{ [[ $RC -eq 0 ]] && out_has 'would: .*tunnel-lock' && ! out_has 'would: unit devotee-db-tunnel.service installed' && ! out_has 'would: .*(id_ed25519|known_hosts|user ikenga-tunnel)'; } || fail "adopt (dry run) should plan nothing but the port lock"
 prov
-{ [[ $RC -eq 0 ]] && out_has 'no changes: the host already matches this profile'; } || fail "adopting the box's tunnel should report no changes"
+{ [[ $RC -eq 0 ]] && out_has 'unit ikenga-tunnel-lock.service enabled and started' && ! out_has 'unit devotee-db-tunnel.service (installed|restarted)'; } || fail "adopting the box's tunnel should only add the port lock"
+prov
+{ [[ $RC -eq 0 ]] && out_has 'no changes: the host already matches this profile'; } || fail "the second adopting run should report no changes"
 [[ "$(snap)" == "$SNAP1" ]] || { diff <(echo "$SNAP1") <(snap) >&2 || true; fail "adoption touched the user, key, known_hosts or unit"; }
 [[ "$(fp)" == "$FPB" ]] || fail "the key fingerprint changed on adoption"
 [[ "$(cut -d' ' -f3 $KEY.pub)" == "ikenga-tunnel@royalti-box" ]] || fail "the key comment changed"
