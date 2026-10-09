@@ -7,12 +7,13 @@
 # sshd on 127.0.0.1 (ports 22 and 2222), a nologin user authorised with the
 # restrict/permitopen line the provisioner prints, and a fake "postgres" TCP
 # listener behind it. No real host can be reached, whatever a unit says.
-# Image: ikenga-test-tunnels:24.04 (ubuntu + systemd + openssh + socat + iproute2).
+# Image: ikenga-test-tunnels:24.04-nft (ubuntu + systemd + openssh + socat + iproute2 + nftables:
+# the tunnels' port lock is an nftables table, so the real kernel enforces it here).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROVISION_DIR="$(cd "${PROVISION_DIR:-$SCRIPT_DIR}" && pwd)"
-IMAGE=ikenga-test-tunnels:24.04
+IMAGE=ikenga-test-tunnels:24.04-nft
 chmod +x "$SCRIPT_DIR/test-tunnels-inside.sh"
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
@@ -21,7 +22,7 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 FROM ubuntu:24.04
 RUN echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4 && \
     apt-get update -qq && \
-    apt-get install -y -qq --no-install-recommends systemd openssh-server openssh-client socat iproute2 util-linux procps ca-certificates && \
+    apt-get install -y -qq --no-install-recommends systemd openssh-server openssh-client socat iproute2 util-linux procps ca-certificates nftables && \
     systemctl disable ssh ssh.socket >/dev/null 2>&1 || true && \
     rm -rf /var/lib/apt/lists/*
 DOCKERFILE
