@@ -657,7 +657,7 @@ pub async fn rpc_proxy(
     };
     parts.extensions.insert(narrowing.clone());
 
-    if cmd.starts_with("access_") {
+    if crate::access::is_broker_arm(&cmd) {
         return state.hooks.access.handle(&ctx, &parts, &cmd, &args).await;
     }
     match state

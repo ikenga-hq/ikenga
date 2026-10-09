@@ -59,6 +59,8 @@ pub mod static_files;
 pub mod supervisor;
 /// A held hook gate's notification row and audit trail (daemon asks).
 pub mod hook_asks;
+/// Host health for the admin Server card (`server_health`).
+pub mod host_health;
 /// Claude terminal hooks + statusline for daemon terminals (gap audit rank
 /// 11): the per-terminal settings file, its authenticated endpoint, and the
 /// permission-gate decision.
@@ -887,10 +889,14 @@ fn build_router(
     ));
     let update = match update {
         UpdateSource::Default => match (&access.mode, &config.data_dir) {
-            (crate::access::DaemonMode::T0, Some(dir)) => Some(Arc::new(update::UpdateCtl::new(
-                update::state_dir(),
-                dir.join(update::REQUEST_FILE),
-            ))),
+            (crate::access::DaemonMode::T0, Some(dir)) => {
+                // The disk figures of `server_health` describe this filesystem.
+                host_health::set_data_dir(dir.clone());
+                Some(Arc::new(update::UpdateCtl::new(
+                    update::state_dir(),
+                    dir.join(update::REQUEST_FILE),
+                )))
+            }
             _ => None,
         },
         #[cfg(test)]

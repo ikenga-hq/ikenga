@@ -219,6 +219,7 @@ export const RPC_REQUIREMENTS: Readonly<Record<string, ArmRequirement>> = {
 	secrets_set_scoped: { caps: ['settings', 'secrets'], class: 'owner' },
 	secrets_unlock: { caps: ['settings', 'secrets'], class: 'owner' },
 	secrets_vault_status: { caps: ['settings'], class: 'owner' },
+	server_health: { caps: [], class: 'access' },
 	server_open_terminals: { caps: [], class: 'internal' },
 	settings_clear_all: { caps: ['settings'], class: 'owner' },
 	settings_get: { caps: ['files'], class: 'shared' },

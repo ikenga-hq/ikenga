@@ -249,4 +249,61 @@ describe('events-socket client', () => {
 		h.sockets[0].open();
 		expect(spy).toHaveBeenCalledWith('events');
 	});
+
+	describe('ping', () => {
+		it('resolves with the round trip once the matching pong arrives', async () => {
+			const h = harness();
+			h.client.listen('a', () => {});
+			const now = vi.spyOn(performance, 'now');
+			now.mockReturnValue(1000);
+			h.sockets[0].open();
+			const p = h.client.ping();
+			const sent = h.sockets[0].sent.map((s) => JSON.parse(s)).find((m) => m.type === 'ping');
+			expect(sent).toEqual({ type: 'ping', id: expect.any(Number) });
+			now.mockReturnValue(1340);
+			h.sockets[0].frame({ type: 'pong', id: sent.id });
+			await expect(p).resolves.toBe(340);
+		});
+
+		it('ignores a pong for another id and times out', async () => {
+			const h = harness();
+			h.client.listen('a', () => {});
+			h.sockets[0].open();
+			const p = h.client.ping(1000);
+			const caught = p.catch((e) => e);
+			h.sockets[0].frame({ type: 'pong', id: 9999 });
+			vi.advanceTimersByTime(1001);
+			const err = await caught;
+			expect(err).toMatchObject({ name: 'PingError', reason: 'timeout' });
+		});
+
+		it('never opens a socket: no socket is "not-open"', async () => {
+			const h = harness();
+			await expect(h.client.ping()).rejects.toMatchObject({ reason: 'not-open' });
+			expect(h.sockets).toHaveLength(0);
+		});
+
+		it('fails in-flight pings when the socket drops', async () => {
+			const h = harness();
+			h.client.listen('a', () => {});
+			h.sockets[0].open();
+			const caught = h.client.ping().catch((e) => e);
+			h.sockets[0].drop();
+			expect(await caught).toMatchObject({ reason: 'closed' });
+		});
+
+		it('treats the old-server error frame as unsupported, until a reconnect', async () => {
+			vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const h = harness();
+			h.client.listen('a', () => {});
+			h.sockets[0].open();
+			const caught = h.client.ping().catch((e) => e);
+			h.sockets[0].frame({
+				type: 'error',
+				message: 'bad events control frame: unknown variant `ping`',
+			});
+			expect(await caught).toMatchObject({ reason: 'unsupported' });
+			await expect(h.client.ping()).rejects.toMatchObject({ reason: 'unsupported' });
+		});
+	});
 });
