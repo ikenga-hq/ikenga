@@ -13,8 +13,10 @@
  * renamed on one side must be renamed on the other.
  *
  * Out: `{type:'subscribe', events:[…]}` · `{type:'unsubscribe', events:[…]}`
+ *      `{type:'ping', id}` (the connection indicator's round-trip probe)
  * In:  `{type:'ready', events:[…], withheld:[…]}` ·
- *      `{type:'event', event, payload}` · `{type:'error', message}`
+ *      `{type:'event', event, payload}` · `{type:'error', message}` ·
+ *      `{type:'pong', id}`
  *
  * ## Semantics
  *
@@ -55,6 +57,31 @@ export type EventHandler = (event: { event: string; payload: unknown }) => void;
 const NOTIFICATIONS_EVENT = 'notifications://changed';
 const NOTIFICATIONS_REFETCH = { reason: 'read_all', notification: null, muted: false };
 
+/** Why {@link EventsSocketClient.ping} produced no round-trip time. */
+export type PingFailure =
+	/** No open socket right now (nobody listening, or reconnecting). */
+	| 'not-open'
+	/** The server is older than the ping frame and answered it with an error. */
+	| 'unsupported'
+	/** The socket closed before the pong. */
+	| 'closed'
+	/** No pong within the timeout: the link is stalled or very slow. */
+	| 'timeout';
+
+export class PingError extends Error {
+	constructor(readonly reason: PingFailure) {
+		super(`events ping: ${reason}`);
+		this.name = 'PingError';
+	}
+}
+
+interface PendingPing {
+	sentAt: number;
+	timer: ReturnType<typeof setTimeout>;
+	resolve: (ms: number) => void;
+	reject: (e: PingError) => void;
+}
+
 export class EventsSocketClient {
 	private ws: WebSocket | null = null;
 	private open = false;
@@ -70,7 +97,49 @@ export class EventsSocketClient {
 	private withheld: Set<string> = new Set();
 	private noted = new Set<string>();
 
+	/** In-flight pings by id. */
+	private pings = new Map<number, PendingPing>();
+	private pingSeq = 0;
+	/** The server answered a ping with an error frame: it predates `ping`.
+	 *  Reset by the next connection. */
+	private pingUnsupported = false;
+
 	constructor(private readonly openSocket: OpenEventsSocket) {}
+
+	/**
+	 * One round trip over the already-open events socket, in milliseconds.
+	 * Costs one ~25-byte frame each way and opens nothing; it never starts the
+	 * socket (that would add a connection, not measure one). Rejects with a
+	 * {@link PingError} instead of guessing.
+	 */
+	ping(timeoutMs = 4000): Promise<number> {
+		return new Promise((resolve, reject) => {
+			const ws = this.ws;
+			if (!ws || !this.open) return reject(new PingError('not-open'));
+			if (this.pingUnsupported) return reject(new PingError('unsupported'));
+			const id = ++this.pingSeq;
+			const timer = setTimeout(() => {
+				this.pings.delete(id);
+				reject(new PingError('timeout'));
+			}, timeoutMs);
+			this.pings.set(id, { sentAt: performance.now(), timer, resolve, reject });
+			try {
+				ws.send(JSON.stringify({ type: 'ping', id }));
+			} catch {
+				clearTimeout(timer);
+				this.pings.delete(id);
+				reject(new PingError('closed'));
+			}
+		});
+	}
+
+	private failPings(reason: PingFailure): void {
+		for (const [id, p] of this.pings) {
+			clearTimeout(p.timer);
+			this.pings.delete(id);
+			p.reject(new PingError(reason));
+		}
+	}
 
 	listen(name: string, handler: EventHandler): () => void {
 		let set = this.listeners.get(name);
@@ -141,6 +210,7 @@ export class EventsSocketClient {
 		ws.onopen = () => {
 			this.open = true;
 			this.attempt = 0;
+			this.pingUnsupported = false;
 			connectionStateStore.socketConnected('events');
 			const names = [...this.listeners.keys()];
 			if (names.length > 0) ws.send(JSON.stringify({ type: 'subscribe', events: names }));
@@ -160,6 +230,7 @@ export class EventsSocketClient {
 		ws.onclose = (ev?: CloseEvent) => {
 			this.open = false;
 			this.ws = null;
+			this.failPings('closed');
 			// G-ACCESS §3.10: 4401 → the re-auth overlay, and no retry (it
 			// would be refused); 4403 → reconnect now with the new caps.
 			const access = handleAccessClose(ev?.code, ev?.reason);
@@ -200,7 +271,24 @@ export class EventsSocketClient {
 			case 'event':
 				if (typeof msg.event === 'string') this.dispatch(msg.event, msg.payload);
 				break;
+			case 'pong': {
+				const id =
+					typeof (msg as { id?: unknown }).id === 'number' ? (msg as { id: number }).id : -1;
+				const p = this.pings.get(id);
+				if (p) {
+					clearTimeout(p.timer);
+					this.pings.delete(id);
+					p.resolve(performance.now() - p.sentAt);
+				}
+				break;
+			}
 			case 'error':
+				// A server older than `ping` rejects the frame like any other
+				// control frame it does not know.
+				if (this.pings.size > 0 && (msg.message ?? '').startsWith('bad events control frame')) {
+					this.pingUnsupported = true;
+					this.failPings('unsupported');
+				}
 				console.warn(`[events-socket] ${msg.message ?? 'unknown error'}`);
 				break;
 			default:
@@ -240,6 +328,7 @@ export class EventsSocketClient {
 		const ws = this.ws;
 		this.ws = null;
 		this.open = false;
+		this.failPings('closed');
 		if (ws) {
 			ws.onclose = null;
 			ws.close();

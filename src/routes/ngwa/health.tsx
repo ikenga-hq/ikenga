@@ -13,7 +13,9 @@ import { NgwaTabs } from '@/shell/ngwa/ngwa-tabs';
 import '@/shell/ngwa/ngwa.css';
 
 const healthSearchSchema = z.object({
-	section: z.enum(['violations', 'sidecars', 'cron', 'data', 'trust', 'engines']).optional(),
+	section: z
+		.enum(['connection', 'violations', 'sidecars', 'cron', 'data', 'trust', 'engines'])
+		.optional(),
 });
 
 function NgwaHealthPage() {
@@ -33,6 +35,7 @@ function NgwaHealthPage() {
 				unreadableSources={unreadableSources}
 				section={section}
 				onOpenBackup={() => void navigate({ to: '/settings/backup' })}
+				onOpenServer={() => void navigate({ to: '/settings/about', hash: 'server-health' })}
 				onOpenStore={() => void navigate({ to: '/ngwa/store', search: { kind: 'engine' } })}
 				canReinstall={(pkgId) => registryPkgs.some((e) => registryNameMatches(e.name, pkgId))}
 				// D-02 "Reinstall from registry": the pkg's Store sheet runs the

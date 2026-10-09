@@ -93,4 +93,9 @@ export const queryKeys = {
 		all: ['server-update'] as const,
 		status: () => ['server-update', 'status'] as const,
 	},
+	// Admin Server card (`server_health`): browser sessions only, admins / T0 owner.
+	serverHealth: {
+		all: ['server-health'] as const,
+		snapshot: () => ['server-health', 'snapshot'] as const,
+	},
 } as const;

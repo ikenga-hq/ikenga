@@ -305,6 +305,12 @@ export class WebRemoteTransport implements RpcTransport {
 		);
 	}
 
+	/** One round trip over the events socket, in ms (the connection
+	 *  indicator's probe). Rejects with a `PingError` — see `events-socket.ts`. */
+	pingEvents(timeoutMs?: number): Promise<number> {
+		return this.events.ping(timeoutMs);
+	}
+
 	/** Deliver an event to everything registered for `name` on this page. */
 	dispatch(name: string, payload: unknown): void {
 		this.events.dispatch(name, payload);

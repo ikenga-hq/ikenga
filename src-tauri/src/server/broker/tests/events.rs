@@ -242,6 +242,27 @@ async fn a_second_principal_never_receives_the_first_principals_events() {
     assert_ne!(settings_path(ada), settings_path(bob));
 }
 
+/// The connection indicator's probe: a `ping` sent through the broker's
+/// proxy is answered by the principal's own child with a `pong` carrying the
+/// same id, and subscribes to nothing.
+#[tokio::test]
+async fn a_ping_through_the_proxy_comes_back_as_a_pong() {
+    let h = harness().await;
+    insert_account(&h.pool, "ada", 20_001, false).await;
+    let a = login_cookie(&h.app, "ada").await;
+    let addr = serve(h.app.clone()).await;
+    let mut ws = open_events(addr, &a).await;
+    ws.send(tungstenite::Message::Text(
+        json!({ "type": "ping", "id": 7 }).to_string(),
+    ))
+    .await
+    .unwrap();
+    let got = next_text(&mut ws, Duration::from_secs(5))
+        .await
+        .expect("a pong through the proxy");
+    assert_eq!(got, json!({ "type": "pong", "id": 7 }));
+}
+
 /// No session: the broker refuses the handshake before any child is reached.
 #[tokio::test]
 async fn the_events_socket_needs_a_session() {

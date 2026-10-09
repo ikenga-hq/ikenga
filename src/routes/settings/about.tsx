@@ -31,6 +31,7 @@ import { useShellVersion } from '@/lib/updater/use-shell-version';
 import { useUpdater } from '@/lib/updater/use-updater';
 import { useUpdaterSnooze } from '@/lib/updater/snooze';
 
+import { ServerHealthPanel } from './-components/server-health-card';
 import { ServerUpdatePanel } from './-components/server-update-panel';
 import { SettingGroup } from './-components/setting-group';
 import { SettingRow } from './-components/setting-row';
@@ -63,6 +64,9 @@ function AboutPage() {
 			</SettingGroup>
 
 			{!desktop && serverUpdate.data && <ServerUpdatePanel />}
+
+			{/* Admin Server card (`server_health`): the box's memory, disk, backups, tunnels. */}
+			{!desktop && <ServerHealthPanel />}
 
 			<AutoUpdateSettings />
 
