@@ -28,6 +28,29 @@ export function createDaemonPtySocketOpener(wsUrl: string, token?: string): Open
 	};
 }
 
+/**
+ * Open PTY sockets that can carry input, by PTY id.
+ *
+ * The daemon writes every binary frame a client sends on `/ws/pty/:id` to
+ * the PTY, under the same `dispatch` check as the `pty_write` RPC. Typing
+ * through the socket keeps keystrokes in order — one stream — where one HTTP
+ * request per key does not: on a jittery link two requests on different
+ * connections overtake each other and the shell receives `teh` for `the`.
+ */
+const inputSinks = new Map<string, Set<(bytes: Uint8Array) => boolean>>();
+
+/**
+ * Send `data` to PTY `id` over an open socket. False when none is open (not
+ * attached yet, or reconnecting); the caller then falls back to the RPC.
+ */
+export function sendPtyInput(id: string, data: string): boolean {
+	const sinks = inputSinks.get(id);
+	if (!sinks) return false;
+	const bytes = new TextEncoder().encode(data);
+	for (const send of sinks) if (send(bytes)) return true;
+	return false;
+}
+
 interface SnapshotControl {
 	type: 'ikenga.snapshot';
 	end_offset: number;
@@ -80,6 +103,8 @@ export function attachRemotePty(
 	let received = 0;
 	/** Absolute end of the daemon stream we have already painted. */
 	let serverOffset: number | null = null;
+	/** The daemon refused our input on this attachment (no `dispatch`). */
+	let inputRefused = false;
 	/** The `ikenga.snapshot` header awaiting its binary payload. */
 	let pendingSnapshot: SnapshotControl | null = null;
 
@@ -173,12 +198,22 @@ export function attachRemotePty(
 			end_offset?: number;
 			len?: number;
 			message?: string;
-			code?: number;
+			code?: number | string;
 		} | null = null;
 		try {
 			msg = JSON.parse(raw);
 		} catch {
 			msg = null;
+		}
+		// The daemon refused an input frame (G-ACCESS §1.6: typing needs
+		// `dispatch`, which a view-only device lacks). It answers every
+		// refused key; that is not terminal output. Stop typing over this
+		// socket, so later keys take the RPC path and fail there quietly,
+		// as they did before input moved to the socket.
+		if (msg?.type === 'error' && msg.code === 'forbidden') {
+			if (!inputRefused) console.warn(`[pty-socket] input refused for ${id}:`, raw);
+			inputRefused = true;
+			return;
 		}
 		// Not a control frame — the daemon still sends bare text for a few
 		// error paths, and those belong in the terminal.
@@ -286,12 +321,29 @@ export function attachRemotePty(
 		reconnectTimer = setTimeout(connect, delay);
 	};
 
+	// Binary, never text: the daemon tries a text frame as a JSON control
+	// message first, and typed text must not be able to spell one.
+	const sink = (bytes: Uint8Array): boolean => {
+		if (closedByCaller || inputRefused || !ws || ws.readyState !== WebSocket.OPEN) return false;
+		ws.send(bytes);
+		return true;
+	};
+	let sinks = inputSinks.get(id);
+	if (!sinks) {
+		sinks = new Set();
+		inputSinks.set(id, sinks);
+	}
+	sinks.add(sink);
+
 	connect();
 
 	return () => {
 		closedByCaller = true;
 		if (reconnectTimer) clearTimeout(reconnectTimer);
 		connectionStateStore.terminalClosed(id);
+		const own = inputSinks.get(id);
+		own?.delete(sink);
+		if (own && own.size === 0) inputSinks.delete(id);
 		if (ws) ws.close();
 	};
 }

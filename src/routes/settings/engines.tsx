@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
-import { openExternalUrl } from '@/lib/transport';
+import { isBrowserHost, openExternalUrl } from '@/lib/transport';
 import {
 	AlertTriangle,
 	Bot,
@@ -41,6 +41,7 @@ import { buildAgentWrappedCmd, type AgentEngineKind } from '@/terminal/claude-wr
 import { SettingsFieldRow, useSettingsSection } from '@/shell/settings/field';
 import { WslHealthSettingsRow } from '@/shell/wsl-health/wsl-health-settings-row';
 import { CustomShellsStatus } from './-components/custom-shells-status';
+import { LocalEchoSettingsRow } from './-components/local-echo-row';
 
 const OFFLINE_AGENT_ID = 'engine-noop';
 
@@ -620,6 +621,8 @@ function TerminalSectionBody() {
 					)}
 					</div>
 				</SettingsFieldRow>
+
+				{isBrowserHost() && <LocalEchoSettingsRow />}
 
 				<div className="flex items-center justify-between px-4 py-3">
 					<div className="space-y-0.5">

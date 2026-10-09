@@ -10,7 +10,8 @@ import { fileUrlToPath, resolvePath } from '@/lib/paths/file-paths';
 import { isWindows } from '@/lib/platform';
 import { createOscObserver, fireOscNotification } from '@/lib/terminal/osc-notify';
 import { copyText } from '@/lib/clipboard';
-import { isRemoteWebSession } from '@/lib/transport';
+import { isBrowserSession, isRemoteWebSession } from '@/lib/transport';
+import { ptyForeground } from '@/lib/tauri-cmd';
 import { readClipboardText } from '@/lib/transport/shims';
 import { handleOsc52, handleTerminalCopyKey, openTerminalUrl } from './clipboard-actions';
 import { explainEmptyPaste, onTerminalPasteEvent } from './paste-image';
@@ -27,6 +28,7 @@ import { Pty, type PtySpawnOpts } from './pty-bridge';
 import { resyncPtySizeOnWindowFocus } from './resync-on-focus';
 import { readCaptureWithOffset } from './pty-output-buffer';
 import { useTerminalStore } from './session-store';
+import { allowAltScreenFor, attachLocalEcho, type LocalEchoHandle } from './local-echo/attach';
 
 export interface TerminalSpec {
 	cwd: string;
@@ -248,6 +250,8 @@ interface XTermCacheEntry {
 	onDataDispose: { dispose: () => void };
 	onResizeDispose: { dispose: () => void };
 	semanticPrompts?: SemanticPromptsManager;
+	/** Predictive local echo — browser sessions only, null on the desktop. */
+	localEcho: LocalEchoHandle | null;
 }
 
 const xtermCache = new Map<string, XTermCacheEntry>();
@@ -285,6 +289,11 @@ function disposeCacheEntry(entry: XTermCacheEntry): void {
 	}
 	try {
 		entry.semanticPrompts?.dispose();
+	} catch {
+		/* ignore */
+	}
+	try {
+		entry.localEcho?.dispose();
 	} catch {
 		/* ignore */
 	}
@@ -340,7 +349,8 @@ function wirePtyToTerm(
 	oscObserver: ReturnType<typeof createOscObserver>,
 	status: (s: string) => void,
 	exit: (code: number | null) => void,
-	webglUsed: boolean
+	webglUsed: boolean,
+	localEcho: LocalEchoHandle | null
 ): {
 	detachData: () => void;
 	detachExit: () => void;
@@ -371,9 +381,31 @@ function wirePtyToTerm(
 	};
 	const detachData = pty.onData(dataHandler);
 	const detachExit = pty.onExit(exitHandler);
-	const onDataDispose = term.onData((data) => {
-		pty.write(data).catch(console.error);
-	});
+	const onDataDispose = localEcho
+		? term.onData((data) => {
+				// Predict first, so the overlay paints before the write's
+				// round trip. A write the server acknowledged (the RPC path)
+				// is an RTT sample and the engine's cue that the server has
+				// the key; one queued on the PTY socket is neither.
+				const seq = localEcho.onInput(data);
+				const sentAt = performance.now();
+				pty
+					.writeInput(data)
+					.then((acked) => {
+						if (acked) localEcho.ackInput(seq, performance.now() - sentAt);
+					})
+					.catch(console.error);
+			})
+		: term.onData((data) => {
+				pty.write(data).catch(console.error);
+			});
+	if (localEcho) {
+		// A different PTY (restart) is a different screen.
+		localEcho.reset();
+		// Full-screen apps are not predicted, except an identified claude
+		// (see `allowAltScreenFor`).
+		localEcho.setAltScreenProbe(() => ptyForeground(pty.id).then(allowAltScreenFor, () => false));
+	}
 	const xtermResizeDispose = term.onResize(({ rows, cols }) => {
 		pty.resize(rows, cols).catch(console.error);
 	});
@@ -580,6 +612,7 @@ export function XTermHost({
 		let onDataDispose: { dispose: () => void } | null = null;
 		let onResizeDispose: { dispose: () => void } | null = null;
 		let oscObserver: ReturnType<typeof createOscObserver>;
+		let localEcho: LocalEchoHandle | null = null;
 
 		if (cachedEntry) {
 			// --- CACHE HIT: reuse the existing Terminal + container. ---
@@ -589,6 +622,7 @@ export function XTermHost({
 			webglAddon = cachedEntry.webglAddon;
 			webglUsed = cachedEntry.webglUsed;
 			oscObserver = cachedEntry.oscObserver;
+			localEcho = cachedEntry.localEcho;
 
 			termRef.current = term;
 			semanticPromptsRef.current = cachedEntry.semanticPrompts ?? null;
@@ -613,7 +647,7 @@ export function XTermHost({
 				cachedEntry.detachExit();
 				cachedEntry.onDataDispose.dispose();
 				cachedEntry.onResizeDispose.dispose();
-				const wired = wirePtyToTerm(term, pty, oscObserver, status, exit, webglUsed);
+				const wired = wirePtyToTerm(term, pty, oscObserver, status, exit, webglUsed, localEcho);
 				cachedEntry.wiredPtyId = pty.id;
 				cachedEntry.detachData = wired.detachData;
 				cachedEntry.detachExit = wired.detachExit;
@@ -816,6 +850,18 @@ export function XTermHost({
 
 			oscObserver = createOscObserver({ onNotify: (n) => void fireOscNotification(n) });
 
+			// Predictive local echo, browser only: the desktop's PTY is local,
+			// so it has nothing to hide and is left exactly as it was. Attached
+			// after `setupSemanticPrompts` on purpose — xterm runs the newest
+			// OSC handler first, and ours passes OSC 133 on to that one.
+			if (isBrowserSession()) {
+				try {
+					localEcho = attachLocalEcho(term);
+				} catch (err) {
+					console.warn('[xterm] local echo unavailable', err);
+				}
+			}
+
 			// Ring-replay fallback: attaching to a session whose PTY has been
 			// alive without a cached xterm listening (cache was evicted, or
 			// this is the first reclaim after a pop-out) — replay whatever the
@@ -842,7 +888,7 @@ export function XTermHost({
 
 			if (pty) {
 				livePtyRef.current = pty;
-				const wired = wirePtyToTerm(term, pty, oscObserver, status, exit, webglUsed);
+				const wired = wirePtyToTerm(term, pty, oscObserver, status, exit, webglUsed, localEcho);
 				detachData = wired.detachData;
 				detachExit = wired.detachExit;
 				onDataDispose = wired.onDataDispose;
@@ -867,6 +913,7 @@ export function XTermHost({
 						onDataDispose,
 						onResizeDispose,
 						semanticPrompts,
+						localEcho,
 					});
 				}
 			}
@@ -1084,7 +1131,7 @@ export function XTermHost({
 					ownedPty = p;
 					livePtyRef.current = p;
 					onPtyIdRef.current?.(p.id);
-					const wired = wirePtyToTerm(term, p, oscObserver, status, exit, webglUsed);
+					const wired = wirePtyToTerm(term, p, oscObserver, status, exit, webglUsed, localEcho);
 					detachData = wired.detachData;
 					detachExit = wired.detachExit;
 					onDataDispose = wired.onDataDispose;
@@ -1146,6 +1193,7 @@ export function XTermHost({
 			pathLinksDisposeFn?.();
 			semanticPromptsRef.current?.dispose();
 			semanticPromptsRef.current = null;
+			localEcho?.dispose();
 			// Only kill the PTY if we own it (spawn-mode). In attach-mode the
 			// session-store (or detached-window caller) owns the lifecycle.
 			if (ownedPty) {
