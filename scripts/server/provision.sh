@@ -6,6 +6,7 @@ set -euo pipefail
 #   provision.sh --profile <file> [--dry-run] [--yes] [--skip-hardening]
 #   provision.sh --profile profiles/dixtrit-public.env --dry-run
 #   provision.sh backups --profile <file> [--dry-run]    (Postgres backups to GCS only)
+#   provision.sh tunnels --profile <file> [--dry-run]    (SSH tunnels to remote hosts only)
 #
 # One idempotent entry point. Every phase checks before it changes, and
 # --dry-run prints what each phase WOULD change without touching the host.
@@ -58,7 +59,7 @@ UPDATE_RETRY_COOLDOWN="${UPDATE_RETRY_COOLDOWN:-3600}"
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
 
 case "${1:-}" in
-  upgrade|check-update|apply-request|install-update-units|install-agent-cli-updates|sync-accounts|backups) ACTION="$1"; shift ;;
+  upgrade|check-update|apply-request|install-update-units|install-agent-cli-updates|sync-accounts|backups|tunnels) ACTION="$1"; shift ;;
 esac
 
 while [[ $# -gt 0 ]]; do
@@ -90,7 +91,7 @@ while [[ $# -gt 0 ]]; do
         exit 0
       fi
       if [[ "$ACTION" != "provision" ]]; then
-        printf 'Usage: %s check-update | apply-request | install-update-units | install-agent-cli-updates | sync-accounts | backups [--profile <file>] [--dry-run]\n\n' "${BASH_SOURCE[0]}"
+        printf 'Usage: %s check-update | apply-request | install-update-units | install-agent-cli-updates | sync-accounts | backups | tunnels [--profile <file>] [--dry-run]\n\n' "${BASH_SOURCE[0]}"
         printf '  check-update          read the release manifest and write %s/available.json (installs nothing)\n' "$STATE_DIR"
         printf '  apply-request         claim and apply an admin update request (run by ikenga-update.service)\n'
         printf '  install-update-units  install %s and the update timer, path and service units\n' "$STABLE_COPY"
@@ -99,6 +100,8 @@ while [[ $# -gt 0 ]]; do
         printf '                        (run it after creating or removing accounts; the full provision run does it too)\n'
         printf '  backups               converge the Postgres backup jobs (BACKUPS_ENABLED): backup user, pg_dump, gcloud, scoped\n'
         printf '                        secrets, systemd service and timers, status file (the full provision run does it too)\n'
+        printf '  tunnels               converge the SSH tunnels (TUNNELS): tunnel user, one key, pinned known_hosts, one systemd unit\n'
+        printf '                        per tunnel; prints the authorized_keys line to install on each remote host (runs before backups)\n'
         exit 0
       fi
       sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -187,6 +190,15 @@ BACKUP_PG_MAJOR="17"            # postgresql-client-<n> from the PGDG apt repo
 BACKUP_TIMEOUT_SEC="10800"      # a run is killed after this (keep it under the shortest interval)
 BACKUP_GCLOUD_KEY_FPRS=()       # extra accepted fingerprints for the Google Cloud apt signing key
 
+# SSH tunnels (e.g. to a database the backups read). See README "SSH tunnels".
+# TUNNELS is deliberately NOT given a default here: a profile that sets it (even
+# to the empty list) hands this script ownership of every tunnel unit of
+# TUNNEL_USER, a profile that never mentions it leaves the host's tunnels alone.
+TUNNEL_USER="ikenga-tunnel"     # a plain system user, NOT an Ikenga principal; owns the one key
+TUNNEL_FROM=""                  # the address printed in the authorized_keys from="" option (default: this box's public address)
+TUNNEL_KNOWN_HOSTS=()           # "<host> <keytype> <base64>": the pinned host keys; host is "name" or "[name]:port"
+unset TUNNELS
+
 if [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$PROFILE_FILE"
@@ -197,6 +209,13 @@ elif [[ "$ACTION" != "provision" ]]; then
   if [[ -f "$SYSTEMD_DIR/ikenga-server-t1.service" ]]; then TIER=t1
   elif [[ -f "$SYSTEMD_DIR/ikenga-server.service" ]]; then TIER=t0
   fi
+fi
+TUNNELS_DEFINED=0
+if declare -p TUNNELS >/dev/null 2>&1; then
+  [[ "$(declare -p TUNNELS)" == "declare -a"* ]] || { echo "error: TUNNELS must be a bash array: TUNNELS=( \"name=user@host 5544:127.0.0.1:5432\" )" >&2; exit 2; }
+  TUNNELS_DEFINED=1
+else
+  TUNNELS=()
 fi
 
 validate_profile() {
@@ -226,6 +245,7 @@ validate_profile() {
   [[ -z "$TS_AUTHKEY_FILE" || -f "$TS_AUTHKEY_FILE" ]] || die "TS_AUTHKEY_FILE '$TS_AUTHKEY_FILE' does not exist"
   [[ -z "$SECRETS_FROM" || -f "$SECRETS_FROM" ]] || die "SECRETS_FROM '$SECRETS_FROM' does not exist"
   validate_accounts_profile
+  validate_tunnels_profile
   validate_backups_profile
 }
 
@@ -724,6 +744,10 @@ summary() {
   printf '    - %s\n' "${CHANGES[@]}"
   if [[ "$ACTION" == sync-accounts ]]; then
     note "Secrets are listed by name only (+ added, ~ value changed, - removed). Per-account files: $SECRETS_DIR (root-owned, 0640)."
+    return
+  fi
+  if [[ "$ACTION" == tunnels ]]; then
+    note "Public key and fingerprint only: the tunnel's private key is never printed. Units are listed by name."
     return
   fi
   if [[ "$ACTION" == backups ]]; then
@@ -3091,6 +3115,458 @@ sync_backups() {
   if [[ "$BACKUPS_ENABLED" == 1 ]]; then sync_backups_enabled; else sync_backups_disabled; fi
 }
 
+# ------------------------------------------------------------- SSH tunnels
+#
+# A tunnel is a systemd unit that keeps `ssh -N -L 127.0.0.1:<port>:<host>:<port>`
+# up to a remote host, as an unprivileged system user, with a PINNED host key.
+# One user and ONE key per box serve every tunnel. Layout (the unit names it):
+#
+#   /var/lib/<TUNNEL_USER>/                  <user> 0700   (the user's home; /var/lib is root's)
+#     .ssh/                                  <user> 0700
+#       id_ed25519, id_ed25519.pub           <user> 0600 / 0644. Generated ONCE, never regenerated.
+#       known_hosts                          <user> 0644   the profile's TUNNEL_KNOWN_HOSTS, nothing else
+#   /etc/systemd/system/<name>-tunnel.service  root       one per TUNNELS entry
+#
+# Root never follows or writes through a path the tunnel user controls: the
+# home hangs off a root-owned parent (the user cannot swap it for a symlink),
+# everything root does INSIDE it (look at, generate, compare, write) is done AS
+# the tunnel user (as_tunnel), and a symlink at any of those paths is refused.
+# Units are root's, in a root-owned directory.
+#
+# The remote end is not ours to configure: the key must be authorised there
+# with the line this prints (restrict,port-forwarding,permitopen=...,from=...).
+
+TUNNEL_HOME="/var/lib/$TUNNEL_USER"
+TUNNEL_SSH_DIR="$TUNNEL_HOME/.ssh"
+TUNNEL_KEY="$TUNNEL_SSH_DIR/id_ed25519"
+TUNNEL_PUB="$TUNNEL_KEY.pub"
+TUNNEL_KH="$TUNNEL_SSH_DIR/known_hosts"
+TN_NAMES=(); declare -A TN_RUSER=() TN_RHOST=() TN_RPORT=() TN_LPORT=() TN_THOST=() TN_TPORT=() TN_KHKEY=()
+TN_KH_ALL=(); TN_KH_USED=()
+TN_UID=""; TN_GID=""; TN_HAVE_USER=0
+TN_PUBLINE=""            # "ssh-ed25519 AAAA... comment": the public half of the key, once it exists
+TN_KH_CHANGED=0
+
+# The entry as it may be shown: quoted, truncated, no control characters.
+tn_show() { local q; q="$(printf '%q' "${1:0:80}")"; printf '%s' "$q"; }
+
+# Cheap checks that need nothing installed. Every field is matched against a
+# strict pattern, so nothing from the profile can reach a unit file or ssh as
+# anything but the one thing it names (no option, no shell, no extra line).
+validate_tunnels_profile() {
+  [[ "$TUNNEL_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "TUNNEL_USER '$(tn_show "$TUNNEL_USER")' is not a valid unix user name"
+  case "$TUNNEL_USER" in
+    root|ikenga|nobody|postgres|"$ADMIN_USER"|"$BACKUP_USER"|ik-*) die "TUNNEL_USER '$TUNNEL_USER' is not allowed: it must be its own plain system user (not root, the admin, the T0 'ikenga' user, the backup user, or an ik-* Ikenga account)" ;;
+  esac
+  [[ "$UID_RANGE" =~ ^[0-9]+-[0-9]+$ ]] || die "UID_RANGE must look like 20000-29999 (got '$UID_RANGE')"
+  [[ -z "$TUNNEL_FROM" || "$TUNNEL_FROM" =~ ^[0-9A-Fa-f.:]{2,45}(/[0-9]{1,3})?$ ]] || die "TUNNEL_FROM must be one IP address or CIDR (got '$(tn_show "$TUNNEL_FROM")')"
+
+  TN_NAMES=(); TN_RUSER=(); TN_RHOST=(); TN_RPORT=(); TN_LPORT=(); TN_THOST=(); TN_TPORT=(); TN_KHKEY=(); TN_KH_ALL=(); TN_KH_USED=()
+  local n=0 e name ruser rhost rport lport thost tport hostre portre
+  hostre='[A-Za-z0-9][A-Za-z0-9.-]{0,251}'; portre='[1-9][0-9]{0,4}'
+  local entre="^([a-z0-9][a-z0-9-]{0,31})=([a-z_][a-z0-9_-]{0,31})@(${hostre})(:(${portre}))? (${portre}):(${hostre}):(${portre})\$"
+  local seen_names=" " seen_ports=" "
+  for e in "${TUNNELS[@]}"; do
+    n=$((n + 1))
+    [[ "$e" =~ $entre ]] || die "TUNNELS entry $n ($(tn_show "$e")) must look like: name=user@host[:sshport] localport:remotehost:remoteport   (name: a-z 0-9 -; host: letters, digits . -; ports 1-65535; exactly one space)"
+    name="${BASH_REMATCH[1]}"; ruser="${BASH_REMATCH[2]}"; rhost="${BASH_REMATCH[3]}"; rport="${BASH_REMATCH[5]:-22}"
+    lport="${BASH_REMATCH[6]}"; thost="${BASH_REMATCH[7]}"; tport="${BASH_REMATCH[8]}"
+    local p
+    for p in "$rport" "$lport" "$tport"; do
+      (( 10#$p >= 1 && 10#$p <= 65535 )) || die "TUNNELS entry $n ('$name'): port $p is outside 1-65535"
+    done
+    [[ "$seen_names" != *" $name "* ]] || die "TUNNELS names '$name' twice (the unit would be $name-tunnel.service)"
+    [[ "$seen_ports" != *" $lport "* ]] || die "TUNNELS entry $n ('$name'): local port $lport is already used by another tunnel"
+    seen_names+="$name "; seen_ports+="$lport "
+    (( 10#$lport >= 1024 )) || note "TUNNELS '$name': local port $lport is below 1024; the unprivileged tunnel user cannot bind it unless net.ipv4.ip_unprivileged_port_start is lowered" >&2
+    TN_NAMES+=("$name"); TN_RUSER[$name]="$ruser"; TN_RHOST[$name]="$rhost"; TN_RPORT[$name]="$rport"
+    TN_LPORT[$name]="$lport"; TN_THOST[$name]="$thost"; TN_TPORT[$name]="$tport"
+    if [[ "$rport" == 22 ]]; then TN_KHKEY[$name]="$rhost"; else TN_KHKEY[$name]="[$rhost]:$rport"; fi
+  done
+
+  # Pinned host keys. No TOFU and no accept-new: an entry here, or no tunnel.
+  local khre="^(\\[${hostre}\\]:${portre}|${hostre}) (ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)) ([A-Za-z0-9+/]{16,2000}={0,2})\$"
+  local line host type b64 k
+  n=0
+  for line in "${TUNNEL_KNOWN_HOSTS[@]}"; do
+    n=$((n + 1))
+    [[ "$line" =~ $khre ]] || die "TUNNEL_KNOWN_HOSTS entry $n ($(tn_show "$line")) must be exactly: <host|[host]:port> <ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-rsa> <base64 key>"
+    host="${BASH_REMATCH[1]}"; type="${BASH_REMATCH[2]}"; b64="${BASH_REMATCH[4]}"
+    TN_KH_ALL+=("$host $type $b64")
+  done
+  for name in "${TN_NAMES[@]}"; do
+    k="${TN_KHKEY[$name]}"; host=""
+    for line in "${TN_KH_ALL[@]}"; do [[ "${line%% *}" == "$k" ]] && host=1; done
+    [[ -n "$host" ]] || die "tunnel '$name' goes to $k but TUNNEL_KNOWN_HOSTS has no key for it. Host keys are pinned, never learned: add the line from the remote host (ssh-keyscan -t ed25519 ${TN_RHOST[$name]}), and confirm its fingerprint out of band"
+  done
+  # What is written to known_hosts: the entries some tunnel uses, in profile order.
+  for line in "${TN_KH_ALL[@]}"; do
+    for name in "${TN_NAMES[@]}"; do
+      if [[ "${line%% *}" == "${TN_KHKEY[$name]}" ]]; then
+        [[ " ${TN_KH_USED[*]:-} " == *" $line "* ]] || TN_KH_USED+=("$line")
+        break
+      fi
+    done
+  done
+  return 0
+}
+
+# The deep check of the host keys needs ssh-keygen, so it runs after the packages.
+tunnel_check_host_keys() {
+  command -v ssh-keygen >/dev/null 2>&1 || { note "ssh-keygen is not installed yet; the pinned host keys are parsed once openssh-client is"; return 0; }
+  local d line type out want
+  d="$(mktemp -d)"
+  for line in "${TN_KH_USED[@]}"; do
+    printf '%s\n' "$line" > "$d/kh"
+    out="$(ssh-keygen -l -f "$d/kh" 2>/dev/null)" || { rm -rf -- "$d"; die "TUNNEL_KNOWN_HOSTS: the key given for ${line%% *} is not a valid SSH public key"; }
+    type="$(cut -d' ' -f2 <<<"$line")"
+    case "$type" in ssh-ed25519) want="(ED25519)" ;; ssh-rsa) want="(RSA)" ;; *) want="(ECDSA)" ;; esac
+    [[ "$out" == *" $want" ]] || { rm -rf -- "$d"; die "TUNNEL_KNOWN_HOSTS: the key for ${line%% *} is not a $type key"; }
+  done
+  rm -rf -- "$d"
+}
+
+tunnel_load_ids() {
+  TN_HAVE_USER=0
+  [[ $EUID -eq 0 ]] || return 1          # an unprivileged dry run cannot look inside the user's directories
+  id "$TUNNEL_USER" >/dev/null 2>&1 || return 1
+  TN_UID="$(id -u "$TUNNEL_USER")"; TN_GID="$(id -g "$TUNNEL_USER")"; TN_HAVE_USER=1
+}
+
+# Run a command as the tunnel user: no supplementary groups, clean environment,
+# HOME a path the user does not control (ssh-keygen and friends never read a
+# user-supplied startup file), time-limited so a FIFO planted where a tool
+# reads cannot hang provisioning. How root touches anything INSIDE the home.
+as_tunnel() {
+  ( cd / && exec timeout --kill-after=5 "${TUNNEL_AS_USER_TIMEOUT:-60}" \
+      setpriv --reuid="$TN_UID" --regid="$TN_GID" --clear-groups \
+      env -i HOME=/nonexistent PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 "$@" )
+}
+
+tunnel_refuse_symlinks() {
+  local p
+  [[ "$(stat -c '%F' -- "$TUNNEL_HOME" 2>/dev/null || true)" != "symbolic link" ]] \
+    || die "$TUNNEL_HOME is a symbolic link. Refusing to follow it: root would chown/chmod whatever it points at. Inspect it, remove it by hand, and run again."
+  tunnel_load_ids || return 0
+  for p in "$TUNNEL_SSH_DIR" "$TUNNEL_KEY" "$TUNNEL_PUB" "$TUNNEL_KH"; do
+    if as_tunnel test -L "$p"; then
+      die "$p is a symbolic link (the tunnel user made it, or tampering). Refusing to follow it. Inspect it, remove it by hand, and run again."
+    fi
+  done
+}
+
+tunnel_ensure_user() {
+  local line uid lo hi shell home
+  lo="${UID_RANGE%-*}"; hi="${UID_RANGE#*-}"
+  if line="$(getent passwd "$TUNNEL_USER")"; then
+    IFS=: read -r _ _ uid _ _ home shell <<<"$line"
+    (( uid > 0 )) || die "TUNNEL_USER $TUNNEL_USER has uid 0"
+    (( uid < lo || uid >= hi )) || die "TUNNEL_USER $TUNNEL_USER has uid $uid, inside the Ikenga account range $UID_RANGE; it must be a plain system user"
+    if [[ "$home" != "$TUNNEL_HOME" ]]; then
+      run usermod -d "$TUNNEL_HOME" "$TUNNEL_USER"; changed "user $TUNNEL_USER: home -> $TUNNEL_HOME"
+    fi
+    if [[ "$shell" != /usr/sbin/nologin ]]; then
+      run usermod -s /usr/sbin/nologin "$TUNNEL_USER"; changed "user $TUNNEL_USER: login shell -> nologin"
+    fi
+    if [[ "$(id -nG "$TUNNEL_USER")" != "$(id -gn "$TUNNEL_USER")" ]]; then
+      run usermod -G "" "$TUNNEL_USER"; changed "user $TUNNEL_USER: supplementary groups removed"
+    fi
+  else
+    run useradd --system --user-group --no-create-home --home-dir "$TUNNEL_HOME" --shell /usr/sbin/nologin \
+      --comment "Ikenga SSH tunnels" "$TUNNEL_USER"
+    changed "system user $TUNNEL_USER created (no login, home $TUNNEL_HOME)"
+  fi
+  tunnel_load_ids || true
+}
+
+tunnel_ensure_ssh_dir() {
+  local d="$TUNNEL_SSH_DIR" info owner mode
+  if [[ $TN_HAVE_USER -eq 1 ]] && info="$(as_tunnel stat -c '%F|%u|%a' -- "$d" 2>/dev/null)"; then
+    [[ "${info%%|*}" == directory ]] || die "$d exists and is a ${info%%|*}, not a directory; refusing to touch it. Move it away and run again."
+    owner="$(cut -d'|' -f2 <<<"$info")"; mode="${info##*|}"
+    [[ "$owner" == "$TN_UID" ]] || die "$d is owned by uid $owner, not $TN_UID ($TUNNEL_USER). Refusing to adopt it: inspect it, fix or remove it by hand, and run again."
+    if [[ "$mode" != 700 ]]; then run as_tunnel chmod 0700 -- "$d"; changed "$d: mode set to 0700"; fi
+  else
+    run as_tunnel install -d -m 0700 -- "$d"
+    changed "$d created ($TUNNEL_USER 0700)"
+  fi
+}
+
+# One key per box. Generated once and NEVER regenerated: an existing one is
+# adopted when it is a regular ed25519 key of this user (a symlink or another
+# owner is refused). Sets TN_PUBLINE.
+tunnel_ensure_key() {
+  local info owner mode pub have_pub fp h
+  TN_PUBLINE=""
+  if [[ $TN_HAVE_USER -eq 1 ]] && as_tunnel test -e "$TUNNEL_KEY"; then
+    info="$(as_tunnel stat -c '%F|%u|%a' -- "$TUNNEL_KEY")"
+    [[ "${info%%|*}" == "regular file" ]] || die "$TUNNEL_KEY is a ${info%%|*}, not a key file; refusing to touch it. Inspect it, move it away, and run again."
+    owner="$(cut -d'|' -f2 <<<"$info")"; mode="${info##*|}"
+    [[ "$owner" == "$TN_UID" ]] || die "$TUNNEL_KEY is owned by uid $owner, not $TN_UID ($TUNNEL_USER). Refusing to adopt it (tampering, or another layout): inspect it, fix or remove it by hand, and run again."
+    if (( (8#$mode & 8#077) != 0 )); then
+      run as_tunnel chmod 0600 -- "$TUNNEL_KEY"; changed "$TUNNEL_KEY: mode set to 0600"
+    fi
+    # The public half, derived by the key's owner. Nothing private is printed.
+    pub="$(as_tunnel ssh-keygen -y -P '' -f "$TUNNEL_KEY" 2>/dev/null </dev/null)" \
+      || die "$TUNNEL_KEY cannot be read as an SSH private key without a passphrase; refusing to touch it"
+    [[ "$pub" == "ssh-ed25519 "* ]] || die "$TUNNEL_KEY is not an ed25519 key; refusing to touch it"
+    TN_PUBLINE="$pub"
+    have_pub=""
+    if as_tunnel test -f "$TUNNEL_PUB"; then
+      have_pub="$(as_tunnel cat -- "$TUNNEL_PUB" 2>/dev/null | cut -d' ' -f1,2 || true)"
+    fi
+    if [[ "$have_pub" != "$(cut -d' ' -f1,2 <<<"$pub")" ]]; then
+      if as_tunnel test -e "$TUNNEL_PUB"; then
+        info="$(as_tunnel stat -c '%F|%u' -- "$TUNNEL_PUB")"
+        [[ "$info" == "regular file|$TN_UID" ]] || die "$TUNNEL_PUB is not a regular file of $TUNNEL_USER; refusing to touch it"
+      fi
+      if [[ $DRY_RUN -eq 0 ]]; then
+        printf '%s\n' "$pub" | as_tunnel sh -c 'umask 022; cat > "$1.new" && mv -f "$1.new" "$1"' sh "$TUNNEL_PUB"
+      fi
+      changed "$TUNNEL_PUB written (derived from the existing key)"
+    fi
+    return 0
+  fi
+  h="$(hostname -s 2>/dev/null || echo box)"; [[ "$h" =~ ^[A-Za-z0-9._-]+$ ]] || h=box
+  run as_tunnel ssh-keygen -q -t ed25519 -N '' -C "$TUNNEL_USER@$h" -f "$TUNNEL_KEY"
+  if [[ $DRY_RUN -eq 0 ]]; then
+    TN_PUBLINE="$(as_tunnel ssh-keygen -y -P '' -f "$TUNNEL_KEY" </dev/null)" || die "could not read back the key just generated"
+    fp="$(as_tunnel ssh-keygen -l -f "$TUNNEL_PUB" | cut -d' ' -f2)"
+    changed "$TUNNEL_KEY generated (ed25519, $fp); it is never regenerated"
+  else
+    changed "$TUNNEL_KEY generated (ed25519)"
+  fi
+}
+
+# known_hosts is exactly the profile's entries for the hosts some tunnel goes
+# to. Compared as a set of lines (order, blanks and comments do not matter) and
+# written by the tunnel user. A replaced file is first copied aside.
+tunnel_kh_norm() { { grep -v '^[[:space:]]*#' || true; } | tr -s ' \t' ' ' | sed -E '/^ *$/d; s/^ //; s/ $//' | LC_ALL=C sort -u; }
+tunnel_sync_known_hosts() {
+  local want have info owner mode
+  TN_KH_CHANGED=0
+  want="$(printf '%s\n' "${TN_KH_USED[@]}")"
+  if [[ $TN_HAVE_USER -eq 1 ]] && as_tunnel test -e "$TUNNEL_KH"; then
+    info="$(as_tunnel stat -c '%F|%u|%a' -- "$TUNNEL_KH")"
+    [[ "${info%%|*}" == "regular file" ]] || die "$TUNNEL_KH is a ${info%%|*}, not a file; refusing to touch it. Inspect it, move it away, and run again."
+    owner="$(cut -d'|' -f2 <<<"$info")"; mode="${info##*|}"
+    [[ "$owner" == "$TN_UID" ]] || die "$TUNNEL_KH is owned by uid $owner, not $TN_UID ($TUNNEL_USER). Refusing to adopt it: inspect it, fix or remove it by hand, and run again."
+    have="$(as_tunnel cat -- "$TUNNEL_KH" 2>/dev/null || true)"
+    if [[ "$(tunnel_kh_norm <<<"$have")" == "$(tunnel_kh_norm <<<"$want")" ]]; then
+      if (( (8#$mode & 8#022) != 0 )); then
+        run as_tunnel chmod 0644 -- "$TUNNEL_KH"; changed "$TUNNEL_KH: mode set to 0644"
+      fi
+      return 0
+    fi
+    if [[ $DRY_RUN -eq 0 ]]; then
+      as_tunnel cp -p -- "$TUNNEL_KH" "$TUNNEL_KH.bak-$(date +%Y%m%d-%H%M%S)" || die "could not back up $TUNNEL_KH"
+    fi
+  fi
+  if [[ $DRY_RUN -eq 0 ]]; then
+    printf '%s\n' "$want" | as_tunnel sh -c 'umask 022; cat > "$1.new" && chmod 0644 "$1.new" && mv -f "$1.new" "$1"' sh "$TUNNEL_KH" \
+      || die "could not write $TUNNEL_KH"
+  fi
+  TN_KH_CHANGED=1
+  changed "$TUNNEL_KH written (${#TN_KH_USED[@]} pinned host key(s), from TUNNEL_KNOWN_HOSTS)"
+}
+
+# ---- the units
+
+tunnel_unit_name() { printf '%s-tunnel.service' "$1"; }
+
+tunnel_unit() {   # name
+  local n="$1"
+  printf '%s\n' "# Managed by ikenga provision.sh (tunnels): change TUNNELS in the profile, not this file." \
+    "[Unit]" \
+    "Description=Ikenga: SSH tunnel $n (127.0.0.1:${TN_LPORT[$n]} to ${TN_THOST[$n]}:${TN_TPORT[$n]} via ${TN_RUSER[$n]}@${TN_RHOST[$n]})" \
+    "Documentation=https://github.com/ikenga-hq/ikenga/blob/main/scripts/server/README.md" \
+    "After=network-online.target" \
+    "Wants=network-online.target" \
+    "" \
+    "[Service]" \
+    "User=$TUNNEL_USER" \
+    "Group=$TUNNEL_USER"
+  printf 'ExecStart=/usr/bin/ssh -NT \\\n'
+  # -F none: never read ~/.ssh/config, so nothing in the tunnel user's home can
+  # add a ProxyCommand, a GlobalKnownHostsFile or an extra forward.
+  printf '  -F none \\\n'
+  printf '  -i %s \\\n' "$TUNNEL_KEY"
+  printf '  -o UserKnownHostsFile=%s \\\n' "$TUNNEL_KH"
+  printf '  -o %s \\\n' StrictHostKeyChecking=yes IdentitiesOnly=yes ExitOnForwardFailure=yes ServerAliveInterval=30 ServerAliveCountMax=3 BatchMode=yes
+  if [[ "${TN_RPORT[$n]}" != 22 ]]; then printf '  -p %s \\\n' "${TN_RPORT[$n]}"; fi
+  printf '  -L 127.0.0.1:%s:%s:%s \\\n' "${TN_LPORT[$n]}" "${TN_THOST[$n]}" "${TN_TPORT[$n]}"
+  printf '  %s@%s\n' "${TN_RUSER[$n]}" "${TN_RHOST[$n]}"
+  printf '%s\n' "Restart=always" "RestartSec=10" "NoNewPrivileges=yes" "ProtectSystem=strict" "ProtectHome=yes" "PrivateTmp=yes" \
+    "ReadOnlyPaths=$TUNNEL_HOME" \
+    "" \
+    "[Install]" \
+    "WantedBy=multi-user.target"
+}
+
+# A unit as systemd sees it, minus what does not change behaviour: comments,
+# blank lines, continuation formatting, Description= and Documentation=. This is
+# what lets a hand-made unit with the same effect be ADOPTED without a rewrite
+# or a restart.
+tunnel_unit_norm() {
+  awk '
+    /^[ \t]*[#;]/ { next }
+    { line = $0; sub(/[ \t]+$/, "", line)
+      if (line ~ /\\$/) { sub(/\\$/, "", line); buf = buf line " "; next }
+      print buf line; buf = "" }
+  ' | sed -E '/^[[:space:]]*$/d; /^(Description|Documentation)=/d; s/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+# Writes the unit when its effective content differs. Returns 0 when it changed it.
+TN_UCHANGED=" "
+tunnel_write_unit() {   # name
+  local n="$1" u f want have ts
+  u="$(tunnel_unit_name "$n")"; f="$SYSTEMD_DIR/$u"
+  want="$(tunnel_unit "$n")"
+  [[ ! -L "$f" ]] || die "$f is a symbolic link. Refusing to write through it. Inspect it, remove it by hand, and run again."
+  if [[ -e "$f" ]]; then
+    [[ -f "$f" ]] || die "$f exists and is not a regular file; refusing to touch it"
+    if [[ "$(tunnel_unit_norm < "$f")" == "$(tunnel_unit_norm <<<"$want")" ]]; then
+      if [[ "$(stat -c '%a %u %g' -- "$f")" != "644 0 0" ]]; then
+        run chown 0:0 "$f"; run chmod 0644 "$f"; changed "unit $u: owner/mode set to root 0644"
+      fi
+      return 1
+    fi
+    ts="$(date +%Y%m%d-%H%M%S)"
+    if [[ $DRY_RUN -eq 0 ]]; then cp -p -- "$f" "$f.bak-$ts"; fi
+    note "$u differs from the profile's tunnel; the old unit is kept as $u.bak-$ts"
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf '    [dry-run] write %s:\n' "$f"
+    printf '%s\n' "$want" | sed 's/^/      | /'
+  else
+    local tmp; tmp="$(mktemp "$SYSTEMD_DIR/.tmp.XXXXXX")"
+    printf '%s\n' "$want" > "$tmp"; chown 0:0 "$tmp"; chmod 0644 "$tmp"; mv -f -- "$tmp" "$f"
+  fi
+  TN_UCHANGED+="$n "
+  changed "unit $u installed"
+  return 0
+}
+
+# Units of TUNNEL_USER that the profile no longer lists: stopped, disabled,
+# removed. The key, the user and known_hosts stay.
+tunnel_stale_units() {
+  local f u n
+  for f in "$SYSTEMD_DIR"/*-tunnel.service; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    u="$(basename -- "$f")"; n="${u%-tunnel.service}"
+    [[ " ${TN_NAMES[*]:-} " == *" $n "* ]] && continue
+    if [[ -L "$f" ]]; then note "$u is a symbolic link; leaving it alone" >&2; continue; fi
+    grep -qFx "User=$TUNNEL_USER" "$f" 2>/dev/null || continue
+    printf '%s\n' "$u"
+  done
+}
+
+tunnel_remove_stale() {
+  local u any=0
+  while IFS= read -r u; do
+    [[ -n "$u" ]] || continue
+    if [[ $DRY_RUN -eq 0 ]]; then sc disable --now "$u" >/dev/null 2>&1 || true; rm -f -- "$SYSTEMD_DIR/$u"; fi
+    changed "unit $u stopped, disabled and removed (not in TUNNELS; the key is kept)"; any=1
+  done < <(tunnel_stale_units)
+  [[ $any -eq 0 || $DRY_RUN -eq 1 ]] || sc daemon-reload
+}
+
+# The address the remote host will see this box connect from.
+tunnel_from_ip() {
+  local ip
+  if [[ -n "$TUNNEL_FROM" ]]; then printf '%s' "$TUNNEL_FROM"; return; fi
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}' | head -n1 || true)"
+  if [[ -z "$ip" || "$ip" =~ ^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.) ]]; then
+    printf '%s' "<THIS-BOX-PUBLIC-IP>"
+  else
+    printf '%s' "$ip"
+  fi
+}
+
+tunnel_print_remote_lines() {
+  local n from line
+  from="$(tunnel_from_ip)"
+  note "Install on each remote host (the provisioner cannot): one line in the tunnel user's authorized_keys there."
+  [[ "$from" != "<THIS-BOX-PUBLIC-IP>" ]] || note "This box's public address could not be determined: replace <THIS-BOX-PUBLIC-IP> (or set TUNNEL_FROM in the profile)."
+  for n in "${TN_NAMES[@]}"; do
+    note "$n: ${TN_RUSER[$n]}@${TN_RHOST[$n]}$([[ ${TN_RPORT[$n]} == 22 ]] || printf ' (ssh port %s)' "${TN_RPORT[$n]}")"
+    line="restrict,port-forwarding,permitopen=\"${TN_THOST[$n]}:${TN_TPORT[$n]}\",from=\"$from\" ${TN_PUBLINE:-<public key: shown once the key exists>}"
+    printf '      %s\n' "$line"
+  done
+  if [[ -n "$TN_PUBLINE" && $DRY_RUN -eq 0 ]]; then
+    note "key fingerprint: $(printf '%s\n' "$TN_PUBLINE" | ssh-keygen -l -f - 2>/dev/null | cut -d' ' -f2 || true)"
+  fi
+}
+
+# ---- converge
+
+sync_tunnels() {
+  if [[ $TUNNELS_DEFINED -eq 0 ]]; then
+    [[ "$ACTION" != tunnels ]] || note "nothing to do: the profile does not define TUNNELS (existing tunnel units are left alone)"
+    return 0
+  fi
+  local stale n u st unit_reload=0 started=" "
+  stale="$(tunnel_stale_units)"
+  if [[ ${#TN_NAMES[@]} -eq 0 && -z "$stale" ]]; then
+    [[ "$ACTION" != tunnels ]] || note "nothing to do: TUNNELS is empty and no tunnel unit of $TUNNEL_USER exists"
+    return 0
+  fi
+  log "SSH tunnels (user $TUNNEL_USER; ${#TN_NAMES[@]} tunnel(s))"
+  [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo)"
+
+  # Root-owned things go first, before any check the tunnel user can influence:
+  # a symlink planted in its own tree must not keep a removed tunnel running.
+  # Profile-only checks first: a malformed pinned host key must stop the run
+  # before anything (including stale-unit removal) changes on the host.
+  backup_apt_install openssh-client util-linux iproute2
+  if [[ ${#TN_NAMES[@]} -gt 0 ]]; then tunnel_check_host_keys; fi
+  tunnel_remove_stale
+  if [[ ${#TN_NAMES[@]} -eq 0 ]]; then return 0; fi
+
+  tunnel_refuse_symlinks
+  tunnel_ensure_user
+  backup_safe_dir 0700 "$TUNNEL_USER" "$TUNNEL_USER" "${TN_UID:-0}" "$TUNNEL_HOME"
+  tunnel_load_ids || true
+  tunnel_ensure_ssh_dir
+  tunnel_ensure_key
+  tunnel_sync_known_hosts
+
+  for n in "${TN_NAMES[@]}"; do
+    if tunnel_write_unit "$n"; then unit_reload=1; fi
+  done
+  if [[ $DRY_RUN -eq 1 ]]; then
+    note "[dry-run] systemctl daemon-reload; enable --now $(for n in "${TN_NAMES[@]}"; do printf '%s ' "$(tunnel_unit_name "$n")"; done)"
+  else
+    [[ $unit_reload -eq 0 ]] || sc daemon-reload
+    for n in "${TN_NAMES[@]}"; do
+      u="$(tunnel_unit_name "$n")"
+      # "activating" is a tunnel waiting out RestartSec (the remote refused it,
+      # or is down): systemd is doing its job, and a rerun must not touch it.
+      st="$(sc is-active "$u" 2>/dev/null || true)"
+      if ! sc is-enabled --quiet "$u" 2>/dev/null || [[ "$st" != active && "$st" != activating ]]; then
+        sc enable --now "$u" >/dev/null 2>&1 || soft_fail "could not enable $u (see: systemctl status $u)"
+        changed "unit $u enabled and started"; started+="$n "
+      elif [[ "$TN_UCHANGED" == *" $n "* || $TN_KH_CHANGED -eq 1 ]]; then
+        sc restart "$u" >/dev/null 2>&1 || soft_fail "could not restart $u"
+        changed "unit $u restarted ($([[ "$TN_UCHANGED" == *" $n "* ]] && echo 'unit changed' || echo 'pinned host keys changed'))"; started+="$n "
+      fi
+    done
+    # Is it connected? ssh opens the local port only after the remote accepted it.
+    local i up
+    for n in "${TN_NAMES[@]}"; do
+      up=0
+      for i in 1 2 3 4 5 6; do
+        if ss -ltn 2>/dev/null | grep -qE "127\.0\.0\.1:${TN_LPORT[$n]}\s"; then up=1; break; fi
+        [[ "$started" == *" $n "* ]] || break
+        sleep 1
+      done
+      if [[ $up -eq 1 ]]; then note "$n: 127.0.0.1:${TN_LPORT[$n]} is listening"
+      else note "$n: 127.0.0.1:${TN_LPORT[$n]} is not listening yet (not connected: install the authorized_keys line below on the remote host; the unit retries every 10 s)"; fi
+    done
+  fi
+  tunnel_print_remote_lines
+}
+
 # ------------------------------------------------------------------ main
 
 case "$ACTION" in
@@ -3112,6 +3588,13 @@ case "$ACTION" in
     sync_accounts
     summary
     [[ $FAILED -eq 0 ]] || { echo "error: some account sync steps failed; see the warnings above" >&2; exit 1; }
+    exit 0 ;;
+  tunnels)
+    [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || die "tunnels needs a profile: pass --profile <file> (or provision once so $INSTALL_DIR/.profile.env exists)"
+    validate_tunnels_profile
+    sync_tunnels
+    summary
+    [[ $FAILED -eq 0 ]] || { echo "error: some tunnel steps failed; see the warnings above" >&2; exit 1; }
     exit 0 ;;
   backups)
     [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || die "backups needs a profile: pass --profile <file> (or provision once so $INSTALL_DIR/.profile.env exists)"
@@ -3143,6 +3626,7 @@ install_agent_cli_updates
 firewall
 verify
 sync_accounts
+sync_tunnels
 sync_backups
 summary
-[[ $FAILED -eq 0 ]] || { echo "error: some account or backup steps failed; see the warnings above" >&2; exit 1; }
+[[ $FAILED -eq 0 ]] || { echo "error: some account, tunnel or backup steps failed; see the warnings above" >&2; exit 1; }
