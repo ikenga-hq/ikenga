@@ -7,6 +7,7 @@ set -euo pipefail
 #   provision.sh --profile profiles/dixtrit-public.env --dry-run
 #   provision.sh backups --profile <file> [--dry-run]    (Postgres backups to GCS only)
 #   provision.sh tunnels --profile <file> [--dry-run]    (SSH tunnels to remote hosts only)
+#   provision.sh swap --profile <file> [--dry-run]       (swap file + vm.swappiness only)
 #
 # One idempotent entry point. Every phase checks before it changes, and
 # --dry-run prints what each phase WOULD change without touching the host.
@@ -59,7 +60,7 @@ UPDATE_RETRY_COOLDOWN="${UPDATE_RETRY_COOLDOWN:-3600}"
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
 
 case "${1:-}" in
-  upgrade|check-update|apply-request|install-update-units|install-agent-cli-updates|sync-accounts|backups|tunnels) ACTION="$1"; shift ;;
+  upgrade|check-update|apply-request|install-update-units|install-agent-cli-updates|sync-accounts|backups|tunnels|swap) ACTION="$1"; shift ;;
 esac
 
 while [[ $# -gt 0 ]]; do
@@ -91,7 +92,7 @@ while [[ $# -gt 0 ]]; do
         exit 0
       fi
       if [[ "$ACTION" != "provision" ]]; then
-        printf 'Usage: %s check-update | apply-request | install-update-units | install-agent-cli-updates | sync-accounts | backups | tunnels [--profile <file>] [--dry-run]\n\n' "${BASH_SOURCE[0]}"
+        printf 'Usage: %s check-update | apply-request | install-update-units | install-agent-cli-updates | sync-accounts | backups | tunnels | swap [--profile <file>] [--dry-run]\n\n' "${BASH_SOURCE[0]}"
         printf '  check-update          read the release manifest and write %s/available.json (installs nothing)\n' "$STATE_DIR"
         printf '  apply-request         claim and apply an admin update request (run by ikenga-update.service)\n'
         printf '  install-update-units  install %s and the update timer, path and service units\n' "$STABLE_COPY"
@@ -102,6 +103,8 @@ while [[ $# -gt 0 ]]; do
         printf '                        secrets, systemd service and timers, status file (the full provision run does it too)\n'
         printf '  tunnels               converge the SSH tunnels (TUNNELS): tunnel user, one key, pinned known_hosts, one systemd unit\n'
         printf '                        per tunnel; prints the authorized_keys line to install on each remote host (runs before backups)\n'
+        printf '  swap                  converge the swap file (SWAP_SIZE, SWAPPINESS, SWAP_FILE): one managed fstab line, vm.swappiness\n'
+        printf '                        in a sysctl drop-in; does nothing when other swap is already active (the full provision run does it too)\n'
         exit 0
       fi
       sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -199,6 +202,13 @@ TUNNEL_FROM=""                  # the address printed in the authorized_keys fro
 TUNNEL_KNOWN_HOSTS=()           # "<host> <keytype> <base64>": the pinned host keys; host is "name" or "[name]:port"
 unset TUNNELS
 
+# Swap (README "Swap"). A small box with several agent sessions needs some, or
+# the OOM killer ends a session. auto = 4G for RAM up to 8 GB, 2G above;
+# off|0 = manage nothing and remove what a previous run made.
+SWAP_SIZE="auto"                # auto | <n>M | <n>G | off | 0
+SWAPPINESS="10"                 # vm.swappiness (0-100): use swap as an overflow, not eagerly
+SWAP_FILE="/swapfile"           # an absolute path on a local ext4/xfs/f2fs filesystem
+
 if [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$PROFILE_FILE"
@@ -247,6 +257,7 @@ validate_profile() {
   validate_accounts_profile
   validate_tunnels_profile
   validate_backups_profile
+  validate_swap_profile
 }
 
 # --------------------------------------------------------------- preflight
@@ -748,6 +759,10 @@ summary() {
   fi
   if [[ "$ACTION" == tunnels ]]; then
     note "Public key and fingerprint only: the tunnel's private key is never printed. Units are listed by name."
+    return
+  fi
+  if [[ "$ACTION" == swap ]]; then
+    note "Swap: $SWAP_FILE, one '$SWAP_MARK' line in $SWAP_FSTAB, $SWAP_SYSCTL. Nothing else is touched."
     return
   fi
   if [[ "$ACTION" == backups ]]; then
@@ -3567,6 +3582,258 @@ sync_tunnels() {
   tunnel_print_remote_lines
 }
 
+# ------------------------------------------------------------------- swap
+
+# A swap file for a small box (a 3.8 GB host with three ~280 MB agent sessions
+# each runs out of memory without one). SWAP_SIZE / SWAPPINESS / SWAP_FILE; see
+# README "Swap". The rule that matters: if ANY swap is already active that we
+# did not create, we leave swap alone and say so.
+#
+# What we own, and only this: SWAP_FILE, one fstab line ending in
+# "# ikenga-swap", and /etc/sysctl.d/90-ikenga-swap.conf. The fstab line is the
+# ownership marker: a swap file without it is never touched.
+SWAP_MARK="# ikenga-swap"
+SWAP_SYSCTL=/etc/sysctl.d/90-ikenga-swap.conf
+SWAP_FSTAB="${IKENGA_FSTAB:-/etc/fstab}"
+SWAP_MEMINFO="${IKENGA_MEMINFO:-/proc/meminfo}"
+SWAP_MARGIN_MB=256     # memory that must stay free after swapoff pulls the used swap back in
+SWAP_MB=0              # resolved size in MiB; 0 = off
+
+validate_swap_profile() {
+  SWAP_SIZE="${SWAP_SIZE,,}"
+  [[ "$SWAP_SIZE" =~ ^(auto|off|0|[0-9]+[mg])$ ]] || die "SWAP_SIZE must be auto, off, 0, or a size like 2G or 4096M (got '$SWAP_SIZE')"
+  [[ "$SWAPPINESS" =~ ^[0-9]{1,3}$ ]] && (( 10#$SWAPPINESS <= 100 )) || die "SWAPPINESS must be a number from 0 to 100 (got '$SWAPPINESS')"
+  SWAPPINESS=$((10#$SWAPPINESS))
+  [[ "$SWAP_FILE" =~ ^/[A-Za-z0-9._/-]+$ && "$SWAP_FILE" != */ && "$SWAP_FILE" != *..* && "$SWAP_FILE" != *//* ]] \
+    || die "SWAP_FILE must be a plain absolute path of letters, digits and . _ - / (got '$SWAP_FILE')"
+  case "$SWAP_SIZE" in
+    off|0) SWAP_MB=0 ;;
+    auto)
+      local kb gb; kb="$(awk '/^MemTotal:/{print $2}' "$SWAP_MEMINFO" 2>/dev/null || true)"
+      [[ "$kb" =~ ^[0-9]+$ ]] || die "cannot read MemTotal from $SWAP_MEMINFO to size SWAP_SIZE=auto"
+      gb=$(( (kb + 1048575) / 1048576 ))      # RAM in GiB, rounded up (a "4 GB" box reports a little under 4)
+      if (( gb <= 8 )); then SWAP_MB=4096; else SWAP_MB=2048; fi ;;
+    *)
+      SWAP_MB=$(( 10#${SWAP_SIZE%[mg]} ))
+      [[ "$SWAP_SIZE" == *g ]] && SWAP_MB=$(( SWAP_MB * 1024 ))
+      (( SWAP_MB >= 64 && SWAP_MB <= 65536 )) || die "SWAP_SIZE '$SWAP_SIZE' is out of range (64M to 64G)" ;;
+  esac
+}
+
+# Active swap names, one per line (empty when none or when swapon is missing).
+swap_active() { command -v swapon >/dev/null 2>&1 && swapon --noheadings --raw --show=NAME 2>/dev/null || true; }
+swap_is_active() { swap_active | grep -qxF -- "$1"; }
+swap_used_bytes() { swapon --noheadings --raw --bytes --show=NAME,USED 2>/dev/null | awk -v n="$1" '$1==n{print $2; exit}'; }
+swap_mem_avail_kb() { awk '/^MemAvailable:/{print $2}' "$SWAP_MEMINFO" 2>/dev/null; }
+
+# The path in the managed fstab line, if there is one (first one; a dup is repaired later).
+swap_marked_path() { awk '$NF=="ikenga-swap" && $(NF-1)=="#" {print $1; exit}' "$SWAP_FSTAB" 2>/dev/null || true; }
+swap_mark_count() { grep -cE '[[:space:]]#[[:space:]]ikenga-swap[[:space:]]*$' "$SWAP_FSTAB" 2>/dev/null || true; }
+
+# swap_fstab_set <line|"">: make fstab hold exactly this one managed line (or none).
+# Backs the file up before changing it. Returns 1 when nothing needed changing.
+swap_fstab_set() {
+  local want="$1" n cur
+  n="$(swap_mark_count)"; n="${n:-0}"
+  cur="$(grep -E '[[:space:]]#[[:space:]]ikenga-swap[[:space:]]*$' "$SWAP_FSTAB" 2>/dev/null || true)"
+  if [[ -z "$want" ]]; then [[ "$n" -gt 0 ]] || return 1
+  elif [[ "$n" -eq 1 && "$cur" == "$want" ]]; then return 1
+  fi
+  [[ $DRY_RUN -eq 1 ]] && return 0
+  local tmp; tmp="$(mktemp)"
+  { [[ -f "$SWAP_FSTAB" ]] && grep -vE '[[:space:]]#[[:space:]]ikenga-swap[[:space:]]*$' "$SWAP_FSTAB"
+    [[ -z "$want" ]] || printf '%s\n' "$want"
+    true
+  } > "$tmp"
+  if [[ -f "$SWAP_FSTAB" ]]; then
+    cp -a "$SWAP_FSTAB" "$SWAP_FSTAB.bak-$(date +%Y%m%d-%H%M%S)"
+    find "$(dirname -- "$SWAP_FSTAB")" -maxdepth 1 -name "$(basename -- "$SWAP_FSTAB").bak-*" | sort | head -n -5 | xargs -r rm -f --
+    cat "$tmp" > "$SWAP_FSTAB"
+  else
+    install -m 0644 -o root -g root "$tmp" "$SWAP_FSTAB"
+  fi
+  rm -f "$tmp"
+  return 0
+}
+
+# Is it safe to turn this swap off? Everything it holds has to fit back in RAM.
+swap_can_swapoff() {   # path
+  local used avail
+  used="$(swap_used_bytes "$1")"; used="${used:-0}"
+  (( used > 0 )) || return 0
+  avail="$(swap_mem_avail_kb)"; avail="${avail:-0}"
+  if (( used + SWAP_MARGIN_MB * 1048576 > avail * 1024 )); then
+    soft_fail "swap: refusing to turn off $1: $((used / 1048576)) MiB is in use and only $((avail / 1024)) MiB of memory is available (need that plus ${SWAP_MARGIN_MB} MiB spare). Nothing was changed; retry when the box is quieter."
+    return 1
+  fi
+}
+
+# Checks on SWAP_FILE that must hold before we create or replace anything.
+swap_check_target() {
+  local f="$SWAP_FILE" dir fs
+  dir="$(dirname -- "$f")"
+  [[ ! -L "$f" ]] || { soft_fail "swap: $f is a symlink; refusing (point SWAP_FILE at a real path)"; return 1; }
+  [[ -d "$dir" ]] || { soft_fail "swap: directory $dir does not exist"; return 1; }
+  [[ "$(realpath -m -- "$f")" == "$f" ]] || { soft_fail "swap: $f goes through a symlink (resolves to $(realpath -m -- "$f")); refusing"; return 1; }
+  [[ ! -e "$f" || -f "$f" ]] || { soft_fail "swap: $f exists and is not a regular file"; return 1; }
+  fs="$(findmnt -n -o FSTYPE -T "$dir" 2>/dev/null | head -1 || true)"
+  [[ -n "$fs" ]] || fs="$(stat -f -c %T "$dir" 2>/dev/null || true)"
+  case "$fs" in
+    ext2|ext3|ext4|ext2/ext3|xfs|f2fs) ;;
+    btrfs) soft_fail "swap: $dir is on btrfs, which needs a nodatacow swap file made by 'btrfs filesystem mkswapfile'; not supported here. Put SWAP_FILE on an ext4 or xfs filesystem."; return 1 ;;
+    *) soft_fail "swap: $dir is on '${fs:-unknown}', not a local ext4/xfs/f2fs filesystem; a swap file cannot live there. Choose another SWAP_FILE."; return 1 ;;
+  esac
+}
+
+# Keep at least 10% of the filesystem free after the file is in place.
+# credit_mb = space that frees up first (the file being replaced).
+swap_disk_ok() {   # need_mb credit_mb
+  local dir free_kb total_kb
+  dir="$(dirname -- "$SWAP_FILE")"
+  read -r total_kb free_kb < <(df -Pk -- "$dir" | awk 'NR==2{print $2, $4}')
+  if (( (free_kb + $2 * 1024 - $1 * 1024) * 10 < total_kb )); then
+    soft_fail "swap: not enough free disk on $dir for a $1 MiB swap file ($((free_kb / 1024)) MiB free of $((total_kb / 1024)) MiB; at least 10% must stay free). Choose a smaller SWAP_SIZE."
+    return 1
+  fi
+}
+
+swap_signature_ok() {
+  command -v blkid >/dev/null 2>&1 || return 0
+  [[ "$(blkid -p -o value -s TYPE -- "$1" 2>/dev/null || true)" == swap ]]
+}
+
+# Build the file next to its final name, then rename it into place: SWAP_FILE
+# is never a half-written file.
+swap_create() {   # mode: fallocate|dd
+  local f="$SWAP_FILE" tmp="$SWAP_FILE.ikenga-new" mode="$1"
+  run rm -f -- "$tmp"
+  run install -m 0600 -o root -g root /dev/null "$tmp"
+  if [[ "$mode" == fallocate ]]; then
+    if ! run fallocate -l "${SWAP_MB}M" -- "$tmp"; then
+      note "fallocate refused on this filesystem; falling back to dd"; mode=dd
+      run truncate -s 0 -- "$tmp"
+    fi
+  fi
+  if [[ "$mode" == dd ]]; then
+    run dd if=/dev/zero of="$tmp" bs=1M count="$SWAP_MB" status=none || { rm -f -- "$tmp"; soft_fail "swap: could not write $SWAP_MB MiB to $tmp"; return 1; }
+  fi
+  run chmod 0600 -- "$tmp"
+  run mkswap -q -- "$tmp" || { rm -f -- "$tmp"; soft_fail "swap: mkswap failed on $tmp"; return 1; }
+  run mv -f -- "$tmp" "$f"
+}
+
+# Create the file, record it in fstab, turn it on. Retries once with dd when
+# fallocate left a file the kernel will not swap on (holes).
+swap_make_active() {
+  local f="$SWAP_FILE" line="$SWAP_FILE none swap sw,nofail 0 0 $SWAP_MARK"
+  swap_create fallocate || return 1
+  if swap_fstab_set "$line"; then changed "swap: fstab line added for $f"; fi
+  if [[ $DRY_RUN -eq 1 ]]; then run swapon "$f"; return 0; fi
+  if ! swapon "$f" 2>/dev/null; then
+    note "swapon refused the fallocate'd file; rebuilding it with dd"
+    swapoff "$f" 2>/dev/null || true; rm -f -- "$f"
+    swap_create dd || return 1
+    if ! swapon "$f"; then
+      rm -f -- "$f"; swap_fstab_set "" >/dev/null || true
+      soft_fail "swap: swapon failed on $f (a container or a filesystem without swap support?). The file and its fstab line were removed."
+      return 1
+    fi
+  fi
+}
+
+swap_sysctl() {
+  local want="# ikenga: managed by provision.sh swap
+vm.swappiness = $SWAPPINESS" live
+  live="$(cat /proc/sys/vm/swappiness 2>/dev/null || true)"
+  if [[ "$(cat "$SWAP_SYSCTL" 2>/dev/null || true)" != "$want" ]]; then
+    if [[ -f "$SWAP_SYSCTL" ]]; then run cp -a "$SWAP_SYSCTL" "$SWAP_SYSCTL.bak-$(date +%Y%m%d-%H%M%S)"; fi
+    run install -d -m 0755 "$(dirname -- "$SWAP_SYSCTL")"
+    if [[ $DRY_RUN -eq 1 ]]; then note "[dry-run] write $SWAP_SYSCTL (vm.swappiness = $SWAPPINESS)"
+    else printf '%s\n' "$want" > "$SWAP_SYSCTL"; chmod 0644 "$SWAP_SYSCTL"; fi
+    changed "swap: vm.swappiness = $SWAPPINESS ($SWAP_SYSCTL)"
+    run sysctl -q -p "$SWAP_SYSCTL" || soft_fail "swap: sysctl could not apply $SWAP_SYSCTL (it takes effect at the next boot)"
+  elif [[ -n "$live" && "$live" != "$SWAPPINESS" ]]; then
+    run sysctl -q -p "$SWAP_SYSCTL" || soft_fail "swap: sysctl could not apply $SWAP_SYSCTL"
+    changed "swap: vm.swappiness $live -> $SWAPPINESS (re-applied $SWAP_SYSCTL)"
+  fi
+}
+
+# SWAP_SIZE=off: take away only what we made.
+swap_remove() {
+  local mp; mp="$(swap_marked_path)"
+  if [[ -z "$mp" && ! -f "$SWAP_SYSCTL" ]]; then note "swap: off, and none is managed here; nothing to remove"; return 0; fi
+  if [[ -n "$mp" ]] && swap_is_active "$mp"; then
+    swap_can_swapoff "$mp" || return 1
+    run swapoff -- "$mp" || { soft_fail "swap: swapoff $mp failed"; return 1; }
+    changed "swap: $mp turned off"
+  fi
+  if swap_fstab_set ""; then changed "swap: fstab line removed"; fi
+  if [[ -n "$mp" && ( -f "$mp" || -L "$mp" ) ]]; then
+    if [[ -L "$mp" ]]; then soft_fail "swap: $mp is a symlink; left in place"
+    else run rm -f -- "$mp"; changed "swap: $mp removed"; fi
+  fi
+  if [[ -f "$SWAP_SYSCTL" ]]; then
+    run rm -f -- "$SWAP_SYSCTL"; changed "swap: $SWAP_SYSCTL removed (the live vm.swappiness stays until reboot)"
+  fi
+}
+
+sync_swap() {
+  log "Swap"
+  if (( SWAP_MB == 0 )); then swap_remove; return 0; fi
+  local f="$SWAP_FILE" mp act others want_bytes have
+  mp="$(swap_marked_path)"
+  act="$(swap_active)"
+  others="$(printf '%s\n' "$act" | grep -vxF -- "${mp:-}" | grep -v '^$' || true)"
+  if [[ -n "$others" ]]; then
+    note "swap: other swap is already active, leaving swap alone ($(printf '%s' "$others" | paste -sd, -)):"
+    note "      set SWAP_SIZE=off to stop managing swap here; the sizes and settings above are not applied"
+    return 0
+  fi
+  if [[ -n "$mp" && "$mp" != "$f" ]]; then
+    soft_fail "swap: the managed swap file is $mp but SWAP_FILE is $f. Set SWAP_FILE=$mp, or SWAP_SIZE=off to remove it first."
+    return 1
+  fi
+  swap_check_target || return 1
+
+  want_bytes=$(( SWAP_MB * 1048576 ))
+  rm -f -- "$f.ikenga-new" 2>/dev/null || true   # a run that died mid-build
+  if [[ -e "$f" ]]; then
+    if [[ -z "$mp" ]]; then
+      soft_fail "swap: $f already exists and is not managed by ikenga (no '$SWAP_MARK' line in $SWAP_FSTAB). Move it, or point SWAP_FILE elsewhere."
+      return 1
+    fi
+    have="$(stat -c %s -- "$f")"
+    if [[ "$have" == "$want_bytes" ]] && swap_signature_ok "$f"; then
+      local mode owner; read -r mode owner < <(stat -c '%a %u:%g' -- "$f")
+      if [[ "$mode" != 600 || "$owner" != 0:0 ]]; then run chown root:root -- "$f"; run chmod 0600 -- "$f"; changed "swap: $f permissions set to root:root 0600"; fi
+      if swap_fstab_set "$f none swap sw,nofail 0 0 $SWAP_MARK"; then changed "swap: fstab line repaired"; fi
+      if ! swap_is_active "$f"; then
+        if run swapon "$f"; then changed "swap: $f turned on"; else soft_fail "swap: swapon $f failed"; return 1; fi
+      fi
+    else
+      # Resize (or a file that is not valid swap): off, replace, on.
+      swap_disk_ok "$SWAP_MB" "$(( have / 1048576 ))" || return 1
+      if swap_is_active "$f"; then
+        swap_can_swapoff "$f" || return 1
+        run swapoff -- "$f" || { soft_fail "swap: swapoff $f failed"; return 1; }
+      fi
+      run rm -f -- "$f"
+      swap_make_active || return 1
+      changed "swap: $f resized $(( have / 1048576 )) MiB -> $SWAP_MB MiB"
+    fi
+  else
+    # An unmanaged fstab entry for this path would be started twice at boot.
+    if grep -E "^[[:space:]]*$(printf '%s' "$f" | sed 's/[.[\*^$/]/\\&/g')[[:space:]]+[^#]*swap" "$SWAP_FSTAB" 2>/dev/null | grep -qvE '#[[:space:]]ikenga-swap'; then
+      soft_fail "swap: $SWAP_FSTAB already has a swap entry for $f that ikenga did not write. Remove it, or point SWAP_FILE elsewhere."
+      return 1
+    fi
+    swap_disk_ok "$SWAP_MB" 0 || return 1
+    swap_make_active || return 1
+    changed "swap: $f created ($SWAP_MB MiB), turned on, and added to fstab"
+  fi
+  swap_sysctl
+}
+
 # ------------------------------------------------------------------ main
 
 case "$ACTION" in
@@ -3596,6 +3863,13 @@ case "$ACTION" in
     summary
     [[ $FAILED -eq 0 ]] || { echo "error: some tunnel steps failed; see the warnings above" >&2; exit 1; }
     exit 0 ;;
+  swap)
+    [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || die "swap needs a profile: pass --profile <file> (or provision once so $INSTALL_DIR/.profile.env exists)"
+    validate_swap_profile
+    sync_swap
+    summary
+    [[ $FAILED -eq 0 ]] || { echo "error: the swap step failed; see the warnings above" >&2; exit 1; }
+    exit 0 ;;
   backups)
     [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || die "backups needs a profile: pass --profile <file> (or provision once so $INSTALL_DIR/.profile.env exists)"
     validate_accounts_profile
@@ -3610,6 +3884,7 @@ validate_profile
 IKENGA_HOST_VALUE="127.0.0.1"; IKENGA_PUBLIC_URL_VALUE=""; ARCH=""; TS_IP=""; BINARY_CHANGED=0; ENV_CHANGED=0
 preflight
 confirm
+sync_swap
 harden_base
 if [[ "$PERIMETER" == tailnet ]]; then perimeter_tailnet; else perimeter_public; fi
 install_deps
@@ -3629,4 +3904,4 @@ sync_accounts
 sync_tunnels
 sync_backups
 summary
-[[ $FAILED -eq 0 ]] || { echo "error: some account, tunnel or backup steps failed; see the warnings above" >&2; exit 1; }
+[[ $FAILED -eq 0 ]] || { echo "error: some swap, account, tunnel or backup steps failed; see the warnings above" >&2; exit 1; }
