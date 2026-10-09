@@ -390,7 +390,7 @@ describe('editing inside the predicted region', () => {
 		expect(r.shown()).toBe('$ ab');
 		expect(r.cursorCell()).toBe(4);
 		r.type(['\x7f', '\x7f', '\x7f']); // the third would delete into the prompt
-		expect(r.shown()).toBe('$');
+		expect(r.shown()).toBeNull(); // net zero: nothing differs from the server's row
 		expect(r.le.stats().predicted).toBe(6);
 		// readline's echo for the same keys
 		await r.server('abc\b \b\b \b\b \b');
@@ -467,6 +467,203 @@ describe('regressions from independent review', () => {
 		await r.server('abc');
 		expect(r.le.engine.view()).toBeNull();
 		expect(r.le.stats().failedVisible).toBe(0);
+	});
+});
+
+/** Deterministic PRNG so jitter runs are reproducible. */
+function mulberry32(seed: number): () => number {
+	let a = seed;
+	return () => {
+		a = (a + 0x6d2b79f5) | 0;
+		let t = Math.imul(a ^ (a >>> 15), 1 | a);
+		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+/** The text the user means to have on the line after `keys` (ideal editor). */
+function idealLine(keys: string[]): string {
+	let s = '';
+	for (const k of keys) s = k === '\x7f' ? s.slice(0, -1) : s + k;
+	return s;
+}
+
+/**
+ * Types `keys` at `spacing` ms intervals into a rig whose server echoes each
+ * one `rtt ± jitter` ms later (in order, as a PTY does), stepping a 5 ms
+ * clock. At every step, whenever the overlay paints anything, the painted row
+ * must be what the user typed — never a stale-base variant of it.
+ */
+async function simulateTyping(
+	keys: string[],
+	opts: { spacing: number; jitter: number; rtt?: number; acks?: boolean; seed?: number }
+): Promise<{ r: Rig; wrong: string[]; sawOverlay: boolean }> {
+	const rtt = opts.rtt ?? 300;
+	const rnd = mulberry32(opts.seed ?? 7);
+	const r = rig();
+	for (let i = 0; i < 20; i++) r.le.engine.recordRtt(rtt);
+	await r.server(PROMPT);
+	const t0 = r.clock;
+
+	const sendAt = keys.map((_, i) => i * opts.spacing);
+	const echoAt: number[] = [];
+	let prev = 0;
+	for (let i = 0; i < keys.length; i++) {
+		prev = Math.max(prev, sendAt[i] + rtt + Math.round((rnd() * 2 - 1) * opts.jitter));
+		echoAt.push(prev);
+	}
+	const end = echoAt[echoAt.length - 1] + 3000;
+	const wrong: string[] = [];
+	let sawOverlay = false;
+	let nextEcho = 0;
+	let nextKey = 0;
+	const seqs: { seq: number; ackAt: number }[] = [];
+
+	for (let t = 0; t <= end; t += 5) {
+		r.clock = t0 + t;
+		while (nextEcho < keys.length && echoAt[nextEcho] <= t) {
+			const k = keys[nextEcho++];
+			await r.server(k === '\x7f' ? '\b \b' : k);
+		}
+		while (nextKey < keys.length && sendAt[nextKey] <= t) {
+			const seq = r.le.onInput(keys[nextKey]);
+			if (opts.acks) seqs.push({ seq, ackAt: t + rtt });
+			nextKey++;
+		}
+		for (const a of seqs.filter((s) => s.ackAt <= t)) r.le.ackInput(a.seq, rtt);
+		r.le.engine.tick();
+		const shown = r.shown();
+		if (shown !== null) {
+			sawOverlay = true;
+			const want = `$ ${idealLine(keys.slice(0, nextKey))}`.trimEnd();
+			if (shown !== want)
+				wrong.push(`t=${t} shown=${JSON.stringify(shown)} want=${JSON.stringify(want)}`);
+		}
+	}
+	return { r, wrong, sawOverlay };
+}
+
+describe('type-then-delete inside one round trip (net-zero runs)', () => {
+	const KEYS = [...'abcdef', '\x7f', '\x7f', '\x7f', 'X', 'Y'];
+	const cases: [number, number][] = [
+		[60, 0],
+		[60, 40],
+		[110, 80],
+		[30, 20],
+		[90, 60],
+	];
+
+	for (const [spacing, jitter] of cases) {
+		for (const acks of [false, true]) {
+			it(`never paints a stale-base row (${spacing} ms spacing, ±${jitter} jitter, ${acks ? 'acked' : 'socket'})`, async () => {
+				for (const seed of [7, 11, 23, 42, 99]) {
+					const { r, wrong, sawOverlay } = await simulateTyping(KEYS, {
+						spacing,
+						jitter,
+						acks,
+						seed,
+					});
+					expect(wrong, `seed ${seed}`).toEqual([]);
+					expect(sawOverlay).toBe(true); // the engine did predict
+					expect(r.rowText().trimEnd()).toBe('$ abcXY');
+					expect(r.le.engine.view()).toBeNull();
+					r.assertSameAsReference();
+				}
+			});
+		}
+	}
+
+	it('still settles a pure net-zero run (type, delete) without counting a failure', async () => {
+		const { r, wrong } = await simulateTyping(['a', 'b', '\x7f', '\x7f'], {
+			spacing: 60,
+			jitter: 0,
+			acks: true,
+		});
+		expect(wrong).toEqual([]);
+		expect(r.le.engine.view()).toBeNull();
+		expect(r.le.stats()).toMatchObject({ failedVisible: 0, failedHidden: 0, pending: 0 });
+	});
+
+	it('does not spin the host timer on a held net-zero match', async () => {
+		const r = rig();
+		for (let i = 0; i < 20; i++) r.le.engine.recordRtt(300);
+		await r.server(PROMPT);
+		r.type(['a', '\x7f']);
+		await r.server('a\b \b'); // the row is back where it started
+		const due = r.le.engine.nextDeadline();
+		expect(due).not.toBeNull();
+		r.clock = (due as number) - 1; // just before the hold is over…
+		// …the next wake-up must be in the future, not already overdue.
+		expect(r.le.engine.nextDeadline() as number).toBeGreaterThan(r.clock);
+	});
+});
+
+describe('barrier keys with predictions pending', () => {
+	it('hides pending text at once on Ctrl-U instead of waiting for the expiry', async () => {
+		const r = rig();
+		for (let i = 0; i < 20; i++) r.le.engine.recordRtt(300);
+		await r.server(PROMPT);
+		r.type('abc');
+		expect(r.shown()).toBe('$ abc');
+		r.type(['\x15']); // Ctrl-U
+		expect(r.le.engine.view()).toBeNull();
+		// The echo and the line-kill arrive together; the row is back at "$ ".
+		await r.server('abc\b\b\b\x1b[K');
+		r.ackAll();
+		expect(r.le.engine.view()).toBeNull();
+		r.advance(1500);
+		expect(r.le.stats()).toMatchObject({ failedVisible: 0 });
+		r.assertSameAsReference();
+	});
+
+	it('does not trip the three-failure suppression, and prediction resumes', async () => {
+		const r = rig();
+		for (let i = 0; i < 20; i++) r.le.engine.recordRtt(300);
+		await r.server(PROMPT);
+		for (let n = 0; n < 4; n++) {
+			r.type('abc');
+			r.type(['\x15']);
+			await r.server('abc\b\b\b\x1b[K');
+			r.ackAll();
+			r.advance(1500);
+		}
+		expect(r.le.stats().failedVisible).toBe(0);
+		expect(r.le.engine.isDisplaying()).toBe(true);
+		// Typing settles back into normal prediction.
+		r.type('l');
+		await r.server('l');
+		r.advance(1500);
+		r.type('s');
+		expect(r.shown()).toBe('$ ls');
+		r.assertSameAsReference();
+	});
+
+	it('hides pending text on Ctrl-A so a later insert at the start is not painted over', async () => {
+		const r = rig();
+		for (let i = 0; i < 20; i++) r.le.engine.recordRtt(300);
+		await r.server(PROMPT);
+		r.type('cho Y');
+		r.type(['\x01', 'e']); // Ctrl-A, then 'e' at the start
+		expect(r.le.engine.view()).toBeNull();
+		await r.server('cho Y\x1b[5D'); // the echo, then Ctrl-A moves the cursor home
+		expect(r.le.engine.view()).toBeNull();
+		await r.server('echo Y\x1b[5D'); // the 'e' insert redraws the rest of the line
+		expect(r.le.engine.view()).toBeNull();
+		r.ackAll();
+		r.advance(1500);
+		expect(r.rowText()).toBe('$ echo Y');
+		expect(r.le.stats().failedVisible).toBe(0);
+		r.assertSameAsReference();
+	});
+
+	it('keeps the pending text visible across Enter, Tab and a paste (the normal path)', async () => {
+		for (const key of ['\r', '\t', 'pasted text', '\x1b[200~pasted\x1b[201~']) {
+			const r = rig();
+			await r.server(PROMPT);
+			r.type('ls');
+			r.type([key]);
+			expect(r.shown()).toBe('$ ls');
+		}
 	});
 });
 

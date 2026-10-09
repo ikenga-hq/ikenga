@@ -43,6 +43,17 @@
  * Shown predictions that fail count against the engine; three within 30 s
  * suppress display for 20 s.
  *
+ * ## Barriers that rewrite the line
+ *
+ * Enter, Tab and a paste leave the pending predictions true: the typed text
+ * is still going to be echoed, so it stays on screen until it is. A key that
+ * edits or moves within the line in a way we do not model — Ctrl-U, Ctrl-A,
+ * Home, an arrow up, Alt-b — makes them meaningless instead: the server's
+ * reply is the echo *and* the edit in one burst, which can leave the row
+ * looking exactly as it did before typing. Those barriers drop the pending
+ * predictions on the spot (they are neither confirmed nor failures), and
+ * prediction restarts tentatively once the server has settled.
+ *
  * ## Confirmation without an echo ack
  *
  * The server does not acknowledge keystrokes, so a prediction is *confirmed*
@@ -145,6 +156,26 @@ function isPredictableChar(ch: string): boolean {
 	return (c >= 0x20 && c <= 0x7e) || (c >= 0xa1 && c <= 0x24f);
 }
 
+/**
+ * Does this unpredicted input rewrite or move within the line in a way the
+ * engine cannot follow? Then predictions still pending are dropped rather
+ * than waited out. Enter and job control (`hard`), Tab (a completion only
+ * adds), text pastes and mouse presses leave the typed text in place.
+ */
+export function rewritesLine(data: string): boolean {
+	if (hasNewline(data)) return false;
+	if (data.length === 1) {
+		const c = data.charCodeAt(0);
+		// Hard barriers are Enter-like; Tab completes; backspace is predicted.
+		if (c === 0x03 || c === 0x04 || c === 0x1a || c === 0x1c || c === 0x09) return false;
+		return c < 0x20 || c === 0x7f;
+	}
+	if (!data.startsWith(ESC)) return false; // pasted or IME text
+	if (data.startsWith(`${ESC}[200~`)) return false; // bracketed paste
+	if (SGR_MOUSE_RE.test(data.slice(1))) return false;
+	return true;
+}
+
 export function classifyInput(data: string): InputClass {
 	if (data.length === 1) {
 		const c = data.charCodeAt(0);
@@ -208,6 +239,12 @@ interface Model {
 	/** An unpredicted key was sent after `ops`; no more predictions on this
 	 *  model, which is dropped once `ops` resolve. */
 	barrier: boolean;
+	/**
+	 * The server's row equals a state the pending keys pass through twice
+	 * (type `def`, delete 3: net zero), so it cannot say how far the echoes
+	 * got. The match is held until this time, when they must all have landed.
+	 */
+	holdUntil: number | null;
 }
 
 export interface OverlayCell {
@@ -460,7 +497,13 @@ export class PredictionEngine {
 		// onto that prompt, so the prompt alone is no longer a sync point.
 		if (cls.type === 'op') this.keysSinceHardBarrier = true;
 		if (cls.type === 'op' && this.tryPredict(cls.op, seq, now)) return seq;
-		this.barrier(cls.type === 'barrier' && cls.hard, now);
+		// (An op the engine declined to predict — Right at the end of the input,
+		// Backspace at the prompt — is not a rewrite; it is just not shown.)
+		this.barrier(
+			cls.type === 'barrier' && cls.hard,
+			now,
+			cls.type === 'barrier' && rewritesLine(data)
+		);
 		return seq;
 	}
 
@@ -538,6 +581,7 @@ export class PredictionEngine {
 			base: this.readState(row, cur.x),
 			ops: [],
 			barrier: false,
+			holdUntil: null,
 		};
 	}
 
@@ -557,9 +601,9 @@ export class PredictionEngine {
 		return { cells, x };
 	}
 
-	private barrier(hard: boolean, now: number): void {
+	private barrier(hard: boolean, now: number, rewrites: boolean): void {
 		const m = this.model;
-		if (m && m.ops.length > 0) m.barrier = true;
+		if (m && m.ops.length > 0 && !rewrites) m.barrier = true;
 		else this.dropModel();
 		this.unsettledUntil = Math.max(this.unsettledUntil, now + this.settleMs());
 		this.becomeTentative();
@@ -623,8 +667,10 @@ export class PredictionEngine {
 
 	/** When the next prediction falls due, for the host's timer. */
 	nextDeadline(): number | null {
-		const op = this.model?.ops[0];
-		return op ? this.deadline(op) : null;
+		const m = this.model;
+		const op = m?.ops[0];
+		if (!m || !op) return null;
+		return m.holdUntil ?? this.deadline(op);
 	}
 
 	private deadline(op: PendingOp): number {
@@ -662,8 +708,23 @@ export class PredictionEngine {
 
 		const states = this.states(m);
 		const n = m.ops.length;
-		for (let k = n; k >= 1; k--) {
+		m.holdUntil = null;
+		// The fewest keys that explain the row: the server cannot have done
+		// more than it shows. (Taking the most keys is what let a net-zero run
+		// "confirm" echoes that were still in flight, and rebase onto the row
+		// mid-stream.)
+		for (let k = 1; k <= n; k++) {
 			if (!this.matchesExactly(row, cur, line, m.floor, states[k])) continue;
+			// A state the keys have already passed through: the row looks the
+			// same whether the server has done none of them or all of them.
+			// Wait until the last of them is due, then take it as done.
+			if (states.slice(0, k).some((earlier) => this.sameLine(earlier, states[k]))) {
+				const due = this.deadline(m.ops[k - 1]);
+				if (now < due) {
+					m.holdUntil = due;
+					return;
+				}
+			}
 			this.confirm(m, k, states, row, cur, onRow, now);
 			return;
 		}
@@ -858,6 +919,9 @@ export class PredictionEngine {
 				hi = Math.max(hi, i);
 			}
 		}
+		// Nothing differs and the cursor is already there: the keys pending net
+		// to nothing (type, then delete), so there is nothing to paint.
+		if (lo === Number.POSITIVE_INFINITY && cur.y === line && cur.x === s.x) return null;
 		lo = Math.min(lo, s.x);
 		hi = Math.max(hi, s.x);
 		if (cur.y === line) {
