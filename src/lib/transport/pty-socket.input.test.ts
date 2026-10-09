@@ -79,6 +79,30 @@ describe('sendPtyInput', () => {
 		vi.useRealTimers();
 	});
 
+	it('a view-only device: refusals are not painted, and typing leaves the socket', () => {
+		const chunks: string[] = [];
+		const sockets: FakeSocket[] = [];
+		const detach = attachRemotePty(
+			() => {
+				const s = new FakeSocket();
+				sockets.push(s);
+				return s as unknown as WebSocket;
+			},
+			't5',
+			(bytes) => chunks.push(new TextDecoder().decode(bytes)),
+			() => {}
+		);
+		sockets[0].open();
+		expect(sendPtyInput('t5', 'l')).toBe(true);
+		const refusal = JSON.stringify({ type: 'error', code: 'forbidden', missing: ['dispatch'] });
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		sockets[0].onmessage?.({ data: refusal });
+		expect(chunks.join('')).toBe('');
+		expect(sendPtyInput('t5', 's')).toBe(false); // falls back to the RPC
+		warn.mockRestore();
+		detach();
+	});
+
 	it('does not route to another PTY', () => {
 		const { sockets, detach } = attach('t4');
 		sockets[0].open();

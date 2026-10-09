@@ -428,6 +428,48 @@ describe('editing inside the predicted region', () => {
 	});
 });
 
+describe('regressions from independent review', () => {
+	it('does not trust a fresh model while failed keys may still echo', async () => {
+		const r = rig();
+		for (let i = 0; i < 20; i++) r.le.engine.recordRtt(100);
+		await r.server(PROMPT);
+		r.type('ab');
+		await r.server('ab');
+		r.type('cd'); // echo delayed past expiry
+		r.advance(1000);
+		expect(r.le.engine.view()).toBeNull();
+		r.type('e');
+		expect(r.shown()).toBeNull(); // not '$ abe' over a stale row
+		await r.server('cde');
+		r.type('f');
+		await r.server('f');
+		r.type('g');
+		expect(r.shown()).toBe('$ abcdefg');
+		r.assertSameAsReference();
+	});
+
+	it("treats fish's truecolour-grey autosuggestion as a hint", async () => {
+		const r = rig();
+		await r.server(`${PROMPT}git \x1b[38;2;85;85;85mstatus\x1b[39m\x1b[6D`);
+		r.type('s');
+		expect(r.shown()).toBe('$ git s');
+		await r.server('s\x1b[38;2;85;85;85mtatus\x1b[39m\x1b[5D');
+		expect(r.le.engine.view()).toBeNull();
+		expect(r.le.stats()).toMatchObject({ confirmed: 1, failedVisible: 0 });
+	});
+
+	it('leaves a right-aligned prompt where it is and keeps predicting', async () => {
+		const r = rig();
+		await r.server(`${PROMPT}\x1b7\x1b[1;30H[12:00:00]\x1b8`); // ends at cols-2
+		r.type('abc');
+		expect(r.le.stats().pending).toBe(3);
+		expect(r.shown()).toBe('$ abc                        [12:00:00]');
+		await r.server('abc');
+		expect(r.le.engine.view()).toBeNull();
+		expect(r.le.stats().failedVisible).toBe(0);
+	});
+});
+
 describe('geometry and lifecycle', () => {
 	it('drops predictions on resize', async () => {
 		const r = rig();

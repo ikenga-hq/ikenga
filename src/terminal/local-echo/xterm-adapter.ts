@@ -10,6 +10,29 @@ import type { CellView, EchoTerm, RowHandle } from './engine';
  *  ghost-text hints are drawn in when they are not drawn faint. */
 const GHOST_PALETTE_INDEX = 8;
 
+/**
+ * Is this cell a hint the app will replace on the next edit (an
+ * autosuggestion, a placeholder) rather than text? Faint, bright-black, a
+ * mid grey from the 256-colour ramp, or a mid grey in truecolour (fish's
+ * default autosuggestion is `555`). A real character misread as a hint only
+ * costs a flicker: the prediction blanks it until the server's row returns.
+ */
+function isGhost(cell: IBufferCell): boolean {
+	if (cell.isDim() !== 0) return true;
+	if (cell.isFgPalette()) {
+		const c = cell.getFgColor();
+		return c === GHOST_PALETTE_INDEX || (c >= 238 && c <= 247);
+	}
+	if (cell.isFgRGB()) {
+		const v = cell.getFgColor();
+		const r = (v >> 16) & 0xff;
+		const g = (v >> 8) & 0xff;
+		const b = v & 0xff;
+		return Math.max(r, g, b) - Math.min(r, g, b) <= 16 && r >= 0x40 && r <= 0x99;
+	}
+	return false;
+}
+
 export function createXtermEchoTerm(term: Terminal, isCursorHidden: () => boolean): EchoTerm {
 	let scratch: IBufferCell | undefined;
 	return {
@@ -33,8 +56,7 @@ export function createXtermEchoTerm(term: Terminal, isCursorHidden: () => boolea
 					continue;
 				}
 				scratch = cell;
-				const ghost =
-					cell.isDim() !== 0 || (cell.isFgPalette() && cell.getFgColor() === GHOST_PALETTE_INDEX);
+				const ghost = isGhost(cell);
 				// A wide glyph's trailing cell (width 0) has no chars of its
 				// own; give it a marker that can never equal a predicted
 				// character, so a row holding wide glyphs is never "confirmed"

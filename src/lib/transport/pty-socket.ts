@@ -103,6 +103,8 @@ export function attachRemotePty(
 	let received = 0;
 	/** Absolute end of the daemon stream we have already painted. */
 	let serverOffset: number | null = null;
+	/** The daemon refused our input on this attachment (no `dispatch`). */
+	let inputRefused = false;
 	/** The `ikenga.snapshot` header awaiting its binary payload. */
 	let pendingSnapshot: SnapshotControl | null = null;
 
@@ -196,12 +198,22 @@ export function attachRemotePty(
 			end_offset?: number;
 			len?: number;
 			message?: string;
-			code?: number;
+			code?: number | string;
 		} | null = null;
 		try {
 			msg = JSON.parse(raw);
 		} catch {
 			msg = null;
+		}
+		// The daemon refused an input frame (G-ACCESS §1.6: typing needs
+		// `dispatch`, which a view-only device lacks). It answers every
+		// refused key; that is not terminal output. Stop typing over this
+		// socket, so later keys take the RPC path and fail there quietly,
+		// as they did before input moved to the socket.
+		if (msg?.type === 'error' && msg.code === 'forbidden') {
+			if (!inputRefused) console.warn(`[pty-socket] input refused for ${id}:`, raw);
+			inputRefused = true;
+			return;
 		}
 		// Not a control frame — the daemon still sends bare text for a few
 		// error paths, and those belong in the terminal.
@@ -312,7 +324,7 @@ export function attachRemotePty(
 	// Binary, never text: the daemon tries a text frame as a JSON control
 	// message first, and typed text must not be able to spell one.
 	const sink = (bytes: Uint8Array): boolean => {
-		if (closedByCaller || !ws || ws.readyState !== WebSocket.OPEN) return false;
+		if (closedByCaller || inputRefused || !ws || ws.readyState !== WebSocket.OPEN) return false;
 		ws.send(bytes);
 		return true;
 	};

@@ -277,21 +277,48 @@ function clearGhosts(s: LineState): void {
 	}
 }
 
-function applyOp(s: LineState, op: KeyOp, cols: number): LineState {
+function isEmpty(c: Cell | undefined): boolean {
+	return !c || blank(c.ch) || c.ghost;
+}
+
+/**
+ * Where the text an edit at `x` moves ends: the first of two empty cells at
+ * or after `x`, or -1 if there is none before the right margin. A line editor
+ * shifts the rest of the input; it does not shift what is drawn further along
+ * the row after a gap — a zsh RPROMPT, a powerlevel10k right segment.
+ */
+function tailEnd(s: LineState, x: number): number {
+	for (let i = x; i + 1 < s.cells.length; i++) {
+		if (isEmpty(s.cells[i]) && isEmpty(s.cells[i + 1])) return i;
+	}
+	return -1;
+}
+
+const EMPTY_CELL: Cell = { ch: ' ', pred: false, ghost: false };
+
+function applyOp(s: LineState, op: KeyOp): LineState {
 	const next = cloneState(s);
 	switch (op.kind) {
-		case 'insert':
+		case 'insert': {
+			const end = tailEnd(next, next.x);
 			clearGhosts(next);
+			// Take one empty cell out of the gap, so nothing past it moves.
+			// (No gap can only happen when re-applying a pending insert over
+			// a newer server row; drop the last cell then, as a plain shift.)
+			next.cells.splice(end < 0 ? next.cells.length - 1 : end, 1);
 			next.cells.splice(next.x, 0, { ch: op.ch, pred: true, ghost: false });
-			next.cells.length = cols;
 			next.x += 1;
 			break;
-		case 'backspace':
+		}
+		case 'backspace': {
+			const end = tailEnd(next, next.x);
 			clearGhosts(next);
 			next.cells.splice(next.x - 1, 1);
-			next.cells.push({ ch: ' ', pred: false, ghost: false });
+			// Give the cell back to the gap (or the end of the row).
+			next.cells.splice(end < 0 ? next.cells.length : end - 1, 0, { ...EMPTY_CELL });
 			next.x -= 1;
 			break;
+		}
 		case 'left':
 			next.x -= 1;
 			break;
@@ -429,6 +456,9 @@ export class PredictionEngine {
 		const now = this.now();
 		const cls = classifyInput(data);
 		if (cls.type === 'neutral') return seq;
+		// Typed ahead of the next prompt, predicted or not: it will be echoed
+		// onto that prompt, so the prompt alone is no longer a sync point.
+		if (cls.type === 'op') this.keysSinceHardBarrier = true;
 		if (cls.type === 'op' && this.tryPredict(cls.op, seq, now)) return seq;
 		this.barrier(cls.type === 'barrier' && cls.hard, now);
 		return seq;
@@ -452,10 +482,12 @@ export class PredictionEngine {
 		const cols = this.term.cols;
 		switch (op.kind) {
 			case 'insert':
-				// Never into the last column (wrap behaviour differs by app) and
-				// never pushing real text off the row.
+				// Never into the last column (wrap behaviour differs by app), and
+				// only with room: a gap after the input to absorb the shift.
+				// No gap — the line is about to collide with a right prompt or
+				// the margin — and the app's response is anyone's guess.
 				if (last.x >= cols - 1) return false;
-				if (!blank(last.cells[cols - 1].ch) && !last.cells[cols - 1].ghost) return false;
+				if (tailEnd(last, last.x) < 0) return false;
 				break;
 			case 'backspace':
 			case 'left':
@@ -734,6 +766,9 @@ export class PredictionEngine {
 
 	private fail(now: number, hadOps: boolean): void {
 		const m = this.model;
+		// The failed keys were sent; their echo may yet arrive. A model built
+		// before it would rest on a stale row, so the next one is tentative.
+		if (m && hadOps) this.unsettledUntil = Math.max(this.unsettledUntil, now + this.settleMs());
 		if (m && hadOps) {
 			const shown = this.isDisplaying() && m.ops.some((o) => o.epoch <= this.confirmedEpoch);
 			if (shown) {
@@ -759,8 +794,7 @@ export class PredictionEngine {
 
 	private states(m: Model): LineState[] {
 		const out: LineState[] = [m.base];
-		const cols = this.term.cols;
-		for (const p of m.ops) out.push(applyOp(out[out.length - 1], p.op, cols));
+		for (const p of m.ops) out.push(applyOp(out[out.length - 1], p.op));
 		return out;
 	}
 
@@ -811,7 +845,7 @@ export class PredictionEngine {
 		if (!row) return null;
 		const cols = this.term.cols;
 		let s = m.base;
-		for (const p of shown) s = applyOp(s, p.op, cols);
+		for (const p of shown) s = applyOp(s, p.op);
 
 		const cur = this.term.cursor();
 		let lo = Number.POSITIVE_INFINITY;
