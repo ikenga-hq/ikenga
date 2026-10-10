@@ -748,6 +748,67 @@ mod tests {
         assert!(authorize(&device(Tier::Full), "brand_new_cmd").is_ok());
     }
 
+    /// WP-18b part c: the Ọba git / npx installers and updaters write into the
+    /// signed-in account's own Ngwa vault by spawning git / npx as that account.
+    /// They are `owner`-class `install`: a share member (any role, any caps)
+    /// reaches the Owner's child but never the Owner's vault; a device needs the
+    /// `full` tier (`install` ∉ view / dispatch / approve); the Owner's own
+    /// session (the password session, the T0 host bearer, a `full` device) may.
+    #[test]
+    fn oba_installers_are_owner_install() {
+        const ARMS: [&str; 8] = [
+            "oba_install_git",
+            "oba_install_npx",
+            "oba_install_bundle",
+            "oba_install_with_deps",
+            "oba_update",
+            "oba_auto_update_all",
+            "oba_resolve_source",
+            "oba_check_update",
+        ];
+        let share = |role: Role| AccessCtx {
+            share: Some(ShareCtx {
+                project_key: "o/p".into(),
+                project_id: "p".into(),
+                member_principal_id: Some("m".into()),
+                member_device_id: None,
+                role: Some(role),
+                artifact_path: None,
+                owner_approval: false,
+            }),
+            share_headers: true,
+            caps: CapSet::ALL,
+            ..ctx(Via::Relayed, Tier::View)
+        };
+        let op = ctx(Via::Operator, Tier::Full);
+        for cmd in ARMS {
+            let req = rpc_requirements::requirement(cmd);
+            assert_eq!(req.class, ArmClass::Owner, "{cmd}");
+            assert_eq!(req.caps, CapSet::of(&[Cap::Install]), "{cmd}");
+            // The Owner's own session and a full-tier device.
+            assert!(authorize(&op, cmd).is_ok(), "{cmd}");
+            assert!(authorize(&device(Tier::Full), cmd).is_ok(), "{cmd}");
+            // A device below full lacks `install`.
+            for tier in [Tier::View, Tier::Dispatch, Tier::Approve] {
+                assert_eq!(
+                    authorize(&device(tier), cmd).unwrap_err().message,
+                    "missing=install",
+                    "{cmd} @ {tier}"
+                );
+            }
+            // A share member is refused on class, whatever the role.
+            for role in [Role::Operator, Role::Reviewer, Role::Guest] {
+                assert_eq!(
+                    authorize(&share(role), cmd).unwrap_err().message,
+                    "class=owner",
+                    "{cmd} via a {role} share"
+                );
+            }
+        }
+        // `oba_install_local` stays desktop-only: no arm, so no row.
+        assert!(!rpc_requirements::is_mapped("oba_install_local"));
+    }
+
     /// §4.5.3 / review F-4: an `internal` arm is refused on a child request
     /// carrying **any** `X-Ikenga-Share-*` header, even one that doesn't
     /// parse into a share (no `X-Ikenga-Share-Project`).

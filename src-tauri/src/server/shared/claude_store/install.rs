@@ -43,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 
 use super::registry;
+use super::remote::{self, SpawnClass};
 use super::{
     atomic_copy_dir, atomic_copy_file, read_description, store_path_for, validate_name,
     ClaudeStoreEntry, ClaudeStoreMutation, Kind, ProvenanceSource, RegistryProvenance,
@@ -153,8 +154,23 @@ fn spawn_error_message(
     }
 }
 
+/// Run `spec` to completion through `executor::current()` and collect its
+/// output. The desktop blocks on `spawn_output_blocking` exactly as it always
+/// did; under the daemon policy ([`remote`]) the same executor spawns it as a
+/// piped child with a deadline whose expiry kills the whole process group.
+fn exec_output(spec: SpawnSpec, class: SpawnClass) -> std::io::Result<std::process::Output> {
+    match remote::budget(class) {
+        None => crate::executor::current().spawn_output_blocking(spec, OUTPUT_OPTS),
+        Some(Err(e)) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, e)),
+        Some(Ok(limit)) => remote::run_bounded(spec, OUTPUT_OPTS, limit),
+    }
+}
+
 fn run(cmd: &str, args: &[&str], cwd: Option<&Path>) -> Result<std::process::Output, String> {
     let mut c = SpawnSpec::new(cmd);
+    // Daemon policy: the principal's environment minus the host's, before any
+    // other `.env()` (a no-op on the desktop).
+    remote::apply_env(&mut c);
     c.args(args);
     if let Some(d) = cwd {
         c.current_dir(d);
@@ -166,22 +182,29 @@ fn run(cmd: &str, args: &[&str], cwd: Option<&Path>) -> Result<std::process::Out
         c.env("GIT_TERMINAL_PROMPT", "0")
             .env("GCM_INTERACTIVE", "never");
     }
-    crate::executor::current()
-        .spawn_output_blocking(c, OUTPUT_OPTS)
-        .map_err(|e| {
-            spawn_error_message(
-                cmd,
-                &format!("install it to use {cmd}-sourced primitives"),
-                cwd,
-                &e,
-            )
-        })
+    let class = if args.contains(&"ls-remote") {
+        SpawnClass::LsRemote
+    } else {
+        SpawnClass::Git
+    };
+    exec_output(c, class).map_err(|e| {
+        spawn_error_message(
+            cmd,
+            &format!("install it to use {cmd}-sourced primitives"),
+            cwd,
+            &e,
+        )
+    })
 }
 
 /// `git clone --depth 1 [--branch <ref>] <url> <dest>`. Public-only (no creds).
 /// `core.autocrlf=false` so a Windows checkout holds the bytes the source
 /// serves — the content hash (R57 · Q3) must not depend on the host.
 fn git_clone(url: &str, ref_: Option<&str>, dest: &Path) -> Result<(), String> {
+    remote::check_git_url(url)?;
+    if let Some(r) = ref_ {
+        remote::check_git_ref(r)?;
+    }
     let dest_s = dest.to_string_lossy().to_string();
     let mut args: Vec<&str> = vec!["clone", "--config", "core.autocrlf=false", "--depth", "1"];
     if let Some(r) = ref_ {
@@ -197,7 +220,7 @@ fn git_clone(url: &str, ref_: Option<&str>, dest: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok(())
+    remote::vet_tree(dest, std::slice::from_ref(&dest.to_path_buf()))
 }
 
 /// R57 · N-C: materialize exactly commit `sha` of `url` at `dest` — never HEAD.
@@ -206,6 +229,12 @@ fn git_clone(url: &str, ref_: Option<&str>, dest: &Path) -> Result<(), String> {
 /// an abbreviation), falls back to a full clone + checkout. Either way the
 /// caller re-reads HEAD and refuses a mismatch.
 fn git_fetch_at_sha(url: &str, sha: &str, dest: &Path) -> Result<(), String> {
+    remote::check_git_url(url)?;
+    git_fetch_at_sha_unvetted(url, sha, dest)?;
+    remote::vet_tree(dest, std::slice::from_ref(&dest.to_path_buf()))
+}
+
+fn git_fetch_at_sha_unvetted(url: &str, sha: &str, dest: &Path) -> Result<(), String> {
     let dest_s = dest.to_string_lossy().to_string();
     let shallow = (|| {
         std::fs::create_dir_all(dest).map_err(|e| format!("mkdir staging: {e}"))?;
@@ -277,6 +306,10 @@ fn git_head_sha(dir: &Path) -> Result<String, String> {
 /// Resolve a remote ref to its SHA WITHOUT cloning (`git ls-remote <url> <ref>`).
 /// `ref` defaults to `HEAD`. Returns the first column (the SHA).
 fn git_ls_remote_sha(url: &str, ref_: Option<&str>) -> Result<String, String> {
+    remote::check_git_url(url)?;
+    if let Some(r) = ref_ {
+        remote::check_git_ref(r)?;
+    }
     let r = ref_.unwrap_or("HEAD");
     let out = run("git", &["ls-remote", url, r], None)?;
     if !out.status.success() {
@@ -303,7 +336,10 @@ fn git_ls_remote_sha(url: &str, ref_: Option<&str>) -> Result<String, String> {
 /// the Claude `skills` CLI writes lands under our isolated tree (never the user's
 /// real `~/.claude`). We adopt the written skill from there.
 fn npx_skills_add(spec: &str, staging: &Path) -> Result<(), String> {
+    remote::check_npx_spec(spec)?;
     let mut c = SpawnSpec::new(crate::runtime::resolve_tool("npx"));
+    // Daemon policy: scrubbed environment first, then the sandbox below.
+    remote::apply_env(&mut c);
     c.args(["--yes", "skills", "add", spec])
         .current_dir(staging)
         .env("HOME", staging)
@@ -311,23 +347,35 @@ fn npx_skills_add(spec: &str, staging: &Path) -> Result<(), String> {
         // without this the sandbox is a no-op there and `skills add` writes
         // into the real user profile instead of `staging`.
         .env("USERPROFILE", staging);
-    let out = crate::executor::current()
-        .spawn_output_blocking(c, OUTPUT_OPTS)
-        .map_err(|e| {
-            spawn_error_message(
-                "npx",
-                "install Node.js to use npx-sourced primitives",
-                Some(staging),
-                &e,
-            )
-        })?;
+    remote::apply_npx_env(&mut c, staging);
+    let out = exec_output(c, SpawnClass::Npx).map_err(|e| {
+        spawn_error_message(
+            "npx",
+            "install Node.js to use npx-sourced primitives",
+            Some(staging),
+            &e,
+        )
+    })?;
     if !out.status.success() {
         return Err(format!(
             "npx skills add failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok(())
+    vet_skills_cli_output(staging)
+}
+
+/// The three dirs the `skills` CLI may have written skills into (the same
+/// candidates `locate_installed_skill` / `collect_installed_skills` read),
+/// vetted as a fetched tree under the daemon policy. The staging HOME also
+/// holds the CLI's npm cache, which is neither copied nor inspected.
+fn vet_skills_cli_output(staging: &Path) -> Result<(), String> {
+    let dirs = [
+        staging.join(".agents").join("skills"),
+        staging.join(".claude").join("skills"),
+        staging.join("skills"),
+    ];
+    remote::vet_tree(staging, &dirs)
 }
 
 /// `npx --yes skills add <spec> --skill '*'` — installs ALL member skills a
@@ -337,29 +385,30 @@ fn npx_skills_add(spec: &str, staging: &Path) -> Result<(), String> {
 /// network/impure edge; the bundle core takes it as an injected fn so the
 /// materialization + members + registry logic stays pure/tempdir-testable.
 fn npx_skills_add_all(spec: &str, staging: &Path) -> Result<(), String> {
+    remote::check_npx_spec(spec)?;
     let mut c = SpawnSpec::new(crate::runtime::resolve_tool("npx"));
+    remote::apply_env(&mut c);
     c.args(["--yes", "skills", "add", spec, "--skill", "*"])
         .current_dir(staging)
         .env("HOME", staging)
         // See npx_skills_add: os.homedir() reads %USERPROFILE% on Windows.
         .env("USERPROFILE", staging);
-    let out = crate::executor::current()
-        .spawn_output_blocking(c, OUTPUT_OPTS)
-        .map_err(|e| {
-            spawn_error_message(
-                "npx",
-                "install Node.js to use npx-sourced primitives",
-                Some(staging),
-                &e,
-            )
-        })?;
+    remote::apply_npx_env(&mut c, staging);
+    let out = exec_output(c, SpawnClass::Npx).map_err(|e| {
+        spawn_error_message(
+            "npx",
+            "install Node.js to use npx-sourced primitives",
+            Some(staging),
+            &e,
+        )
+    })?;
     if !out.status.success() {
         return Err(format!(
             "npx skills add --skill '*' failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok(())
+    vet_skills_cli_output(staging)
 }
 
 // ─── locate the primitive inside a fetched tree ──────────────────────────────
@@ -624,6 +673,9 @@ fn stage_npx(
     pin: &Pin,
     npx_add: &dyn Fn(&str, &Path) -> Result<(), String>,
 ) -> Result<Staged, String> {
+    // Daemon policy: the spec is vetted before ANY route uses it (the pinned
+    // route reaches git with `gh_url(spec)`, the unpinned one the CLI).
+    remote::check_npx_spec(spec)?;
     if kind != Kind::Skill {
         return Err(
             "npx (skills CLI) installs skills only; use git for agents/commands/hooks/mcp"
@@ -683,6 +735,10 @@ fn stage_npx(
 /// Local route (WP-25): `url` is an absolute source dir. Copy-only — the
 /// source tree is never moved, symlinked, mutated or removed.
 fn stage_local(kind: Kind, name: &str, url: &str) -> Result<Staged, String> {
+    // A `local` source is the caller's own path: the desktop's, never a
+    // remote token holder's (`oba_install_local` stays desktop-only, and a
+    // `local` source named by `oba_install_with_deps` or a catalog row ends here).
+    remote::refuse_local()?;
     if is_fragment(kind) {
         return Err(format!(
             "{} install from a local path is not supported; install it from git",
@@ -1179,6 +1235,7 @@ fn fetch_and_adopt_bundle(
     spec: &str,
     fetch_fn: &dyn Fn(&str, &Path) -> Result<(), String>,
 ) -> Result<(PathBuf, Vec<String>, Option<String>), String> {
+    remote::check_npx_spec(spec)?;
     let dest = store_path_for(store, Kind::Bundle, name)?;
     if !dest.starts_with(store) {
         return Err(format!("install dest outside store: {}", dest.display()));
@@ -1636,6 +1693,7 @@ fn resolve_source_core(
 
     match route {
         ProvenanceSource::Npx => {
+            remote::check_npx_spec(&url)?;
             if kind.is_some_and(|k| k != Kind::Skill) {
                 return Err(format!(
                     "{url} is an npx spec, and `npx skills add` installs skills only — use a git URL for a {}",
@@ -1698,8 +1756,53 @@ fn resolve_source_core(
     }
 }
 
+// ─── Command bodies (thin: resolve the real store root, delegate to core) ─────
+//
+// The desktop's `#[tauri::command]` wrappers of the same names live in
+// `commands::claude_store` and call the plain `oba_*` functions, which run the
+// `*_in` bodies against `Vault::desktop()`. The daemon's `/api/rpc` arms
+// (`server::rpc_claude`) call the `*_in` bodies against their own confined
+// vault: the same cores, but moved onto a blocking thread under
+// [`remote`]'s policy (WP-18b part c) — see [`on_blocking`].
+
+/// Run the synchronous install core `f`. On the desktop (`Reach::Follow`) it
+/// runs inline, exactly as the commands always ran it. On the daemon it runs
+/// on a blocking thread — the core waits on child processes, which must not
+/// stall the async workers — inside [`remote::scoped`], so its sources are
+/// vetted, its spawns scrubbed and bounded, and one install runs at a time.
+async fn on_blocking<T, F>(v: &super::Vault<'_>, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    if v.checks().is_none() {
+        return f();
+    }
+    tokio::task::spawn_blocking(move || remote::scoped(f))
+        .await
+        .map_err(|e| format!("the install task did not finish: {e}"))?
+}
+
 /// R57 · N-B: dry-run resolve of a pasted git URL / `owner/repo` spec. Writes
 /// nothing to the vault; staging is removed before this returns.
+pub(crate) async fn oba_resolve_source_in(
+    v: &super::Vault<'_>,
+    url: String,
+    kind: Option<String>,
+    name: Option<String>,
+    git_ref: Option<String>,
+) -> Result<ResolvedSource, String> {
+    let k = match kind.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => Some(Kind::parse(s)?),
+        None => None,
+    };
+    on_blocking(v, move || {
+        let n = name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        resolve_source_core(&url, k, n, git_ref.as_deref(), &npx_skills_add)
+    })
+    .await
+}
+
 #[allow(non_snake_case)]
 pub(crate) async fn oba_resolve_source(
     url: String,
@@ -1707,20 +1810,39 @@ pub(crate) async fn oba_resolve_source(
     name: Option<String>,
     gitRef: Option<String>,
 ) -> Result<ResolvedSource, String> {
-    let k = match kind.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) => Some(Kind::parse(s)?),
-        None => None,
-    };
-    let n = name.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    resolve_source_core(&url, k, n, gitRef.as_deref(), &npx_skills_add)
+    oba_resolve_source_in(&super::Vault::desktop(), url, kind, name, gitRef).await
 }
 
-// ─── Command bodies (thin: resolve the real store root, delegate to core) ─────
-//
-// The desktop's `#[tauri::command]` wrappers of the same names live in
-// `commands::claude_store` and call these.
-
 /// Install a primitive from a git remote into the vault as a managed canonical.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn oba_install_git_in(
+    v: &super::Vault<'_>,
+    kind: String,
+    name: String,
+    url: String,
+    git_ref: Option<String>,
+    from_catalog: Option<bool>,
+    expect_sha: Option<String>,
+    expect_hash: Option<String>,
+) -> Result<ClaudeStoreEntry, String> {
+    let k = Kind::parse(&kind)?;
+    let pin = Pin::from_wire(expect_sha, expect_hash)?;
+    let store = v.store()?;
+    on_blocking(v, move || {
+        install_core_pinned(
+            &store,
+            k,
+            &name,
+            ProvenanceSource::Git,
+            &url,
+            git_ref.as_deref(),
+            from_catalog.unwrap_or(false),
+            &pin,
+        )
+    })
+    .await
+}
+
 #[allow(non_snake_case)]
 pub(crate) async fn oba_install_git(
     kind: String,
@@ -1731,25 +1853,50 @@ pub(crate) async fn oba_install_git(
     expectSha: Option<String>,
     expectHash: Option<String>,
 ) -> Result<ClaudeStoreEntry, String> {
-    let k = Kind::parse(&kind)?;
-    let pin = Pin::from_wire(expectSha, expectHash)?;
-    let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
-    install_core_pinned(
-        &store,
-        k,
-        &name,
-        ProvenanceSource::Git,
-        &url,
-        gitRef.as_deref(),
-        fromCatalog.unwrap_or(false),
-        &pin,
+    oba_install_git_in(
+        &super::Vault::desktop(),
+        kind,
+        name,
+        url,
+        gitRef,
+        fromCatalog,
+        expectSha,
+        expectHash,
     )
+    .await
 }
 
 /// Install a primitive via the Claude `skills` CLI (`npx skills add <spec>`).
 /// `fromCatalog` records that the install was discovered through the recommended
 /// catalog (Phase 3) — set by the catalog Install path, omitted/false for a
 /// direct npx install.
+pub(crate) async fn oba_install_npx_in(
+    v: &super::Vault<'_>,
+    kind: String,
+    name: String,
+    spec: String,
+    from_catalog: Option<bool>,
+    expect_sha: Option<String>,
+    expect_hash: Option<String>,
+) -> Result<ClaudeStoreEntry, String> {
+    let k = Kind::parse(&kind)?;
+    let pin = Pin::from_wire(expect_sha, expect_hash)?;
+    let store = v.store()?;
+    on_blocking(v, move || {
+        install_core_pinned(
+            &store,
+            k,
+            &name,
+            ProvenanceSource::Npx,
+            &spec,
+            None,
+            from_catalog.unwrap_or(false),
+            &pin,
+        )
+    })
+    .await
+}
+
 #[allow(non_snake_case)]
 pub(crate) async fn oba_install_npx(
     kind: String,
@@ -1759,19 +1906,16 @@ pub(crate) async fn oba_install_npx(
     expectSha: Option<String>,
     expectHash: Option<String>,
 ) -> Result<ClaudeStoreEntry, String> {
-    let k = Kind::parse(&kind)?;
-    let pin = Pin::from_wire(expectSha, expectHash)?;
-    let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
-    install_core_pinned(
-        &store,
-        k,
-        &name,
-        ProvenanceSource::Npx,
-        &spec,
-        None,
-        fromCatalog.unwrap_or(false),
-        &pin,
+    oba_install_npx_in(
+        &super::Vault::desktop(),
+        kind,
+        name,
+        spec,
+        fromCatalog,
+        expectSha,
+        expectHash,
     )
+    .await
 }
 
 /// Install a primitive from a LOCAL path into the vault as a managed canonical
@@ -1784,6 +1928,8 @@ pub(crate) async fn oba_install_npx(
 /// independent of the skill's own frontmatter name — so a local dir whose
 /// SKILL.md is named `mail` can be installed as `skill-mail` to satisfy a pkg's
 /// `requires:{kind:"skill",name:"skill-mail"}` edge.
+///
+/// Desktop-only: the daemon never serves this (an unconfined read source).
 pub(crate) async fn oba_install_local(
     kind: String,
     name: String,
@@ -1812,6 +1958,28 @@ pub(crate) async fn oba_install_local(
 /// members (so it doubles as the update path). `scope` is accepted for forward
 /// compatibility with WP-21 placement but is unused here (store population only).
 /// `fromCatalog` records catalog discovery (Phase 3).
+pub(crate) async fn oba_install_bundle_in(
+    v: &super::Vault<'_>,
+    name: String,
+    spec: String,
+    scope: Option<String>,
+    from_catalog: Option<bool>,
+) -> Result<ClaudeStoreEntry, String> {
+    // WP-19 is store + registry only; placement (the `scope`) is WP-21.
+    let _ = scope;
+    let store = v.store()?;
+    on_blocking(v, move || {
+        install_bundle_core(
+            &store,
+            &name,
+            &spec,
+            from_catalog.unwrap_or(false),
+            &|spec, staging| npx_skills_add_all(spec, staging),
+        )
+    })
+    .await
+}
+
 #[allow(non_snake_case)]
 pub(crate) async fn oba_install_bundle(
     name: String,
@@ -1819,28 +1987,40 @@ pub(crate) async fn oba_install_bundle(
     scope: Option<String>,
     fromCatalog: Option<bool>,
 ) -> Result<ClaudeStoreEntry, String> {
-    // WP-19 is store + registry only; placement (the `scope`) is WP-21.
-    let _ = scope;
-    let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
-    install_bundle_core(
-        &store,
-        &name,
-        &spec,
-        fromCatalog.unwrap_or(false),
-        &|spec, staging| npx_skills_add_all(spec, staging),
-    )
+    oba_install_bundle_in(&super::Vault::desktop(), name, spec, scope, fromCatalog).await
 }
 
 /// Check whether a git/npx-installed primitive is behind its remote.
-pub(crate) async fn oba_check_update(kind: String, name: String) -> Result<UpdateStatus, String> {
+pub(crate) async fn oba_check_update_in(
+    v: &super::Vault<'_>,
+    kind: String,
+    name: String,
+) -> Result<UpdateStatus, String> {
     let k = Kind::parse(&kind)?;
-    let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
-    check_update_core(&store, k, &name)
+    let store = v.store()?;
+    on_blocking(v, move || check_update_core(&store, k, &name)).await
+}
+
+pub(crate) async fn oba_check_update(kind: String, name: String) -> Result<UpdateStatus, String> {
+    oba_check_update_in(&super::Vault::desktop(), kind, name).await
 }
 
 /// Re-fetch a managed primitive into its existing canonical in place (no relink).
 /// R57 · N-C: `expectSha` fetches exactly that commit ("Update to <sha>");
 /// `expectHash` must match the fetched content. Required for a pinned master.
+pub(crate) async fn oba_update_in(
+    v: &super::Vault<'_>,
+    kind: String,
+    name: String,
+    expect_sha: Option<String>,
+    expect_hash: Option<String>,
+) -> Result<ClaudeStoreEntry, String> {
+    let k = Kind::parse(&kind)?;
+    let pin = Pin::from_wire(expect_sha, expect_hash)?;
+    let store = v.store()?;
+    on_blocking(v, move || update_core_pinned(&store, k, &name, &pin)).await
+}
+
 #[allow(non_snake_case)]
 pub(crate) async fn oba_update(
     kind: String,
@@ -1848,10 +2028,7 @@ pub(crate) async fn oba_update(
     expectSha: Option<String>,
     expectHash: Option<String>,
 ) -> Result<ClaudeStoreEntry, String> {
-    let k = Kind::parse(&kind)?;
-    let pin = Pin::from_wire(expectSha, expectHash)?;
-    let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
-    update_core_pinned(&store, k, &name, &pin)
+    oba_update_in(&super::Vault::desktop(), kind, name, expectSha, expectHash).await
 }
 
 /// Phase 3 — auto-update every `auto_update`-opted entry that's behind its
@@ -1860,11 +2037,21 @@ pub(crate) async fn oba_update(
 /// errored entries.
 /// R57 · Q3: `pins` are the signed catalog's current pins; a pinned catalog
 /// install moves only to its pin.
+pub(crate) async fn oba_auto_update_all_in(
+    v: &super::Vault<'_>,
+    pins: Option<Vec<CatalogPin>>,
+) -> Result<AutoUpdateSummary, String> {
+    let store = v.store()?;
+    on_blocking(v, move || {
+        Ok(auto_update_all_pinned(&store, &pins.unwrap_or_default()))
+    })
+    .await
+}
+
 pub(crate) async fn oba_auto_update_all(
     pins: Option<Vec<CatalogPin>>,
 ) -> Result<AutoUpdateSummary, String> {
-    let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
-    Ok(auto_update_all_pinned(&store, &pins.unwrap_or_default()))
+    oba_auto_update_all_in(&super::Vault::desktop(), pins).await
 }
 
 /// Phase 3 — toggle the per-entry auto-update opt-in and persist it to
@@ -2257,7 +2444,43 @@ fn missing_requires_core(
 /// source; the missing closure auto-installs transactionally (rolled back with
 /// the target on any failure). Returns the target + the installed closure
 /// (enable order) + already-satisfied deps (consent UX).
-#[allow(non_snake_case)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn oba_install_with_deps_in(
+    v: &super::Vault<'_>,
+    db: &PaDb,
+    kind: String,
+    name: String,
+    source: String,
+    url: String,
+    git_ref: Option<String>,
+    from_catalog: Option<bool>,
+    catalog: Vec<CatalogEntryRef>,
+    expect_sha: Option<String>,
+    expect_hash: Option<String>,
+) -> Result<InstallWithDepsResult, String> {
+    let k = Kind::parse(&kind)?;
+    let src = parse_source(&source)?;
+    let pin = Pin::from_wire(expect_sha, expect_hash)?;
+    let store = v.store()?;
+    let scope_roots = super::all_scope_roots_in(db, v.home_opt()).await;
+    on_blocking(v, move || {
+        install_with_deps_core_pinned(
+            &store,
+            &scope_roots,
+            k,
+            &name,
+            src,
+            &url,
+            git_ref.as_deref(),
+            from_catalog.unwrap_or(false),
+            &catalog,
+            &pin,
+        )
+    })
+    .await
+}
+
+#[allow(non_snake_case, clippy::too_many_arguments)]
 pub(crate) async fn oba_install_with_deps(
     db: &PaDb,
     kind: String,
@@ -2270,23 +2493,20 @@ pub(crate) async fn oba_install_with_deps(
     expectSha: Option<String>,
     expectHash: Option<String>,
 ) -> Result<InstallWithDepsResult, String> {
-    let k = Kind::parse(&kind)?;
-    let src = parse_source(&source)?;
-    let pin = Pin::from_wire(expectSha, expectHash)?;
-    let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
-    let scope_roots = super::all_scope_roots(db).await;
-    install_with_deps_core_pinned(
-        &store,
-        &scope_roots,
-        k,
-        &name,
-        src,
-        &url,
-        gitRef.as_deref(),
-        fromCatalog.unwrap_or(false),
-        &catalog,
-        &pin,
+    oba_install_with_deps_in(
+        &super::Vault::desktop(),
+        db,
+        kind,
+        name,
+        source,
+        url,
+        gitRef,
+        fromCatalog,
+        catalog,
+        expectSha,
+        expectHash,
     )
+    .await
 }
 
 /// Re-verify a primitive's `requires` at enable time: return the recorded deps
@@ -4596,5 +4816,175 @@ mod tests {
         );
         st.cleanup();
         assert!(!st.staging.as_ref().unwrap().exists(), "staging removed");
+    }
+
+    // ── WP-18b part c — the daemon policy at the fetch edge ─────────────────
+
+    fn store_is_empty(store: &Path) -> bool {
+        !store.join("skills").exists()
+            && !store.join("agents").exists()
+            && !store.join("registry.json").exists()
+    }
+
+    /// Under the daemon policy a source that is not public https is refused
+    /// BEFORE anything is fetched or written — `file://`, a bare path,
+    /// `ext::`, an option-looking URL — and a `local` source is refused where
+    /// it is staged. The same call off-policy still installs (the desktop).
+    #[test]
+    fn daemon_policy_refuses_non_https_sources_and_writes_nothing() {
+        let base = unique_tmp("policy_refuse");
+        let store = base.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let (repo, file_url) = make_skill_repo(&base, "demo", "a demo skill");
+
+        for url in [
+            file_url.as_str(),
+            repo.to_str().unwrap(),
+            "ext::sh -c touch /tmp/oba-policy-pwned",
+            "--upload-pack=touch /tmp/oba-policy-pwned",
+            "git@github.com:o/r.git",
+            "http://github.com/o/r",
+        ] {
+            let err = remote::scoped(|| {
+                install_core(
+                    &store,
+                    Kind::Skill,
+                    "demo",
+                    ProvenanceSource::Git,
+                    url,
+                    None,
+                    false,
+                )
+            })
+            .unwrap_err();
+            assert!(err.contains("public host"), "{url}: {err}");
+        }
+        // A local source (also what a caller-named `source: "local"` becomes).
+        let err = remote::scoped(|| {
+            install_core(
+                &store,
+                Kind::Skill,
+                "demo",
+                ProvenanceSource::Local,
+                repo.to_str().unwrap(),
+                None,
+                false,
+            )
+        })
+        .unwrap_err();
+        assert!(err.contains("desktop-only"), "{err}");
+        // A hostile ref and a non-owner/repo npx spec.
+        let err = remote::scoped(|| {
+            git_clone(
+                "https://github.com/o/r",
+                Some("--upload-pack=x"),
+                &base.join("d"),
+            )
+        })
+        .unwrap_err();
+        assert!(err.contains("plain branch or tag"), "{err}");
+        for spec in ["./local", "/abs/path", "file:///tmp/x", "a/b/c"] {
+            let err = remote::scoped(|| {
+                stage_npx(Kind::Skill, "demo", spec, &Pin::default(), &|_, _| {
+                    panic!("the CLI must not run for {spec}")
+                })
+                .map(|_| ())
+            })
+            .unwrap_err();
+            assert!(err.contains("public host"), "{spec}: {err}");
+        }
+        assert!(store_is_empty(&store));
+
+        // Off-policy (the desktop): the very same file:// install works.
+        install_core(
+            &store,
+            Kind::Skill,
+            "demo",
+            ProvenanceSource::Git,
+            &file_url,
+            None,
+            false,
+        )
+        .expect("the desktop still installs from file://");
+        assert!(store.join("skills/demo/SKILL.md").is_file());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The `oba_install_with_deps` path: a caller-supplied catalog row naming a
+    /// `local` source for a dependency fails the closure — under the policy only.
+    #[test]
+    fn daemon_policy_refuses_a_local_dependency_in_the_closure() {
+        let base = unique_tmp("policy_deps");
+        let store = base.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        // The closure core is what `oba_install_with_deps` runs after the target.
+        let requires = vec![RequiresEntry {
+            kind: "skill".into(),
+            name: "child".into(),
+            source: None,
+            r#ref: None,
+        }];
+        let catalog = vec![CatalogEntryRef {
+            kind: "skill".into(),
+            name: "child".into(),
+            source: "local".into(),
+            url: base.to_string_lossy().into_owned(),
+            ..Default::default()
+        }];
+        let err = remote::scoped(|| {
+            install_requires_closure_core(&store, &[], &requires, &catalog).map(|_| ())
+        })
+        .unwrap_err();
+        assert!(err.contains("desktop-only"), "{err}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A symlink in what the `skills` CLI wrote that leaves the staging tree is
+    /// refused under the policy (the copy follows links); an in-tree link, as
+    /// the CLI itself lays out, is fine; off-policy nothing is checked.
+    #[cfg(unix)]
+    #[test]
+    fn daemon_policy_vets_the_skills_cli_output() {
+        use std::os::unix::fs::symlink;
+        let base = unique_tmp("policy_vet");
+        let secret = base.join("secret.txt");
+        std::fs::write(&secret, "s3cret").unwrap();
+
+        let ok = base.join("ok");
+        std::fs::create_dir_all(ok.join(".agents/skills/demo")).unwrap();
+        std::fs::write(ok.join(".agents/skills/demo/SKILL.md"), "x").unwrap();
+        std::fs::create_dir_all(ok.join(".claude/skills")).unwrap();
+        symlink("../../.agents/skills/demo", ok.join(".claude/skills/demo")).unwrap();
+        assert!(remote::scoped(|| vet_skills_cli_output(&ok)).is_ok());
+
+        let bad = base.join("bad");
+        std::fs::create_dir_all(bad.join(".agents/skills/demo")).unwrap();
+        symlink(&secret, bad.join(".agents/skills/demo/SKILL.md")).unwrap();
+        let err = remote::scoped(|| vet_skills_cli_output(&bad)).unwrap_err();
+        assert!(err.contains("leaves the repository"), "{err}");
+        assert!(vet_skills_cli_output(&bad).is_ok(), "desktop: unchecked");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Through the real executor path: under the policy a spawn gets this
+    /// process's environment minus `IKENGA_*` / `GIT_*` and plus the transport
+    /// pin; off-policy it inherits everything, as the desktop always did.
+    #[cfg(unix)]
+    #[test]
+    fn spawns_scrub_the_host_environment_only_on_policy() {
+        std::env::set_var("IKENGA_OBA_POLICY_PROBE", "daemon-secret");
+        std::env::set_var("GIT_OBA_POLICY_PROBE", "git-knob");
+        std::env::set_var("OBA_POLICY_KEEP", "keep");
+        let script = r#"printf '[%s][%s][%s][%s]' "$IKENGA_OBA_POLICY_PROBE" "$GIT_OBA_POLICY_PROBE" "$OBA_POLICY_KEEP" "$GIT_ALLOW_PROTOCOL""#;
+        let inherited = run("sh", &["-c", script], None).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&inherited.stdout),
+            "[daemon-secret][git-knob][keep][]"
+        );
+        let scrubbed = remote::scoped(|| run("sh", &["-c", script], None)).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&scrubbed.stdout),
+            "[][][keep][https]"
+        );
     }
 }

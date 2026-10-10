@@ -7,7 +7,7 @@
 import { useCallback, useMemo } from 'react';
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { z } from 'zod';
-import { installUnavailableReason } from '@/lib/desktop-only';
+import { installSourceBlock, pkgInstallUnavailableReason } from '@/lib/desktop-only';
 import { markBrokenEntries, registryNameMatches, useBrokenPkgs } from '@/lib/ngwa/broken-pkgs';
 import { mergeCatalogIntoStore } from '@/lib/ngwa/enrichment';
 import { useNgwaSnapshot } from '@/lib/ngwa/use-ngwa-snapshot';
@@ -92,11 +92,17 @@ function NgwaStorePage() {
 	useObaAutoUpdateOnMount(catalogQuery.isSuccess, pins);
 
 	const ctx = { catalog: catalogEntries, vault: vault.entries };
-	// Gap audit rank 3: the daemon serves no install or update yet. Leaving the
-	// handlers off makes the surface disable Install / Update / Update all
-	// before the click (with its NOT_AVAILABLE_ON_SERVER_YET reason) instead of
-	// letting a click end in a raw error. Drop this gate once they are served.
-	const installReason = installUnavailableReason();
+	// Two kinds of thing live in the Store and a browser session treats them
+	// differently. Registry PACKAGES need a pkg kernel the headless daemon does
+	// not run, and the pkg set is the server operator's: leaving their handlers
+	// off makes the surface disable Install / Update / Update all before the
+	// click, with that reason, instead of letting a click end in a raw error.
+	// Ọba PRIMITIVES (skills, agents, commands, hooks, MCP) are fetched from a
+	// git URL / npx spec into the signed-in account's own vault, which the
+	// daemon serves (WP-18b part c): their handlers stay on. A source the
+	// server would refuse (a local path, a non-https URL) is stopped in the
+	// Add-from-URL sheet with its own reason (`remoteSourceBlock`).
+	const installReason = pkgInstallUnavailableReason();
 	const installBlocked = installReason !== false;
 
 	return (
@@ -121,19 +127,15 @@ function NgwaStorePage() {
 				catalogStatus={catalogStatus}
 				catalogError={catalogQuery.error ? (catalogQuery.error as Error).message : null}
 				onRecheckCatalog={() => void catalogQuery.refetch()}
-				onInstallPrimitive={
-					installBlocked
-						? undefined
-						: (row, scope, onStage) => store.installPrimitive(row, scope, { ...ctx, onStage })
+				onInstallPrimitive={(row, scope, onStage) =>
+					store.installPrimitive(row, scope, { ...ctx, onStage })
 				}
-				onUpdatePrimitive={installBlocked ? undefined : store.updatePrimitive}
+				onUpdatePrimitive={store.updatePrimitive}
 				onResolveSource={store.resolveSource}
-				onInstallResolved={
-					installBlocked
-						? undefined
-						: (resolved, scope, onStage) =>
-								store.installResolved(resolved, scope, { ...ctx, onStage })
+				onInstallResolved={(resolved, scope, onStage) =>
+					store.installResolved(resolved, scope, { ...ctx, onStage })
 				}
+				sourceBlock={installSourceBlock}
 				onOpenInstalled={(name) =>
 					void navigate({ to: '/ngwa/installed', search: { search: name } })
 				}
