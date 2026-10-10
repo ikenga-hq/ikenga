@@ -179,6 +179,22 @@ fn check_https_url(url: &str) -> Result<(), String> {
             "{HTTPS_ONLY}: credentials in a URL are not accepted (they would be recorded in the registry)"
         ));
     }
+    // git and curl parse the RAW string, not the WHATWG form `url` checked,
+    // so the raw text must say exactly what was checked: `https://` written
+    // out, no backslash (WHATWG reads `\` as `/`, curl does not:
+    // `https://github.com\@127.0.0.1/x` would connect to 127.0.0.1), and an
+    // authority that is the checked host (optionally `:443`) verbatim.
+    if !url.starts_with("https://") || url.contains('\\') {
+        return Err(format!(
+            "{HTTPS_ONLY}: `{}` is not a plain https:// URL",
+            shown(url)
+        ));
+    }
+    let raw_authority = url["https://".len()..]
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let host = match parsed.host() {
         Some(url::Host::Domain(d)) => d.to_ascii_lowercase(),
         Some(_) => {
@@ -188,6 +204,14 @@ fn check_https_url(url: &str) -> Result<(), String> {
         }
         None => return Err(format!("{HTTPS_ONLY}: the URL has no host")),
     };
+    if raw_authority != host && raw_authority != format!("{host}:443") {
+        return Err(format!(
+            "{HTTPS_ONLY}: `{}` is not a plain https:// URL",
+            shown(url)
+        ));
+    }
+    // A trailing dot is the same name (`localhost.` resolves to 127.0.0.1).
+    let host = host.trim_end_matches('.').to_string();
     let internal = host == "localhost"
         || !host.contains('.')
         || [
@@ -573,6 +597,14 @@ mod tests {
                 "--upload-pack=touch /tmp/x",
                 "-ohttps://github.com/o/r",
                 "https://user:pw@github.com/o/r",
+                "https://github.com\\@127.0.0.1:1/x",
+                "https://github.com\\@localhost/x",
+                "https://localhost./o/r",
+                "https://foo.local./o/r",
+                "https:/github.com/o/r",
+                "https:github.com/o/r",
+                "HTTPS://localhost/o/r",
+                "https://github.com:0443/o/r",
                 "https://user@github.com/o/r",
                 "https://127.0.0.1/o/r",
                 "https://[::1]/o/r",
@@ -831,9 +863,14 @@ mod tests {
         assert_eq!(out.status.code(), Some(3));
 
         // A runaway child with a grandchild holding the pipes open.
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
         let started = Instant::now();
         let mut slow = SpawnSpec::new("sh");
-        slow.args(["-c", "sleep 60 & sleep 60"]);
+        slow.args([
+            "-c".to_string(),
+            format!("sleep 60 & echo $! > '{}'; sleep 60", pidfile.display()),
+        ]);
         let err = run_bounded(slow, OPTS, Duration::from_millis(400)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
         assert!(err.to_string().contains("timed out"), "{err}");
@@ -841,6 +878,22 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "returned at the deadline, not when the child finished: {:?}",
             started.elapsed()
+        );
+        // The whole group is gone, not just the direct child.
+        let grandchild: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: signal 0 only probes for existence.
+        while unsafe { libc::kill(grandchild, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_ne!(
+            unsafe { libc::kill(grandchild, 0) },
+            0,
+            "grandchild {grandchild} survived the timeout"
         );
 
         // A program that does not exist is a spawn error, not a hang.
