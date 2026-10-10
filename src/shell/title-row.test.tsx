@@ -237,17 +237,7 @@ describe('<TitleRow /> — native-menu cascade (non-mac)', () => {
 		render(<TitleRow mac={false} />);
 		const button = await screen.findByTestId('native-menu-button');
 		await user.click(button);
-		for (const label of [
-			'Ikenga',
-			'File',
-			'Edit',
-			'View',
-			'Project',
-			'Chi',
-			'Ngwa',
-			'Window',
-			'Help',
-		]) {
+		for (const label of ['Ikenga', 'File', 'Edit', 'View', 'Project', 'Chi', 'Ngwa', 'Window', 'Help']) {
 			expect(await screen.findByText(label)).toBeTruthy();
 		}
 	});

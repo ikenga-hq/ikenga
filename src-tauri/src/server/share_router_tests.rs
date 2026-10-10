@@ -177,11 +177,7 @@ fn has_cost_key(v: &Value) -> bool {
 fn read_text(resp: &Value) -> String {
     let bytes: Vec<u8> = resp["data"]["bytes"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|b| b.as_u64().map(|b| b as u8))
-                .collect()
-        })
+        .map(|a| a.iter().filter_map(|b| b.as_u64().map(|b| b as u8)).collect())
         .unwrap_or_default();
     String::from_utf8_lossy(&bytes).into_owned()
 }
@@ -444,6 +440,24 @@ async fn git_status_under_share_confinement() {
     assert_eq!(inside["ok"], true, "{inside}");
     assert_eq!(inside["data"], Value::Null);
 
+    // 1b. Once the shared project is a repository, the member reads its state.
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&c.project)
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let repo = call(
+        &c,
+        Some("viewer"),
+        "git_status",
+        json!({ "root": s(&c.project) }),
+    )
+    .await;
+    assert_eq!(repo["ok"], true, "{repo}");
+    assert!(repo["data"]["branch"].is_string(), "{repo}");
+
     // 2. A path outside the shared project: refused for a share member.
     let outside_dir = c.outside.parent().unwrap();
     let refused = call(
@@ -471,4 +485,18 @@ async fn git_status_under_share_confinement() {
             .contains("must name the shared project"),
         "{bad_proj}"
     );
+
+    // 4. A principal without the Files capability: refused (the pre-hook, not
+    // the arm), whether it holds other capabilities or none.
+    for caps in ["sessions", ""] {
+        let no_files = call_with_caps(
+            &c,
+            Some("viewer"),
+            caps,
+            "git_status",
+            json!({ "root": s(&c.project) }),
+        )
+        .await;
+        assert_eq!(no_files["ok"], false, "caps `{caps}`: {no_files}");
+    }
 }

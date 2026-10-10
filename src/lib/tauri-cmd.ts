@@ -9,7 +9,11 @@
 // later phases just fill in the Rust side.
 
 import type { NgwaSnapshot, WindowDescriptor } from '@ikenga/contract';
-import type { SettingsFileResult, SettingsScope, SettingsWriteOptions } from '@/lib/settings/types';
+import type {
+	SettingsFileResult,
+	SettingsScope,
+	SettingsWriteOptions,
+} from '@/lib/settings/types';
 import { getTransport, isRemoteWebSession, isTauri, type RpcTransport } from './transport';
 import { getFsSocketClient } from './transport/fs-socket';
 import { attachRemotePty } from './transport/pty-socket';
@@ -527,7 +531,7 @@ export async function settingsClearAll(): Promise<void> {
 
 export async function settingsReadFile(
 	scope: SettingsScope = 'project',
-	projectId?: string | null
+	projectId?: string | null,
 ): Promise<SettingsFileResult> {
 	return invoke<SettingsFileResult>('settings_read_file', {
 		scope,
@@ -536,7 +540,7 @@ export async function settingsReadFile(
 }
 
 export async function settingsWriteField(
-	options: SettingsWriteOptions
+	options: SettingsWriteOptions,
 ): Promise<SettingsFileResult> {
 	return invoke<SettingsFileResult>('settings_write_field', {
 		scope: options.scope,
@@ -562,7 +566,7 @@ export function canOpenFilesWithOs(): boolean {
 
 export async function settingsOpenFile(
 	scope: SettingsScope,
-	projectId?: string | null
+	projectId?: string | null,
 ): Promise<string> {
 	return invoke<string>('settings_open_file', {
 		scope,
@@ -727,7 +731,7 @@ export interface NotificationsChangedEvent {
 export const NOTIFICATIONS_CHANGED_EVENT = 'notifications://changed';
 
 export async function notificationsList(
-	options: NotificationsListOptions = {}
+	options: NotificationsListOptions = {},
 ): Promise<NotificationRow[]> {
 	return invoke<NotificationRow[]>('notifications_list', {
 		unreadOnly: options.unreadOnly ?? null,
@@ -754,14 +758,12 @@ export async function notificationsMuteState(): Promise<NotificationsMuteState> 
 	return invoke<NotificationsMuteState>('notifications_mute_state');
 }
 
-export async function notificationsMuteKind(
-	kind: NotificationKind
-): Promise<NotificationsMuteState> {
+export async function notificationsMuteKind(kind: NotificationKind): Promise<NotificationsMuteState> {
 	return invoke<NotificationsMuteState>('notifications_mute_kind', { kind });
 }
 
 export async function notificationsUnmuteKind(
-	kind: NotificationKind
+	kind: NotificationKind,
 ): Promise<NotificationsMuteState> {
 	return invoke<NotificationsMuteState>('notifications_unmute_kind', { kind });
 }
@@ -779,7 +781,7 @@ export interface NotificationsRecordUpdateArgs {
  * the created row, or `null` when that version was already announced.
  */
 export async function notificationsRecordUpdate(
-	args: NotificationsRecordUpdateArgs
+	args: NotificationsRecordUpdateArgs,
 ): Promise<NotificationRow | null> {
 	return invoke<NotificationRow | null>('notifications_record_update', {
 		source: args.source,
@@ -828,7 +830,7 @@ export type WslFixOutcome =
 /** Probe WSL networking. `distro` omitted = `engines.agentWslDistro`; results
  *  are cached 30 s per distro unless `force`. */
 export async function wslHealthProbe(
-	args: { distro?: string | null; force?: boolean } = {}
+	args: { distro?: string | null; force?: boolean } = {},
 ): Promise<WslHealth> {
 	return invoke<WslHealth>('wsl_health_probe', {
 		distro: args.distro ?? null,
@@ -840,7 +842,7 @@ export async function wslHealthProbe(
  *  `switch_to_nat` shut WSL down — confirm first, relaunch sessions after. */
 export async function wslHealthFix(
 	action: WslFixAction,
-	distro?: string | null
+	distro?: string | null,
 ): Promise<WslFixOutcome> {
 	return invoke<WslFixOutcome>('wsl_health_fix', { action, distro: distro ?? null });
 }
@@ -3105,9 +3107,7 @@ export interface OsShortcutStatusResult {
 /** Replace the OS-wide shortcuts `lib.rs` registers with `rules` (the
  *  effective default + personal `scope: "os"` rules). Tolerant per rule: one
  *  failure is reported in its status and never blocks the others. */
-export async function osShortcutsApply(
-	rules: OsShortcutRuleArg[]
-): Promise<OsShortcutStatusResult[]> {
+export async function osShortcutsApply(rules: OsShortcutRuleArg[]): Promise<OsShortcutStatusResult[]> {
 	return invoke<OsShortcutStatusResult[]>('os_shortcuts_apply', { rules });
 }
 
@@ -5134,10 +5134,7 @@ export async function listWindows(): Promise<WindowDescriptor[]> {
  * Resolves to that window's label, or `null` when there is no Window 2 (then
  * spawn one with {@link spawnWindow}). The caller focuses the label.
  */
-export async function windowJoinSurface(
-	surfaceId: string,
-	projectId: string | null
-): Promise<string | null> {
+export async function windowJoinSurface(surfaceId: string, projectId: string | null): Promise<string | null> {
 	return invoke<string | null>('window_join_surface', { surfaceId, projectId });
 }
 
@@ -5146,11 +5143,7 @@ export async function windowJoinSurface(
  * main window* when `moveBack`). The window closes when it held nothing else.
  * Resolves to its `surface_set` after the change.
  */
-export async function windowRemoveSurface(
-	label: string,
-	surfaceId: string,
-	moveBack = false
-): Promise<string[]> {
+export async function windowRemoveSurface(label: string, surfaceId: string, moveBack = false): Promise<string[]> {
 	return invoke<string[]>('window_remove_surface', { label, surfaceId, moveBack });
 }
 
