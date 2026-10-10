@@ -60,7 +60,14 @@ fn is_broad_dir(dir: &Path, home: Option<&Path>) -> bool {
         .components()
         .filter(|c| matches!(c, Component::Normal(_)))
         .count();
-    depth <= 1 || dir.parent().is_none() || home.is_some_and(|h| h.starts_with(dir))
+    depth <= 1
+        || dir.parent().is_none()
+        || home.is_some_and(|h| h.starts_with(dir))
+        // Someone's home directory (a sibling of ours, or anything directly
+        // under /home) is as broad as our own, even when registered as a project.
+        || dir.parent().is_some_and(|p| {
+            p == Path::new("/home") || home.is_some_and(|h| h.parent() == Some(p))
+        })
 }
 
 /// Decide what a viewer mount rooted at `root` may serve for the page `file`
@@ -140,6 +147,18 @@ pub fn is_sensitive_path(path: &Path) -> bool {
 pub fn may_serve(scope: &MountScope, target: &Path) -> bool {
     if is_sensitive_path(target) {
         return false;
+    }
+    // The denylist is by name, so a hardlink with an innocent name to a
+    // credential (e.g. pages/notes.txt -> ~/.ssh/id_rsa) would pass it. A
+    // previewable file never needs more than one link.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(md) = std::fs::metadata(target) {
+            if md.is_file() && md.nlink() > 1 {
+                return false;
+            }
+        }
     }
     match scope {
         MountScope::Tree => true,
@@ -288,6 +307,34 @@ mod tests {
         ] {
             assert!(!is_sensitive_path(Path::new(s)), "{s}");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn may_serve_refuses_a_hardlinked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("key");
+        std::fs::write(&secret, "FAKE-KEY").unwrap();
+        let innocent = dir.path().join("notes.txt");
+        std::fs::hard_link(&secret, &innocent).unwrap();
+        let plain = dir.path().join("page.html");
+        std::fs::write(&plain, "<p>ok</p>").unwrap();
+        assert!(!may_serve(&MountScope::Tree, &innocent));
+        assert!(!may_serve(
+            &MountScope::SingleFile(innocent.clone()),
+            &innocent
+        ));
+        assert!(may_serve(&MountScope::Tree, &plain));
+    }
+
+    #[test]
+    fn another_users_home_is_broad() {
+        let home = p("/home/alice");
+        assert!(is_broad_dir(&p("/home/bob"), Some(&home)));
+        assert!(is_broad_dir(&p("/home/bob"), None));
+        assert!(is_broad_dir(&home, Some(&home)));
+        assert!(!is_broad_dir(&p("/home/alice/work/proj"), Some(&home)));
+        assert!(!is_broad_dir(&p("/srv/projects/app"), Some(&home)));
     }
 
     #[test]
