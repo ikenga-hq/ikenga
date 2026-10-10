@@ -93,8 +93,17 @@ export type StoreDetailLoader = (
 
 export interface NgwaStoreSurfaceProps {
 	catalog: NgwaStoreEntry[];
-	/** Reason install/update are disabled on this host (e.g. NOT_AVAILABLE_ON_SERVER_YET). */
+	/** Reason a registry PACKAGE's install/update is disabled on this host (e.g.
+	 *  "Packages are installed by the server operator"). Also the fallback for
+	 *  the primitive controls when {@link primitiveDisabledReason} is not given. */
 	disabledReason?: string;
+	/** Reason an Ọba PRIMITIVE's (catalog row / pasted URL) install/update is
+	 *  disabled, when it differs from {@link disabledReason}. */
+	primitiveDisabledReason?: string;
+	/** A reason a pasted install source cannot be installed on this host (a
+	 *  local path in a browser session: "Local installs are desktop-only"), or
+	 *  `null`. Shown in the Add-from-URL sheet instead of letting Resolve fail. */
+	sourceBlock?: (raw: string) => string | null;
 	isLoading?: boolean;
 	/** The Ngwa snapshot failed: what is installed is unknown, so no row can
 	 *  say installed / update / install. Not a registry outage. */
@@ -296,7 +305,12 @@ export function NgwaStoreSurface({
 	initialAddUrl = false,
 	initialSelectedId = null,
 	disabledReason,
+	primitiveDisabledReason,
+	sourceBlock,
 }: NgwaStoreSurfaceProps) {
+	// The primitive controls (catalog rows, the Add-from-URL sheet) read their
+	// own reason; absent, they share the package one.
+	const primReason = primitiveDisabledReason ?? disabledReason;
 	const [search, setSearch] = useState('');
 	const [kindFilter, setKindFilter] = useState('*');
 	const [trustFilter, setTrustFilter] = useState('*');
@@ -770,7 +784,7 @@ export function NgwaStoreSurface({
 									busy={Boolean(pending[row.id])}
 									onSelect={() => selectRow(row.id)}
 									onUpdate={updatePrimitive}
-									disabledReason={disabledReason}
+									disabledReason={primReason}
 								/>
 							))}
 
@@ -800,7 +814,8 @@ export function NgwaStoreSurface({
 							projectLabel={projectLabel}
 							catalog={catalogEntries}
 							installedKeys={installedKeys}
-							disabledReason={disabledReason}
+							disabledReason={primReason}
+							sourceBlock={sourceBlock}
 							onClose={() => setAddUrl(null)}
 							onResolve={onResolveSource}
 							onInstall={onInstallResolved}
@@ -819,7 +834,7 @@ export function NgwaStoreSurface({
 							updateError={actionErrors[selectedPrimitive.id] ?? null}
 							onRecheckCatalog={onRecheckCatalog}
 							onOpenInstalled={onOpenInstalled}
-							disabledReason={disabledReason}
+							disabledReason={primReason}
 						/>
 					) : selectedEntry ? (
 						<StoreSheet

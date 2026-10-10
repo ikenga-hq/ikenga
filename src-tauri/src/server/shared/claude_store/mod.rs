@@ -37,8 +37,11 @@
 //! What differs is the [`Vault`] they are handed ([`confine`]): the desktop
 //! passes its process home and store and follows symlinks as it always has;
 //! the daemon passes its router home and store and is confined to the vault.
-//! The git / npx install paths (`install.rs`) compile here too, but only the
-//! desktop wrappers reach them — no daemon arm does.
+//! The git / npx install paths (`install.rs`) compile here too. The desktop
+//! wrappers reach them with their own unrestricted rules; the daemon's arms
+//! reach them through the `*_in` bodies under `remote`'s policy (https-only
+//! public sources, no local paths, a scrubbed environment, deadlines, vetted
+//! trees) — `oba_install_local` stays desktop-only.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -80,9 +83,14 @@ mod registry;
 /// / update. Fetches a managed canonical into the vault (`store/<kind>s/<name>`,
 /// in-place uniform) and records provenance; placement stays the separate
 /// `claude_primitive_enable` step. Reuses this module's `atomic_copy_*` as the
-/// atomic swap and the `registry` I/O above. Its git / npx paths spawn and are
-/// reached only from the desktop's `commands::claude_store` wrappers.
+/// atomic swap and the `registry` I/O above. Its git / npx paths spawn; the
+/// desktop's `commands::claude_store` wrappers and (WP-18b part c) the daemon's
+/// `rpc_claude` arms reach them, the daemon's under [`remote`]'s policy.
 pub(crate) mod install;
+
+/// The daemon-only policy of the fetch edge (https-only sources, no local
+/// paths, scrubbed env, deadlines, vetted trees). Inert off the daemon.
+pub(crate) mod remote;
 
 pub use install::{
     resolve_pkg_requires, AutoUpdateSummary, CatalogEntryRef, CatalogPin, InstallWithDepsResult,

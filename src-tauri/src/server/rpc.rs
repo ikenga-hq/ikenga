@@ -748,9 +748,12 @@ pub async fn rpc_handler(
         // no symlink planted in a scope can turn a copy, write or delete into
         // one outside the vault or inside `--data-dir`; relink / unlink name
         // only placements in a known scope; an import source and a new master
-        // must pass the fs allowlist. Left allowlisted: the git / npx
-        // installers and updaters (they spawn, WP-18b) and `oba_install_local`
-        // (an unconfined read source) — see `desktop_only.toml`.
+        // must pass the fs allowlist. The git / npx installers and updaters
+        // (WP-18b part c) spawn through `executor::current()` — as the
+        // signed-in account under T1 — under `claude_store::remote`'s policy
+        // (https-only public sources, scrubbed env, deadlines, vetted trees).
+        // Left allowlisted: `oba_install_local` (an unconfined read source) —
+        // see `desktop_only.toml`.
         "claude_store_list" => rpc_claude::claude_store_list(&state, &payload.args).await,
         "claude_store_import" => rpc_claude::claude_store_import(&state, &payload.args).await,
         "claude_primitive_enable" => {
@@ -784,6 +787,14 @@ pub async fn rpc_handler(
         "oba_set_auto_update" => rpc_claude::oba_set_auto_update(&state, &payload.args).await,
         "oba_relink_dependents" => rpc_claude::oba_relink_dependents(&state, &payload.args).await,
         "oba_unlink_one" => rpc_claude::oba_unlink_one(&state, &payload.args).await,
+        "oba_install_git" => rpc_claude::oba_install_git(&state, &payload.args).await,
+        "oba_install_npx" => rpc_claude::oba_install_npx(&state, &payload.args).await,
+        "oba_install_bundle" => rpc_claude::oba_install_bundle(&state, &payload.args).await,
+        "oba_install_with_deps" => rpc_claude::oba_install_with_deps(&state, &payload.args).await,
+        "oba_resolve_source" => rpc_claude::oba_resolve_source(&state, &payload.args).await,
+        "oba_check_update" => rpc_claude::oba_check_update(&state, &payload.args).await,
+        "oba_update" => rpc_claude::oba_update(&state, &payload.args).await,
+        "oba_auto_update_all" => rpc_claude::oba_auto_update_all(&state, &payload.args).await,
 
         // --- Ngwa snapshot (WP-19) ---
         //

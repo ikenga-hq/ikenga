@@ -1,0 +1,5 @@
+---
+"ikenga-desktop": minor
+---
+
+Install and update Ngwa skills, agents, commands, hooks and MCP entries from a browser session. The daemon now serves the Ọba git / npx installers (`oba_install_git`, `oba_install_npx`, `oba_install_bundle`, `oba_install_with_deps`, `oba_resolve_source`, `oba_update`, `oba_check_update`, `oba_auto_update_all`) as the signed-in account (its own HOME and vault under multi-user mode). They are owner-class `install`: a share member never reaches them, and a paired device needs the full tier. A remote install fetches over https from a public host only (no `file://`, `ext::`, local path, `git@`, IP or internal host, credentials), refuses `local` sources and any symlink that leaves the fetched tree, runs git/npx with a scrubbed environment (no `IKENGA_*`, no `GIT_*`, lifecycle scripts off) under per-spawn and per-install deadlines, and one install at a time. `oba_install_local` stays desktop-only. In browser sessions the Store disables registry-package install/update with "Packages are installed by the server operator", and Add-from-URL stops a local path with "Local installs are desktop-only"; the desktop is unchanged.

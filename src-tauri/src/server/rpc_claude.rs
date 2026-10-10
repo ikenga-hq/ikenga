@@ -451,10 +451,18 @@ pub(super) fn terminal_detect_shells() -> RpcResponse {
 //   database, plus relink / unlink (whose confinement needs the scope list),
 //   refuses without one. `claude_store_import`, `oba_forget` and
 //   `oba_set_auto_update` touch only the store.
-// * **Not served:** the git / npx installers, `oba_update`,
-//   `oba_check_update`, `oba_auto_update_all` (they spawn; WP-18b) and
-//   `oba_install_local` (an unconfined, symlink-following read source with no
-//   FE caller) — see `desktop_only.toml`.
+// * **The installers (WP-18b part c).** `oba_install_git` / `_npx` / `_bundle` /
+//   `_with_deps`, `oba_resolve_source`, `oba_check_update`, `oba_update` and
+//   `oba_auto_update_all` run the desktop's cores (`claude_store::install`)
+//   against this vault's store, on a blocking thread, under
+//   `claude_store::remote`'s policy: https-only public sources (no `file://`,
+//   `ext::`, local path, `git@`, IP / internal host, credentials), no `local`
+//   source, a scrubbed environment (no `IKENGA_*`, `GIT_*`), a deadline per
+//   spawn and per install, a vetted fetched tree. Every spawn goes through
+//   `executor::current()`, so under T1 it runs as the signed-in account in
+//   its own HOME / TMPDIR, and what lands is that account's own store.
+// * **Not served:** `oba_install_local` (an unconfined, symlink-following read
+//   source with no FE caller) — see `desktop_only.toml`.
 
 /// Bind `$v` to the daemon's [`Vault`] for `$state`: its router home and
 /// store, confined by its `PathGuard` (the checks borrow `$state`).
@@ -699,6 +707,147 @@ pub(super) async fn oba_set_auto_update(state: &AppState, args: &Value) -> RpcRe
     respond("oba_set_auto_update", r)
 }
 
+// ─── Ọba installers: git / npx fetches (WP-18b part c) ───────────────────────
+
+pub(super) async fn oba_install_git(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (kind, name) = kind_name(args)?;
+        let url: String = targ(args, &["url"])?;
+        let git_ref: Option<String> = targ(args, &["gitRef", "git_ref"])?;
+        let from_catalog: Option<bool> = targ(args, &["fromCatalog", "from_catalog"])?;
+        let expect_sha: Option<String> = targ(args, &["expectSha", "expect_sha"])?;
+        let expect_hash: Option<String> = targ(args, &["expectHash", "expect_hash"])?;
+        daemon_vault!(state, v);
+        claude_store::install::oba_install_git_in(
+            &v,
+            kind,
+            name,
+            url,
+            git_ref,
+            from_catalog,
+            expect_sha,
+            expect_hash,
+        )
+        .await
+    }
+    .await;
+    respond("oba_install_git", r)
+}
+
+pub(super) async fn oba_install_npx(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (kind, name) = kind_name(args)?;
+        let spec: String = targ(args, &["spec"])?;
+        let from_catalog: Option<bool> = targ(args, &["fromCatalog", "from_catalog"])?;
+        let expect_sha: Option<String> = targ(args, &["expectSha", "expect_sha"])?;
+        let expect_hash: Option<String> = targ(args, &["expectHash", "expect_hash"])?;
+        daemon_vault!(state, v);
+        claude_store::install::oba_install_npx_in(
+            &v,
+            kind,
+            name,
+            spec,
+            from_catalog,
+            expect_sha,
+            expect_hash,
+        )
+        .await
+    }
+    .await;
+    respond("oba_install_npx", r)
+}
+
+pub(super) async fn oba_install_bundle(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let name: String = targ(args, &["name"])?;
+        let spec: String = targ(args, &["spec"])?;
+        let scope: Option<String> = targ(args, &["scope"])?;
+        let from_catalog: Option<bool> = targ(args, &["fromCatalog", "from_catalog"])?;
+        daemon_vault!(state, v);
+        claude_store::install::oba_install_bundle_in(&v, name, spec, scope, from_catalog).await
+    }
+    .await;
+    respond("oba_install_bundle", r)
+}
+
+pub(super) async fn oba_install_with_deps(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (kind, name) = kind_name(args)?;
+        let source: String = targ(args, &["source"])?;
+        let url: String = targ(args, &["url"])?;
+        let git_ref: Option<String> = targ(args, &["gitRef", "git_ref"])?;
+        let from_catalog: Option<bool> = targ(args, &["fromCatalog", "from_catalog"])?;
+        let catalog: Vec<claude_store::CatalogEntryRef> =
+            targ::<Option<Vec<claude_store::CatalogEntryRef>>>(args, &["catalog"])?
+                .unwrap_or_default();
+        let expect_sha: Option<String> = targ(args, &["expectSha", "expect_sha"])?;
+        let expect_hash: Option<String> = targ(args, &["expectHash", "expect_hash"])?;
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::install::oba_install_with_deps_in(
+            &v,
+            db,
+            kind,
+            name,
+            source,
+            url,
+            git_ref,
+            from_catalog,
+            catalog,
+            expect_sha,
+            expect_hash,
+        )
+        .await
+    }
+    .await;
+    respond("oba_install_with_deps", r)
+}
+
+pub(super) async fn oba_resolve_source(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let url: String = targ(args, &["url"])?;
+        let kind: Option<String> = targ(args, &["kind"])?;
+        let name: Option<String> = targ(args, &["name"])?;
+        let git_ref: Option<String> = targ(args, &["gitRef", "git_ref"])?;
+        daemon_vault!(state, v);
+        claude_store::install::oba_resolve_source_in(&v, url, kind, name, git_ref).await
+    }
+    .await;
+    respond("oba_resolve_source", r)
+}
+
+pub(super) async fn oba_check_update(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (kind, name) = kind_name(args)?;
+        daemon_vault!(state, v);
+        claude_store::install::oba_check_update_in(&v, kind, name).await
+    }
+    .await;
+    respond("oba_check_update", r)
+}
+
+pub(super) async fn oba_update(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (kind, name) = kind_name(args)?;
+        let expect_sha: Option<String> = targ(args, &["expectSha", "expect_sha"])?;
+        let expect_hash: Option<String> = targ(args, &["expectHash", "expect_hash"])?;
+        daemon_vault!(state, v);
+        claude_store::install::oba_update_in(&v, kind, name, expect_sha, expect_hash).await
+    }
+    .await;
+    respond("oba_update", r)
+}
+
+pub(super) async fn oba_auto_update_all(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let pins: Option<Vec<claude_store::CatalogPin>> = targ(args, &["pins"])?;
+        daemon_vault!(state, v);
+        claude_store::install::oba_auto_update_all_in(&v, pins).await
+    }
+    .await;
+    respond("oba_auto_update_all", r)
+}
+
 // ─── Ngwa snapshot ───────────────────────────────────────────────────────────
 //
 // The desktop's own join (`server::shared::ngwa::build_snapshot`) over what
@@ -834,6 +983,13 @@ mod vault_tests;
 #[cfg(test)]
 #[path = "rpc_ngwa_tests.rs"]
 mod ngwa_tests;
+
+/// Router tests for the Ọba git / npx installers (WP-18b part c): argument
+/// decoding and response shape against `tauri-cmd.ts`, and the daemon
+/// policy's refusals, over a temp home, store and data dir.
+#[cfg(test)]
+#[path = "rpc_oba_install_tests.rs"]
+mod oba_install_tests;
 
 #[cfg(test)]
 mod tests {

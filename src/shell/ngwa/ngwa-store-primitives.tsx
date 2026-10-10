@@ -815,6 +815,7 @@ export function AddUrlSheet({
 	catalog,
 	installedKeys,
 	disabledReason,
+	sourceBlock,
 	onClose,
 	onResolve,
 	onInstall,
@@ -827,6 +828,9 @@ export function AddUrlSheet({
 	/** `${kind}:${name}` of the vault, for the closure's "already installed". */
 	installedKeys: ReadonlySet<string>;
 	disabledReason?: string;
+	/** Why this host cannot install the pasted source (a local path in a
+	 *  browser session), or `null`. Disables Resolve with that reason. */
+	sourceBlock?: (raw: string) => string | null;
 	onClose: () => void;
 	onResolve?: (
 		url: string,
@@ -851,6 +855,9 @@ export function AddUrlSheet({
 
 	const src = normalizeSource(source);
 	const npx = isNpxSpec(source);
+	// A source this host would refuse (a local path in a browser session) is
+	// stopped here, with its reason, rather than failing after the click.
+	const blockedSource = src ? (sourceBlock?.(src) ?? null) : null;
 	const locked = state.step === 'resolving' || state.step === 'installing' || state.step === 'done';
 	const inputsVisible =
 		state.step === 'empty' || state.step === 'resolving' || state.step === 'error';
@@ -875,7 +882,7 @@ export function AddUrlSheet({
 	}
 
 	async function resolve() {
-		if (!onResolve || !src || locked) return;
+		if (!onResolve || !src || locked || blockedSource) return;
 		setState({ step: 'resolving' });
 		setTicked({});
 		try {
@@ -992,6 +999,11 @@ export function AddUrlSheet({
 						<span className="mono">npx skills add</span>, which installs skills only. Public sources
 						only for now.
 					</span>
+					{blockedSource && (
+						<span className="hint" role="alert" data-source-blocked>
+							{blockedSource}
+						</span>
+					)}
 				</div>
 
 				<div className="subhead">Kind</div>
@@ -1108,9 +1120,9 @@ export function AddUrlSheet({
 					type="button"
 					className="btn primary lg"
 					data-resolve
-					disabled={!src || !onResolve || state.step === 'resolving'}
+					disabled={!src || !onResolve || state.step === 'resolving' || Boolean(blockedSource)}
 					aria-busy={state.step === 'resolving' || undefined}
-					title={!src ? 'Paste a URL or an owner/repo first' : undefined}
+					title={blockedSource ?? (!src ? 'Paste a URL or an owner/repo first' : undefined)}
 					onClick={() => void resolve()}
 				>
 					{state.step === 'error' ? 'Resolve again' : 'Resolve'}

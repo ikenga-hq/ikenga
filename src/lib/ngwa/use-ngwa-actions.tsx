@@ -67,7 +67,7 @@ import {
 	type RemoteUpdateRequest,
 } from '@/shell/ngwa/ngwa-remote-dialogs';
 import { placementTarget } from '@/shell/ngwa/ngwa-scope-model';
-import { DESKTOP_ONLY_REASON, installUnavailableReason } from '@/lib/desktop-only';
+import { DESKTOP_ONLY_REASON, pkgInstallUnavailableReason } from '@/lib/desktop-only';
 import { canOpenLocalPath, openLocalPath, writeClipboardText } from '@/lib/transport';
 import { honestRpcError } from '@/lib/transport/unavailable';
 import type { PkgViewEntry } from '@/lib/pkg/use-activity-bar-entries';
@@ -595,10 +595,12 @@ export function useNgwaItemActions({
 			/** A writer is blocked while the last change settles (Scopes rule). */
 			const gate = (why: string | undefined) => why ?? (busy ? BUSY_REASON : undefined);
 			const open = (req: ConfirmRequest) => () => setConfirm(req);
-			// Gap audit rank 3: the daemon serves no oba_update yet, so in a
-			// browser session an actionable Update reads the honest reason
-			// instead of ending in a raw failure. Drop with `installUnavailableReason`.
-			const updateGate = (why: string | undefined) => installUnavailableReason() || gate(why);
+			// A registry PACKAGE's Update cannot run from a browser session (the
+			// pkg set is the server operator's), so there it reads the honest
+			// reason instead of ending in a raw failure. An Ọba primitive's
+			// Update (`oba_update`, a git / npx re-fetch into the account's own
+			// vault) is served by the daemon and needs no such gate.
+			const pkgUpdateGate = (why: string | undefined) => pkgInstallUnavailableReason() || gate(why);
 
 			// ── Disable / Enable ──
 			let toggle: NgwaAct;
@@ -707,7 +709,7 @@ export function useNgwaItemActions({
 								record,
 								check,
 								(target) => setUpdateReq({ item, record, target, links: record.links }),
-								updateGate
+								gate
 							),
 					}
 				: null;
@@ -728,7 +730,7 @@ export function useNgwaItemActions({
 				: entry?.isUpdate === true
 					? {
 							label: `Update to ${entry.latestVersion}`,
-							disabledReason: updateGate(undefined),
+							disabledReason: pkgUpdateGate(undefined),
 							run: () =>
 								void exec(`Updated ${label} to ${entry.latestVersion}`, () => store.update(entry)),
 						}

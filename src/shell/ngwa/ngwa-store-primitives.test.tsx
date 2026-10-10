@@ -609,3 +609,80 @@ describe('R57 · Add from URL', () => {
 		expect(stageText()).toContain('Reading requires');
 	});
 });
+
+// ─── A browser session: packages are blocked, primitives are not ─────────────
+// Registry PACKAGES need a pkg kernel the daemon does not run, so their rows
+// read "Packages are installed by the server operator". Ọba primitives are
+// fetched into the signed-in account's own vault, which the daemon serves, so
+// their controls stay live — and a source the server would refuse (a local
+// path) is stopped in the Add-from-URL sheet with its own reason.
+
+describe('browser session · pkg vs primitive install reasons', () => {
+	const PKG_REASON = 'Packages are installed by the server operator';
+
+	it('with packages blocked, a catalog primitive stays installable', async () => {
+		const props = renderStore({
+			disabledReason: PKG_REASON,
+			onInstall: undefined,
+			onUpdate: undefined,
+			onUpdateAll: undefined,
+		});
+		fireEvent.click(row('cat:skill:ikenga-artifact-builder'));
+		const s = sheet();
+		// The only thing holding Install back is the consent, never the package
+		// reason.
+		expect(s.querySelector('[data-install-blocked]')?.textContent).not.toContain(PKG_REASON);
+		const install = within(s).getByRole('button', { name: 'Install to royalti-co' });
+		fireEvent.click(s.querySelector('[data-consent="dep:frontend-design"]') as HTMLInputElement);
+		expect((install as HTMLButtonElement).disabled).toBe(false);
+		await act(async () => {
+			fireEvent.click(install);
+		});
+		expect(props.onInstallPrimitive).toHaveBeenCalled();
+	});
+
+	it('primitiveDisabledReason, when given, is what a primitive control reads', () => {
+		renderStore({
+			disabledReason: PKG_REASON,
+			primitiveDisabledReason: 'Local installs are desktop-only',
+			onInstallPrimitive: undefined,
+		});
+		fireEvent.click(row('cat:skill:ikenga-artifact-builder'));
+		expect(sheet().querySelector('[data-install-blocked]')?.textContent).toBe(
+			'Local installs are desktop-only'
+		);
+	});
+
+	it('Add from URL: a local path is stopped with the desktop-only reason, before any fetch', () => {
+		const props = renderStore({
+			sourceBlock: (raw) => (raw.startsWith('/') ? 'Local installs are desktop-only' : null),
+		});
+		const s = openAddUrl();
+		const resolve = within(s).getByRole('button', { name: 'Resolve' }) as HTMLButtonElement;
+
+		fireEvent.change(sourceInput(), { target: { value: '/home/me/skills/pdf' } });
+		expect(resolve.disabled).toBe(true);
+		expect(resolve.title).toBe('Local installs are desktop-only');
+		expect(s.querySelector('[data-source-blocked]')?.textContent).toBe(
+			'Local installs are desktop-only'
+		);
+		// Enter in the field does not sneak a resolve through.
+		fireEvent.keyDown(sourceInput(), { key: 'Enter' });
+		expect(props.onResolveSource).not.toHaveBeenCalled();
+
+		// A public URL is fine again.
+		fireEvent.change(sourceInput(), { target: { value: 'https://github.com/o/pdf' } });
+		expect(resolve.disabled).toBe(false);
+		expect(s.querySelector('[data-source-blocked]')).toBeNull();
+	});
+
+	it('Add from URL: no sourceBlock (the desktop) never blocks a source', () => {
+		renderStore();
+		const s = openAddUrl();
+		fireEvent.change(sourceInput(), { target: { value: '/home/me/skills/pdf' } });
+		expect((within(s).getByRole('button', { name: 'Resolve' }) as HTMLButtonElement).disabled).toBe(
+			false
+		);
+		expect(s.querySelector('[data-source-blocked]')).toBeNull();
+	});
+});
