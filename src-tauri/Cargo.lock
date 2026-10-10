@@ -3152,7 +3152,7 @@ dependencies = [
 
 [[package]]
 name = "ikenga-desktop"
-version = "0.24.1"
+version = "0.25.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3243,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "ikenga-server"
-version = "0.24.1"
+version = "0.25.0"
 dependencies = [
  "anyhow",
  "clap",
