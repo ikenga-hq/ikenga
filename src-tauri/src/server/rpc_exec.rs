@@ -41,17 +41,19 @@
 //! [`PkgIndex::sidecar`]: super::pkg_index::PkgIndex::sidecar
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::Value;
 
-use super::AppState;
 use super::rpc::RpcResponse;
 use super::rpc_local::{arg, opt_str, pa_db, req_str, respond};
 use super::rpc_shell::targ;
 use super::shared::action_exec::{self, ActionExecRequest, ActionExecResult};
 use super::shared::comment_route::{self as route, RouteResult, RouteSink};
-use super::shared::{agent_ops, chi_exec, comments, sidecar_call};
-use crate::executor::SpawnSpec;
+use super::shared::{agent_ops, chi_exec, comments, pkg_helpers, sidecar_call};
+use super::AppState;
+use crate::access::AccessCtx;
+use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 
 // ─── pkg_sidecar_call (rank 21) ──────────────────────────────────────────────
 
@@ -60,7 +62,11 @@ use crate::executor::SpawnSpec;
 /// resolve is an `ok: false` result naming why, as on the desktop — the
 /// title-row branch chip and the Explorer badges read that as "no repo
 /// data" and stay hidden; a bad argument is an RPC error.
-pub(super) async fn pkg_sidecar_call(state: &AppState, args: &Value) -> RpcResponse {
+pub(super) async fn pkg_sidecar_call(
+    state: &AppState,
+    ctx: Option<&AccessCtx>,
+    args: &Value,
+) -> RpcResponse {
     let r = async {
         let pkg_id = req_str(args, &["pkgId", "pkg_id"])?;
         let name = req_str(args, &["name"])?;
@@ -77,6 +83,11 @@ pub(super) async fn pkg_sidecar_call(state: &AppState, args: &Value) -> RpcRespo
                     .ok_or_else(|| "`timeoutSecs` must be a non-negative integer".to_string())?,
             ),
         };
+        if let Err(e) =
+            pkg_helpers::check_pkg_assignment(state.config.data_dir.as_deref(), &pkg_id, ctx)
+        {
+            return Ok(sidecar_call::PkgSidecarCallResult::failed(e));
+        }
         let resolved = match state.pkg_index.sidecar(&pkg_id, &name) {
             Ok(r) => r,
             Err(e) => return Ok(sidecar_call::PkgSidecarCallResult::failed(e)),
@@ -125,6 +136,296 @@ fn sidecar_program(bin: &Path) -> (PathBuf, Vec<PathBuf>) {
         }
     }
     crate::runtime::sidecar_program(bin)
+}
+
+// ─── pkg_mcp_call ────────────────────────────────────────────────────────────
+
+pub(super) async fn pkg_mcp_call(
+    state: &AppState,
+    ctx: Option<&AccessCtx>,
+    args: &Value,
+) -> RpcResponse {
+    let r = async {
+        let pkg_id = req_str(args, &["pkgId", "pkg_id"])?;
+        let tool = req_str(args, &["tool", "name"])?;
+        let tool_args = arg(args, &["args", "arguments"])
+            .cloned()
+            .unwrap_or(Value::Object(Default::default()));
+
+        // 1. Assignment gate (R4-2)
+        if let Err(e) =
+            pkg_helpers::check_pkg_assignment(state.config.data_dir.as_deref(), &pkg_id, ctx)
+        {
+            return Ok(pkg_helpers::PkgMcpCallResult {
+                ok: false,
+                error: Some(e),
+                result: None,
+            });
+        }
+
+        // 2. Resolve pkg from PkgIndex
+        let pkg = match state.pkg_index.live_pkg(&pkg_id) {
+            Some(p) => p,
+            None => {
+                return Ok(pkg_helpers::PkgMcpCallResult {
+                    ok: false,
+                    error: Some(format!("pkg `{pkg_id}` is not installed")),
+                    result: None,
+                });
+            }
+        };
+
+        if pkg.manifest.mcp.is_empty() {
+            return Ok(pkg_helpers::PkgMcpCallResult {
+                ok: false,
+                error: Some(format!("pkg `{pkg_id}` declares no mcp servers")),
+                result: None,
+            });
+        }
+
+        // 3. Trust gate (R4-4)
+        if let Err(e) = pkg_helpers::check_pkg_trust(state.config.data_dir.as_deref(), pkg) {
+            return Ok(pkg_helpers::PkgMcpCallResult {
+                ok: false,
+                error: Some(e),
+                result: None,
+            });
+        }
+
+        let server = match pkg_helpers::pick_server(&pkg.manifest.mcp, "") {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(pkg_helpers::PkgMcpCallResult {
+                    ok: false,
+                    error: Some(format!("{e:#}")),
+                    result: None,
+                });
+            }
+        };
+
+        match pkg_helpers::call_mcp_tool(
+            &pkg.install_path,
+            server,
+            &tool,
+            tool_args,
+            &pkg_id,
+            &pkg.manifest.permissions.shell_execute,
+        )
+        .await
+        {
+            Ok(val) => Ok(pkg_helpers::PkgMcpCallResult {
+                ok: true,
+                error: None,
+                result: Some(val),
+            }),
+            Err(e) => Ok(pkg_helpers::PkgMcpCallResult {
+                ok: false,
+                error: Some(format!("{e:#}")),
+                result: None,
+            }),
+        }
+    }
+    .await;
+    respond("pkg_mcp_call", r)
+}
+
+// ─── pkg_invoke ──────────────────────────────────────────────────────────────
+
+pub(super) async fn pkg_invoke(
+    state: &AppState,
+    ctx: Option<&AccessCtx>,
+    args: &Value,
+) -> RpcResponse {
+    let r = async {
+        let pkg_id = req_str(args, &["pkgId", "pkg_id"])?;
+        let command = req_str(args, &["command"])?;
+        let call_args: Vec<String> = match arg(args, &["args"]) {
+            None => Vec::new(),
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|_| "`args` must be an array of strings".to_string())?,
+        };
+
+        // 1. Assignment gate (R4-2)
+        if let Err(e) =
+            pkg_helpers::check_pkg_assignment(state.config.data_dir.as_deref(), &pkg_id, ctx)
+        {
+            return Ok(pkg_helpers::PkgInvokeResult::err(e));
+        }
+
+        // 2. Resolve pkg from PkgIndex
+        let pkg = match state.pkg_index.live_pkg(&pkg_id) {
+            Some(p) => p,
+            None => {
+                return Ok(pkg_helpers::PkgInvokeResult::err(format!(
+                    "pkg `{pkg_id}` is not installed on this server"
+                )));
+            }
+        };
+
+        // 3. Capability presence
+        let invoke_cap = match pkg
+            .manifest
+            .capabilities
+            .as_ref()
+            .and_then(|c| c.invoke.as_ref())
+        {
+            Some(i) => i,
+            None => {
+                return Ok(pkg_helpers::PkgInvokeResult::err(format!(
+                    "pkg `{pkg_id}` lacks the 'invoke' capability"
+                )));
+            }
+        };
+
+        // 4. Trust gate (R4-4)
+        if let Err(e) = pkg_helpers::check_invoke_trust(state.config.data_dir.as_deref(), pkg) {
+            return Ok(pkg_helpers::PkgInvokeResult::err(e));
+        }
+
+        // 5. Command allowlist match
+        if !pkg_helpers::matches_glob_list(&invoke_cap.commands, &command) {
+            return Ok(pkg_helpers::PkgInvokeResult::err(format!(
+                "pkg `{pkg_id}` not permitted to invoke `{command}` (not in capabilities.invoke.commands)"
+            )));
+        }
+
+        // 6. Spawn through executor as requesting account
+        let mut cmd = SpawnSpec::new(&command);
+        cmd.args(&call_args);
+        chi_exec::inherit_scrubbed_env(&mut cmd);
+        cmd.current_dir(&pkg.install_path);
+        cmd.env("PATH", crate::runtime::augmented_path());
+
+        let opts = PipedOpts {
+            stdin: StdioMode::Null,
+            stdout: StdioMode::Piped,
+            stderr: StdioMode::Piped,
+            kill_on_drop: false,
+            no_console_window: true,
+            detached: false,
+            new_process_group: false,
+        };
+
+        let child = match crate::executor::current().spawn_piped(cmd, opts) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(pkg_helpers::PkgInvokeResult::err(format!(
+                    "spawn `{command}` failed: {e}"
+                )));
+            }
+        };
+
+        let dur = Duration::from_secs(120);
+        let output = match tokio::time::timeout(dur, child.wait_with_output()).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => {
+                return Ok(pkg_helpers::PkgInvokeResult::err(format!(
+                    "`{command}` wait failed: {e}"
+                )));
+            }
+            Err(_) => {
+                return Ok(pkg_helpers::PkgInvokeResult {
+                    ok: false,
+                    error: Some(format!("`{command}` timed out after 120s")),
+                    stdout: None,
+                    stderr: None,
+                    exit_code: None,
+                    timed_out: true,
+                });
+            }
+        };
+
+        Ok(pkg_helpers::PkgInvokeResult {
+            ok: output.status.success(),
+            error: None,
+            stdout: Some(String::from_utf8_lossy(&output.stdout).to_string()),
+            stderr: Some(String::from_utf8_lossy(&output.stderr).to_string()),
+            exit_code: output.status.code(),
+            timed_out: false,
+        })
+    }
+    .await;
+    respond("pkg_invoke", r)
+}
+
+// ─── pkg_sidecar_rpc_send (R4-3 streaming sidecars) ──────────────────────────
+
+pub(super) async fn pkg_sidecar_rpc_send(
+    state: &AppState,
+    ctx: Option<&AccessCtx>,
+    args: &Value,
+) -> RpcResponse {
+    let r = async {
+        let pkg_id = req_str(args, &["pkgId", "pkg_id"])?;
+        let name = req_str(args, &["name"])?;
+        let message = req_str(args, &["message"])?;
+
+        pkg_helpers::check_pkg_assignment(state.config.data_dir.as_deref(), &pkg_id, ctx)?;
+
+        let pkg = state
+            .pkg_index
+            .live_pkg(&pkg_id)
+            .ok_or_else(|| format!("pkg `{pkg_id}` is not installed on this server"))?;
+
+        pkg_helpers::check_pkg_trust(state.config.data_dir.as_deref(), pkg)?;
+
+        let resolved = state.pkg_index.sidecar(&pkg_id, &name)?;
+
+        let principal_id = ctx.map(|c| c.principal_id);
+        let key: pkg_helpers::SidecarKey = (principal_id, pkg_id.clone(), name.clone());
+
+        let bin_path = resolved.bin_path.clone();
+        let install_path = resolved.install_path.clone();
+
+        let child = state
+            .sidecars
+            .get_or_spawn(key, || async move {
+                let spec = sidecar_spec(&bin_path, &install_path, &[]);
+                let opts = PipedOpts {
+                    stdin: StdioMode::Piped,
+                    stdout: StdioMode::Piped,
+                    stderr: StdioMode::Piped,
+                    kill_on_drop: false,
+                    no_console_window: true,
+                    detached: false,
+                    new_process_group: false,
+                };
+                let mut child = crate::executor::current()
+                    .spawn_piped(spec, opts)
+                    .map_err(|e| format!("spawn `{}`: {e}", bin_path.display()))?;
+                let pid = child.id().unwrap_or(0);
+                let stdin = child.stdin.take().ok_or_else(|| "no stdin".to_string())?;
+                let stdout = child.stdout.take().ok_or_else(|| "no stdout".to_string())?;
+                Ok((stdin, pid, stdout))
+            })
+            .await?;
+
+        state.sidecars.send_line(&child, &message).await?;
+        Ok(Value::Null)
+    }
+    .await;
+    respond("pkg_sidecar_rpc_send", r)
+}
+
+// ─── pkg_sidecar_rpc_shutdown ────────────────────────────────────────────────
+
+pub(super) async fn pkg_sidecar_rpc_shutdown(
+    state: &AppState,
+    ctx: Option<&AccessCtx>,
+    args: &Value,
+) -> RpcResponse {
+    let r = async {
+        let pkg_id = req_str(args, &["pkgId", "pkg_id"])?;
+        let name = req_str(args, &["name"])?;
+
+        let principal_id = ctx.map(|c| c.principal_id);
+        let key: pkg_helpers::SidecarKey = (principal_id, pkg_id, name);
+
+        let terminated = state.sidecars.shutdown(&key).await;
+        Ok(Value::Bool(terminated))
+    }
+    .await;
+    respond("pkg_sidecar_rpc_shutdown", r)
 }
 
 // ─── action_exec (rank 23) ───────────────────────────────────────────────────

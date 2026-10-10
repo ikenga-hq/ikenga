@@ -14,10 +14,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axum::Router;
 use axum::body::Body;
 use axum::http::StatusCode;
-use serde_json::{Value, json};
+use axum::Router;
+use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use super::sidecar_spec;
@@ -27,7 +27,7 @@ use crate::pty::PtyManager;
 use crate::server::rpc_local::DaemonChi;
 use crate::server::rpc_shell::PathGuard;
 use crate::server::shared::chi_exec;
-use crate::server::{ServerConfig, router_for_exec_tests};
+use crate::server::{router_for_exec_tests, ServerConfig};
 
 const PKG: &str = "com.test.exec";
 const SIDECAR: &str = "pa-com-test-exec-probe";
@@ -106,6 +106,35 @@ fn pkgs_fixture() -> PathBuf {
                 .to_string(),
         )
         .unwrap();
+
+        let full = root.join("com.ikenga.full");
+        std::fs::create_dir_all(full.join("bin")).unwrap();
+        std::fs::write(
+            full.join("manifest.json"),
+            json!({
+                "id": "com.ikenga.full", "name": "Full", "version": "0.1.0", "ikenga_api": "1",
+                "capabilities": {
+                    "invoke": {
+                        "commands": ["echo", "echo *"]
+                    }
+                },
+                "mcp": [
+                    { "name": "full-mcp", "command": "bin/mcp" }
+                ],
+                "permissions": {
+                    "shell.execute": ["bin/mcp", "echo"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mcp_bin = full.join("bin/mcp");
+        std::fs::write(
+            &mcp_bin,
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(echo \"$line\" | grep -o '\"id\":[0-9]*' | cut -d: -f2)\n  if [ -n \"$id\" ]; then\n    echo \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$id,\\\"result\\\":{\\\"ok\\\":true}}\"\n  fi\ndone\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&mcp_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         root.canonicalize().unwrap()
     })
     .clone()
@@ -431,12 +460,10 @@ async fn t1_comment_route_stays_in_the_principals_ptys_db_and_allowlist() {
     .await;
     assert_eq!(routed["sink"], "clipboard", "{routed}");
     assert_eq!(routed["pty_id"], Value::Null);
-    assert!(
-        routed["clipboard_text"]
-            .as_str()
-            .unwrap()
-            .contains("make it bigger")
-    );
+    assert!(routed["clipboard_text"]
+        .as_str()
+        .unwrap()
+        .contains("make it bigger"));
     // `clipboard` / `chi` are recorded in the audit column (WP-S 0071).
     assert_eq!(routed["comment"]["sink"], "clipboard");
 
@@ -650,4 +677,125 @@ async fn t1_pkg_settings_set_is_principal_scoped_and_declared_only() {
         .await,
         "pkg_settings_set: `value` is required"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn t1_streaming_sidecar_rpc_send_and_shutdown() {
+    let p = principal();
+    // 1. Send to live sidecar
+    let res = ok(
+        &p.router,
+        "pkg_sidecar_rpc_send",
+        json!({
+            "pkgId": PKG,
+            "name": SIDECAR,
+            "message": "hello stream"
+        }),
+    )
+    .await;
+    assert_eq!(res, Value::Null);
+
+    // 2. Shut down the streaming sidecar
+    let res = ok(
+        &p.router,
+        "pkg_sidecar_rpc_shutdown",
+        json!({
+            "pkgId": PKG,
+            "name": SIDECAR,
+        }),
+    )
+    .await;
+    assert_eq!(res, json!(true));
+
+    // Shut down again is idempotent (returns false)
+    let res2 = ok(
+        &p.router,
+        "pkg_sidecar_rpc_shutdown",
+        json!({
+            "pkgId": PKG,
+            "name": SIDECAR,
+        }),
+    )
+    .await;
+    assert_eq!(res2, json!(false));
+
+    // 3. Unknown pkg or sidecar is refused
+    let e = err(
+        &p.router,
+        "pkg_sidecar_rpc_send",
+        json!({
+            "pkgId": "com.test.nope",
+            "name": SIDECAR,
+            "message": "ping"
+        }),
+    )
+    .await;
+    assert!(e.contains("not installed"), "{e}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn t1_pkg_invoke_and_mcp_call() {
+    let p = principal();
+
+    // 1. pkg_invoke: permitted command succeeds
+    let out = ok(
+        &p.router,
+        "pkg_invoke",
+        json!({
+            "pkgId": "com.ikenga.full",
+            "command": "echo",
+            "args": ["daemon-test"],
+        }),
+    )
+    .await;
+    assert_eq!(out["ok"], true, "{out}");
+    assert_eq!(out["exitCode"], 0);
+    assert_eq!(out["stdout"].as_str().unwrap().trim(), "daemon-test");
+
+    // 2. pkg_invoke: command outside invoke allowlist is refused
+    let out = ok(
+        &p.router,
+        "pkg_invoke",
+        json!({
+            "pkgId": "com.ikenga.full",
+            "command": "sh",
+            "args": ["-c", "id"],
+        }),
+    )
+    .await;
+    assert_eq!(out["ok"], false, "{out}");
+    let err = out["error"].as_str().unwrap();
+    assert!(err.contains("not permitted to invoke `sh`"), "{err}");
+
+    // 3. pkg_mcp_call: succeeds against mock MCP server
+    let out = ok(
+        &p.router,
+        "pkg_mcp_call",
+        json!({
+            "pkgId": "com.ikenga.full",
+            "tool": "probe",
+            "args": {},
+        }),
+    )
+    .await;
+    assert_eq!(out["ok"], true, "{out}");
+    assert_eq!(out["result"]["ok"], true);
+
+    // 4. pkg_mcp_call: pkg without MCP block returns ok: false
+    let out = ok(
+        &p.router,
+        "pkg_mcp_call",
+        json!({
+            "pkgId": PKG,
+            "tool": "probe",
+        }),
+    )
+    .await;
+    assert_eq!(out["ok"], false, "{out}");
+    assert!(out["error"]
+        .as_str()
+        .unwrap()
+        .contains("declares no mcp servers"));
 }
