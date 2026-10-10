@@ -61,6 +61,13 @@ import { useSeats } from '@/lib/queries/seats';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { listen } from '@/lib/transport';
 import { useTerminalStore } from '@/terminal/session-store';
+import { useConnectionRtt } from '@/lib/connection/rtt-monitor';
+import {
+	CONNECTION_ROUTE,
+	ConnectionSegmentBody,
+	connectionTitle,
+	hasConnectionReading,
+} from './connection/connection-segment';
 import type { StatuslineSnapshot } from '@/terminal/cost-hud';
 import { openCommandPalette } from './command-palette';
 import { useCompanionStore } from './companion/companion-store';
@@ -224,6 +231,9 @@ export function StatusBar() {
 	const runIds = useLiveRunIds();
 	const snaps = useStatuslineSnapshots();
 	const engine = useNextEngineId();
+	// Browser tabs only (empty on the desktop): this viewer's round trip to the server.
+	const rtt = useConnectionRtt();
+	const showConnection = hasConnectionReading(rtt);
 
 	const installed = pkgs.installed.length;
 	const updates = pkgs.updates.length;
@@ -269,6 +279,7 @@ export function StatusBar() {
 		git && git.modified > 0 && 'modified',
 		...ngwaSegments.map((seg) => seg.id),
 		// WP-40b's bell leads the right-hand cluster and joins the roving set.
+		showConnection && 'connection',
 		'notifications',
 		approvals > 0 && 'permissions',
 		runs > 0 && 'runs',
@@ -380,6 +391,17 @@ export function StatusBar() {
 
 			{/* ── right ── */}
 			<span className="ml-auto flex items-center gap-1">
+				{showConnection && (
+					<SegButton
+						id="connection"
+						rovingId={rovingId}
+						onClick={() => navigateFocused(CONNECTION_ROUTE)}
+						label={connectionTitle(rtt)}
+						title={connectionTitle(rtt)}
+					>
+						<ConnectionSegmentBody summary={rtt} />
+					</SegButton>
+				)}
 				<NotificationsBellSlot rovingId={rovingId} />
 				{approvals > 0 && (
 					<SegButton

@@ -23,7 +23,11 @@ import {
 	type PtySpawnOpts as RawPtySpawnOpts,
 } from '../lib/tauri-cmd';
 import { isRemoteWebSession } from '../lib/transport';
-import { attachRemotePty, createDaemonPtySocketOpener } from '../lib/transport/pty-socket';
+import {
+	attachRemotePty,
+	createDaemonPtySocketOpener,
+	sendPtyInput,
+} from '../lib/transport/pty-socket';
 
 export interface PtySpawnOpts extends RawPtySpawnOpts {
 	/** Human-readable label, e.g. `bash -l`. Used for status messages. */
@@ -575,7 +579,22 @@ export class Pty {
 	}
 
 	async write(data: string): Promise<void> {
-		if (this.disposed || this.exited) return;
+		await this.writeInput(data);
+	}
+
+	/**
+	 * `write`, reporting how the bytes went: `true` when the server
+	 * acknowledged them (the write call returned), `false` when they were only
+	 * queued on the browser's PTY socket, which carries no per-write ack.
+	 * Predictive local echo uses the difference to time its checks.
+	 */
+	async writeInput(data: string): Promise<boolean> {
+		if (this.disposed || this.exited) return false;
+		// Browser: type through the open PTY socket, in order (see
+		// `sendPtyInput`). Not open yet / reconnecting: the RPC below.
+		if (this.mode === 'ephemeral' && isRemoteWebSession() && sendPtyInput(this.id, data)) {
+			return false;
+		}
 		if (this.mode === 'persistent') {
 			const daemonInfo = await getDaemonInfo();
 			if (daemonInfo?.available) {
@@ -590,10 +609,11 @@ export class Pty {
 						args: { id: this.id, data },
 					}),
 				}).catch(() => {});
-				return;
+				return true;
 			}
 		}
-		return ptyWrite(this.id, data);
+		await ptyWrite(this.id, data);
+		return true;
 	}
 
 	async resize(rows: number, cols: number): Promise<void> {

@@ -748,9 +748,12 @@ pub async fn rpc_handler(
         // no symlink planted in a scope can turn a copy, write or delete into
         // one outside the vault or inside `--data-dir`; relink / unlink name
         // only placements in a known scope; an import source and a new master
-        // must pass the fs allowlist. Left allowlisted: the git / npx
-        // installers and updaters (they spawn, WP-18b) and `oba_install_local`
-        // (an unconfined read source) — see `desktop_only.toml`.
+        // must pass the fs allowlist. The git / npx installers and updaters
+        // (WP-18b part c) spawn through `executor::current()` — as the
+        // signed-in account under T1 — under `claude_store::remote`'s policy
+        // (https-only public sources, scrubbed env, deadlines, vetted trees).
+        // Left allowlisted: `oba_install_local` (an unconfined read source) —
+        // see `desktop_only.toml`.
         "claude_store_list" => rpc_claude::claude_store_list(&state, &payload.args).await,
         "claude_store_import" => rpc_claude::claude_store_import(&state, &payload.args).await,
         "claude_primitive_enable" => {
@@ -784,6 +787,14 @@ pub async fn rpc_handler(
         "oba_set_auto_update" => rpc_claude::oba_set_auto_update(&state, &payload.args).await,
         "oba_relink_dependents" => rpc_claude::oba_relink_dependents(&state, &payload.args).await,
         "oba_unlink_one" => rpc_claude::oba_unlink_one(&state, &payload.args).await,
+        "oba_install_git" => rpc_claude::oba_install_git(&state, &payload.args).await,
+        "oba_install_npx" => rpc_claude::oba_install_npx(&state, &payload.args).await,
+        "oba_install_bundle" => rpc_claude::oba_install_bundle(&state, &payload.args).await,
+        "oba_install_with_deps" => rpc_claude::oba_install_with_deps(&state, &payload.args).await,
+        "oba_resolve_source" => rpc_claude::oba_resolve_source(&state, &payload.args).await,
+        "oba_check_update" => rpc_claude::oba_check_update(&state, &payload.args).await,
+        "oba_update" => rpc_claude::oba_update(&state, &payload.args).await,
+        "oba_auto_update_all" => rpc_claude::oba_auto_update_all(&state, &payload.args).await,
 
         // --- Ngwa snapshot (WP-19) ---
         //
@@ -813,6 +824,11 @@ pub async fn rpc_handler(
         "fs_mime" => rpc_files::fs_mime(&state, &payload.args),
         "fs_search" => rpc_files::fs_search(&state, &payload.args).await,
         "fs_rename" => rpc_files::fs_rename(&state, &payload.args).await,
+        "viewer_serve" => {
+            let pid = ctx.as_ref().map(|c| *c.principal_id.as_uuid());
+            rpc_files::viewer_serve(&state, &payload.args, pid).await
+        }
+        "viewer_stop" => rpc_files::viewer_stop(&state, &payload.args).await,
         "actions_read_files" => rpc_files::actions_read_files(&state, &payload.args).await,
         "actions_write" => rpc_files::actions_write(&state, &payload.args).await,
         "keybindings_write" => rpc_files::keybindings_write(&state, &payload.args).await,
@@ -955,6 +971,7 @@ pub async fn rpc_handler(
         | "access_push_unsubscribe"
         | "access_push_list"
         | "access_push_test"
+        | "server_health"
         | "permission_relay_put"
         | "permission_relay_take"
         | "permission_relay_resolve"
@@ -969,9 +986,22 @@ pub async fn rpc_handler(
         // `internal` (only the T1 broker's own call reaches it): how many
         // terminals a restart of this process would end. Served by T0 and
         // principal children alike; nothing else.
-        "server_open_terminals" => RpcResponse::success(serde_json::json!({
-            "open": state.pty_manager.active_session_count(),
-        })),
+        //
+        // The admin Server card (`server::host_health`) asks the same arm for
+        // `claude_procs`: how many processes of this child's own uid are a
+        // `claude` (a count — never a name, argument or another uid's).
+        "server_open_terminals" => {
+            let claude_procs = tokio::task::spawn_blocking(|| {
+                super::host_health::count_own_processes("claude")
+            })
+            .await
+            .ok()
+            .flatten();
+            RpcResponse::success(serde_json::json!({
+                "open": state.pty_manager.active_session_count(),
+                "claude_procs": claude_procs,
+            }))
+        }
 
         // --- Unknown Command Fallback ---
         other => {

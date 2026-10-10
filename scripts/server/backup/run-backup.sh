@@ -31,9 +31,20 @@
 #     (which can carry hostnames and key ids) goes to a 0600 file in the backup
 #     user's private directory, with the connection strings scrubbed out.
 #
+#   * Authentication is pinned for a database reached through an SSH tunnel.
+#     The tunnel's local end (127.0.0.1:<port>) is a plain TCP port that, while
+#     the tunnel is down, any local account could bind; a fake server there would
+#     happily ask for a cleartext password. So libpq is told require_auth: the
+#     per-database "require_auth" of the config (PGREQUIREAUTH in the pg_dump
+#     environment), defaulting to scram-sha-256 when the connection string points
+#     at loopback and one of the config's "tunnel_ports". With it libpq refuses
+#     to answer a cleartext/md5 request and refuses a server that never
+#     authenticated, so the password is not sent and no forged dump is accepted.
+#     "require_auth": false in the config opts one database out.
+#
 # Error kinds (status.json "last_error_kind"): bad-config no-secret
-# bad-connection-string no-pg-dump dump-failed verify-failed gcs-auth
-# upload-failed.
+# bad-connection-string no-pg-dump dump-failed auth-refused verify-failed
+# gcs-auth upload-failed.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -211,8 +222,11 @@ parse_pg_url() {
         sslrootcert) CONNV[PGSSLROOTCERT]="$v" ;;
         connect_timeout) CONNV[PGCONNECT_TIMEOUT]="$v" ;;
         channel_binding) CONNV[PGCHANNELBINDING]="$v" ;;
+        require_auth)
+          require_auth_ok "$v" || { PARSE_ERR="require_auth is not a libpq list such as scram-sha-256"; return 1; }
+          CONNV[PGREQUIREAUTH]="$v" ;;
         application_name) CONNV[PGAPPNAME]="$v" ;;
-        *) PARSE_ERR="unsupported URL parameter '$k' (supported: sslmode sslrootcert connect_timeout channel_binding application_name)"; return 1 ;;
+        *) PARSE_ERR="unsupported URL parameter '$k' (supported: sslmode sslrootcert connect_timeout channel_binding require_auth application_name)"; return 1 ;;
       esac
     done
   fi
@@ -221,6 +235,16 @@ parse_pg_url() {
   : "${CONNV[PGCONNECT_TIMEOUT]:=30}"
   : "${CONNV[PGAPPNAME]:=ikenga-backup}"
   return 0
+}
+
+# libpq require_auth: a comma list of password md5 gss sspi scram-sha-256 none,
+# each optionally negated with !, all negated or none (libpq refuses a mix).
+REQUIRE_AUTH_RE='^!?(password|md5|gss|sspi|scram-sha-256|none)(,!?(password|md5|gss|sspi|scram-sha-256|none))*$'
+require_auth_ok() {
+  [[ "$1" =~ $REQUIRE_AUTH_RE ]] || return 1
+  local IFS=,; local -a parts=($1); local neg=0 p
+  for p in "${parts[@]}"; do [[ "$p" == '!'* ]] && neg=$((neg + 1)); done
+  [[ $neg -eq 0 || $neg -eq ${#parts[@]} ]]
 }
 
 # Replace each secret in stdin with ***. Used before any tool output is kept.
@@ -250,11 +274,18 @@ pick_pg_dump() {
 
 # ---------------------------------------------------------------- one db
 
-# backup_one <name> <connection secret name> <bucket>
+# The local ends of the box's SSH tunnels (config "tunnel_ports", written by
+# provision.sh), as " 5544 5545 ".
+TUNNEL_PORTS=" "
+load_tunnel_ports() {
+  TUNNEL_PORTS=" $(jq -r '(.tunnel_ports // []) | map(select(type == "number") | floor | tostring) | join(" ")' "$CONFIG" 2>/dev/null || true) "
+}
+
+# backup_one <name> <connection secret name> <bucket> [require_auth: "" = default, "@off" = none, else a list]
 # Sets KIND (error kind on failure), OBJECT and BYTES (on success). Returns 0/1.
 KIND=""; OBJECT=""; BYTES=0
 backup_one() {
-  local name="$1" secret="$2" bucket="$3"
+  local name="$1" secret="$2" bucket="$3" reqauth="${4:-}"
   KIND=""; OBJECT=""; BYTES=0
   local errf="$ERR_DIR/last-error-$name.log" url="" out ts year month
 
@@ -265,6 +296,19 @@ backup_one() {
   url="${CONN[$secret]:-}"
   [[ -n "$url" ]] || { KIND=no-secret; echo "connection secret $secret is not in the connections file" >"$errf"; return 1; }
   parse_pg_url "$url" || { KIND=bad-connection-string; echo "$PARSE_ERR" >"$errf"; return 1; }
+  case "$reqauth" in
+    ""|@off) ;;
+    *) require_auth_ok "$reqauth" || { KIND=bad-config; echo "require_auth is not a libpq list such as scram-sha-256" >"$errf"; return 1; } ;;
+  esac
+  # The config's require_auth wins over a weaker one in the URL. Absent, a
+  # connection that ends at one of the box's tunnel ports gets scram-sha-256.
+  if [[ -n "$reqauth" && "$reqauth" != @off ]]; then
+    CONNV[PGREQUIREAUTH]="$reqauth"
+  elif [[ -z "$reqauth" && -z "${CONNV[PGREQUIREAUTH]:-}" \
+          && "${CONNV[PGHOST]}" =~ ^(127(\.[0-9]{1,3}){3}|localhost|::1)$ \
+          && "$TUNNEL_PORTS" == *" ${CONNV[PGPORT]:-5432} "* ]]; then
+    CONNV[PGREQUIREAUTH]="scram-sha-256"
+  fi
   [[ -n "$DUMP_BIN" ]] || { KIND=no-pg-dump; echo "no pg_dump >= $DUMP_MIN_MAJOR installed" >"$errf"; return 1; }
   if [[ $GCS_AUTH_OK -ne 1 ]]; then KIND=gcs-auth; return 1; fi
 
@@ -284,8 +328,14 @@ backup_one() {
     exec "$DUMP_BIN" -w
   ) 2>"$rawerr" | gzip -c >"$out"
   rcs=("${PIPESTATUS[@]}")
-  scrub "$url" "${CONNV[PGPASSWORD]:-}" <"$rawerr" >>"$errf"; rm -f -- "$rawerr"
-  if [[ "${rcs[0]}" -ne 0 || "${rcs[1]}" -ne 0 ]]; then KIND=dump-failed; rm -f -- "$out"; return 1; fi
+  scrub "$url" "${CONNV[PGPASSWORD]:-}" <"$rawerr" >>"$errf"
+  local refused=0
+  grep -q 'authentication method requirement' "$rawerr" 2>/dev/null && refused=1
+  rm -f -- "$rawerr"
+  if [[ "${rcs[0]}" -ne 0 || "${rcs[1]}" -ne 0 ]]; then
+    KIND=dump-failed; [[ $refused -eq 0 ]] || KIND=auth-refused
+    rm -f -- "$out"; return 1
+  fi
 
   if ! "$VERIFY" "$out" >>"$errf" 2>&1; then KIND=verify-failed; rm -f -- "$out"; return 1; fi
   BYTES="$(stat -c %s -- "$out")"
@@ -338,6 +388,7 @@ WORK="$(mktemp -d "$WORK_ROOT/run-XXXXXX")"
 trap 'rm -rf -- "$WORK"' EXIT
 
 load_connections
+load_tunnel_ports
 [[ $CONN_READABLE -eq 1 ]] || say "WARNING: the connections file is not readable; every database will fail with no-secret"
 
 DUMP_BIN=""; DUMP_MAJOR=0
@@ -359,8 +410,9 @@ while IFS= read -r db_json; do
   name="$(jq -r '.name' <<<"$db_json")"
   secret="$(jq -r '.connection_secret' <<<"$db_json")"
   bucket="$(jq -r '.gcs_bucket' <<<"$db_json")"
+  reqauth="$(jq -r 'if (has("require_auth") | not) or .require_auth == null then "" elif .require_auth == false then "@off" elif (.require_auth | type) == "string" then .require_auth else "@bad" end' <<<"$db_json")"
   t0=$SECONDS
-  if backup_one "$name" "$secret" "$bucket"; then
+  if backup_one "$name" "$secret" "$bucket" "$reqauth"; then
     SUCCEEDED=$((SUCCEEDED + 1))
     say "db=$name status=ok bytes=$BYTES"
     record_db "$name" "$SCHEDULE" true "" "$OBJECT" "$BYTES" $((SECONDS - t0)) || say "WARNING: could not update the status file"

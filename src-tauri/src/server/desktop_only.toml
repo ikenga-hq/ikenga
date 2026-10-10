@@ -187,41 +187,9 @@ reason = "Resolves a pending wait-for-condition round trip targeting the app's o
 tag = "WP-19"
 reason = "Not served with the rest of notifications_* (slice 4). It emits nothing, so events are not the blocker: after recording the row it sweeps update rows against the running shell's app.package_info() version and the live pkg kernel's installed set (app.try_state::<KernelState>(), commands/notifications.rs sweep_installed_updates). The daemon has neither (no shell package_info; its --pkgs-dir PkgIndex is a read-only view, not an install record), so it could record 'update available' rows it can never honestly resolve, leaving them stale; and producers::update lives in the desktop-only notifications::producers (it leans on engines::claude_code)."
 
-[oba_auto_update_all]
-tag = "WP-18b"
-reason = "auto_update_all_core loops update_core per opted-in entry, inheriting its git/npx child-process spawns."
-
-[oba_check_update]
-tag = "WP-18b"
-reason = "check_update_core calls git_ls_remote_sha, which runs `git ls-remote`; executor-routed (spawn_output_blocking) since WP-18b part b, rpc.rs arm still pending."
-
-[oba_install_bundle]
-tag = "WP-18b"
-reason = "install_bundle_core->fetch_fn is npx_skills_add_all, spawning `npx` for the whole bundle; executor-routed (spawn_output_blocking) since WP-18b part b, rpc.rs arm still pending."
-
-[oba_install_git]
-tag = "WP-18b"
-reason = "install_core->fetch_and_adopt spawns `git clone` (install.rs git_clone -> run()); executor-routed (spawn_output_blocking) since WP-18b part b, rpc.rs arm still pending."
-
 [oba_install_local]
 tag = "WP-19"
-reason = "No spawn, but not servable as-is: `path` is an unconfined read source (no PathGuard / allowlist check, only exists + is_dir), and the Local branch copies the whole located tree into the persisted store with an unchecked atomic_copy_dir, which follows symlinks inside it (std::fs::read) — a remote token holder could lift any directory the daemon uid can read. No FE caller (no tauri-cmd.ts wrapper); only the local iyke CLI bridge (POST /iyke/oba/install-local) uses it. Serve once the source goes through PathGuard as given and canonicalized and escaping links are refused, as claude_store_import's daemon arm does (WP-19 slice 7)."
-
-[oba_install_npx]
-tag = "WP-18b"
-reason = "install_core->fetch_and_adopt calls npx_skills_add, which runs `npx`; executor-routed (spawn_output_blocking) since WP-18b part b, rpc.rs arm still pending."
-
-[oba_install_with_deps]
-tag = "WP-18b"
-reason = "install_with_deps_core resolves the closure via install_core per dep, spawning git/npx (same site as oba_install_git/npx)."
-
-[oba_resolve_source]
-tag = "WP-18b"
-reason = "resolve_source_core clones into staging (git_clone / git_fetch_at_sha) or runs `npx skills add` — the same git/npx spawn sites as oba_install_git/npx; executor-routed (spawn_output_blocking), rpc.rs arm still pending."
-
-[oba_update]
-tag = "WP-18b"
-reason = "update_core re-fetches via fetch_and_adopt/npx_skills_add_all — same git/npx spawn sites as install."
+reason = "No spawn, but not servable as-is: `path` is an unconfined read source (no PathGuard / allowlist check, only exists + is_dir), and the Local branch copies the whole located tree into the persisted store with an unchecked atomic_copy_dir, which follows symlinks inside it (std::fs::read) — a remote token holder could lift any directory the daemon uid can read. No FE caller (no tauri-cmd.ts wrapper); only the local iyke CLI bridge (POST /iyke/oba/install-local) uses it. Kept desktop-only on purpose even after the git/npx installers were served (WP-18b part c): a remote session installs from https git URLs only (claude_store::remote refuses a `local` source wherever it is staged, so oba_install_with_deps cannot smuggle one in). Serve once the source goes through PathGuard as given and canonicalized and escaping links are refused, as claude_store_import's daemon arm does (WP-19 slice 7)."
 
 [os_shortcuts_apply]
 tag = "desktop-only-forever"
@@ -445,15 +413,8 @@ reason = "Helper solely for the spike_grant_fs_read debug harness (module doc: '
 
 [viewer_port]
 tag = "WP-19"
-reason = "The daemon runs no viewer server: ViewerServerManager is constructed only in desktop lib.rs, and ViewerServerManager::start needs a Tauri AppHandle for app.asset_resolver() (its fallback route). Served now it would answer None forever. Needs the viewer routes nested into the daemon router and an AppState field first."
+reason = "The daemon runs no separate viewer server: viewer routes are served directly on the daemon's main HTTP server at /__viewer/<token>/..., so there is no second port to report. Browser sessions never call viewer_port (the pane builds a same-origin URL from the viewer_serve result)."
 
-[viewer_serve]
-tag = "WP-19"
-reason = "The daemon runs no viewer server (ViewerServerManager is desktop lib.rs-only; ViewerServerManager::start needs AppHandle's asset_resolver), so a served register() would hand back a {url, token} for a mount nothing answers: every /__viewer URL 404s against the SPA fallback. rootDir confinement is not the blocker (resolve_allowlisted maps onto PathGuard). Needs the viewer routes nested into the daemon router and an AppState field first."
-
-[viewer_stop]
-tag = "WP-19"
-reason = "The daemon runs no viewer server (ViewerServerManager is desktop lib.rs-only; ViewerServerManager::start needs AppHandle's asset_resolver), so there is no mount registry to unregister from. Trivial (a DashMap remove) once the viewer routes and an AppState field exist."
 
 [window_close]
 tag = "desktop-only-forever"

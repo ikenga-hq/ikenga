@@ -6,7 +6,6 @@ import {
 	fsUnwatch,
 	fsWatch,
 	viewerPort,
-	viewerServe,
 	isRemoteWebSession,
 	viewerStop,
 	type ViewerHandle,
@@ -24,8 +23,7 @@ import {
 import { useEffectiveMenu } from '@/lib/actions/store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { resolveMenuItems } from '@/shell/menu/resolve';
-import { pickViewerRoot } from '../lib/relative-root';
-import { PreviewUnavailable } from './preview-unavailable';
+import { mountViewerRoot } from '../lib/viewer-root';
 import { PinComposer, type PickResult } from '@/shell/artifact-studio/pin-composer';
 import * as M from '@/lib/artifact/bridge-messages';
 import { wrapHostMessage } from '@/lib/artifact/bridge-messages';
@@ -69,9 +67,6 @@ interface HtmlFrameProps {
 // External script loads are blocked by the CSP header injected on every
 // response from the viewer server.
 export function HtmlFrame(props: HtmlFrameProps) {
-	// The viewer server is desktop-only (gap audit rank 8): its localhost URL
-	// would point at the browser's own machine.
-	if (isRemoteWebSession()) return <PreviewUnavailable name={props.path.split('/').pop()} />;
 	return <LocalHtmlFrame {...props} />;
 }
 
@@ -90,14 +85,11 @@ function LocalHtmlFrame({ path, paneId }: HtmlFrameProps) {
 		setState({ kind: 'loading' });
 
 		fsRead(path)
-			.then((res) => {
+			.then(async (res) => {
 				const html = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(res.bytes));
-				const { root, file } = pickViewerRoot(path, html);
-				return Promise.all([viewerServe(root), viewerPort()]).then(([h, port]) => ({
-					h,
-					file,
-					port,
-				}));
+				const { handle: h, file } = await mountViewerRoot(path, html);
+				const port = isRemoteWebSession() ? null : await viewerPort();
+				return { h, file, port };
 			})
 			.then(({ h, file, port }) => {
 				handle = h;
@@ -113,8 +105,9 @@ function LocalHtmlFrame({ path, paneId }: HtmlFrameProps) {
 				// it cannot reach `window.parent`. `h.url` is a path relative to the
 				// viewer server's mount root; we prefix the bound viewer port so
 				// the child can fetch its own assets.
-				const port_ = port ?? 47821;
-				const src = `http://localhost:${port_}${h.url}${file}`;
+				const src = isRemoteWebSession()
+					? `${window.location.origin}${h.url}${file}`
+					: `http://localhost:${port ?? 47821}${h.url}${file}`;
 				setState({ kind: 'ready', src, handle: h });
 			})
 			.catch((err) => {

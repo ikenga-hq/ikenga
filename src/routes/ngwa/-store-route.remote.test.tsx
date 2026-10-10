@@ -1,9 +1,12 @@
-// /ngwa/store in a browser session (gap audit rank 3): the daemon serves no
-// install or update, so the sheet's Install button is disabled before the
-// click, not failed after it.
+// /ngwa/store in a browser session. The daemon serves the Ọba git / npx
+// installers (WP-18b part c), so a catalog primitive's Install is live; what it
+// cannot install it names before the click — a local path in Add from URL
+// reads "Local installs are desktop-only", and registry packages read
+// "Packages are installed by the server operator" (covered where a package
+// row exists: ngwa-store-primitives.test / use-ngwa-actions.remote.test).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
 import * as cmd from '@/lib/tauri-cmd';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { Route as StoreRoute } from './store';
@@ -92,16 +95,42 @@ const selectCatalogRow = async () => {
 };
 
 describe('/ngwa/store — install gate', () => {
-	it('disables Install before the click in a browser session', async () => {
+	it('leaves a catalog primitive installable in a browser session', async () => {
 		remote.on = true;
 		const install = await selectCatalogRow();
-		expect(install.disabled).toBe(true);
-		expect(install.title).toMatch(/not available/i);
+		expect(install.disabled).toBe(false);
+		expect(install.title).not.toMatch(/not available/i);
+	});
+
+	it('stops a local path in Add from URL with the desktop-only reason', async () => {
+		remote.on = true;
+		mountRoutes([{ route: StoreRoute, path: '/ngwa/store' }], '/ngwa/store');
+		await waitFor(() => expect(document.querySelector('[data-id^="cat:"]')).not.toBeNull());
+		fireEvent.click(screen.getByRole('button', { name: /Add from URL/ }));
+		const input = (await screen.findByLabelText('git URL or npx package')) as HTMLInputElement;
+		fireEvent.change(input, { target: { value: '/home/me/skills/pdf' } });
+		const resolve = screen.getByRole('button', { name: 'Resolve' }) as HTMLButtonElement;
+		expect(resolve.disabled).toBe(true);
+		expect(resolve.title).toBe('Local installs are desktop-only');
+		fireEvent.change(input, { target: { value: 'https://github.com/o/pdf' } });
+		expect(resolve.disabled).toBe(false);
 	});
 
 	it('leaves Install enabled on the desktop', async () => {
 		remote.on = false;
 		const install = await selectCatalogRow();
 		expect(install.disabled).toBe(false);
+	});
+
+	it('does not block a local path on the desktop', async () => {
+		remote.on = false;
+		mountRoutes([{ route: StoreRoute, path: '/ngwa/store' }], '/ngwa/store');
+		await waitFor(() => expect(document.querySelector('[data-id^="cat:"]')).not.toBeNull());
+		fireEvent.click(screen.getByRole('button', { name: /Add from URL/ }));
+		const input = (await screen.findByLabelText('git URL or npx package')) as HTMLInputElement;
+		fireEvent.change(input, { target: { value: '/home/me/skills/pdf' } });
+		expect((screen.getByRole('button', { name: 'Resolve' }) as HTMLButtonElement).disabled).toBe(
+			false
+		);
 	});
 });

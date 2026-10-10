@@ -1,7 +1,10 @@
-// Installed-surface Update in a browser session (gap audit rank 3): the daemon
-// serves no oba_update / install, so an actionable "Update to <version>" row is
-// disabled with the honest reason before the click — and a failure that still
-// slips through reads as that reason, not the daemon's raw "not implemented".
+// Installed-surface Update in a browser session. A registry PACKAGE cannot be
+// updated from one (the pkg set is the server operator's), so its actionable
+// "Update to <version>" row is disabled with that reason before the click — and
+// a failure that still slips through reads as the honest line, not the daemon's
+// raw "not implemented". An Ọba primitive (a git / npx install in the account's
+// own vault) updates through `oba_update`, which the daemon serves: its row is
+// NOT gated.
 
 import type { NgwaItem } from '@ikenga/contract';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -40,6 +43,8 @@ vi.mock('@/lib/registry/use-registry', async (orig) => ({
 	useRegistryIndex: () => ({ data: { indexUrl: 'https://registry.test/index.json' } }),
 }));
 
+import { PACKAGES_OPERATOR_REASON } from '@/lib/desktop-only';
+import { obaCheckUpdateQueryOptions } from '@/lib/queries/claude-config';
 import { NOT_AVAILABLE_ON_SERVER_YET } from '@/lib/transport/unavailable';
 import { useNgwaItemActions } from './use-ngwa-actions';
 
@@ -84,7 +89,8 @@ describe('Installed Update — install gate', () => {
 		const { result } = setup();
 		const upd = result.current.actionsFor(item).update;
 		expect(upd.label).toBe('Update to 0.8.0');
-		expect(upd.disabledReason).toBe(NOT_AVAILABLE_ON_SERVER_YET);
+		expect(upd.disabledReason).toBe(PACKAGES_OPERATOR_REASON);
+		expect(upd.disabledReason).toBe('Packages are installed by the server operator');
 	});
 
 	it('leaves Update enabled on the desktop', () => {
@@ -105,5 +111,56 @@ describe('Installed Update — install gate', () => {
 		await waitFor(() => expect(result.current.status?.tone).toBe('err'));
 		expect(result.current.status?.text).toContain(NOT_AVAILABLE_ON_SERVER_YET);
 		expect(result.current.status?.text).not.toMatch(/not implemented/i);
+	});
+});
+
+describe('Installed Update — an Ọba primitive is not gated', () => {
+	const skill: NgwaItem = mkItem({
+		id: 'skill:pdf',
+		kind: 'skill',
+		name: 'pdf',
+		version: 'aaaaaaa',
+		origin: {
+			source: 'git',
+			url: 'https://github.com/o/pdf',
+			ref: null,
+			resolved_version: 'aaaaaaa1111111',
+			publisher: null,
+			managed: true,
+			auto_update: false,
+			installed_at_ms: 1,
+			updated_at_ms: 1,
+		},
+	});
+
+	function setupSkill() {
+		const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		// The remote check the detail would have run: the remote moved on.
+		qc.setQueryData(obaCheckUpdateQueryOptions('skill', 'pdf').queryKey, {
+			current: 'aaaaaaa1111111',
+			latest: 'bbbbbbb2222222',
+			behind: true,
+		});
+		const wrapper = ({ children }: { children: ReactNode }) => (
+			<QueryClientProvider client={qc}>{children}</QueryClientProvider>
+		);
+		return renderHook(
+			() => useNgwaItemActions({ items: [skill], storeCatalog: [], unreadableSources: [] }),
+			{ wrapper }
+		);
+	}
+
+	it('offers "Update to <sha>" enabled in a browser session', () => {
+		remote.on = true;
+		const { result } = setupSkill();
+		const upd = result.current.actionsFor(skill).update;
+		expect(upd.label).toBe('Update to bbbbbbb');
+		expect(upd.disabledReason).toBeUndefined();
+	});
+
+	it('is the same on the desktop', () => {
+		remote.on = false;
+		const { result } = setupSkill();
+		expect(result.current.actionsFor(skill).update.disabledReason).toBeUndefined();
 	});
 });

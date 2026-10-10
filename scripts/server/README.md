@@ -239,6 +239,135 @@ The daemon has no way for the root side to inject a per-account environment: a p
 
 The fix for the second group belongs in the daemon: `T1Launcher::host_env()` reading the root-owned `/etc/ikenga/secrets/<unix_name>.env` and adding its entries to the child's environment, under names the PTY denylist does not match, would carry them into every PTY and Chi run. The file format is a plain `NAME=value` list so that change needs nothing new from the provisioner. Until then, treat agent-account secrets delivered this way as available to shell-launched work only.
 
+## Swap
+
+A small box with several agent sessions open (a 3.8 GB host with three people each running a ~280 MB `claude` session plus agents) runs out of memory without swap, and the OOM killer then ends a session. The provisioner gives the box a swap file, as part of the full run (it goes **first**, before the apt installs) or on its own with `sudo ikenga-provision swap` (`--dry-run` prints the plan).
+
+```bash
+SWAP_SIZE=auto        # auto | 2G | 4096M | off | 0        (default auto)
+SWAPPINESS=10         # vm.swappiness, 0-100: swap is overflow, not eager paging   (default 10)
+SWAP_FILE=/swapfile   # absolute path on a local ext4/xfs/f2fs filesystem          (default /swapfile)
+```
+
+`auto` is 4G for a box with up to 8 GB of RAM (RAM is rounded up to whole GiB, so a "4 GB" host that reports a little under counts as 4) and 2G above that. An explicit size is `<n>M` or `<n>G`, between 64M and 64G. `off` and `0` mean "manage nothing, and take away what a previous run made".
+
+What a run owns, and nothing else: the `SWAP_FILE` itself (root:root, 0600), **one** `/etc/fstab` line ending in `# ikenga-swap`, and `/etc/sysctl.d/90-ikenga-swap.conf` (`vm.swappiness`, applied with `sysctl -p` on that file). The fstab line is the ownership marker: a swap file without it is never touched, and fstab is backed up (`/etc/fstab.bak-<time>`, last five kept) before every change and never gets a second line.
+
+| State | What the run does |
+|-------|-------------------|
+| Any **other** swap is active (a partition, `/swap.img`, another file, zram, or an active `SWAP_FILE` with no ikenga marker) | Nothing. It reports the swap it found and exits 0. Swappiness is left alone too. |
+| No swap file yet | Checks the target, then builds `SWAP_FILE.ikenga-new` (`fallocate`; `dd` if the filesystem refuses it), `mkswap`, renames it into place, adds the fstab line, `swapon`, writes the sysctl file. `SWAP_FILE` is never a half-written file. |
+| Managed file, right size | "no changes". It repairs a missing or duplicated fstab line and a wrong mode, turns the file back on if it is off, and re-applies `vm.swappiness` if the live value drifted. |
+| Managed file, different size | `swapoff`, replace, `swapon`. It **refuses** (exit 1, nothing changed) unless the swap in use plus 256 MiB fits in `MemAvailable`. The new size is also checked against the free disk first. |
+| `SWAP_SIZE=off` | `swapoff` (same memory check), then removes the file, the fstab line and the sysctl file. The live `vm.swappiness` stays until the next reboot. Nothing managed = "nothing to remove". |
+
+Refused before anything changes (exit 1, with the reason): `SWAP_FILE` is a symlink or sits behind one; its directory is missing; it is on btrfs (needs a `nodatacow` file from `btrfs filesystem mkswapfile`, not done here), on tmpfs, overlayfs, NFS, FUSE or anything else that is not ext2/3/4, xfs or f2fs; creating it would leave less than 10% of that filesystem free; the file already exists and is not managed by ikenga; fstab already has a swap line for that path that ikenga did not write; or the managed file lives at a different path than `SWAP_FILE` now says (set it back, or `SWAP_SIZE=off` first).
+
+Tests: `scripts/server/test-swap-container.sh` (loop-mounted ext4 in a privileged container, real `swapon`; the swap table and `vm.swappiness` are kernel-global, so it restores both on exit).
+
+## SSH tunnels
+
+A tunnel is a systemd unit that keeps `ssh -N -L 127.0.0.1:<port>:<host>:<port>` up to a remote host, as an unprivileged user, with a **pinned host key**. The backups use one to reach a database that only listens on its own machine. `sudo ikenga-provision tunnels` (or the full provision run, which does it **before** backups) converges all of it from the profile; `--dry-run` prints the plan.
+
+```bash
+TUNNEL_USER=ikenga-tunnel                       # default
+TUNNELS=(
+  "devotee-db=pgtunnel@157.180.123.30 5544:127.0.0.1:55432"
+  "alt-db=pgtunnel2@db.example.com:2222 5545:127.0.0.1:55433"
+)
+TUNNEL_KNOWN_HOSTS=(                            # no trust-on-first-use: the key comes from here, or the tunnel is refused
+  "157.180.123.30 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA..."
+  "[db.example.com]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA..."     # a non-22 ssh port is written [host]:port
+)
+TUNNEL_FROM=203.0.113.7                         # optional: the address printed in from="" (default: this box's public address)
+TUNNEL_ALLOW_USERS=(ikenga-backup)              # optional: who may connect to the tunnels' local ports besides root (default: the backup user when BACKUPS_ENABLED=1, else nobody)
+```
+
+`TUNNELS` entry: `name=user@host[:sshport] localport:remotehost:remoteport`, exactly one space. The local end is **always `127.0.0.1`**. Every field is matched against a strict pattern (name `a-z 0-9 -`, user `a-z 0-9 _ -`, host letters/digits/`.`/`-` and never a leading `-`, ports 1-65535 with no leading zero, no duplicate name or local port), so nothing in the profile can become an ssh option, a shell word or an extra unit line; a failing entry is refused by number before anything on the host changes. A local port below 1024 cannot be bound by the unprivileged user (the tunnel would sit in its restart loop). Get a host key with `ssh-keyscan -t ed25519 <host>` and **confirm its fingerprint out of band** before putting it in the profile. IPv6 literals are not supported.
+
+| Profile | Effect |
+|---------|--------|
+| `TUNNELS` not mentioned | The tunnels phase does nothing, and tunnel units already on the host are left alone (a profile written before this feature cannot remove a hand-made tunnel). |
+| `TUNNELS=( ... )` | Converge exactly these. A `<name>-tunnel.service` of `TUNNEL_USER` that is not listed is **stopped, disabled and removed**. The key, the user and `known_hosts` stay. |
+| `TUNNELS=()` | Remove every tunnel unit of `TUNNEL_USER` (and the port lock below). |
+
+| `TUNNEL_ALLOW_USERS` | Who may connect to a tunnel's local port (root always may) |
+|---------|--------|
+| not mentioned | The backup user (`BACKUP_USER`) when `BACKUPS_ENABLED=1`, else nobody but root. |
+| `( )` | Root only. |
+| `(a b)` | Root, `a` and `b`. Names are resolved to uids when the lock is converged; a name that is not a user on the box is refused before anything changes (the one exception is the backup user while backups are enabled: the backups phase creates it, after tunnels, and the lock is converged again once it exists). Duplicates and `root` are folded. |
+
+### What is installed
+
+| Path | Owner / mode | |
+|------|--------------|--|
+| `/var/lib/<TUNNEL_USER>/` | `<user>` `0700` | The user's home (`/var/lib` is root's, so the user cannot swap it for a symlink). No login shell, no supplementary groups. |
+| `.ssh/id_ed25519`, `.pub` | `<user>` `0600` / `0644` | **One key per box**, shared by every tunnel. Generated once, with comment `<user>@<hostname>`, and **never regenerated**: an existing one is adopted if it is a regular, passphrase-less ed25519 key of that user (a symlink, another owner or another type is refused; a group/other-readable mode is corrected to `0600`). |
+| `.ssh/known_hosts` | `<user>` `0644` | Exactly the `TUNNEL_KNOWN_HOSTS` entries some tunnel goes to. A changed set is written after the old file is copied to `known_hosts.bak-<time>`, and the tunnels restart to pick it up. |
+| `/etc/systemd/system/<name>-tunnel.service` | `root` `0644` | One per tunnel. |
+| `/etc/systemd/system/<name>-tunnel.service.d/10-ikenga-lock.conf` | `root` `0644` | A drop-in per tunnel: `Requires=` and `After=ikenga-tunnel-lock.service` (the tunnel does not run without its lock). The unit file itself is untouched. |
+| `/etc/ikenga-tunnels/lock.nft` | `root` `0644` | The port lock's rules (below). |
+| `/etc/systemd/system/ikenga-tunnel-lock.service` | `root` `0644` | Loads them at boot. |
+
+The unit runs `ssh -NT` with `StrictHostKeyChecking=yes`, `IdentitiesOnly=yes`, `BatchMode=yes`, `ExitOnForwardFailure=yes`, a 30 s keep-alive and `-L 127.0.0.1:<local>:<host>:<port>` (plus `-p <port>` for a non-22 ssh port), as `User=<TUNNEL_USER>` with `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome` and `PrivateTmp`, `ReadOnlyPaths` on the home, `Restart=always` every 10 s. `TUNNEL_USER` may not be `root`, the admin, the T0 `ikenga` user, the backup user, an `ik-*` name or anything with a uid inside `UID_RANGE`.
+
+**Root never follows or writes through a path the tunnel user controls.** Everything root does *inside* the home (look at, generate and compare the key, write `known_hosts`) is done **as the tunnel user** (`setpriv`, no groups, clean environment, time-limited), never by root through a path the user could have swapped; the home itself is checked with root's own `lstat`. A symlink at the home, `.ssh`, key, `.pub`, `known_hosts` or unit path, or a key/`known_hosts` owned by anyone else, is **refused** (the run stops before changing anything and names the path). The private key is never printed, logged or put in argv.
+
+### The port lock: who may use a tunnel
+
+A tunnel's local end `127.0.0.1:<port>` is a loopback port, and loopback is open to **every account on the box**, people and agents alike. Left like that, any of them can connect to it and talk to the remote database through the tunnel's key, and, while the tunnel is down, any of them can *bind* the port and receive the backup job's connection, login included (shown by execution in a security review). The lock closes the first; the next section neutralises the second.
+
+For each tunnel port the provisioner loads one nftables table, **`inet ikenga_tunnels`**, whose `output` chain has, per tunnel port and per family (`127.0.0.1` and `::1`), an **allow** rule for the uids of **root and `TUNNEL_ALLOW_USERS`** followed by a **reject** rule for everything else, with a TCP reset (the client fails at once with `ECONNREFUSED`). The tunnel's own user is *not* on the list (it never connects to its own port). Traffic to any other port, to any other address, and the whole input side are not touched; the chain's policy is `accept`.
+
+```
+table inet ikenga_tunnels {
+  chain output {
+    type filter hook output priority 0; policy accept;
+    ip daddr 127.0.0.1 tcp dport 5544 meta skuid { 0, 994 } accept comment "ikenga:lock:devotee-db:ip:5544:allow:0,994"
+    ip daddr 127.0.0.1 tcp dport 5544 counter reject with tcp reset comment "ikenga:lock:devotee-db:ip:5544:deny"
+    ip6 daddr ::1      tcp dport 5544 meta skuid { 0, 994 } accept comment "ikenga:lock:devotee-db:ip6:5544:allow:0,994"
+    ip6 daddr ::1      tcp dport 5544 counter reject with tcp reset comment "ikenga:lock:devotee-db:ip6:5544:deny"
+  }
+}
+```
+
+**Why allow-then-reject, not `skuid != { allowed } reject`.** The second form fails open: nft cannot read an owner uid from a socket that has no owning file, so `!=` does not match it and the packet goes through. `socket(AF_SMC)` is exactly such a socket (SMC connects through a kernel-internal TCP socket), and an unprivileged account can create one (the kernel autoloads the `smc` module), so with that form any local account reached the tunnel port over SMC (shown by execution in a security review). With "accept the allowed uids, reject whatever is left" an ownerless socket is rejected like any other. As defence in depth the provisioner also writes `/etc/modprobe.d/ikenga-no-smc.conf` (`install smc /bin/false`, `install smc_diag /bin/false`) while the lock is enabled, removed with the lock. **A module that is already loaded is not unloaded** (it may be in use): the run reports it (`the smc kernel module is already loaded`); `rmmod smc_diag smc` or a reboot finishes the job, and the port rules hold either way.
+
+**Why a table of its own, and why a unit.** ufw cannot match on the local user, and `ufw --force reset` (the perimeter step runs it whenever the rule set differs) rebuilds only ufw's own chains, so a separate nft table is never touched by it. The obvious persistence, `nftables.service` with `/etc/nftables.d/`, is the wrong one: the stock `/etc/nftables.conf` starts with `flush ruleset`, which would wipe ufw's tables whenever the service ran (the test does exactly that to show it). So `ikenga-tunnel-lock.service` (a oneshot, `WantedBy=sysinit.target`, `Before=network-pre.target`) loads `/etc/ikenga-tunnels/lock.nft`, which is `table X` / `delete table X` / `table X { ... }`: one nft transaction, so a reload swaps the rules atomically and never opens a gap. The tunnels `Require` and order after it through a drop-in, so **the lock fails closed**: stop it, or break its rules file, and the tunnels stop and refuse to start (restarting the lock restarts the tunnels; the provisioner uses a reload, which does not).
+
+**Converge.** The rules are generated from the profile and checked with `nft -c` before anything is written; the old file is kept as `lock.nft.bak-<time>`. A rerun that finds nothing to do reports `no changes` and does not reload (the reject counters survive). The live table is compared with the file rule by rule, in order (verb and comment), so a deleted table, a deleted rule, an inserted `accept`, a reordered rule or a stale uid is **drift** and a rerun reloads it. A tunnel removed from the profile loses its rules and drop-in; `TUNNELS=()` removes the table, file, unit and drop-ins; a profile that never mentions `TUNNELS` leaves all of it alone. The `backups` action converges the lock too (it is what creates the backup user). A symlink at the lock directory (`/etc/ikenga-tunnels`), the rules file, the modprobe file, the lock unit or a drop-in directory is refused, before anything is written; `--dry-run` gives the same refusals as the real run, including a `TUNNEL_ALLOW_USERS` name that is not a user on the box.
+
+**Two things to know.** (1) **Use `127.0.0.1` in connection strings, not `localhost`.** The tunnel listens on `127.0.0.1` only, so any account can bind `[::1]:<port>` and `localhost` may try `::1` first and reach that squatter. (`require_auth` below still protects the password, but the backup would fail.) (2) **`nft flush ruleset` as root at runtime opens the port to everybody** until something puts the table back: the lock unit still reports `active` and the tunnel stays up. `systemctl reload ikenga-tunnel-lock` restores it without restarting the tunnels, and so do a provisioner rerun (it sees the drift) and a reboot. Nothing watches for this; run `sudo ikenga-provision tunnels` (or the reload) after any firewall change that flushes the whole ruleset.
+
+**What it does not do:** it does not stop a process running as root or as an allowed user (the backup user also runs `gcloud`), nor an account from *binding* the port (next section), nor traffic to `127.0.0.2:<port>` or the box's own address (ssh only listens on `127.0.0.1`, so nothing is there to protect).
+
+### Squatting: binding the port while the tunnel is down
+
+nft has no say in `bind()`. While a tunnel is down, any account can listen on `127.0.0.1:<port>`, and the backup job (an allowed user) will connect to it: a fake server could ask it for a cleartext password. Two defences were evaluated:
+
+- **`net.ipv4.ip_local_reserved_ports`** only keeps the kernel's *automatic* port choice away from the listed ports. An explicit `bind()` to a reserved port succeeds for any unprivileged account, so it does not stop a squatter. The test proves it (an unprivileged account binds a reserved port) and the provisioner does not set it.
+- **`require_auth`** (used). The backup job tells libpq which authentication it will accept, so a fake server gets nothing: `PGREQUIREAUTH=scram-sha-256` makes libpq refuse to answer a cleartext or md5 request (the server's log shows the client hanging up without sending a password) and refuse a server that never authenticates (a forged dump). It is the per-database `"require_auth"` of `BACKUP_CONFIG`, and the **default `scram-sha-256` for any database whose connection string points at loopback and one of this box's tunnel ports** (the provisioner writes `"tunnel_ports": [..]` into the installed config; the connection strings are never read or rewritten here). `"require_auth": false` opts one database out; a value in the URL (`?require_auth=...`) is accepted, and the config field wins over a weaker one. See "Database backups".
+
+A squatted port is loud, not silent: the tunnel cannot bind it (`ExitOnForwardFailure`; the journal says `cannot listen to port`) and the backup reports `kind=auth-refused`, a distinct status kind. Limits: SCRAM does not send the password, but a squatter that *offers* SCRAM learns a proof it can brute-force offline, so the database passwords must be long and random (that is the case for any password that crosses a network); `channel_binding` needs TLS and the devotee server has `ssl=off`, so it cannot be used; libpq must be 16 or newer (the provisioner installs 17). Closing the bind itself would take a local port below 1024 (an unprivileged account cannot bind one; the tunnel unit would need `AmbientCapabilities=CAP_NET_BIND_SERVICE`) and a changed port in every connection string; that is not done here.
+
+### The remote end (you do this once per tunnel)
+
+The provisioner cannot authorise the key on the remote host. Each run prints, per tunnel, the exact line for that host's `authorized_keys` (for a `nologin` user created for this purpose):
+
+```
+restrict,port-forwarding,permitopen="127.0.0.1:55432",from="203.0.113.7" ssh-ed25519 AAAA... ikenga-tunnel@royalti-box
+```
+
+`restrict` turns off everything but what follows (no shell, no tty, no agent/X11 forwarding), `permitopen` limits the one allowed forward to the target the tunnel uses, and `from` limits the source address: this box's public address if it can be determined (the route to the internet, when it is not a private range), otherwise `<THIS-BOX-PUBLIC-IP>` for you to fill in, or set `TUNNEL_FROM`. Two tunnels to the same remote user need one line with both `permitopen` options. Until the line is installed the unit retries every 10 s, and the run says `not listening yet`; once it is in, the tunnel comes up by itself (ssh opens the local port only after the remote accepted the key).
+
+### Converge, and adopting a hand-made tunnel
+
+`tunnels` is idempotent: a rerun reports `no changes` and touches nothing; a changed unit is rewritten (the previous one is kept as `<unit>.bak-<time>`) and that tunnel restarts; a stopped tunnel is started (a tunnel waiting out its 10 s restart delay is left alone). **Units are compared by what they do**: comments, blank lines, line-continuation layout, `Description=` and `Documentation=` are ignored, so a hand-made unit with the same effect is adopted as it is, with no rewrite and no restart. The live box's `devotee-db-tunnel.service` (user `ikenga-tunnel`, key `/var/lib/ikenga-tunnel/.ssh/id_ed25519`) is adopted this way with the entry `devotee-db=pgtunnel@157.180.123.30 5544:127.0.0.1:55432` and that host's key in `TUNNEL_KNOWN_HOSTS`: same user, same key (not regenerated), same unit name. Run it with `--dry-run` first; on a box that has no port lock yet it plans **only the lock** (its file, its unit, one drop-in per tunnel) and nothing about the user, key, `known_hosts` or the unit itself, and the tunnel is not restarted; the run after that says `no changes`. If a unit differs in what it does, that run says so and converges it.
+
+The container test (`test-tunnels-container.sh`) runs against real systemd with **no network**: the "remote" is a second sshd on `127.0.0.1` (ports 22 and 2222) with a `nologin` user authorised by the printed line, and a fake Postgres listener behind it. The port lock has its own suite, `test-portlock-container.sh` (real systemd and the real kernel's nf_tables, a real container restart as the reboot, ufw reset, drift, fail-closed, and the squatting runs against a fake Postgres through the real `run-backup.sh` and libpq).
+
+**Not handled:** the remote side (above); rotating the key (delete it by hand, rerun, install the new line, remove the old); IPv6 targets (the local end is IPv4 only; the lock covers `::1` all the same); binding of a tunnel port by another account (above); processes of root or of an allowed user; tunnels that need a jump host or a non-default `ssh_config`; alerting on a down tunnel (a down tunnel makes the backups report `dump-failed`).
+
 ## Database backups
 
 Postgres backups run **on this box**, as system jobs, by a dedicated user that holds only the database connection strings and the GCS credentials (decision D-B10; they moved here from rex-vps). Rex's alerts only *read* a status file the jobs leave behind. `sudo ikenga-provision backups` (or the full provision run) converges all of it from the profile; `--dry-run` prints the plan by secret and file **name**, never a value.
@@ -260,12 +389,12 @@ BACKUP_GCLOUD_KEY_FPRS=()                             # extra accepted Google ap
 |-----|---------|--|
 | `BACKUPS_ENABLED` | `0` | `1` installs and starts the timers. Back to `0` removes them (see "Converge" below). |
 | `BACKUP_USER` | `ikenga-backup` | A plain system user: no login shell, no supplementary groups, no home except its `0700` private state directory. Not an Ikenga principal: `root`, the admin, the T0 `ikenga` user, any `ik-*` name and any uid inside `UID_RANGE` are refused. |
-| `BACKUP_CONFIG` | none (required) | Path to a **JSON file** (not an inline list: it is data, it is reviewed on its own, and the same file is installed for the job). Shape = rex-vps's `backup-config.json`; an example with the nine Royalti databases is `scripts/server/backup/backup-config.example.json`. Only `databases[]` is read. |
+| `BACKUP_CONFIG` | none (required) | Path to a **JSON file** (not an inline list: it is data, it is reviewed on its own, and the same file is installed for the job). Shape = rex-vps's `backup-config.json`; an example with the nine Royalti databases is `scripts/server/backup/backup-config.example.json`. Only `databases[]` is read (the provisioner adds `tunnel_ports` to the installed copy, never to your file). |
 | `BACKUP_GCS_KEY_SECRET` | none (required) | The **name** of the `SECRETS_FILE` entry holding the service-account key. |
 | `BACKUP_SCHEDULES` | see below | `name=OnCalendar` entries that override or add schedules. |
 | `BACKUP_PG_MAJOR` | `17` | The `postgresql-client-<n>` to install. **Values below 17 are refused**: the servers are PostgreSQL 17 and an older `pg_dump` refuses to dump a newer server, so every backup would fail. |
 
-`BACKUP_CONFIG` per database: `name` (also the object folder: letters, digits, `. _ -`), `connection_secret` (the **name** of a `[backup]` secret), `schedule` (a schedule name), `gcs_bucket`, `enabled`. **A database is backed up only with `"enabled": true`**; one without the field (or `false`) is skipped, as on rex-vps, and the run names the databases it skipped. A config where none is enabled is refused. It holds names only, never a value, and is installed (`0640`, `root:<backup group>`) as `/etc/ikenga-backup/backup-config.json`. A schedule name with no calendar, a duplicate `name`, a bad bucket, or a secret name that is reserved is refused with the entry number.
+`BACKUP_CONFIG` per database: `name` (also the object folder: letters, digits, `. _ -`), `connection_secret` (the **name** of a `[backup]` secret), `schedule` (a schedule name), `gcs_bucket`, `enabled`, and optionally **`require_auth`**: the libpq `require_auth` list the connection must satisfy (`scram-sha-256`, `password`, `md5`, `gss`, `sspi`, `none`, comma separated, all negated with `!` or none of them), or `false` to opt out. It becomes `PGREQUIREAUTH` in the `pg_dump` environment. **When it is absent and the database's connection string points at `127.0.0.1`/`localhost`/`::1` on one of this box's tunnel ports, `scram-sha-256` is applied** (the provisioner adds `"tunnel_ports": [..]`, from `TUNNELS` or from the existing tunnel units, to the *installed* copy of the config only; see "Squatting" above). A value in the URL is honoured too, and the config field wins over it. libpq must be 16+; the provisioner installs 17. A server that cannot satisfy it (it only does md5, say) fails that database with `auth-refused` until `"require_auth": false` or the server's `password_encryption` is fixed. **A database is backed up only with `"enabled": true`**; one without the field (or `false`) is skipped, as on rex-vps, and the run names the databases it skipped. A config where none is enabled is refused. It holds names only, never a value, and is installed (`0640`, `root:<backup group>`) as `/etc/ikenga-backup/backup-config.json`. A schedule name with no calendar, a duplicate `name`, a bad bucket, or a secret name that is reserved is refused with the entry number.
 
 **Schedules.** One systemd timer per schedule that some enabled database uses. Defaults match rex-vps's crontab, in **UTC**:
 
@@ -289,7 +418,7 @@ The connection strings are `SECRETS_FILE` lines with the new scope **`backup`**:
 
 - `backup` is the backup user's alone. It **cannot be combined** with another scope, `everyone` and `agents` never include it, and the run refuses if a secret of the same name is also delivered to an account, or if a database's connection secret is in the file under any other scope. `backup` is now a reserved name (no account may be called that).
 - **The key** is a multi-line JSON file and the secrets format is one line per value, so it is stored **base64-encoded**: `base64 -w0 key.json`. Scope it `[root]` (nobody gets it but the provisioner) or `[backup]`. It is decoded and checked (`type: service_account`, `private_key`, `client_email`) without printing anything; scoping it any other way is refused.
-- **Connection strings** are `postgres://` or `postgresql://` URLs with the user and password percent-encoded. Supported query parameters: `sslmode`, `sslrootcert`, `connect_timeout`, `channel_binding`, `application_name`; anything else makes that database fail with `bad-connection-string` (a name, never the URL).
+- **Connection strings** are `postgres://` or `postgresql://` URLs with the user and password percent-encoded. Supported query parameters: `sslmode`, `sslrootcert`, `connect_timeout`, `channel_binding`, `require_auth`, `application_name`; anything else makes that database fail with `bad-connection-string` (a name, never the URL).
 - Where they land: the strings in `/etc/ikenga-backup/connections.env` (`root:<backup group>`, `0640`, only the strings some enabled database uses, parsed line by line, never `source`d); the key in `/var/lib/ikenga-backup/private/gcs-key.json` (`ikenga-backup`, `0600`, written by the backup user from stdin, never by root). Nowhere else: not argv, not a unit file, not the journal, not `status.json`. Backup-scoped secrets that no database refers to are named in the output and not written. A replaced env file is first copied to `/etc/ikenga/secrets-backup/` (root-only, last five).
 - **How the job keeps them out of argv:** `pg_dump` is not given the URL. `run-backup.sh` parses it and passes `PGHOST`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, ... in the `pg_dump` process's environment (only the owner and root can read `/proc/<pid>/environ`; anyone can read `/proc/<pid>/cmdline`). `gcloud` is only ever given the key *path*.
 
@@ -340,7 +469,7 @@ The journal (`journalctl -u 'ikenga-backup@*'`) gets one line per database: `db=
 }
 ```
 
-`last_error_kind` is null after a successful attempt and otherwise one of `bad-config`, `no-secret`, `bad-connection-string`, `no-pg-dump`, `gcs-auth` (the key was rejected: nothing is dumped), `dump-failed`, `verify-failed`, `upload-failed`. `object` and `last_success` always describe the last **successful** upload; a failure never erases them. The file lists every enabled database from the moment of provisioning (a never-run one has nulls), and it is rewritten atomically after each database. `enabled` is `false` when backups are disabled.
+`last_error_kind` is null after a successful attempt and otherwise one of `bad-config`, `no-secret`, `bad-connection-string`, `no-pg-dump`, `gcs-auth` (the key was rejected: nothing is dumped), `dump-failed`, `auth-refused` (libpq refused the server's authentication under `require_auth`: through a tunnel this can mean something else holds the port, so treat it as a security alert, not a flake), `verify-failed`, `upload-failed`. `object` and `last_success` always describe the last **successful** upload; a failure never erases them. The file lists every enabled database from the moment of provisioning (a never-run one has nulls), and it is rewritten atomically after each database. `enabled` is `false` when backups are disabled.
 
 **The alert contract for Rex's box-alerts schedule** (replaces `cron-alert.sh` and the fleet-audit log greps): read `/var/lib/ikenga-backup/status.json` and alert when `enabled` is false or the file is missing or older than a day; or for any database `last_attempt_ok == false`, or `last_success` is null or older than twice its schedule's interval (suggested: `4hourly` 9 h, `daily` 26 h, `weekly` 8 d, `monthly` 32 d). Also alert on `systemctl is-failed 'ikenga-backup@*'` and on a missing timer (`systemctl list-timers 'ikenga-backup-*'`). Nothing in the file is secret; the alert text can name the database and the kind.
 

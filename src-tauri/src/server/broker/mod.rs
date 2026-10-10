@@ -24,6 +24,7 @@
 
 pub mod children;
 pub mod fs_roots_admin;
+pub mod health_probe;
 pub mod proxy;
 pub mod ws_registry;
 
@@ -219,7 +220,7 @@ pub fn router(
     let public = Router::new()
         .route("/api/health", get(health::health_handler))
         .route("/auth/login", post(auth_mod::routes::login))
-        .with_state(state)
+        .with_state(state.clone())
         .merge(extensions.public.into_router());
 
     let spa = SpaStaticService::new(static_dir);
@@ -232,8 +233,13 @@ pub fn router(
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any);
 
+    let viewer_routes = Router::new()
+        .route("/__viewer/*rest", any(proxy::viewer_proxy))
+        .with_state(state.clone());
+
     Router::new()
         .merge(public)
+        .merge(viewer_routes)
         .merge(protected)
         // With the request headers, so the broker gzips like the T0 daemon
         // and refuses a non-`/sw.js` service-worker install the same way.
@@ -397,6 +403,13 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
     )));
     broker_state.access_t1 = Some(access_t1.clone());
     let state = Arc::new(broker_state);
+    // The admin Server card (`server_health`): the disk figures describe the
+    // operator root's filesystem; per-account figures are asked of each
+    // running child.
+    crate::server::host_health::set_data_dir(root.root().to_path_buf());
+    crate::server::host_health::install_account_loads(Arc::new(
+        health_probe::BrokerAccountLoads::new(state.clone()),
+    ));
     if let Some(hub) = push_hub {
         crate::server::push::install_hub(hub);
         crate::server::push::pump::spawn(state.children.clone());

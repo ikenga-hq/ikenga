@@ -60,6 +60,9 @@ pub mod server;
 // live-session watcher, which emits on a Tauri event channel, stays
 // desktop-only inside the module.
 pub mod transcript;
+// What a viewer preview mount may serve (root bound, single-file mode, credential
+// denylist). Pure path logic shared by the daemon and the desktop viewer server.
+pub mod viewer_guard;
 
 // --- Desktop facades over the headless `server::shared` substrate ---
 // The implementations already compile into both binaries (WP-19 slices

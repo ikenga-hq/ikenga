@@ -65,6 +65,9 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("fs_roots_remove", req!(owner[Files, Settings])),
     ("fs_roots_reset", req!(owner[Files, Settings])),
     ("fs_home", req!(owner[Files])),
+    // Viewer mount management (gap audit rank 8).
+    ("viewer_serve", req!(shared[Files])),
+    ("viewer_stop", req!(shared[Files])),
     // ── fs write (P-2: files + dispatch) ──
     ("fs_write", req!(shared[Files, Dispatch])),
     ("fs_trash", req!(shared[Files, Dispatch])),
@@ -231,6 +234,22 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("oba_set_auto_update", req!(owner[Install])),
     ("oba_relink_dependents", req!(owner[Install])),
     ("oba_unlink_one", req!(owner[Install])),
+    // WP-18b part c: the git / npx installers and updaters. Install into the
+    // signed-in account's own store (`store_root()` under the account's HOME
+    // in its child) by spawning git / npx as that account, so they are
+    // owner-class like `claude_store_import`: a share member reaches the
+    // Owner's child but must never add or replace anything in the Owner's
+    // Ngwa vault, nor make the Owner's host fetch from the network. The dry-run
+    // resolve and the update check write nothing, but they spawn and fetch, so
+    // they sit in the same class rather than `shared[Files]`.
+    ("oba_install_git", req!(owner[Install])),
+    ("oba_install_npx", req!(owner[Install])),
+    ("oba_install_bundle", req!(owner[Install])),
+    ("oba_install_with_deps", req!(owner[Install])),
+    ("oba_update", req!(owner[Install])),
+    ("oba_auto_update_all", req!(owner[Install])),
+    ("oba_resolve_source", req!(owner[Install])),
+    ("oba_check_update", req!(owner[Install])),
     // ── Ngwa snapshot: reads the Owner's personal `~/.claude` scan (as
     // `claude_config_load` does), so owner-class like it ──
     ("ngwa_snapshot", req!(owner[Files])),
@@ -308,6 +327,10 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("permission_decide", req!(shared[Approve])),
     ("notifications_record_access", req!(internal)),
     ("share_project_info", req!(internal)),
+    // Admin Server card. `access` class: the T1 broker serves it itself
+    // (`access::is_broker_arm`) and `server::host_health::authorize` is the
+    // admin rule (T1 admin / T0 owner, admin strength, never a share).
+    ("server_health", req!(access)),
     // WP-P9: the broker's cross-principal open-terminal count.
     ("server_open_terminals", req!(internal)),
     ("permission_relay_put", req!(operator)),

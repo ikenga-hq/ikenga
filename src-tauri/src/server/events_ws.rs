@@ -62,8 +62,18 @@ use crate::access::{AccessCtx, DaemonAccess};
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum EventsControlMessage {
-    Subscribe { events: Vec<String> },
-    Unsubscribe { events: Vec<String> },
+    Subscribe {
+        events: Vec<String>,
+    },
+    Unsubscribe {
+        events: Vec<String>,
+    },
+    /// A viewer's round-trip probe (the Health page's connection indicator):
+    /// answered at once with `{type:"pong", id}`. Costs one tiny frame each
+    /// way on a socket that is open anyway.
+    Ping {
+        id: u64,
+    },
 }
 
 /// The topics `ctx` may receive: produced, and its caps meet the gate.
@@ -216,6 +226,9 @@ fn handle_control(raw: &str, subscribed: &mut HashSet<Topic>) -> Option<Message>
             }
             None
         }
+        Ok(EventsControlMessage::Ping { id }) => Some(Message::Text(
+            json!({ "type": "pong", "id": id }).to_string(),
+        )),
         Err(e) => {
             debug!("[events_ws] undecodable control frame: {e}");
             Some(error_frame(&format!("bad events control frame: {e}")))
@@ -240,6 +253,22 @@ mod tests {
             admin_strength: false,
             meta: RequestMeta::default(),
         }
+    }
+
+    #[test]
+    fn ping_is_answered_with_a_pong_carrying_its_id() {
+        let mut subs = HashSet::new();
+        let reply = handle_control(r#"{"type":"ping","id":42}"#, &mut subs).expect("a pong");
+        let Message::Text(text) = reply else {
+            panic!("pong must be a text frame");
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v, json!({ "type": "pong", "id": 42 }));
+        assert!(subs.is_empty(), "a ping subscribes to nothing");
+        // A malformed ping is the existing error frame, not a silent drop.
+        let bad = handle_control(r#"{"type":"ping"}"#, &mut subs).expect("an error frame");
+        let Message::Text(text) = bad else { panic!() };
+        assert!(text.contains("\"type\":\"error\""));
     }
 
     #[test]
