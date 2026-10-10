@@ -25,6 +25,7 @@ use tower::util::ServiceExt;
 use tower_http::services::ServeFile;
 
 use super::AppState;
+use crate::viewer_guard::{self, MountScope};
 
 /// Iyke iframe bridge, bundled from `src/lib/iyke/iframe-bridge.entry.ts`.
 const IYKE_BRIDGE_JS: &str = include_str!("../../resources/iyke-iframe-bridge.js");
@@ -66,6 +67,8 @@ pub const VIEWER_PATH_PREFIX: &str = "/__viewer";
 #[derive(Clone, Debug)]
 pub struct ViewerMount {
     pub root: PathBuf,
+    /// What the mount may serve under `root` (see [`viewer_guard`]).
+    pub scope: MountScope,
 }
 
 /// A mount idle for this long is dropped (its URL stops working). Every served
@@ -78,6 +81,7 @@ const MAX_MOUNTS: usize = 256;
 
 struct MountEntry {
     root: PathBuf,
+    scope: MountScope,
     last_used: Instant,
 }
 
@@ -115,7 +119,12 @@ impl ViewerService {
     /// the broker can route sub-resource requests to the principal's own
     /// child; the broker never launches a child for it (a mount lives in the
     /// child's memory, so no running child means no valid mount).
-    pub fn register(&self, root: PathBuf, principal_id: Option<uuid::Uuid>) -> (String, String) {
+    pub fn register(
+        &self,
+        root: PathBuf,
+        scope: MountScope,
+        principal_id: Option<uuid::Uuid>,
+    ) -> (String, String) {
         self.sweep();
         let token = match principal_id {
             Some(pid) => format!("{}_{}", pid.simple(), random_token_hex(24)),
@@ -125,6 +134,7 @@ impl ViewerService {
             token.clone(),
             MountEntry {
                 root: root.clone(),
+                scope,
                 last_used: Instant::now(),
             },
         );
@@ -187,6 +197,7 @@ impl ViewerService {
                 m.last_used = Instant::now();
                 return Some(ViewerMount {
                     root: m.root.clone(),
+                    scope: m.scope.clone(),
                 });
             }
         };
@@ -204,84 +215,14 @@ pub fn random_token_hex(n_bytes: usize) -> String {
     hex::encode(buf)
 }
 
-/// Why `viewer_serve` refused a root. Names neither the project root nor any
-/// path it was not handed: the caller already knows what it asked for.
-pub const ROOT_ABOVE_PROJECT: &str =
-    "preview root is above the project root; refusing to widen the viewer mount beyond it";
-
-/// The deepest project root (from the daemon's own `projects` table) that
-/// contains `file`, or `None` when the file belongs to no project.
-///
-/// A root that is, or contains, `home` is skipped: a project registered at the
-/// whole home directory bounds nothing, so a file under it falls back to the
-/// next project, or to its own directory. The default project has no root.
-pub(crate) fn project_root_of(
-    file: &Path,
-    project_roots: &[PathBuf],
-    home: Option<&Path>,
-) -> Option<PathBuf> {
-    project_roots
-        .iter()
-        .filter(|r| r.parent().is_some()) // `/` is not a project
-        .filter(|r| home.is_none_or(|h| !h.starts_with(r)))
-        .filter(|r| file.starts_with(r))
-        .max_by_key(|r| r.components().count())
-        .cloned()
-}
-
-/// Whether a viewer mount rooted at `root` may serve the page `file`
-/// (both canonical). The root must contain the file, and may reach no higher
-/// than the file's project root, or, for a file in no project, its own
-/// directory. A root above that bound is refused, never silently clamped.
-///
-/// This is the only thing keeping an `<img src="../../../.ssh/id_rsa">` in a
-/// hostile page from widening the mount to the whole home (the widened root
-/// is computed client-side from the page's own markup).
-pub(crate) fn check_root(
-    root: &Path,
-    file: &Path,
-    project_roots: &[PathBuf],
-    home: Option<&Path>,
-) -> Result<(), String> {
-    if !file.starts_with(root) {
-        return Err("preview root does not contain the file".to_string());
-    }
-    let bound = match project_root_of(file, project_roots, home) {
-        Some(p) => p,
-        None => file
-            .parent()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| "preview file has no directory".to_string())?,
-    };
-    if root.starts_with(&bound) {
-        Ok(())
-    } else {
-        Err(ROOT_ABOVE_PROJECT.to_string())
-    }
-}
-
 /// Canonical roots of the active projects in this daemon's `ikenga.db`. Under
 /// T1 that is the calling principal's own child database; under a share the
-/// Owner's. Unreadable rows (missing directory, no root) are skipped, which
-/// can only shrink the set of project roots and so only tighten the bound.
+/// Owner's.
 pub(crate) async fn project_roots(state: &AppState) -> Vec<PathBuf> {
-    let Some(db) = state.pa_db.as_ref() else {
-        return Vec::new();
-    };
-    let Ok(pool) = db.ensure_reader_pool().await else {
-        return Vec::new();
-    };
-    let rows: Vec<(Option<String>,)> =
-        sqlx::query_as("SELECT root_path FROM projects WHERE archived_at IS NULL")
-            .fetch_all(&pool)
-            .await
-            .unwrap_or_default();
-    rows.into_iter()
-        .filter_map(|(r,)| r)
-        .filter(|r| !r.trim().is_empty())
-        .filter_map(|r| Path::new(&r).canonicalize().ok())
-        .filter(|r| r.is_dir())
-        .collect()
+    match state.pa_db.as_ref() {
+        Some(db) => viewer_guard::project_roots(db).await,
+        None => Vec::new(),
+    }
 }
 
 /// Safely join `root` and `rel`, rejecting traversal segments (`..`), root prefixes,
@@ -395,7 +336,7 @@ pub async fn serve_viewer_handler(
     let Some(mount) = state.viewer.get_mount(&token) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    serve_mount_file(&state, &mount.root, &path, req).await
+    serve_mount_file(&state, &mount, &path, req).await
 }
 
 pub async fn serve_viewer_root_handler(
@@ -406,7 +347,7 @@ pub async fn serve_viewer_root_handler(
     let Some(mount) = state.viewer.get_mount(&token) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    serve_mount_file(&state, &mount.root, "index.html", req).await
+    serve_mount_file(&state, &mount, "index.html", req).await
 }
 
 /// A plain refusal. The body never names a path or a reason: whoever holds a
@@ -457,10 +398,11 @@ fn host_is_csp_safe(host: &str) -> bool {
 
 async fn serve_mount_file(
     state: &AppState,
-    root: &PathBuf,
+    mount: &ViewerMount,
     rel_path: &str,
     mut req: Request<Body>,
 ) -> Response {
+    let root = &mount.root;
     if req.method() == Method::OPTIONS {
         return Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -487,6 +429,12 @@ async fn serve_mount_file(
     let Some(mut target) = safe_join(root, rel_path) else {
         return refuse(StatusCode::NOT_FOUND);
     };
+    // Credential paths and, for a single-file mount, every path but the
+    // previewed file (directories included): a plain 404, before the directory
+    // redirect below could confirm that a directory exists.
+    if !viewer_guard::may_serve(&mount.scope, &target) {
+        return refuse(StatusCode::NOT_FOUND);
+    }
     if target.is_dir() {
         // `sub` -> `sub/`, keeping the `/__viewer/<token>` prefix, so relative
         // assets of `sub/index.html` resolve against the directory.
@@ -507,6 +455,9 @@ async fn serve_mount_file(
         let Some(idx) = safe_join(root, &index) else {
             return refuse(StatusCode::NOT_FOUND);
         };
+        if !viewer_guard::may_serve(&mount.scope, &idx) {
+            return refuse(StatusCode::NOT_FOUND);
+        }
         target = idx;
     }
     if !target.is_file() {
@@ -1087,36 +1038,196 @@ mod tests {
         assert!(!v["ok"].as_bool().unwrap_or(true), "{v}");
     }
 
+    /// The reviewer's finding: a page straight in the home directory (in no
+    /// project) is bounded by its own directory, which is the home. The mount
+    /// is single-file: the page itself loads, nothing else does, in any spelling.
+    #[tokio::test]
+    async fn a_page_in_the_home_dir_gets_a_single_file_mount() {
+        let f = fixture_with(true, Some("home"));
+        let home = f.root.join("home");
+        let ssh = home.join(".ssh");
+        fs::create_dir_all(&ssh).unwrap();
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::write(ssh.join("id_rsa"), "FAKE-PRIVATE-KEY").unwrap();
+        fs::write(home.join(".claude/.credentials.json"), "FAKE-CLAUDE-TOKEN").unwrap();
+        fs::write(home.join("notes.txt"), "private notes").unwrap();
+        let page = home.join("evil.html");
+        fs::write(&page, "<p>evil</p>").unwrap();
+
+        // The preview still works: the client's root for this page is `~`.
+        let token = f.mount_for(&home, &page).await;
+        let (st, _, body) = f
+            .get("GET", &format!("/__viewer/{token}/evil.html"), &[])
+            .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&body).contains("<p>evil</p>"));
+
+        // Nothing else under the mount, in any spelling, is served.
+        for uri in [
+            ".ssh/id_rsa",
+            "%2essh/id_rsa",
+            ".ssh%2fid_rsa",
+            "./.ssh/id_rsa",
+            "sub/../.ssh/id_rsa",
+            ".claude/.credentials.json",
+            "notes.txt",
+            "evil.html/../notes.txt",
+            "",
+            "index.html",
+            ".ssh",
+            ".ssh/",
+        ] {
+            let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/{uri}"), &[]).await;
+            assert_ne!(st, StatusCode::OK, "{uri:?}");
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                !body.contains("FAKE-") && !body.contains("private notes"),
+                "{uri:?}: {body}"
+            );
+        }
+        for uri in [
+            ".ssh/id_rsa",
+            "notes.txt",
+            ".ssh",
+            ".ssh/",
+            ".claude/.credentials.json",
+        ] {
+            let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/{uri}"), &[]).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{uri:?}");
+            assert_eq!(body, b"not found");
+        }
+
+        // The root is not widened above the page's own directory.
+        let v = f.serve(&f.root, &page).await;
+        assert!(!v["ok"].as_bool().unwrap_or(true), "{v}");
+
+        // A project rooted at the home dir bounds nothing: same single-file mount.
+        f.add_project("everything", &home).await;
+        let token = f.mount_for(&home, &page).await;
+        let (st, _, _) = f
+            .get("GET", &format!("/__viewer/{token}/evil.html"), &[])
+            .await;
+        assert_eq!(st, StatusCode::OK);
+        for uri in [".ssh/id_rsa", "notes.txt"] {
+            let (st, _, _) = f.get("GET", &format!("/__viewer/{token}/{uri}"), &[]).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{uri}");
+        }
+
+        // So does a page in a subdirectory of a home-wide project: it is bounded by
+        // its own directory (a tree), not by the home.
+        let sub = home.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("a.html"), "<p>a</p>").unwrap();
+        fs::write(sub.join("a.css"), "b{}").unwrap();
+        let token = f.mount_for(&sub, &sub.join("a.html")).await;
+        let (st, _, _) = f.get("GET", &format!("/__viewer/{token}/a.css"), &[]).await;
+        assert_eq!(st, StatusCode::OK);
+        let v = f.serve(&home, &sub.join("a.html")).await;
+        assert!(!v["ok"].as_bool().unwrap_or(true), "{v}");
+    }
+
+    /// Credential paths are 404 inside an otherwise valid project mount, and a
+    /// symlink to one gets the same answer.
+    #[tokio::test]
+    async fn credential_paths_are_not_served_inside_a_project_mount() {
+        let f = fixture_with(true, Some("home"));
+        let proj = f.root.join("home/proj");
+        fs::create_dir_all(proj.join(".ssh")).unwrap();
+        fs::create_dir_all(proj.join("sub/.claude")).unwrap();
+        fs::create_dir_all(proj.join("keys")).unwrap();
+        fs::write(proj.join("index.html"), "<p>ok</p>").unwrap();
+        fs::write(proj.join("app.js"), "1").unwrap();
+        fs::write(proj.join(".env"), "SECRET=1").unwrap();
+        fs::write(proj.join(".env.local"), "SECRET=2").unwrap();
+        fs::write(proj.join(".ssh/x"), "SECRET").unwrap();
+        fs::write(proj.join("sub/.claude/y"), "SECRET").unwrap();
+        fs::write(proj.join("keys/id_ed25519"), "SECRET").unwrap();
+        fs::write(proj.join("keys/id_rsa"), "SECRET").unwrap();
+        fs::create_dir_all(proj.join(".config")).unwrap();
+        fs::write(proj.join(".config/z"), "SECRET").unwrap();
+        fs::write(proj.join(".netrc"), "SECRET").unwrap();
+        fs::write(proj.join(".git-credentials"), "SECRET").unwrap();
+        for d in [".aws", ".gnupg", ".docker", ".kube"] {
+            fs::create_dir_all(proj.join(d)).unwrap();
+            fs::write(proj.join(d).join("c"), "SECRET").unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(proj.join(".env"), proj.join("innocent.txt")).unwrap();
+        f.add_project("p", &proj).await;
+        let token = f.mount_for(&proj, &proj.join("index.html")).await;
+
+        for ok in ["index.html", "app.js", ""] {
+            let (st, _, _) = f.get("GET", &format!("/__viewer/{token}/{ok}"), &[]).await;
+            assert_eq!(st, StatusCode::OK, "{ok}");
+        }
+        for uri in [
+            ".env",
+            ".env.local",
+            ".ssh/x",
+            ".ssh",
+            ".ssh/",
+            "sub/.claude/y",
+            "sub/.claude",
+            "keys/id_ed25519",
+            "keys/id_rsa",
+            ".config/z",
+            ".netrc",
+            ".git-credentials",
+            ".aws/c",
+            ".gnupg/c",
+            ".docker/c",
+            ".kube/c",
+            "%2eenv",
+            ".ENV",
+            "sub/../.env",
+            "innocent.txt",
+        ] {
+            let (st, _, body) = f.get("GET", &format!("/__viewer/{token}/{uri}"), &[]).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(body, b"not found", "{uri}");
+        }
+        // A missing file answers identically (no existence oracle).
+        let (st, _, body) = f
+            .get("GET", &format!("/__viewer/{token}/.env.nope"), &[])
+            .await;
+        assert_eq!((st, &body[..]), (StatusCode::NOT_FOUND, &b"not found"[..]));
+    }
+
+    /// The previewed file may itself be a credential file reached through a
+    /// symlink named innocently: still a 404.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_page_into_credentials_is_not_served() {
+        let f = fixture_with(true, Some("home"));
+        let home = f.root.join("home");
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        fs::write(home.join(".ssh/id_rsa"), "FAKE-PRIVATE-KEY").unwrap();
+        std::os::unix::fs::symlink(home.join(".ssh/id_rsa"), home.join("page.html")).unwrap();
+        // The canonical file is `~/.ssh/id_rsa`: bound is `~/.ssh`, a tree, but sensitive.
+        let page = home.join("page.html").canonicalize().unwrap();
+        let v = f.serve(&page.parent().unwrap().to_path_buf(), &page).await;
+        if v["ok"].as_bool().unwrap_or(false) {
+            let token = v["data"]["token"].as_str().unwrap();
+            let (st, _, body) = f
+                .get("GET", &format!("/__viewer/{token}/id_rsa"), &[])
+                .await;
+            assert_eq!(st, StatusCode::NOT_FOUND);
+            assert!(!String::from_utf8_lossy(&body).contains("FAKE-"));
+        }
+    }
+
     #[test]
-    fn check_root_unit() {
-        let p = |s: &str| PathBuf::from(s);
-        let projects = vec![p("/h/proj"), p("/h/proj/inner"), p("/h")];
-        let home = p("/h");
-        // `/h` is the home: ignored. The deepest remaining project bounds.
-        assert_eq!(
-            project_root_of(Path::new("/h/proj/inner/x/a.html"), &projects, Some(&home)),
-            Some(p("/h/proj/inner"))
+    fn mount_scope_is_kept_per_token() {
+        let svc = ViewerService::new();
+        let only = PathBuf::from("/h/u/a.html");
+        let (_, t) = svc.register(
+            PathBuf::from("/h/u"),
+            MountScope::SingleFile(only.clone()),
+            None,
         );
-        assert_eq!(
-            project_root_of(Path::new("/h/other/a.html"), &projects, Some(&home)),
-            None
-        );
-        let ok = |root: &str, file: &str| {
-            check_root(Path::new(root), Path::new(file), &projects, Some(&home))
-        };
-        assert!(ok("/h/proj", "/h/proj/a/b.html").is_ok());
-        assert!(ok("/h/proj/a", "/h/proj/a/b.html").is_ok());
-        assert!(ok("/h", "/h/proj/a/b.html").is_err());
-        assert!(ok("/h/proj/inner", "/h/proj/inner/b.html").is_ok());
-        // Nested project: the deepest one bounds, so `/h/proj` is too high.
-        assert!(ok("/h/proj", "/h/proj/inner/b.html").is_err());
-        // No project: own directory only.
-        assert!(ok("/h/other", "/h/other/a.html").is_ok());
-        assert!(ok("/h", "/h/other/a.html").is_err());
-        // The root must contain the file.
-        assert!(ok("/h/proj/a", "/h/proj/b/c.html").is_err());
-        // `/` is never a project.
-        assert!(check_root(Path::new("/"), Path::new("/x/a.html"), &[p("/")], None).is_err());
+        let m = svc.get_mount(&t).unwrap();
+        assert_eq!(m.scope, MountScope::SingleFile(only));
+        assert_eq!(m.root, PathBuf::from("/h/u"));
     }
 
     /// A mount of an allowlisted parent that contains the daemon's data dir
@@ -1354,7 +1465,7 @@ mod tests {
     #[test]
     fn mounts_expire_when_idle_and_are_capped() {
         let svc = ViewerService::with_ttl(Duration::from_millis(40));
-        let (_, t) = svc.register(PathBuf::from("/tmp"), None);
+        let (_, t) = svc.register(PathBuf::from("/tmp"), MountScope::Tree, None);
         assert!(svc.has_token(&t) && svc.get_mount(&t).is_some());
         std::thread::sleep(Duration::from_millis(80));
         assert!(!svc.has_token(&t), "idle mount survived its ttl");
@@ -1362,7 +1473,7 @@ mod tests {
 
         // Use refreshes the clock.
         let svc = ViewerService::with_ttl(Duration::from_millis(120));
-        let (_, t) = svc.register(PathBuf::from("/tmp"), None);
+        let (_, t) = svc.register(PathBuf::from("/tmp"), MountScope::Tree, None);
         for _ in 0..4 {
             std::thread::sleep(Duration::from_millis(50));
             assert!(svc.get_mount(&t).is_some());
@@ -1370,9 +1481,9 @@ mod tests {
 
         // Cap: the least recently used mount is evicted first.
         let svc = ViewerService::new();
-        let (_, first) = svc.register(PathBuf::from("/tmp"), None);
+        let (_, first) = svc.register(PathBuf::from("/tmp"), MountScope::Tree, None);
         for _ in 0..MAX_MOUNTS {
-            svc.register(PathBuf::from("/tmp"), None);
+            svc.register(PathBuf::from("/tmp"), MountScope::Tree, None);
         }
         assert!(!svc.has_token(&first));
         assert!(svc.mounts.len() <= MAX_MOUNTS);
@@ -1382,7 +1493,7 @@ mod tests {
     fn token_carries_principal_prefix_in_simple_form() {
         let pid = uuid::Uuid::now_v7();
         let svc = ViewerService::new();
-        let (url, token) = svc.register(PathBuf::from("/tmp"), Some(pid));
+        let (url, token) = svc.register(PathBuf::from("/tmp"), MountScope::Tree, Some(pid));
         assert!(token.starts_with(&format!("{}_", pid.simple())));
         assert_eq!(url, format!("/__viewer/{token}/"));
     }

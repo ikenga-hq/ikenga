@@ -299,8 +299,10 @@ pub(super) async fn fs_rename(state: &AppState, args: &Value) -> RpcResponse {
 /// influenced: a hostile page in a shared project could otherwise widen its
 /// mount to the whole home and `fetch()` credentials out of it. The daemon
 /// therefore decides how high the root may go from its own project registry
-/// (`viewer::check_root`): no higher than the file's project root, or for a
-/// file in no project its own directory. Above that is an error, not a clamp.
+/// (`viewer_guard::resolve_mount`): no higher than the file's project root, or
+/// for a file in no project its own directory. Above that is an error, not a
+/// clamp. A bound that is the home directory or above makes the mount
+/// single-file: only the previewed page is served.
 pub(super) async fn viewer_serve(
     state: &AppState,
     args: &Value,
@@ -322,15 +324,23 @@ pub(super) async fn viewer_serve(
         }
         let projects = super::viewer::project_roots(state).await;
         let home = state.home.as_ref().and_then(|h| h.canonicalize().ok());
-        if let Err(e) = super::viewer::check_root(&canonical, &file, &projects, home.as_deref()) {
-            tracing::warn!(
-                "viewer_serve: refused root {} for {}: {e}",
-                canonical.display(),
-                file.display()
-            );
-            return Err(e);
-        }
-        let (url, token) = state.viewer.register(canonical, principal_id);
+        let scope = match crate::viewer_guard::resolve_mount(
+            &canonical,
+            &file,
+            &projects,
+            home.as_deref(),
+        ) {
+            Ok(scope) => scope,
+            Err(e) => {
+                tracing::warn!(
+                    "viewer_serve: refused root {} for {}: {e}",
+                    canonical.display(),
+                    file.display()
+                );
+                return Err(e);
+            }
+        };
+        let (url, token) = state.viewer.register(canonical, scope, principal_id);
         Ok(serde_json::json!({
             "url": url,
             "token": token,

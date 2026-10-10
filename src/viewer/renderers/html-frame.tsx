@@ -6,7 +6,6 @@ import {
 	fsUnwatch,
 	fsWatch,
 	viewerPort,
-	viewerServe,
 	isRemoteWebSession,
 	viewerStop,
 	type ViewerHandle,
@@ -24,7 +23,7 @@ import {
 import { useEffectiveMenu } from '@/lib/actions/store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { resolveMenuItems } from '@/shell/menu/resolve';
-import { resolveViewerRoot } from '../lib/viewer-root';
+import { mountViewerRoot } from '../lib/viewer-root';
 import { PinComposer, type PickResult } from '@/shell/artifact-studio/pin-composer';
 import * as M from '@/lib/artifact/bridge-messages';
 import { wrapHostMessage } from '@/lib/artifact/bridge-messages';
@@ -88,15 +87,9 @@ function LocalHtmlFrame({ path, paneId }: HtmlFrameProps) {
 		fsRead(path)
 			.then(async (res) => {
 				const html = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(res.bytes));
-				const { root, file } = await resolveViewerRoot(path, html);
-				if (isRemoteWebSession()) {
-					return viewerServe(root, path).then((h) => ({ h, file, port: null }));
-				}
-				return Promise.all([viewerServe(root, path), viewerPort()]).then(([h, port]) => ({
-					h,
-					file,
-					port,
-				}));
+				const { handle: h, file } = await mountViewerRoot(path, html);
+				const port = isRemoteWebSession() ? null : await viewerPort();
+				return { h, file, port };
 			})
 			.then(({ h, file, port }) => {
 				handle = h;
