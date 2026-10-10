@@ -863,6 +863,7 @@ pub async fn rpc_handler(
         "atelier_file_read" => rpc_files::atelier_file_read(&state, &payload.args),
         "atelier_file_write" => rpc_files::atelier_file_write(&state, &payload.args),
         "action_git_branch" => rpc_files::action_git_branch(&state, &payload.args).await,
+        "git_status" => rpc_files::git_status(&state, &payload.args).await,
 
         // --- Pin screenshots, agent-config scaffold, pkg manifest / workspace
         //     / scaffold helpers (WP-19 slice 8) ---

@@ -661,6 +661,15 @@ async fn prehook_inner(
             }
         }
         "project_get_active" => return project_row(state, &share.project_id).await,
+        "git_status" => {
+            if let Some(pid) = str_arg(args, &["projectId", "project_id"]) {
+                if pid != share.project_id.as_str() {
+                    return Err(forbidden(
+                        "a shared project request must name the shared project (projectId)",
+                    ));
+                }
+            }
+        }
         "claude_read_jsonl" => transcript_check(state, args, &target).await?,
         "comment_create" => return comment_create(state, ctx, share, args, &target).await,
         "comment_set_status" | "comment_delete" | "comment_record_routing" => {

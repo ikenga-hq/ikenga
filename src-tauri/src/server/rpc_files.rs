@@ -574,6 +574,68 @@ pub(super) async fn action_git_branch(state: &AppState, args: &Value) -> RpcResp
     respond("action_git_branch", r)
 }
 
+/// Read-only, project-confined `git_status` (WP-G): branch name, ahead/behind,
+/// and per-file status for the title-row branch chip and explorer badges.
+///
+/// Refuses paths outside the fs allowlist / project root with an error.
+/// If `root` is not a git repository, returns `null` (None).
+pub(super) async fn git_status(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let root_arg: Option<String> = targ(args, &["root", "repo", "path"]).ok();
+        let project_id_arg: Option<String> = targ(args, &["projectId", "project_id"]).ok();
+
+        let root_str = match (root_arg, project_id_arg) {
+            (Some(r), _) => r,
+            (None, Some(pid)) => {
+                let pool = state
+                    .pa_db
+                    .as_ref()
+                    .ok_or(super::rpc::NO_DB)?
+                    .ensure_pool()
+                    .await?;
+                let resolved: Option<String> =
+                    sqlx::query_scalar("SELECT root_path FROM projects WHERE id = ?")
+                        .bind(&pid)
+                        .fetch_optional(&pool)
+                        .await
+                        .map_err(|e| format!("db query project: {e}"))?;
+                resolved.ok_or_else(|| format!("project `{pid}` not found"))?
+            }
+            (None, None) => return Err("`root` is required".to_string()),
+        };
+
+        fs_boundary(state)?;
+        let root = PathBuf::from(&root_str);
+        if !root.is_absolute() {
+            return Err("`root` must be an absolute path".to_string());
+        }
+        if root
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("`root` may not contain `..`".to_string());
+        }
+
+        let canonical_root = state.path_guard.resolve_deep(&root_str)?;
+        if !canonical_root.is_dir() {
+            return Err(format!("`{}` is not a directory", canonical_root.display()));
+        }
+
+        let guard = state.path_guard.clone();
+        let paths = match git::prepare_git_paths(canonical_root.clone(), move |p: &Path| {
+            guard.check(p).is_ok()
+        })
+        .await?
+        {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        git::run_hardened_git_status(&canonical_root, paths).await
+    }
+    .await;
+    respond("git_status", r)
+}
+
 // ─── pkg manifests + scaffold (WP-19 slice 8) ────────────────────────────────
 //
 // None of these needs the live pkg kernel: a preview parses one manifest, the
@@ -2780,6 +2842,838 @@ mod tests {
                 ok(&r, "action_git_branch", json!({ "root": s(&wt) })).await,
                 Value::Null
             );
+        }
+
+        // ── git_status (WP-G) ───────────────────────────────────────────────
+
+        #[tokio::test]
+        async fn git_status_refuses_roots_the_guard_refuses() {
+            let d = daemon();
+            let r = &d.router;
+            let mut roots = vec![
+                s(&d.outside),
+                s(&d.outside.join("repo")),
+                format!("{}/..", s(&d.allowed)),
+                "relative".to_string(),
+            ];
+            #[cfg(unix)]
+            {
+                symlink(&d.outside, &d.allowed.join("link_status"));
+                roots.push(s(&d.allowed.join("link_status")));
+            }
+            for root in roots {
+                let e = err(r, "git_status", json!({ "root": root })).await;
+                assert!(e.starts_with("git_status: "), "{root}: {e}");
+            }
+            let e = err(r, "git_status", json!({})).await;
+            assert!(e.contains("`root` is required"), "{e}");
+        }
+
+        #[tokio::test]
+        async fn git_status_not_a_repo_returns_null() {
+            let d = daemon();
+            let r = &d.router;
+            let non_repo = d.allowed.join("not-a-repo");
+            std::fs::create_dir_all(&non_repo).unwrap();
+            let got = ok(r, "git_status", json!({ "root": s(&non_repo) })).await;
+            assert_eq!(got, Value::Null);
+        }
+
+        /// Run `git` in `dir` with the user's config out of the picture.
+        fn git_in(dir: &Path, args: &[&str]) -> std::process::Output {
+            std::process::Command::new("git")
+                .args(["-c", "user.name=T", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap()
+        }
+
+        /// A script that records that it ran (and passes stdin through, so a
+        /// `clean` filter does not fail the status by itself).
+        #[cfg(unix)]
+        fn marker_script(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+            use std::os::unix::fs::PermissionsExt;
+            let marker = dir.join(format!("{name}.marker"));
+            let script = dir.join(format!("{name}.sh"));
+            std::fs::write(
+                &script,
+                format!("#!/bin/sh\necho ran >> \"{}\"\ncat\n", marker.display()),
+            )
+            .unwrap();
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+            (script, marker)
+        }
+
+        /// A repo whose own config and tracked `.gitattributes` try every way
+        /// of making `git status` run code: fsmonitor, hooksPath, `clean` /
+        /// `smudge` / `process` filters (one defined through an `include`), a
+        /// textconv / external diff, a pager, an ssh command and a
+        /// `core.worktree` pointing outside the repo. Tracked files are
+        /// stat-dirty, so git really does need to run the filters.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn git_status_malicious_repo_config_never_executes_scripts() {
+            let d = daemon();
+            let r = &d.router;
+            let scripts = d.allowed.join("scripts");
+            std::fs::create_dir_all(&scripts).unwrap();
+            let repo = d.allowed.join("evil-repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            assert!(git_in(&repo, &["init", "-q"]).status.success());
+
+            let names = [
+                "fsmonitor",
+                "hook",
+                "clean",
+                "smudge",
+                "process",
+                "inc",
+                "textconv",
+                "extdiff",
+                "pager",
+                "ssh",
+            ];
+            let mut markers = std::collections::HashMap::new();
+            let mut scr = std::collections::HashMap::new();
+            for n in names {
+                let (s_, m_) = marker_script(&scripts, n);
+                scr.insert(n, s_);
+                markers.insert(n, m_);
+            }
+            let outside_wt = d.allowed.join("worktree-elsewhere");
+            std::fs::create_dir_all(&outside_wt).unwrap();
+            std::fs::write(outside_wt.join("leak.txt"), "x").unwrap();
+
+            // Commit first (clean config), then arm the config and dirty the stats.
+            std::fs::write(
+                repo.join(".gitattributes"),
+                "a.txt filter=evil diff=evil\nb.txt filter=inc\nc.txt filter=proc\n",
+            )
+            .unwrap();
+            for f in ["a.txt", "b.txt", "c.txt"] {
+                std::fs::write(repo.join(f), "hello\n").unwrap();
+            }
+            assert!(git_in(&repo, &["add", "-A"]).status.success());
+            assert!(git_in(&repo, &["commit", "-qm", "init"]).status.success());
+
+            let sc = |n: &str| scr[n].display().to_string();
+            std::fs::write(
+                repo.join(".git/included.cfg"),
+                format!(
+                    "[filter \"inc\"]\n\tclean = {}\n\tsmudge = {}\n",
+                    sc("inc"),
+                    sc("inc")
+                ),
+            )
+            .unwrap();
+            let mut cfg = std::fs::read_to_string(repo.join(".git/config")).unwrap();
+            cfg.push_str(&format!(
+                "[core]\n\tfsmonitor = {fsm}\n\thooksPath = {hk}\n\tpager = {pg}\n\tsshCommand = {ssh}\n\tworktree = {wt}\n\
+                 [filter \"evil\"]\n\tclean = {cl}\n\tsmudge = {sm}\n\trequired = true\n\
+                 [filter \"proc\"]\n\tprocess = {pr}\n\
+                 [diff \"evil\"]\n\ttextconv = {tc}\n\tcommand = {xd}\n\
+                 [diff]\n\texternal = {xd}\n\
+                 [include]\n\tpath = included.cfg\n",
+                fsm = sc("fsmonitor"),
+                hk = scripts.display(),
+                pg = sc("pager"),
+                ssh = sc("ssh"),
+                wt = outside_wt.display(),
+                cl = sc("clean"),
+                sm = sc("smudge"),
+                pr = sc("process"),
+                tc = sc("textconv"),
+                xd = sc("extdiff"),
+            ));
+            std::fs::write(repo.join(".git/config"), cfg).unwrap();
+            // core.worktree moved the work tree; the checks below use the real one.
+            let touch = |repo: &Path| {
+                for f in ["a.txt", "b.txt", "c.txt"] {
+                    let p = repo.join(f);
+                    let t = std::fs::read(&p).unwrap();
+                    std::fs::write(&p, t).unwrap();
+                }
+            };
+
+            // Guard against a vacuous test: with this config, plain git DOES run
+            // the fsmonitor and the filters. (Worktree pinned like the arm does.)
+            let plain = |repo: &Path| {
+                touch(repo);
+                std::process::Command::new("git")
+                    .args(["status", "--porcelain"])
+                    .current_dir(repo)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_DIR", repo.join(".git"))
+                    .env("GIT_WORK_TREE", repo)
+                    .output()
+                    .unwrap();
+            };
+            plain(&repo);
+            for n in ["fsmonitor", "clean", "inc"] {
+                assert!(
+                    markers[n].exists(),
+                    "test setup is vacuous: plain git did not run the `{n}` script"
+                );
+            }
+            for m in markers.values() {
+                let _ = std::fs::remove_file(m);
+            }
+
+            touch(&repo);
+            let got = ok(r, "git_status", json!({ "root": s(&repo) })).await;
+            assert!(got.is_object(), "expected a status object, got: {got:?}");
+            for (n, m) in &markers {
+                assert!(!m.exists(), "the `{n}` script was executed by git_status");
+            }
+            // `core.worktree` did not move the work tree outside the repo.
+            let leaked = got.to_string().contains("leak.txt");
+            assert!(!leaked, "work tree escaped the root: {got}");
+        }
+
+        /// Filter drivers declared in every odd way the config can: through an
+        /// include, odd-case / dotted / spaced names, `process`, attributes in
+        /// `.git/info/attributes`, in a linked worktree's common config. None
+        /// may run, and no enumeration of the config exists to be raced.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn git_status_filter_forms_never_execute() {
+            let d = daemon();
+            let r = &d.router;
+            let scripts = d.allowed.join("scripts2");
+            std::fs::create_dir_all(&scripts).unwrap();
+            let repo = d.allowed.join("evil-filters");
+            std::fs::create_dir_all(&repo).unwrap();
+            assert!(git_in(&repo, &["init", "-q"]).status.success());
+            let names = ["upper", "dotted", "spaced", "lfs", "info", "worktreecfg"];
+            let mut markers = Vec::new();
+            let mut scr = std::collections::HashMap::new();
+            for n in names {
+                let (s_, m_) = marker_script(&scripts, n);
+                scr.insert(n, s_);
+                markers.push((n, m_));
+            }
+            let sc = |n: &str| scr[n].display().to_string();
+            std::fs::write(
+                repo.join(".gitattributes"),
+                "u.txt filter=UPPER\nd.txt filter=a.b.c\ns.txt filter=\"e v\"\nl.txt filter=lfs\n",
+            )
+            .unwrap();
+            for f in ["u.txt", "d.txt", "s.txt", "l.txt", "i.txt", "w.txt"] {
+                std::fs::write(repo.join(f), "hello\n").unwrap();
+            }
+            assert!(git_in(&repo, &["add", "-A"]).status.success());
+            assert!(git_in(&repo, &["commit", "-qm", "init"]).status.success());
+            std::fs::write(
+                repo.join(".git/info/attributes"),
+                "i.txt filter=info\nw.txt filter=worktreecfg\n",
+            )
+            .unwrap();
+            std::fs::write(
+                repo.join(".git/more.cfg"),
+                format!(
+                    "[FILTER \"UPPER\"]\n\tClean = {u}\n[filter \"a.b.c\"]\n\tclean = {d}\n\
+                     [Filter \"e v\"]\n\tprocess = {s}\n[filter \"lfs\"]\n\tclean = {l}\n\tprocess = {l}\n\trequired = true\n",
+                    u = sc("upper"),
+                    d = sc("dotted"),
+                    s = sc("spaced"),
+                    l = sc("lfs"),
+                ),
+            )
+            .unwrap();
+            let mut cfg = std::fs::read_to_string(repo.join(".git/config")).unwrap();
+            cfg.push_str(&format!(
+                "[include]\n\tpath = more.cfg\n[includeIf \"gitdir:**\"]\n\tpath = more.cfg\n\
+                 [filter \"info\"]\n\tclean = {i}\n[filter \"worktreecfg\"]\n\tclean = {w}\n",
+                i = sc("info"),
+                w = sc("worktreecfg"),
+            ));
+            std::fs::write(repo.join(".git/config"), cfg).unwrap();
+            for f in ["u.txt", "d.txt", "s.txt", "l.txt", "i.txt", "w.txt"] {
+                let p = repo.join(f);
+                let t = std::fs::read(&p).unwrap();
+                std::fs::write(&p, t).unwrap();
+            }
+            // Vacuous-test guard: plain git does run at least the info filter.
+            std::process::Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&repo)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                markers.iter().any(|(_, m)| m.exists()),
+                "test setup is vacuous: plain git ran no filter"
+            );
+            for (_, m) in &markers {
+                let _ = std::fs::remove_file(m);
+            }
+            for f in ["u.txt", "d.txt", "s.txt", "l.txt", "i.txt", "w.txt"] {
+                let p = repo.join(f);
+                let t = std::fs::read(&p).unwrap();
+                std::fs::write(&p, t).unwrap();
+            }
+            // Call it repeatedly while the config flips: nothing may ever run.
+            for round in 0..6 {
+                if round % 2 == 1 {
+                    let mut c = std::fs::read_to_string(repo.join(".git/config")).unwrap();
+                    c.push_str("\n[filter \"late\"]\n\tclean = /bin/false\n");
+                    std::fs::write(repo.join(".git/config"), c).unwrap();
+                }
+                let got = ok(r, "git_status", json!({ "root": s(&repo) })).await;
+                assert!(got.is_object(), "{got:?}");
+                for (n, m) in &markers {
+                    assert!(!m.exists(), "filter `{n}` ran (round {round})");
+                }
+            }
+        }
+
+        /// The sandbox config keeps what status needs: upstream tracking
+        /// (ahead/behind) and the linked-worktree layout (`commondir`).
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn git_status_keeps_upstream_and_linked_worktrees() {
+            let d = daemon();
+            let r = &d.router;
+            let origin = d.allowed.join("up-origin");
+            let repo = d.allowed.join("up-clone");
+            std::fs::create_dir_all(&origin).unwrap();
+            assert!(git_in(&origin, &["init", "-q", "-b", "main"])
+                .status
+                .success());
+            std::fs::write(origin.join("a.txt"), "a\n").unwrap();
+            assert!(git_in(&origin, &["add", "-A"]).status.success());
+            assert!(git_in(&origin, &["commit", "-qm", "one"]).status.success());
+            assert!(std::process::Command::new("git")
+                .args(["clone", "-q", &s(&origin), &s(&repo)])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap()
+                .status
+                .success());
+            std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+            assert!(git_in(&repo, &["add", "-A"]).status.success());
+            assert!(git_in(&repo, &["commit", "-qm", "two"]).status.success());
+            let got = ok(r, "git_status", json!({ "root": s(&repo) })).await;
+            assert_eq!(got["branch"], "main", "{got}");
+            assert_eq!(got["ahead"], 1, "{got}");
+            assert_eq!(got["behind"], 0, "{got}");
+
+            let wt = d.allowed.join("up-wt");
+            assert!(
+                git_in(&repo, &["worktree", "add", "-q", "-b", "side", &s(&wt)])
+                    .status
+                    .success()
+            );
+            std::fs::write(wt.join("loose.txt"), "x").unwrap();
+            let got = ok(r, "git_status", json!({ "root": s(&wt) })).await;
+            assert_eq!(got["branch"], "side", "{got}");
+            assert!(
+                got["untracked"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|f| f["path"] == "loose.txt"),
+                "{got}"
+            );
+        }
+
+        #[tokio::test]
+        async fn git_status_never_reads_a_repo_above_the_root() {
+            let d = daemon();
+            let r = &d.router;
+            let outer = d.allowed.join("outer");
+            let inner = outer.join("inner");
+            std::fs::create_dir_all(&inner).unwrap();
+            assert!(git_in(&outer, &["init", "-q"]).status.success());
+            std::fs::write(outer.join("private-outside-inner.txt"), "x").unwrap();
+            std::fs::write(inner.join("inside.txt"), "x").unwrap();
+            // `inner` is not a repo of its own: reads as "not a repository".
+            let got = ok(r, "git_status", json!({ "root": s(&inner) })).await;
+            assert_eq!(got, Value::Null, "{got}");
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn git_status_refuses_a_symlinked_dot_git() {
+            let d = daemon();
+            let r = &d.router;
+            let other = d.allowed.join("other-repo");
+            let proj = d.allowed.join("proj");
+            std::fs::create_dir_all(&other).unwrap();
+            std::fs::create_dir_all(&proj).unwrap();
+            assert!(git_in(&other, &["init", "-q"]).status.success());
+            symlink(&other.join(".git"), &proj.join(".git"));
+            let e = err(r, "git_status", json!({ "root": s(&proj) })).await;
+            assert!(e.contains("symlink"), "{e}");
+        }
+
+        /// Commit one file in a fresh repo at `dir` (branch `main`).
+        fn init_repo(dir: &Path, files: &[(&str, &str)]) {
+            std::fs::create_dir_all(dir).unwrap();
+            assert!(git_in(dir, &["init", "-q", "-b", "main"]).status.success());
+            for (f, body) in files {
+                if let Some(parent) = Path::new(f).parent() {
+                    std::fs::create_dir_all(dir.join(parent)).unwrap();
+                }
+                std::fs::write(dir.join(f), body).unwrap();
+            }
+            assert!(git_in(dir, &["add", "-A"]).status.success());
+            assert!(git_in(dir, &["commit", "-qm", "init"]).status.success());
+        }
+
+        #[cfg(unix)]
+        fn mkfifo(p: &Path) {
+            use std::os::unix::ffi::OsStrExt as _;
+            let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        }
+
+        /// Minimal SHA-1, to re-seal a hand-patched index (git checks its
+        /// trailing checksum).
+        fn sha1(data: &[u8]) -> [u8; 20] {
+            let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+            let mut msg = data.to_vec();
+            msg.push(0x80);
+            while msg.len() % 64 != 56 {
+                msg.push(0);
+            }
+            msg.extend_from_slice(&((data.len() as u64) * 8).to_be_bytes());
+            for chunk in msg.chunks(64) {
+                let mut w = [0u32; 80];
+                for i in 0..16 {
+                    w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
+                }
+                for i in 16..80 {
+                    w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+                }
+                let [mut a, mut b, mut c, mut d, mut e] = h;
+                for (i, wi) in w.iter().enumerate() {
+                    let (f, k) = match i {
+                        0..=19 => ((b & c) | (!b & d), 0x5A827999),
+                        20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                        40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                        _ => (b ^ c ^ d, 0xCA62C1D6u32),
+                    };
+                    let t = a
+                        .rotate_left(5)
+                        .wrapping_add(f)
+                        .wrapping_add(e)
+                        .wrapping_add(k)
+                        .wrapping_add(*wi);
+                    e = d;
+                    d = c;
+                    c = b.rotate_left(30);
+                    b = a;
+                    a = t;
+                }
+                h[0] = h[0].wrapping_add(a);
+                h[1] = h[1].wrapping_add(b);
+                h[2] = h[2].wrapping_add(c);
+                h[3] = h[3].wrapping_add(d);
+                h[4] = h[4].wrapping_add(e);
+            }
+            let mut out = [0u8; 20];
+            for (i, v) in h.iter().enumerate() {
+                out[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
+            }
+            out
+        }
+
+        #[test]
+        fn sha1_helper_matches_known_vector() {
+            assert_eq!(
+                hex::encode(sha1(b"abc")),
+                "a9993e364706816aba3e25717850c26c9cd0d89d"
+            );
+        }
+
+        /// ROUND-3 #1: `objects/info/alternates` made git read any object
+        /// store the serving principal could read. A repo that names one is
+        /// refused with a reason; the outside names never come back.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn git_status_refuses_alternates_and_leaks_no_outside_names() {
+            let d = daemon();
+            let r = &d.router;
+            let secret = d.outside.join("secret-repo");
+            init_repo(
+                &secret,
+                &[("PRIVATE-ROADMAP.md", "x"), ("hr/SALARIES-2026.xlsx", "y")],
+            );
+            let oid = String::from_utf8(git_in(&secret, &["rev-parse", "HEAD"]).stdout).unwrap();
+            let repo = d.allowed.join("alt-repo");
+            init_repo(&repo, &[("a.txt", "a")]);
+            std::fs::write(
+                repo.join(".git/objects/info/alternates"),
+                format!("{}\n", secret.join(".git/objects").display()),
+            )
+            .unwrap();
+            std::fs::write(repo.join(".git/HEAD"), oid).unwrap();
+            let e = err(r, "git_status", json!({ "root": s(&repo) })).await;
+            assert!(e.contains("alternate"), "{e}");
+            assert!(
+                !e.contains("PRIVATE-ROADMAP") && !e.contains("SALARIES"),
+                "{e}"
+            );
+            // A comment-only / empty alternates file names no store: still served.
+            std::fs::write(repo.join(".git/objects/info/alternates"), "# none\n\n").unwrap();
+            std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+            let got = ok(r, "git_status", json!({ "root": s(&repo) })).await;
+            assert_eq!(got["branch"], "main", "{got}");
+        }
+
+        /// ROUND-3 #1: a symlink under `refs/` or `objects/` points git at
+        /// data outside the allowlist.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn git_status_refuses_symlinks_under_refs_and_objects() {
+            let d = daemon();
+            let r = &d.router;
+            let out_ref = d.outside.join("ref-file");
+            std::fs::write(&out_ref, "0123456789012345678901234567890123456789\n").unwrap();
+            let out_dir = d.outside.join("some-dir");
+            std::fs::create_dir_all(&out_dir).unwrap();
+
+            let repo = d.allowed.join("sym-refs");
+            init_repo(&repo, &[("a.txt", "a")]);
+            std::fs::remove_file(repo.join(".git/refs/heads/main")).unwrap();
+            symlink(&out_ref, &repo.join(".git/refs/heads/main"));
+            let e = err(r, "git_status", json!({ "root": s(&repo) })).await;
+            assert!(e.contains("symlink"), "{e}");
+
+            let repo = d.allowed.join("sym-pack");
+            init_repo(&repo, &[("a.txt", "a")]);
+            assert!(git_in(&repo, &["gc", "-q"]).status.success());
+            let pack = std::fs::read_dir(repo.join(".git/objects/pack"))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| p.extension().is_some_and(|x| x == "pack"))
+                .unwrap();
+            let moved = d.outside.join("moved.pack");
+            std::fs::rename(&pack, &moved).unwrap();
+            symlink(&moved, &pack);
+            let e = err(r, "git_status", json!({ "root": s(&repo) })).await;
+            assert!(e.contains("symlink"), "{e}");
+
+            let repo = d.allowed.join("sym-fanout");
+            init_repo(&repo, &[("a.txt", "a")]);
+            let fan = std::fs::read_dir(repo.join(".git/objects"))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| p.is_dir() && p.file_name().unwrap().len() == 2)
+                .unwrap();
+            std::fs::remove_dir_all(&fan).unwrap();
+            symlink(&out_dir, &fan);
+            let e = err(r, "git_status", json!({ "root": s(&repo) })).await;
+            assert!(e.contains("symlink"), "{e}");
+        }
+
+        /// ROUND-3 #2: a FIFO where a repo file should be hung every route of
+        /// the daemon (a blocking `read` on an async worker). Now each is a
+        /// prompt error, and an unrelated request still answers meanwhile.
+        #[cfg(unix)]
+        #[test]
+        fn git_status_fifo_files_do_not_hang_the_daemon() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let res = rt.block_on(async {
+                    let d = daemon();
+                    let good = d.allowed.join("good");
+                    init_repo(&good, &[("a.txt", "a")]);
+                    // HEAD, commondir and the `.git` file itself as FIFOs.
+                    let head = d.allowed.join("fifo-head");
+                    init_repo(&head, &[("a.txt", "a")]);
+                    std::fs::remove_file(head.join(".git/HEAD")).unwrap();
+                    mkfifo(&head.join(".git/HEAD"));
+                    let com = d.allowed.join("fifo-commondir");
+                    init_repo(&com, &[("a.txt", "a")]);
+                    mkfifo(&com.join(".git/commondir"));
+                    let dot = d.allowed.join("fifo-dotgit");
+                    std::fs::create_dir_all(&dot).unwrap();
+                    mkfifo(&dot.join(".git"));
+                    let mut tasks = Vec::new();
+                    for root in [&head, &com, &dot] {
+                        for _ in 0..4 {
+                            let router = d.router.clone();
+                            let root = s(root);
+                            tasks.push(tokio::spawn(async move {
+                                rpc(&router, "git_status", json!({ "root": root })).await
+                            }));
+                        }
+                    }
+                    let unrelated = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        rpc(&d.router, "git_status", json!({ "root": s(&good) })),
+                    )
+                    .await
+                    .expect("an unrelated request must still be answered");
+                    assert_eq!(unrelated["ok"], true, "{unrelated}");
+                    for t in tasks {
+                        let v = tokio::time::timeout(std::time::Duration::from_secs(10), t)
+                            .await
+                            .expect("a FIFO repo file must fail promptly")
+                            .unwrap();
+                        assert_eq!(v["ok"], false, "{v}");
+                    }
+                });
+                let _ = tx.send(res);
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(60))
+                .expect("git_status hung on a FIFO repo file");
+        }
+
+        /// ROUND-3 #3: an index entry `../x` made git `lstat` outside the
+        /// root and the arm echo the path back (an existence oracle).
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn git_status_refuses_an_index_naming_paths_outside_the_root() {
+            let d = daemon();
+            let r = &d.router;
+            let repo = d.allowed.join("idx-escape");
+            init_repo(&repo, &[("a.txt", "a")]);
+            std::fs::write(d.outside.join("exists.txt"), "x").unwrap();
+            let p = repo.join(".git/index");
+            let mut b = std::fs::read(&p).unwrap();
+            b.truncate(b.len() - 20);
+            let at = b.windows(5).position(|w| w == b"a.txt").unwrap();
+            b[at..at + 5].copy_from_slice(b"../.x");
+            let sum = sha1(&b);
+            b.extend_from_slice(&sum);
+            std::fs::write(&p, b).unwrap();
+            let e = err(r, "git_status", json!({ "root": s(&repo) })).await;
+            assert!(
+                e.contains("the index names a path outside the project"),
+                "the pre-scan must be what fires: {e}"
+            );
+            assert!(!e.contains("exists.txt"), "{e}");
+        }
+
+        /// ROUND-4: git calls an entry "racily clean" when its mtime is not
+        /// older than the INDEX FILE's. The sandbox copy of the index used to be
+        /// stamped "now", so a same-size rewrite made in the same second as the
+        /// last index write read as clean (no badge, a lower modified count).
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn git_status_sees_a_same_second_same_size_rewrite() {
+            use std::os::unix::fs::MetadataExt as _;
+            let d = daemon();
+            let r = &d.router;
+            let mut hit = false;
+            for i in 0..30 {
+                let repo = d.allowed.join(format!("racy{i}"));
+                init_repo(&repo, &[("notes.md", "aaaa")]);
+                std::fs::write(repo.join("notes.md"), "bbbb").unwrap();
+                let idx = std::fs::metadata(repo.join(".git/index")).unwrap().mtime();
+                let wt = std::fs::metadata(repo.join("notes.md")).unwrap().mtime();
+                if idx != wt {
+                    continue; // second boundary crossed: not the racy case
+                }
+                hit = true;
+                // Let the sandbox copy be made well after the index write.
+                tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+                let got = ok(r, "git_status", json!({ "root": s(&repo) })).await;
+                assert!(got["unstaged"].to_string().contains("notes.md"), "{got}");
+                break;
+            }
+            assert!(hit, "setup never produced a same-second rewrite");
+        }
+
+        /// ROUND-4: a FIFO under refs/ is refused up front, not waited on.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn git_status_refuses_a_fifo_under_refs_promptly() {
+            let d = daemon();
+            let r = &d.router;
+            let repo = d.allowed.join("frefs");
+            init_repo(&repo, &[("a.txt", "a")]);
+            std::fs::remove_file(repo.join(".git/refs/heads/main")).unwrap();
+            mkfifo(&repo.join(".git/refs/heads/main"));
+            let started = std::time::Instant::now();
+            let e = err(r, "git_status", json!({ "root": s(&repo) })).await;
+            assert!(started.elapsed() < std::time::Duration::from_secs(3), "{e}");
+            assert!(e.contains("not a regular file"), "{e}");
+        }
+
+        /// ROUND-3 #4: split-index and shallow repositories are ordinary and
+        /// were answered with `null` ("not a repository") because the sandbox
+        /// lacked `sharedindex.*` / `shallow`. Index v4 and sha256 too.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn git_status_serves_split_index_shallow_v4_and_sha256_repos() {
+            let d = daemon();
+            let r = &d.router;
+
+            let split = d.allowed.join("split");
+            init_repo(&split, &[("a.txt", "a"), ("b.txt", "b")]);
+            assert!(git_in(&split, &["update-index", "--split-index"])
+                .status
+                .success());
+            std::fs::write(split.join("a.txt"), "changed").unwrap();
+            assert!(git_in(&split, &["add", "b.txt"]).status.success());
+            std::fs::write(split.join("new.txt"), "n").unwrap();
+            let has_shared = std::fs::read_dir(split.join(".git")).unwrap().any(|e| {
+                e.unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("sharedindex.")
+            });
+            assert!(has_shared, "setup: no shared index was written");
+            let got = ok(r, "git_status", json!({ "root": s(&split) })).await;
+            assert_eq!(got["branch"], "main", "{got}");
+            assert!(got["unstaged"].to_string().contains("a.txt"), "{got}");
+            assert!(got["untracked"].to_string().contains("new.txt"), "{got}");
+
+            let origin = d.allowed.join("sh-origin");
+            init_repo(&origin, &[("a.txt", "1")]);
+            std::fs::write(origin.join("a.txt"), "2").unwrap();
+            assert!(git_in(&origin, &["commit", "-qam", "two"]).status.success());
+            let shallow = d.allowed.join("shallow");
+            assert!(std::process::Command::new("git")
+                .args([
+                    "clone",
+                    "-q",
+                    "--depth",
+                    "1",
+                    &format!("file://{}", s(&origin)),
+                    &s(&shallow)
+                ])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap()
+                .status
+                .success());
+            assert!(shallow.join(".git/shallow").exists(), "setup: not shallow");
+            std::fs::write(shallow.join("loose.txt"), "x").unwrap();
+            let got = ok(r, "git_status", json!({ "root": s(&shallow) })).await;
+            assert_eq!(got["branch"], "main", "{got}");
+            assert!(got["untracked"].to_string().contains("loose.txt"), "{got}");
+
+            let v4 = d.allowed.join("v4");
+            init_repo(
+                &v4,
+                &[
+                    ("dir/one.txt", "1"),
+                    ("dir/two.txt", "2"),
+                    ("dir/sub/three.txt", "3"),
+                ],
+            );
+            assert!(git_in(&v4, &["update-index", "--index-version", "4"])
+                .status
+                .success());
+            std::fs::write(v4.join("dir/sub/three.txt"), "changed").unwrap();
+            let got = ok(r, "git_status", json!({ "root": s(&v4) })).await;
+            assert!(
+                got["unstaged"].to_string().contains("dir/sub/three.txt"),
+                "{got}"
+            );
+
+            let sha256 = d.allowed.join("sha256");
+            std::fs::create_dir_all(&sha256).unwrap();
+            if git_in(
+                &sha256,
+                &["init", "-q", "-b", "main", "--object-format=sha256"],
+            )
+            .status
+            .success()
+            {
+                std::fs::write(sha256.join("a.txt"), "a").unwrap();
+                assert!(git_in(&sha256, &["add", "-A"]).status.success());
+                assert!(git_in(&sha256, &["commit", "-qm", "i"]).status.success());
+                std::fs::write(sha256.join("a.txt"), "changed").unwrap();
+                let got = ok(r, "git_status", json!({ "root": s(&sha256) })).await;
+                assert!(got["unstaged"].to_string().contains("a.txt"), "{got}");
+            }
+        }
+
+        #[tokio::test]
+        async fn git_status_returns_matching_shape_for_valid_repo() {
+            let d = daemon();
+            let r = &d.router;
+            let repo = d.allowed.join("valid-repo");
+            std::fs::create_dir_all(&repo).unwrap();
+
+            assert!(std::process::Command::new("git")
+                .arg("init")
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success());
+
+            std::fs::write(repo.join("tracked.txt"), "initial\n").unwrap();
+            assert!(std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "add",
+                    "tracked.txt"
+                ])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success());
+            assert!(std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "init"
+                ])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success());
+
+            std::fs::write(repo.join("tracked.txt"), "modified\n").unwrap();
+            std::fs::write(repo.join("untracked.txt"), "untracked\n").unwrap();
+            std::fs::write(repo.join("staged.txt"), "staged\n").unwrap();
+            assert!(std::process::Command::new("git")
+                .args(["add", "staged.txt"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success());
+
+            let got = ok(r, "git_status", json!({ "root": s(&repo) })).await;
+            assert!(got.is_object());
+            assert!(got["branch"].is_string());
+            assert_eq!(got["detached"], false);
+            assert_eq!(got["modified"], 3);
+            assert!(got["staged"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["path"] == "staged.txt"));
+            assert!(got["unstaged"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["path"] == "tracked.txt"));
+            assert!(got["untracked"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["path"] == "untracked.txt"));
         }
     }
 }

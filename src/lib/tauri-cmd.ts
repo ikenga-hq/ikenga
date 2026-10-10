@@ -4049,6 +4049,27 @@ export async function pkgSidecarCall(
 	});
 }
 
+export interface GitStatusResult {
+	branch?: string | null;
+	headSha?: string | null;
+	detached: boolean;
+	ahead: number;
+	behind: number;
+	staged: Array<{ path: string }>;
+	unstaged: Array<{ path: string }>;
+	untracked: Array<{ path: string }>;
+	conflicted: Array<{ path: string }>;
+	modified: number;
+}
+
+export async function gitStatus(opts: {
+	root?: string;
+	repo?: string;
+	projectId?: string;
+}): Promise<GitStatusResult | null> {
+	return invoke<GitStatusResult | null>('git_status', opts);
+}
+
 // ─── Streaming sidecar RPC ───────────────────────────────────────────────────
 //
 // Companion to `pkgSidecarCall` (one-shot) for long-lived sidecars that

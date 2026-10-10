@@ -121,6 +121,7 @@ export const RPC_REQUIREMENTS: Readonly<Record<string, ArmRequirement>> = {
 	fs_search: { caps: ['files'], class: 'shared' },
 	fs_trash: { caps: ['files', 'dispatch'], class: 'shared' },
 	fs_write: { caps: ['files', 'dispatch'], class: 'shared' },
+	git_status: { caps: ['files'], class: 'shared' },
 	keybindings_write: { caps: ['settings'], class: 'shared' },
 	list_agent_projects: { caps: ['files'], class: 'owner' },
 	list_all_skill_actions: { caps: ['files'], class: 'shared' },

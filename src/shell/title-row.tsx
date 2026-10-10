@@ -31,7 +31,7 @@ import { cn } from '@/components/ui/utils';
 import { labelFor } from '@/lib/keymap/registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { useShellStore } from '@/lib/shell/shell-store';
-import { pkgSidecarCall, type Project } from '@/lib/tauri-cmd';
+import { gitStatus, isRemoteWebSession, pkgSidecarCall, type Project } from '@/lib/tauri-cmd';
 import { todayLocalDate } from '@/shell/home/daily-address';
 import { NativeMenuCascade } from './menu/cascade';
 
@@ -102,6 +102,21 @@ export function useGitRepoSummary() {
 		enabled: !!rootPath,
 		queryFn: async () => {
 			if (!rootPath) return null;
+			if (isRemoteWebSession()) {
+				try {
+					const res = await gitStatus({ root: rootPath, projectId: activeProjectId ?? undefined });
+					if (!res) return null;
+					const branch = res.branch ?? (res.headSha ? res.headSha.slice(0, 7) : null);
+					if (!branch) return null;
+					return {
+						branch,
+						detached: res.detached,
+						modified: res.modified,
+					};
+				} catch {
+					return null;
+				}
+			}
 			const stdin = JSON.stringify({
 				jsonrpc: '2.0',
 				id: 1,

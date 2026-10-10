@@ -68,6 +68,7 @@ const DAEMON_ONLY_VERBS: &[&str] = &[
     "access_push_unsubscribe",
     "access_push_update",
     "fs_home",
+    "git_status",
     "notifications_record_access",
     "permission_relay_put",
     "permission_relay_resolve",
