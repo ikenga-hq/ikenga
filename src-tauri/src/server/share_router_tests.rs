@@ -177,7 +177,11 @@ fn has_cost_key(v: &Value) -> bool {
 fn read_text(resp: &Value) -> String {
     let bytes: Vec<u8> = resp["data"]["bytes"]
         .as_array()
-        .map(|a| a.iter().filter_map(|b| b.as_u64().map(|b| b as u8)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|b| b.as_u64().map(|b| b as u8))
+                .collect()
+        })
         .unwrap_or_default();
     String::from_utf8_lossy(&bytes).into_owned()
 }
@@ -236,6 +240,66 @@ async fn the_share_prehook_end_to_end() {
         operator["data"].as_array().map(Vec::len),
         "only cost fields go, never the events"
     );
+}
+
+/// A member previews a page in the shared project. The mount is confined to
+/// the share: the project root (and below) works, anything above it, though
+/// the Owner's own allowlist admits it, is refused, and so is a page outside
+/// the share.
+#[tokio::test]
+async fn a_share_member_cannot_widen_a_viewer_root_past_the_shared_project() {
+    let c = child().await;
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    let page = c.project.join("docs/brief.md");
+    let work = c.project.parent().unwrap().to_path_buf();
+
+    let ok = call(
+        &c,
+        Some("operator"),
+        "viewer_serve",
+        json!({ "rootDir": s(&c.project), "filePath": s(&page) }),
+    )
+    .await;
+    assert_eq!(ok["ok"], true, "{ok}");
+    let below = call(
+        &c,
+        Some("operator"),
+        "viewer_serve",
+        json!({ "rootDir": s(&c.project.join("docs")), "filePath": s(&page) }),
+    )
+    .await;
+    assert_eq!(below["ok"], true, "{below}");
+
+    // Above the project: the Owner may mount `work`, a member may not.
+    let owner = call(
+        &c,
+        None,
+        "viewer_serve",
+        json!({ "rootDir": s(&work), "filePath": s(&page) }),
+    )
+    .await;
+    assert_eq!(
+        owner["ok"], false,
+        "{owner}: the project bound applies to the Owner too"
+    );
+    let widened = call(
+        &c,
+        Some("operator"),
+        "viewer_serve",
+        json!({ "rootDir": s(&work), "filePath": s(&page) }),
+    )
+    .await;
+    assert_eq!(widened["ok"], false, "{widened}");
+
+    // A page outside the share, with its own directory as the root.
+    let outside = call(
+        &c,
+        Some("operator"),
+        "viewer_serve",
+        json!({ "rootDir": s(&work), "filePath": s(&c.outside) }),
+    )
+    .await;
+    assert_eq!(outside["ok"], false, "{outside}");
 }
 
 /// The same relay with an explicit caps header.
