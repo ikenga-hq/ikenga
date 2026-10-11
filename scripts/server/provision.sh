@@ -555,7 +555,14 @@ install_deps() {
     case "$lib" in
       bun|node22) ;;                       # handled above
       ffmpeg|git-lfs|jq|ripgrep|sqlite3|build-essential|python3|python3-pip) apt_install "$lib" ;;
-      *) die "unknown LIB '$lib' (allowed: bun node22 ffmpeg git-lfs jq ripgrep sqlite3 build-essential python3 python3-pip)" ;;
+      gh)
+        # GitHub CLI from GitHub's own apt repository, key pinned. Each account
+        # signs in for itself (`gh auth login` in its own terminal); the box
+        # holds no GitHub token for anyone.
+        backup_apt_repo githubcli "$GH_CLI_KEY_URL" "$GH_CLI_KEY_FPRS" \
+          "deb [arch=$(dpkg --print-architecture) signed-by={KEYRING}] https://cli.github.com/packages stable main"
+        apt_install gh ;;
+      *) die "unknown LIB '$lib' (allowed: bun node22 ffmpeg gh git-lfs jq ripgrep sqlite3 build-essential python3 python3-pip)" ;;
     esac
   done
   local cli
@@ -2491,6 +2498,9 @@ PGDG_KEY_URL="https://www.postgresql.org/media/keys/ACCC4CF8.asc"
 # it against Google's install docs, then add it to BACKUP_GCLOUD_KEY_FPRS.
 GCLOUD_KEY_FPR="35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3"
 GCLOUD_KEY_URL="https://packages.cloud.google.com/apt/doc/apt-key.gpg"
+# GitHub CLI apt signing keys (the published keyring carries both).
+GH_CLI_KEY_FPRS="2C6106201985B60E6C7AC87323F3D4EA75716059 7F38BBB59D064DBCB3D84D725612B36462313325"
+GH_CLI_KEY_URL="https://cli.github.com/packages/githubcli-archive-keyring.gpg"
 
 declare -A BK_CAL=([4hourly]="*-*-* 00/4:00:00 UTC" [6hourly]="*-*-* 00/6:00:00 UTC" [12hourly]="*-*-* 00/12:00:00 UTC"
                    [daily]="*-*-* 02:00:00 UTC" [weekly]="Sun *-*-* 03:00:00 UTC" [monthly]="*-*-01 04:00:00 UTC")
