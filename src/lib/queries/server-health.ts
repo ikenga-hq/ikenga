@@ -28,12 +28,16 @@ export async function fetchServerHealth(): Promise<ServerHealth | null> {
 	return h;
 }
 
-export function useServerHealth() {
+/** The status-bar chip polls slower than the card; with both mounted
+ *  TanStack uses the shortest interval of the observers on the shared key. */
+export const SERVER_HEALTH_CHIP_POLL_MS = 60_000;
+
+export function useServerHealth(opts: { pollMs?: number } = {}) {
 	return useQuery({
 		queryKey: queryKeys.serverHealth.snapshot(),
 		queryFn: fetchServerHealth,
 		enabled: mayAskForServerHealth(),
-		refetchInterval: SERVER_HEALTH_POLL_MS,
+		refetchInterval: opts.pollMs ?? SERVER_HEALTH_POLL_MS,
 		refetchIntervalInBackground: false,
 		refetchOnWindowFocus: true,
 		retry: false,

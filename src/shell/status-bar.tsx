@@ -68,6 +68,11 @@ import {
 	connectionTitle,
 	hasConnectionReading,
 } from './connection/connection-segment';
+import {
+	SERVER_HEALTH_ROUTE,
+	ServerHealthChipBody,
+	useServerHealthChip,
+} from './server-health/health-chip';
 import type { StatuslineSnapshot } from '@/terminal/cost-hud';
 import { openCommandPalette } from './command-palette';
 import { useCompanionStore } from './companion/companion-store';
@@ -234,6 +239,8 @@ export function StatusBar() {
 	// Browser tabs only (empty on the desktop): this viewer's round trip to the server.
 	const rtt = useConnectionRtt();
 	const showConnection = hasConnectionReading(rtt);
+	// Admins in a browser tab only (null otherwise): a one-glance server verdict.
+	const serverChip = useServerHealthChip();
 
 	const installed = pkgs.installed.length;
 	const updates = pkgs.updates.length;
@@ -279,6 +286,7 @@ export function StatusBar() {
 		git && git.modified > 0 && 'modified',
 		...ngwaSegments.map((seg) => seg.id),
 		// WP-40b's bell leads the right-hand cluster and joins the roving set.
+		serverChip && 'server-health',
 		showConnection && 'connection',
 		'notifications',
 		approvals > 0 && 'permissions',
@@ -391,6 +399,17 @@ export function StatusBar() {
 
 			{/* ── right ── */}
 			<span className="ml-auto flex items-center gap-1">
+				{serverChip && (
+					<SegButton
+						id="server-health"
+						rovingId={rovingId}
+						onClick={() => navigateFocused(SERVER_HEALTH_ROUTE)}
+						label={serverChip.aria}
+						title={serverChip.tooltip}
+					>
+						<ServerHealthChipBody chip={serverChip} />
+					</SegButton>
+				)}
 				{showConnection && (
 					<SegButton
 						id="connection"
