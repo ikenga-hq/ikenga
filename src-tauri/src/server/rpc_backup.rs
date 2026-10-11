@@ -62,7 +62,35 @@ fn resolve_confined_path(
                 if raw.contains("..") {
                     return Err(format!("path `{raw}` contains invalid directory traversal"));
                 }
-                Ok(base.join(raw))
+                let target = base.join(raw);
+                let canon_base = base
+                    .canonicalize()
+                    .map_err(|e| format!("canon base {}: {e}", base.display()))?;
+                let canon_target = if target.exists() {
+                    target
+                        .canonicalize()
+                        .map_err(|e| format!("canonicalize target: {e}"))?
+                } else if let Some(parent) = target.parent() {
+                    if parent.exists() {
+                        let canon_parent = parent
+                            .canonicalize()
+                            .map_err(|e| format!("canonicalize parent: {e}"))?;
+                        let fname = target
+                            .file_name()
+                            .ok_or_else(|| format!("invalid filename: {raw}"))?;
+                        canon_parent.join(fname)
+                    } else {
+                        target
+                    }
+                } else {
+                    target
+                };
+                if !canon_target.starts_with(&canon_base) {
+                    return Err(format!(
+                        "refusing unconfined relative path outside account {subdir} directory: {raw}"
+                    ));
+                }
+                Ok(canon_target)
             } else {
                 let canon_base = base
                     .canonicalize()
@@ -154,7 +182,16 @@ pub(super) async fn backup_import(state: &AppState, args: &Value) -> RpcResponse
                 if raw.contains("..") {
                     return Err(format!("path `{raw}` contains invalid directory traversal"));
                 }
-                data_dir.join(backups::BACKUPS_DIR).join(raw)
+                let base = data_dir.join(backups::BACKUPS_DIR);
+                let target = base.join(raw);
+                let canon = target
+                    .canonicalize()
+                    .map_err(|e| format!("source file not found or inaccessible: {e}"))?;
+                let canon_base = base.canonicalize().unwrap_or_else(|_| base.clone());
+                if !canon.starts_with(&canon_base) {
+                    return Err(format!("refusing unconfined source path: {raw}"));
+                }
+                canon
             } else {
                 // Must be confined to data_dir or allowed roots
                 let canon = p
@@ -221,7 +258,18 @@ pub(super) async fn db_import_ndjson(state: &AppState, args: &Value) -> RpcRespo
                     "path `{src_dir_raw}` contains invalid directory traversal"
                 ));
             }
-            data_dir.join(backups::EXPORTS_DIR).join(&src_dir_raw)
+            let base = data_dir.join(backups::EXPORTS_DIR);
+            let target = base.join(&src_dir_raw);
+            let canon = target
+                .canonicalize()
+                .map_err(|e| format!("source directory not found: {e}"))?;
+            let canon_base = base.canonicalize().unwrap_or_else(|_| base.clone());
+            if !canon.starts_with(&canon_base) {
+                return Err(format!(
+                    "refusing unconfined source directory: {src_dir_raw}"
+                ));
+            }
+            canon
         } else {
             let canon = p
                 .canonicalize()
@@ -432,7 +480,9 @@ mod tests {
 
     async fn ok(router: &axum::Router, cmd: &str, args: Value) -> Value {
         let res = rpc(router, cmd, args.clone()).await;
-        assert_eq!(res["ok"], true, "{cmd} {args} → {res}");
+        if res["ok"] != true {
+            panic!("FAILED {cmd} error: {:?}", res.get("error"));
+        }
         res.get("data").cloned().unwrap_or(Value::Null)
     }
 
@@ -617,6 +667,239 @@ mod tests {
         assert_eq!(
             count_after, 1,
             "project was restored into requesting account's db"
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_level_zip_bomb_with_lying_header_is_refused() {
+        let d = test_daemon();
+        let r = &d.router;
+
+        let bomb_zip = d.data.join("bomb_lying_header.ikbak");
+        let file = std::fs::File::create(&bomb_zip).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file::<_, ()>("manifest.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(
+            json!({
+                "format_version": 3, "schema_version": 7, "created_at": "2026-01-01T00:00:00Z",
+                "hostname": "h", "username": "u", "path_mode": "raw", "has_secrets": false, "pkg_count": 0
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+
+        // app.db with 105 MB of deflated zeroes
+        zip.start_file::<_, ()>(
+            "app.db",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated),
+        )
+        .unwrap();
+        let chunk = vec![0u8; 1024 * 1024];
+        for _ in 0..105 {
+            zip.write_all(&chunk).unwrap();
+        }
+        zip.finish().unwrap();
+
+        let mut bytes = std::fs::read(&bomb_zip).unwrap();
+        // Compressed zip of zeroes is small (< 500 KB)
+        assert!(bytes.len() < 500 * 1024, "compressed bomb is small");
+
+        // Forge a lying header: patch declared uncompressed size to 100 bytes
+        let magic_local = [0x50, 0x4b, 0x03, 0x04];
+        let magic_cd = [0x50, 0x4b, 0x01, 0x02];
+        for i in 0..bytes.len().saturating_sub(50) {
+            if &bytes[i..i + 4] == &magic_local {
+                let name_len = u16::from_le_bytes([bytes[i + 26], bytes[i + 27]]) as usize;
+                if i + 30 + name_len <= bytes.len()
+                    && &bytes[i + 30..i + 30 + name_len] == b"app.db"
+                {
+                    bytes[i + 22..i + 26].copy_from_slice(&100u32.to_le_bytes());
+                }
+            } else if &bytes[i..i + 4] == &magic_cd {
+                let name_len = u16::from_le_bytes([bytes[i + 28], bytes[i + 29]]) as usize;
+                if i + 46 + name_len <= bytes.len()
+                    && &bytes[i + 46..i + 46 + name_len] == b"app.db"
+                {
+                    bytes[i + 24..i + 28].copy_from_slice(&100u32.to_le_bytes());
+                }
+            }
+        }
+        std::fs::write(&bomb_zip, &bytes).unwrap();
+
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        let e = err(
+            r,
+            "backup_import",
+            json!({ "bytesBase64": b64, "dryRun": false }),
+        )
+        .await;
+        assert!(
+            e.contains("decompressed size exceeds maximum"),
+            "expected zip bomb refusal, got: {e}"
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_level_failed_restore_keeps_previous_db_and_rolls_back() {
+        let d = test_daemon();
+        let r = &d.router;
+
+        // Seed project row in live DB
+        let pool = d.db.ensure_pool().await.unwrap();
+        sqlx::query(
+            "INSERT INTO projects (id, display_name, root_path, position, is_default, created_at) \
+             VALUES ('proj_survives', 'Surviving Project', '/home/proj', 1, 0, 100)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Create a corrupted backup holding invalid _pa_migrations
+        let bad_zip = d.data.join("bad_migrations.ikbak");
+        let bad_db_file = d.data.join("bad_migrations.db");
+        {
+            let opts = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&bad_db_file)
+                .create_if_missing(true);
+            let bad_pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+            sqlx::query(
+                "CREATE TABLE _pa_migrations(nonsense TEXT);
+                 CREATE TABLE layout_state(id TEXT PRIMARY KEY, value TEXT);",
+            )
+            .execute(&bad_pool)
+            .await
+            .unwrap();
+            bad_pool.close().await;
+        }
+
+        let file = std::fs::File::create(&bad_zip).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file::<_, ()>("manifest.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(
+            json!({
+                "format_version": 3, "schema_version": 7, "created_at": "2026-01-01T00:00:00Z",
+                "hostname": "h", "username": "u", "path_mode": "raw", "has_secrets": false, "pkg_count": 0
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+
+        zip.start_file::<_, ()>("app.db", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let db_bytes = std::fs::read(&bad_db_file).unwrap();
+        zip.write_all(&db_bytes).unwrap();
+        zip.finish().unwrap();
+
+        let bytes = std::fs::read(&bad_zip).unwrap();
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        let e = err(
+            r,
+            "backup_import",
+            json!({ "bytesBase64": b64, "dryRun": false }),
+        )
+        .await;
+        assert!(
+            e.contains("missing `id` column") || e.contains("migrations"),
+            "expected error, got: {e}"
+        );
+
+        // Verify live DB was NOT destroyed: project row is still present!
+        let pool_after = d.db.ensure_pool().await.unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE id = 'proj_survives'")
+                .fetch_one(&pool_after)
+                .await
+                .unwrap();
+        assert_eq!(
+            count, 1,
+            "original project row was preserved after failed restore"
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_level_wrong_schema_junk_tables_is_refused() {
+        let d = test_daemon();
+        let r = &d.router;
+
+        // Seed project row in live DB
+        let pool = d.db.ensure_pool().await.unwrap();
+        sqlx::query(
+            "INSERT INTO projects (id, display_name, root_path, position, is_default, created_at) \
+             VALUES ('proj_survives_junk', 'Surviving Junk Project', '/home/proj', 1, 0, 100)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Create a backup with only junk(x) table, claiming schema 7
+        let junk_zip = d.data.join("junk_schema.ikbak");
+        let junk_db_file = d.data.join("junk.db");
+        {
+            let opts = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&junk_db_file)
+                .create_if_missing(true);
+            let junk_pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+            sqlx::query("CREATE TABLE junk(x TEXT);")
+                .execute(&junk_pool)
+                .await
+                .unwrap();
+            junk_pool.close().await;
+        }
+
+        let file = std::fs::File::create(&junk_zip).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file::<_, ()>("manifest.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(
+            json!({
+                "format_version": 3, "schema_version": 7, "created_at": "2026-01-01T00:00:00Z",
+                "hostname": "h", "username": "u", "path_mode": "raw", "has_secrets": false, "pkg_count": 0
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+
+        zip.start_file::<_, ()>("app.db", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let db_bytes = std::fs::read(&junk_db_file).unwrap();
+        zip.write_all(&db_bytes).unwrap();
+        zip.finish().unwrap();
+
+        let bytes = std::fs::read(&junk_zip).unwrap();
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        let e = err(
+            r,
+            "backup_import",
+            json!({ "bytesBase64": b64, "dryRun": false }),
+        )
+        .await;
+        assert!(
+            e.contains("missing required `_pa_migrations` table"),
+            "expected error, got: {e}"
+        );
+
+        // Verify live DB was NOT destroyed: project row is still present!
+        let pool_after = d.db.ensure_pool().await.unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE id = 'proj_survives_junk'")
+                .fetch_one(&pool_after)
+                .await
+                .unwrap();
+        assert_eq!(
+            count, 1,
+            "original project row was preserved after wrong-schema restore"
         );
     }
 }

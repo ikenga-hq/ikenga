@@ -191,6 +191,8 @@ pub fn router(
         .route("/api/rpc", post(proxy::rpc_proxy))
         .route("/ws/*rest", get(proxy::ws_proxy))
         .route("/pkgs/*rest", get(proxy::pkgs_proxy))
+        .route("/api/backup/export", get(proxy::backup_export_proxy))
+        .route("/api/backup/import", post(proxy::backup_import_proxy))
         .route("/auth/logout", post(auth_mod::routes::logout))
         .route("/auth/me", get(auth_mod::routes::me))
         .route("/auth/password", post(auth_mod::routes::change_password))

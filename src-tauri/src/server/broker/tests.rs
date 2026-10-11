@@ -91,7 +91,13 @@ impl ChildLauncher for FakeLauncher {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             let requests = Arc::new(Mutex::new(Vec::new()));
-            let (r1, r2, r3) = (requests.clone(), requests.clone(), requests.clone());
+            let (r1, r2, r3, r4, r5) = (
+                requests.clone(),
+                requests.clone(),
+                requests.clone(),
+                requests.clone(),
+                requests.clone(),
+            );
             let (open, open_delay) = (self.open_terminals.clone(), self.open_delay_ms.clone());
             let app = Router::new()
                 .route(
@@ -128,6 +134,14 @@ impl ChildLauncher for FakeLauncher {
                 .route(
                     "/pkgs/*rest",
                     get(move |req: Request<Body>| echo_http(r2.clone(), req)),
+                )
+                .route(
+                    "/api/backup/export",
+                    get(move |req: Request<Body>| echo_http(r4.clone(), req)),
+                )
+                .route(
+                    "/api/backup/import",
+                    post(move |req: Request<Body>| echo_http(r5.clone(), req)),
                 )
                 .route(
                     "/__viewer/*rest",
@@ -1908,11 +1922,7 @@ async fn viewer_token_routes_to_the_running_child_without_a_cookie_and_never_lau
         format!("/__viewer/{ada_tok}/../api/rpc"),
         format!("/__viewer/{ada_tok}/%2e%2e/api/rpc"),
     ] {
-        let (status, _, _) = send(
-            &h.app,
-            request("GET", &path).body(Body::empty()).unwrap(),
-        )
-        .await;
+        let (status, _, _) = send(&h.app, request("GET", &path).body(Body::empty()).unwrap()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
     }
     let (status, _, _) = send(
@@ -1923,6 +1933,59 @@ async fn viewer_token_routes_to_the_running_child_without_a_cookie_and_never_lau
     )
     .await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn arm_level_t1_broker_proxies_backup_export_and_import() {
+    let h = harness().await;
+    let _id = insert_account(&h.pool, "ada", 20_001, false).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+
+    // 1. Unauthenticated requests are refused
+    let (status, _, _) = send(
+        &h.app,
+        request("GET", "/api/backup/export")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _, _) = send(
+        &h.app,
+        request("POST", "/api/backup/import")
+            .body(Body::from(b"zip".to_vec()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // 2. Authenticated GET /api/backup/export proxies to child (200 OK)
+    let (status, _, body) = send(
+        &h.app,
+        request("GET", "/api/backup/export")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "export route was proxied");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["path"], "/api/backup/export");
+
+    // 3. Authenticated POST /api/backup/import proxies to child (200 OK)
+    let (status, _, body) = send(
+        &h.app,
+        request("POST", "/api/backup/import")
+            .header("cookie", &cookie)
+            .header("content-type", "application/zip")
+            .body(Body::from(b"test-zip-payload".to_vec()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "import route was proxied");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["path"], "/api/backup/import");
 }
 
 /// `/ws/events` under T1 (principal isolation through the proxy).

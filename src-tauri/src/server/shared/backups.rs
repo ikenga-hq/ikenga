@@ -194,18 +194,28 @@ pub const PATH_COLUMNS: &[PathColumn] = &[
 ];
 
 pub fn read_manifest(zip_path: &Path) -> Result<BackupManifest, String> {
-    let bytes = read_zip_bytes(zip_path, "manifest.json")?;
+    let bytes = read_zip_bytes_limited(zip_path, "manifest.json", 1024 * 1024)?;
     serde_json::from_slice(&bytes).map_err(|e| format!("parse manifest: {e}"))
 }
 
 pub fn read_zip_bytes(zip_path: &Path, name: &str) -> Result<Vec<u8>, String> {
+    read_zip_bytes_limited(zip_path, name, MAX_BACKUP_SIZE_BYTES)
+}
+
+pub fn read_zip_bytes_limited(zip_path: &Path, name: &str, limit: u64) -> Result<Vec<u8>, String> {
     let file = fs::File::open(zip_path).map_err(|e| format!("open zip: {e}"))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("read zip: {e}"))?;
     let mut entry = archive.by_name(name).map_err(|e| format!("{name}: {e}"))?;
     let mut buf = Vec::new();
-    entry
+    let mut limited = (&mut entry).take(limit + 1);
+    let n = limited
         .read_to_end(&mut buf)
         .map_err(|e| format!("read {name}: {e}"))?;
+    if n as u64 > limit {
+        return Err(format!(
+            "zip entry `{name}` decompressed size exceeds maximum allowed ({limit} bytes)"
+        ));
+    }
     Ok(buf)
 }
 
@@ -308,7 +318,7 @@ pub async fn read_installed_pkgs(db_path: &Path) -> Result<Vec<PkgEntry>, String
 }
 
 pub fn read_pkgs_from_zip(zip_path: &Path) -> Result<Vec<PkgEntry>, String> {
-    match read_zip_bytes(zip_path, "installed-pkgs.json") {
+    match read_zip_bytes_limited(zip_path, "installed-pkgs.json", 10 * 1024 * 1024) {
         Ok(bytes) => {
             serde_json::from_slice::<Vec<PkgEntry>>(&bytes).map_err(|e| format!("parse pkgs: {e}"))
         }
@@ -464,10 +474,23 @@ pub async fn export_backup_zip(
         return Err(format!("no database found at {}", db_path.display()));
     };
 
-    let snapshot = data_dir.join(format!("{LIVE_DB_NAME}.export.tmp"));
-    if snapshot.exists() {
-        let _ = fs::remove_file(&snapshot);
+    let active_db_size = fs::metadata(&active_db).map(|m| m.len()).unwrap_or(0);
+    if active_db_size > MAX_BACKUP_SIZE_BYTES {
+        return Err(format!(
+            "database size ({active_db_size} bytes) exceeds maximum backup limit ({MAX_BACKUP_SIZE_BYTES} bytes)"
+        ));
     }
+
+    let tmp_id = uuid::Uuid::new_v4().simple();
+    let snapshot = data_dir.join(format!("{LIVE_DB_NAME}.export-{tmp_id}.tmp"));
+    struct TmpFileGuard(PathBuf);
+    impl Drop for TmpFileGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let _snapshot_guard = TmpFileGuard(snapshot.clone());
+
     vacuum_into(&active_db, &snapshot).await?;
 
     let pkgs = read_installed_pkgs(&snapshot).await.unwrap_or_default();
@@ -490,7 +513,6 @@ pub async fn export_backup_zip(
         serde_json::to_vec_pretty(&manifest).map_err(|e| format!("serialize manifest: {e}"))?;
     let pkgs_json = serde_json::to_vec_pretty(&pkgs).map_err(|e| format!("serialize pkgs: {e}"))?;
     let db_bytes = fs::read(&snapshot).map_err(|e| format!("read snapshot: {e}"))?;
-    let _ = fs::remove_file(&snapshot);
 
     let file = fs::File::create(dest).map_err(|e| format!("create zip: {e}"))?;
     let mut zip = zip::ZipWriter::new(file);
@@ -556,33 +578,50 @@ pub fn validate_backup_zip(
         "installed-pkgs.json",
         "secrets.age",
     ];
+    let mut seen_entries = std::collections::HashSet::new();
 
     for i in 0..archive.len() {
-        let entry = archive
+        let mut entry = archive
             .by_index(i)
             .map_err(|e| format!("zip entry {i}: {e}"))?;
-        let name = entry.name();
+        let name = entry.name().to_string();
 
-        // 1. Zip Slip check
+        // 1. Duplicate entry check
+        if !seen_entries.insert(name.clone()) {
+            return Err(format!("refusing duplicate zip entry `{name}`"));
+        }
+
+        // 2. Zip Slip check
         if name.contains("..") || name.starts_with('/') || name.starts_with('\\') {
             return Err(format!("refusing malicious zip entry path `{name}`"));
         }
 
-        // 2. Allowlist of valid backup entry names
-        if !allowed_entries.contains(&name) {
+        // 3. Allowlist of valid backup entry names
+        if !allowed_entries.contains(&name.as_str()) {
             return Err(format!(
                 "refusing unknown or unauthorized zip entry `{name}`"
             ));
         }
 
-        // 3. Zip bomb check
-        let size = entry.size();
-        if size > MAX_BACKUP_SIZE_BYTES {
+        // 4. Zip bomb check - declared size
+        let declared_size = entry.size();
+        if declared_size > MAX_BACKUP_SIZE_BYTES {
             return Err(format!(
-                "zip entry `{name}` uncompressed size ({size}) exceeds maximum"
+                "zip entry `{name}` uncompressed size ({declared_size}) exceeds maximum"
             ));
         }
-        total_uncompressed += size;
+
+        // 5. Zip bomb check - stream with take(MAX+1) to verify actual decompressed bytes
+        let mut limited = (&mut entry).take(MAX_BACKUP_SIZE_BYTES + 1);
+        let actual_size = std::io::copy(&mut limited, &mut std::io::sink())
+            .map_err(|e| format!("verify entry `{name}`: {e}"))?;
+        if actual_size > MAX_BACKUP_SIZE_BYTES {
+            return Err(format!(
+                "zip entry `{name}` decompressed size exceeds maximum ({MAX_BACKUP_SIZE_BYTES} bytes)"
+            ));
+        }
+
+        total_uncompressed += actual_size;
         if total_uncompressed > 2 * MAX_BACKUP_SIZE_BYTES {
             return Err("total uncompressed backup size exceeds maximum allowed".to_string());
         }
@@ -613,14 +652,80 @@ pub fn validate_backup_zip(
 }
 
 pub fn extract_app_db(zip_path: &Path, dest: &Path) -> Result<(), String> {
-    let bytes = read_zip_bytes(zip_path, "app.db")
-        .or_else(|_| read_zip_bytes(zip_path, "pa.db"))
-        .or_else(|_| read_zip_bytes(zip_path, "ikenga.db"))
-        .map_err(|_| "archive missing db member (app.db / pa.db / ikenga.db)".to_string())?;
+    let file = fs::File::open(zip_path).map_err(|e| format!("open zip: {e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("read zip: {e}"))?;
+
+    let db_name = if archive.by_name("app.db").is_ok() {
+        "app.db"
+    } else if archive.by_name("pa.db").is_ok() {
+        "pa.db"
+    } else if archive.by_name("ikenga.db").is_ok() {
+        "ikenga.db"
+    } else {
+        return Err("archive missing db member (app.db / pa.db / ikenga.db)".to_string());
+    };
+
+    let mut entry = archive
+        .by_name(db_name)
+        .map_err(|e| format!("{db_name}: {e}"))?;
     if dest.exists() {
         let _ = fs::remove_file(dest);
     }
-    fs::write(dest, &bytes).map_err(|e| format!("write staged db: {e}"))
+    let mut out = fs::File::create(dest).map_err(|e| format!("create staged db: {e}"))?;
+    let mut limited = (&mut entry).take(MAX_BACKUP_SIZE_BYTES + 1);
+    let copied =
+        std::io::copy(&mut limited, &mut out).map_err(|e| format!("write staged db: {e}"))?;
+    if copied > MAX_BACKUP_SIZE_BYTES {
+        let _ = fs::remove_file(dest);
+        return Err(format!(
+            "zip entry `{db_name}` decompressed size exceeds maximum allowed ({MAX_BACKUP_SIZE_BYTES} bytes)"
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_staged_schema(
+    pool: &sqlx::SqlitePool,
+    _schema_version: i64,
+) -> Result<(), String> {
+    // 1. Check _pa_migrations table exists
+    let migrations_table_exists: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='_pa_migrations'",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("query sqlite_master: {e}"))?;
+
+    if migrations_table_exists.is_none() {
+        return Err("staged database is missing required `_pa_migrations` table".to_string());
+    }
+
+    // Check column 'id' in _pa_migrations
+    let col_rows: Vec<sqlx::sqlite::SqliteRow> = sqlx::query("PRAGMA table_info(_pa_migrations)")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("PRAGMA table_info(_pa_migrations): {e}"))?;
+    let has_id_col = col_rows.iter().any(|r| {
+        use sqlx::Row;
+        r.get::<String, _>("name") == "id"
+    });
+    if !has_id_col {
+        return Err("staged database `_pa_migrations` table is missing `id` column".to_string());
+    }
+
+    // 2. Check required core table layout_state (persistent across all schema versions)
+    let layout_table_exists: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='layout_state'",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("query sqlite_master: {e}"))?;
+
+    if layout_table_exists.is_none() {
+        return Err("staged database is missing required core table `layout_state`".to_string());
+    }
+
+    Ok(())
 }
 
 pub async fn import_backup_zip(
@@ -629,6 +734,9 @@ pub async fn import_backup_zip(
     zip_path: &Path,
     dry_run: bool,
 ) -> Result<serde_json::Value, String> {
+    static RESTORE_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _lock = RESTORE_MUTEX.lock().await;
+
     let (manifest, schema_action, pkgs) = validate_backup_zip(zip_path)?;
     let size_bytes = fs::metadata(zip_path).map(|m| m.len()).unwrap_or(0);
 
@@ -648,12 +756,22 @@ pub async fn import_backup_zip(
         ));
     }
 
-    let staged_dir = data_dir.join(STAGED_DIR);
+    let run_id = uuid::Uuid::new_v4().simple();
+    let staged_dir = data_dir.join(format!("{STAGED_DIR}-{run_id}"));
     fs::create_dir_all(&staged_dir).map_err(|e| format!("mkdir staged: {e}"))?;
     let staged_db = staged_dir.join(STAGED_DB_NAME);
+
+    struct StagedDirGuard(PathBuf);
+    impl Drop for StagedDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _staged_guard = StagedDirGuard(staged_dir.clone());
+
     extract_app_db(zip_path, &staged_db)?;
 
-    // Verify SQLite integrity of staged db
+    // 1. Verify SQLite integrity & schema of staged db
     {
         let url = format!("sqlite://{}?mode=ro", staged_db.display());
         let test_pool = sqlx::SqlitePool::connect(&url)
@@ -662,41 +780,115 @@ pub async fn import_backup_zip(
         let check: Result<String, _> = sqlx::query_scalar("PRAGMA integrity_check")
             .fetch_one(&test_pool)
             .await;
-        test_pool.close().await;
         match check {
             Ok(ref s) if s == "ok" => {}
             Ok(other) => {
-                let _ = fs::remove_file(&staged_db);
+                test_pool.close().await;
                 return Err(format!("staged db integrity check failed: {other}"));
             }
             Err(e) => {
-                let _ = fs::remove_file(&staged_db);
+                test_pool.close().await;
                 return Err(format!("staged db probe failed: {e}"));
             }
         }
+
+        // Schema validation (Blocker 3)
+        if let Err(e) = validate_staged_schema(&test_pool, manifest.schema_version).await {
+            test_pool.close().await;
+            return Err(e);
+        }
+        test_pool.close().await;
     }
+
+    // 2. Run migrations on staged db copy first (Blocker 2)
+    {
+        let staged_pa_db = crate::db::PaDb::new(staged_db.clone());
+        let _staged_writer = staged_pa_db
+            .ensure_pool()
+            .await
+            .map_err(|e| format!("run migrations on staged db failed: {e}"))?;
+        staged_pa_db.close().await;
+    }
+
+    // 3. Atomic swap with rollback (Blocker 2)
+    let live_db = data_dir.join(LIVE_DB_NAME);
+    let prev_db = data_dir.join(format!("{LIVE_DB_NAME}.prev"));
 
     // Close live pool
     db.close().await;
 
-    // Atomically swap staged_db to live_db
-    let live_db = data_dir.join(LIVE_DB_NAME);
+    // Remove old .prev files if present
+    let _ = fs::remove_file(&prev_db);
+    for ext in ["-wal", "-shm", "-journal"] {
+        let _ = fs::remove_file(data_dir.join(format!("{LIVE_DB_NAME}.prev{ext}")));
+    }
+
+    // Move live_db -> prev_db
+    if live_db.exists() {
+        fs::rename(&live_db, &prev_db)
+            .map_err(|e| format!("backup live db to .prev failed: {e}"))?;
+    }
     for ext in ["-wal", "-shm", "-journal"] {
         let aux = data_dir.join(format!("{LIVE_DB_NAME}{ext}"));
-        let _ = fs::remove_file(&aux);
-    }
-    fs::rename(&staged_db, &live_db).map_err(|e| format!("swap db: {e}"))?;
-
-    if matches!(manifest.path_mode, PathMode::Tokenized) {
-        if let Some(home) = current_home_dir() {
-            apply_path_rewrites_to_db(&live_db, HOME_TOKEN, &home).await?;
+        let prev_aux = data_dir.join(format!("{LIVE_DB_NAME}.prev{ext}"));
+        if aux.exists() {
+            let _ = fs::rename(&aux, &prev_aux);
         }
     }
 
-    let _ = fs::remove_dir_all(&staged_dir);
+    // Swap staged -> live
+    if let Err(e) = fs::rename(&staged_db, &live_db) {
+        // Roll back immediately
+        if prev_db.exists() {
+            let _ = fs::rename(&prev_db, &live_db);
+            for ext in ["-wal", "-shm", "-journal"] {
+                let prev_aux = data_dir.join(format!("{LIVE_DB_NAME}.prev{ext}"));
+                let aux = data_dir.join(format!("{LIVE_DB_NAME}{ext}"));
+                if prev_aux.exists() {
+                    let _ = fs::rename(&prev_aux, &aux);
+                }
+            }
+        }
+        let _ = db.ensure_pool().await;
+        return Err(format!("swap db: {e}"));
+    }
 
-    // Reopen/ensure pool
-    db.ensure_pool().await?;
+    // Post-swap: path rewrites and ensure live pool
+    let post_swap_res = async {
+        if matches!(manifest.path_mode, PathMode::Tokenized) {
+            if let Some(home) = current_home_dir() {
+                apply_path_rewrites_to_db(&live_db, HOME_TOKEN, &home).await?;
+            }
+        }
+        db.ensure_pool()
+            .await
+            .map_err(|e| format!("reopen live pool: {e}"))?;
+        Ok::<(), String>(())
+    }
+    .await;
+
+    if let Err(e) = post_swap_res {
+        // Roll back on any error after the swap!
+        db.close().await;
+        let _ = fs::remove_file(&live_db);
+        for ext in ["-wal", "-shm", "-journal"] {
+            let _ = fs::remove_file(data_dir.join(format!("{LIVE_DB_NAME}{ext}")));
+        }
+        if prev_db.exists() {
+            let _ = fs::rename(&prev_db, &live_db);
+            for ext in ["-wal", "-shm", "-journal"] {
+                let prev_aux = data_dir.join(format!("{LIVE_DB_NAME}.prev{ext}"));
+                let aux = data_dir.join(format!("{LIVE_DB_NAME}{ext}"));
+                if prev_aux.exists() {
+                    let _ = fs::rename(&prev_aux, &aux);
+                }
+            }
+        }
+        let _ = db.ensure_pool().await;
+        return Err(format!(
+            "restore failed post-swap, rolled back to previous database: {e}"
+        ));
+    }
 
     let res = ImportResult {
         staged_at: live_db.to_string_lossy().into_owned(),
