@@ -122,6 +122,10 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("data_health_db_size", req!(owner[Settings])),
     ("backup_list", req!(owner[Settings])),
     ("backup_delete", req!(owner[Settings])),
+    ("backup_export", req!(owner[Settings])),
+    ("backup_import", req!(owner[Settings])),
+    ("db_export_ndjson", req!(owner[Settings])),
+    ("db_import_ndjson", req!(owner[Settings])),
     // ── chi / agent-ops / identity ──
     ("chi_status", req!(shared[Sessions])),
     ("chi_list", req!(shared[Sessions])),

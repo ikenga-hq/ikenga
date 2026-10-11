@@ -61,13 +61,6 @@ reason = "Verifies the PIN against the SecretRecord in app-lock.json (not the se
 tag = "WP-20"
 reason = "OS-credential op (biometric_support/OS biometrics) explicitly named under WP-20; also single global state."
 
-[backup_export]
-tag = "WP-19"
-reason = "dest_path is unconfined: PathBuf::from(dest_path) + create_dir_all(parent) + the zip write, no allowlist or data-dir check, so a token holder could write a zip anywhere the daemon can (backup_list / backup_delete are served only because they stay inside <data-dir>/backups). include_secrets also reads the desktop Stronghold vault through SecretsLock, which the daemon has no analog for. Needs a dest confined to <data-dir>/backups and a secrets story first."
-
-[backup_import]
-tag = "WP-19"
-reason = "src_path is unconfined (PathBuf::from(src_path), no allowlist check). And what it produces, staged-restore/pa.db.new + RESTORE_PENDING, is only applied by desktop lib.rs .setup() (apply_staged_restore_if_present, pre-pool) on the next desktop launch; the daemon has no boot-apply step, so a served import would stage a restore that is never applied."
 
 [bg_spike_reply]
 tag = "desktop-only-forever"
@@ -89,13 +82,6 @@ reason = "Releases claude_config_watch's watcher ids; nothing to release while c
 tag = "WP-19"
 reason = "Registers FsWatchManager watchers that emit `claude-config:changed` on the Tauri event channel; the daemon has none (the web transport's listen() is a no-op, and /ws/fs is its own subscription protocol, not these watcher ids). Not served in slice 5b; needs an event channel first."
 
-[db_export_ndjson]
-tag = "WP-19"
-reason = "dest_dir is unconfined (Path::new(&dest_dir), no allowlist or data-dir check): it writes one NDJSON file per table wherever the caller points. It also has no FE caller (no tauri-cmd.ts wrapper; only the wp06 round-trip unit test). Needs a contained destination before a remote client may drive it."
-
-[db_import_ndjson]
-tag = "WP-19"
-reason = "src_dir is unconfined (no allowlist check), and import_ndjson_from_dir interpolates each file's filename-derived stem into SQL as the table name (INSERT OR REPLACE INTO \"{table}\" ...) with no check against the real schema, so a crafted filename can break out of the quoted identifier. No FE caller (test-only). Needs containment + a table allowlist first."
 
 [detect_system]
 tag = "WP-19"

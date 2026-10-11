@@ -30,6 +30,10 @@ pub mod events;
 pub mod events_ws;
 pub mod fs_ws;
 pub mod health;
+/// A held hook gate's notification row and audit trail (daemon asks).
+pub mod hook_asks;
+/// Host health for the admin Server card (`server_health`).
+pub mod host_health;
 /// T1 operator: the operator root, `operator/accounts.db`, passwords and the
 /// provisioning core (G-PRINCIPAL §4, §6, §7; WP-20). Linux-only, like T1.
 #[cfg(target_os = "linux")]
@@ -45,6 +49,7 @@ pub mod pty_ws;
 pub mod push;
 mod reserved;
 pub mod rpc;
+mod rpc_backup;
 mod rpc_claude;
 mod rpc_exec;
 mod rpc_files;
@@ -57,10 +62,6 @@ pub mod static_files;
 /// `ikenga-server supervise`: a minimal init that keeps detached runs alive
 /// across server restarts where there is no systemd (containers). Linux-only.
 pub mod supervisor;
-/// A held hook gate's notification row and audit trail (daemon asks).
-pub mod hook_asks;
-/// Host health for the admin Server card (`server_health`).
-pub mod host_health;
 /// Claude terminal hooks + statusline for daemon terminals (gap audit rank
 /// 11): the per-terminal settings file, its authenticated endpoint, and the
 /// permission-gate decision.
@@ -72,16 +73,16 @@ pub mod update;
 /// Authenticated viewer file serving for browser sessions (gap audit rank 8).
 pub mod viewer;
 
+#[cfg(test)]
+mod events_ws_tests;
+#[cfg(test)]
+mod fs_roots_router_tests;
 /// Tauri-command ↔ daemon-RPC parity ratchet (WP-19). Test-only; reads
 /// `lib.rs` and `rpc.rs` as text so it compiles in both feature sets.
 /// `pub(crate)` so G-ACCESS A-1 (`access::rpc_requirements`) reuses its arm
 /// lexer.
 #[cfg(test)]
 pub(crate) mod parity;
-#[cfg(test)]
-mod events_ws_tests;
-#[cfg(test)]
-mod fs_roots_router_tests;
 #[cfg(test)]
 mod share_router_tests;
 
@@ -581,8 +582,8 @@ async fn auth_middleware(
     // Non-RPC routes: their §1.6 requirement (RPCs are per command).
     // (A live viewer token already proved `Files` when `viewer_serve` minted it,
     // and a principal child sees no caps header on a capability request.)
-    let requirement = crate::access::route_requirement(req.uri().path())
-        .filter(|_| !viewer_token_ok);
+    let requirement =
+        crate::access::route_requirement(req.uri().path()).filter(|_| !viewer_token_ok);
     if let Some(requirement) = requirement {
         if let Err(e) = crate::access::check(&ctx, requirement) {
             return Err(with_cookie(forbidden(&e), &set_cookie));
@@ -952,6 +953,14 @@ fn build_router(
         // In-app updates (WP-P9): operator only (`access::route_requirement`).
         .route("/api/server/update", get(update::t0_status))
         .route("/api/server/update/apply", post(update::t0_apply))
+        // Backup export/import (WP-B): streamed download / upload (100MB max)
+        .route("/api/backup/export", get(rpc_backup::http_backup_export))
+        .route(
+            "/api/backup/import",
+            post(rpc_backup::http_backup_import).layer(axum::extract::DefaultBodyLimit::max(
+                shared::backups::MAX_BACKUP_SIZE_BYTES as usize,
+            )),
+        )
         .route("/ws/pty/:id", get(pty_ws::pty_ws_handler))
         .route("/ws/chat/:id", get(chat_ws::chat_ws_handler))
         .route("/ws/fs", get(fs_ws::fs_ws_handler))
@@ -968,9 +977,18 @@ fn build_router(
         .route("/pkgs/:id/", get(pkg_static::pkg_static_root_handler))
         .route("/pkgs/:id/*path", get(pkg_static::pkg_static_file_handler))
         // Authenticated viewer routes (gap audit rank 8).
-        .route("/__viewer/:token", axum::routing::any(viewer::serve_viewer_root_handler))
-        .route("/__viewer/:token/", axum::routing::any(viewer::serve_viewer_root_handler))
-        .route("/__viewer/:token/*path", axum::routing::any(viewer::serve_viewer_handler));
+        .route(
+            "/__viewer/:token",
+            axum::routing::any(viewer::serve_viewer_root_handler),
+        )
+        .route(
+            "/__viewer/:token/",
+            axum::routing::any(viewer::serve_viewer_root_handler),
+        )
+        .route(
+            "/__viewer/:token/*path",
+            axum::routing::any(viewer::serve_viewer_handler),
+        );
     // plans/pwa S2 §10: a principal child's push outbox, drained by the T1
     // broker only (`internal` class: the per-child token plus the broker's
     // internal-call header; the broker never proxies `/internal/*`).
@@ -1880,14 +1898,22 @@ mod tests {
         assert!(set.contains("; HttpOnly"), "{set}");
         assert!(set.contains("; SameSite=Strict"), "{set}");
         assert!(set.contains("; Path=/pkgs;"), "{set}");
-        assert!(!set.contains("tok;"), "the cookie must not carry the bearer: {set}");
+        assert!(
+            !set.contains("tok;"),
+            "the cookie must not carry the bearer: {set}"
+        );
         let pair = cookie_pair(&set);
         assert!(!pair.contains("=tok"), "{pair}");
 
         // That cookie alone now loads app files (an ES module import, say).
         let res = get_pkgs(&router, file, &[("cookie", pair.as_str())]).await;
         assert_eq!(res.status(), StatusCode::OK);
-        let res = get_pkgs(&router, "/pkgs/com.test.good/", &[("cookie", pair.as_str())]).await;
+        let res = get_pkgs(
+            &router,
+            "/pkgs/com.test.good/",
+            &[("cookie", pair.as_str())],
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::OK);
 
         // ...but nothing outside `/pkgs`.
@@ -1997,7 +2023,11 @@ mod tests {
         }
 
         // Nothing is ever parked for review.
-        let res = rpc(&router, serde_json::json!({ "cmd": "pkg_trust_list_pending" })).await;
+        let res = rpc(
+            &router,
+            serde_json::json!({ "cmd": "pkg_trust_list_pending" }),
+        )
+        .await;
         assert_eq!(res["ok"], true, "{res}");
         assert_eq!(res["data"], serde_json::json!([]));
 

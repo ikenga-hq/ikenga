@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::hook_asks;
+use super::rpc_backup;
 use super::rpc_claude;
 use super::rpc_exec;
 use super::rpc_files;
@@ -502,7 +503,9 @@ pub async fn rpc_handler(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
             if pkg_id.is_empty() {
-                return Json(RpcResponse::error("pkg_activity_bar_set_badge: `pkgId` is required"));
+                return Json(RpcResponse::error(
+                    "pkg_activity_bar_set_badge: `pkgId` is required",
+                ));
             }
             // Absent or null clears the badge; anything else must parse.
             let badge: Option<crate::pkg::registries::ActivityBarBadge> =
@@ -521,7 +524,9 @@ pub async fn rpc_handler(
             // `activity_bar` registry; the server has no desktop event to emit.
             match state.pkg_index.set_badge(pkg_id, badge) {
                 Ok(true) => RpcResponse::success(()),
-                Ok(false) => RpcResponse::error(format!("no activity-bar entry for pkg `{pkg_id}`")),
+                Ok(false) => {
+                    RpcResponse::error(format!("no activity-bar entry for pkg `{pkg_id}`"))
+                }
                 Err(e) => RpcResponse::error(format!("{e:#}")),
             }
         }
@@ -531,10 +536,9 @@ pub async fn rpc_handler(
         // No trust store, so no pkg's trust can be evaluated. An empty list
         // would read as "nothing to trust"; the refusal names why, and the
         // frontend renders it as "not available on this server".
-        "pkg_trust_list" => RpcResponse::error(format!(
-            "pkg_trust_list: {}",
-            rpc_claude::TRUST_NOT_SERVED
-        )),
+        "pkg_trust_list" => {
+            RpcResponse::error(format!("pkg_trust_list: {}", rpc_claude::TRUST_NOT_SERVED))
+        }
         // What the daemon can see: `--pkgs-dir` entries that failed to load,
         // are api-incompatible, or a registry rejected — plus one
         // `records_unavailable` row saying install-record health is not
@@ -608,6 +612,10 @@ pub async fn rpc_handler(
         "data_health_db_size" => rpc_local::data_health_db_size(&state),
         "backup_list" => rpc_local::backup_list(&state),
         "backup_delete" => rpc_local::backup_delete(&state, &payload.args),
+        "backup_export" => rpc_backup::backup_export(&state, &payload.args).await,
+        "backup_import" => rpc_backup::backup_import(&state, &payload.args).await,
+        "db_export_ndjson" => rpc_backup::db_export_ndjson(&state, &payload.args).await,
+        "db_import_ndjson" => rpc_backup::db_import_ndjson(&state, &payload.args).await,
         "pkg_settings_get" => rpc_local::pkg_settings_get(&state, &payload.args).await,
 
         // --- Chi runs, agent-ops files, identity (WP-19 slice 3, WP-P10) ---
@@ -993,12 +1001,11 @@ pub async fn rpc_handler(
         // `claude_procs`: how many processes of this child's own uid are a
         // `claude` (a count — never a name, argument or another uid's).
         "server_open_terminals" => {
-            let claude_procs = tokio::task::spawn_blocking(|| {
-                super::host_health::count_own_processes("claude")
-            })
-            .await
-            .ok()
-            .flatten();
+            let claude_procs =
+                tokio::task::spawn_blocking(|| super::host_health::count_own_processes("claude"))
+                    .await
+                    .ok()
+                    .flatten();
             RpcResponse::success(serde_json::json!({
                 "open": state.pty_manager.active_session_count(),
                 "claude_procs": claude_procs,

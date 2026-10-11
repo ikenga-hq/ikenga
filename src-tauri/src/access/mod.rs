@@ -570,6 +570,8 @@ pub fn route_requirement(path: &str) -> Option<Requirement> {
         "/api/shutdown" | "/api/server/update" | "/api/server/update/apply"
     ) {
         Some(Requirement::operator())
+    } else if matches!(path, "/api/backup/export" | "/api/backup/import") {
+        Some(Requirement::owner(&[Cap::Settings]))
     } else if path.starts_with("/ws/pty/") {
         Some(Requirement::owner(&[Cap::Sessions]))
     } else if path.starts_with("/ws/chat/") {
@@ -585,8 +587,7 @@ pub fn route_requirement(path: &str) -> Option<Requirement> {
         Some(Requirement::shared(&[Cap::Files]))
     } else if path.starts_with("/__viewer/") || path == "/__viewer" {
         Some(Requirement::shared(&[Cap::Files]))
-    } else if path == crate::server::push::outbox::EVENTS_PATH
-        || path == audit::child::EVENTS_PATH
+    } else if path == crate::server::push::outbox::EVENTS_PATH || path == audit::child::EVENTS_PATH
     {
         // plans/pwa S2 §10: the broker's push long-poll, broker → child only.
         Some(Requirement::internal())
@@ -934,6 +935,11 @@ mod tests {
                 ArmClass::Operator,
                 "{p}"
             );
+        }
+        for p in ["/api/backup/export", "/api/backup/import"] {
+            let req = route_requirement(p).unwrap();
+            assert_eq!(req.class, ArmClass::Owner, "{p}");
+            assert_eq!(req.caps, CapSet::of(&[Cap::Settings]), "{p}");
         }
         assert_eq!(
             route_requirement("/ws/pty/abc").unwrap().caps,
