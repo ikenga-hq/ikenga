@@ -1,5 +1,14 @@
 # ikenga-desktop
 
+## 0.26.1
+
+### Patch Changes
+
+- 98d1e3b: `provision.sh sync-accounts`: an account's project clone now pushes to the project's upstream, not to the read-only local mirror, so `git push` from a box terminal works with the account's own `gh` login. New clones get the push URL at creation. Existing clones are repointed only while their push URL still equals the mirror.
+- f8b92a3: `provision.sh`: new `gh` LIB installs the GitHub CLI from GitHub's apt repository, with its signing keys pinned like the Postgres and gcloud repositories. Each account signs in for itself with `gh auth login` in its own terminal, and the box holds no GitHub token for anyone. The example profiles include it.
+- 61d0ed5: Serve hardened git branch and dirty status to shared-project members and remote browser sessions. The read runs git against a private sandbox git dir with an allowlist-sanitized config, refuses repositories that use alternate object stores or symlinks under `refs/`/`objects/`, refuses an index naming paths outside the project, and serves shallow and split-index repositories. Dirty submodules are not shown (status runs with `--ignore-submodules=all`, because a submodule's own config is untrusted).
+- e1531f4: Status bar: admins in a browser tab get a compact server-health chip (dot plus "Server" or the worst reason, e.g. "Memory 88%"). It shares the Settings server-health query, polls every 60 s while the tab is visible, and opens Settings > About.
+
 ## 0.26.0
 
 ### Minor Changes
