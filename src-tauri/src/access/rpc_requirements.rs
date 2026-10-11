@@ -350,16 +350,7 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("permission_relay_put", req!(operator)),
     ("permission_relay_take", req!(operator)),
     ("permission_relay_resolve", req!(operator)),
-];
-
-/// The §1.6 defaults for the `WP-20`-tagged verbs WP-21 did **not** serve.
-/// Not arms yet, so they are NOT in [`RPC_REQUIREMENTS`] (A-1 refuses a row
-/// that names no arm). WP-21 served the four `secrets_*` lock verbs, which
-/// moved into the table above (X-1); `app_lock_*` stays desktop-only (its
-/// PIN record is `app-lock.json`, not the secrets store). `fs_roots_*` moved
-/// up when the gap-audit rank-1 work served it. Whichever WP serves one of
-/// these moves its row up.
-pub const PENDING_WP21: &[(&str, Requirement)] = &[
+    // ── App lock (WP-C) ──
     ("app_lock_status", req!(owner[])),
     ("app_lock_clear_secret", req!(owner[Settings])),
     ("app_lock_configure", req!(owner[Settings])),
@@ -367,6 +358,14 @@ pub const PENDING_WP21: &[(&str, Requirement)] = &[
     ("app_lock_set_secret", req!(owner[Settings])),
     ("app_lock_touch", req!(owner[Settings])),
     ("app_lock_unlock", req!(owner[Settings])),
+];
+
+/// The §1.6 defaults for the `WP-20`-tagged verbs WP-21 did **not** serve.
+/// Not arms yet, so they are NOT in [`RPC_REQUIREMENTS`] (A-1 refuses a row
+/// that names no arm). WP-21 served the four `secrets_*` lock verbs, which
+/// moved into the table above (X-1); `app_lock_*` served by WP-C.
+/// `app_lock_unlock_biometric` stays desktop-only.
+pub const PENDING_WP21: &[(&str, Requirement)] = &[
     ("app_lock_unlock_biometric", req!(owner[Settings])),
 ];
 

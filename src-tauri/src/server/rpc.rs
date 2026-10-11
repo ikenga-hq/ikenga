@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::hook_asks;
+use super::rpc_app_lock;
 use super::rpc_backup;
 use super::rpc_claude;
 use super::rpc_exec;
@@ -912,6 +913,13 @@ pub async fn rpc_handler(
         "seats_rename" => rpc_seats::seats_rename(&state, &payload.args).await,
         "seats_remove" => rpc_seats::seats_remove(&state, &payload.args).await,
         "seats_release" => rpc_seats::seats_release(&state, &payload.args).await,
+        "app_lock_status" => rpc_app_lock::app_lock_status(&state),
+        "app_lock_touch" => rpc_app_lock::app_lock_touch(&state),
+        "app_lock_lock" => rpc_app_lock::app_lock_lock(&state),
+        "app_lock_unlock" => rpc_app_lock::app_lock_unlock(&state, &payload.args).await,
+        "app_lock_configure" => rpc_app_lock::app_lock_configure(&state, &payload.args),
+        "app_lock_set_secret" => rpc_app_lock::app_lock_set_secret(&state, &payload.args).await,
+        "app_lock_clear_secret" => rpc_app_lock::app_lock_clear_secret(&state, &payload.args).await,
 
         // --- Executor-routed arms + the pkg-settings write (gap audit
         //     2026-10-06 ranks 21, 23, 20-partial) ---

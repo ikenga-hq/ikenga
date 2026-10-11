@@ -49,6 +49,7 @@ pub mod pty_ws;
 pub mod push;
 mod reserved;
 pub mod rpc;
+mod rpc_app_lock;
 mod rpc_backup;
 mod rpc_claude;
 mod rpc_exec;
@@ -300,6 +301,8 @@ pub struct AppState {
     pub(crate) viewer: Arc<viewer::ViewerService>,
     /// Per-account streaming sidecar manager (R4-3).
     pub(crate) sidecars: Arc<shared::pkg_helpers::DaemonSidecarManager>,
+    /// App lock state and PIN record scoped to this daemon's `--data-dir` (WP-C).
+    pub(crate) app_lock: Arc<shared::app_lock::AppLockState>,
 }
 
 /// Compare two secrets without leaking their common prefix through timing.
@@ -938,6 +941,24 @@ fn build_router(
         asks.sweep_orphans();
         term_hooks.attach_asks(asks);
     }
+    let app_lock = Arc::new(shared::app_lock::AppLockState::new());
+    if let Some(ref data_dir) = config.data_dir {
+        app_lock.configure(data_dir.join(shared::app_lock::CONFIG_FILENAME));
+        let ticker_lock = Arc::clone(&app_lock);
+        let ticker_events = events.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(shared::app_lock::IDLE_TICK);
+            loop {
+                tick.tick().await;
+                let (locked_now, _) = ticker_lock.check_idle();
+                if locked_now {
+                    tracing::info!("[app-lock] locked after idle");
+                    ticker_events.publish(events::Topic::AppLockChanged, &serde_json::json!({}));
+                }
+            }
+        });
+    }
+
     let state = Arc::new(AppState {
         config,
         spa_service: spa_service.clone(),
@@ -959,6 +980,7 @@ fn build_router(
         shutdown_tx,
         viewer: Arc::new(viewer::ViewerService::new()),
         sidecars: Arc::new(shared::pkg_helpers::DaemonSidecarManager::new()),
+        app_lock,
     });
 
     // Same-origin needs no CORS headers at all; anything else has to be named

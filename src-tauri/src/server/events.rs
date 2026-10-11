@@ -86,10 +86,12 @@ pub enum Topic {
     HooksDecision,
     /// A daemon terminal's Claude statusline snapshot (the cost HUD).
     StatuslineSnapshot,
+    /// App lock state or config changed (lock, unlock, idle timeout, PIN set/cleared).
+    AppLockChanged,
 }
 
 impl Topic {
-    pub const ALL: [Topic; 12] = [
+    pub const ALL: [Topic; 13] = [
         Topic::SettingsChanged,
         Topic::ProjectsActiveChanged,
         Topic::ActionsChanged,
@@ -102,6 +104,7 @@ impl Topic {
         Topic::HooksEvent,
         Topic::HooksDecision,
         Topic::StatuslineSnapshot,
+        Topic::AppLockChanged,
     ];
 
     /// The wire name — exactly the desktop's `app.emit` name.
@@ -119,6 +122,7 @@ impl Topic {
             Topic::HooksEvent => "hooks://event",
             Topic::HooksDecision => "hooks://decision",
             Topic::StatuslineSnapshot => "statusline://snapshot",
+            Topic::AppLockChanged => "app-lock://changed",
         }
     }
 
@@ -144,6 +148,7 @@ impl Topic {
             Topic::HooksEvent | Topic::HooksDecision | Topic::StatuslineSnapshot => {
                 "pty_terminal_list"
             }
+            Topic::AppLockChanged => "app_lock_status",
         }
     }
 

@@ -1005,13 +1005,11 @@ export const APP_LOCK_CHANGED_EVENT = 'app-lock://changed';
 /** The lock state and config. `null` in a remote web session. Also runs the
  *  idle check, so a window waking from sleep sees an overdue lock at once. */
 export async function appLockStatus(): Promise<AppLockStatus | null> {
-	if (isRemoteWebSession()) return null;
 	return invoke<AppLockStatus>('app_lock_status');
 }
 
 /** Report user activity (throttled by the caller). Ignored while locked. */
 export async function appLockTouch(): Promise<void> {
-	if (isRemoteWebSession()) return;
 	return invoke('app_lock_touch');
 }
 
@@ -1058,7 +1056,6 @@ export async function appLockClearSecret(current: string): Promise<AppLockStatus
 }
 
 export function onAppLockChanged(callback: () => void): Promise<UnlistenFn> {
-	if (isRemoteWebSession()) return Promise.resolve(() => {});
 	return listen<unknown>(APP_LOCK_CHANGED_EVENT, () => callback());
 }
 

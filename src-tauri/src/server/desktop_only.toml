@@ -29,34 +29,6 @@
 tag = "desktop-only-forever"
 reason = "manager.open_file -> open_path spawns explorer.exe/open/xdg-open — native open-in-OS-app, same as settings_open_file."
 
-[app_lock_clear_secret]
-tag = "WP-20"
-reason = "Clears the one shared PIN record after verify_secret; same single-tenant AppLockState as the rest of the family."
-
-[app_lock_configure]
-tag = "WP-20"
-reason = "Writes the one AppLockConfig (idle_enabled/method) shared app-wide; no per-principal config exists."
-
-[app_lock_lock]
-tag = "WP-20"
-reason = "Locks the single shared AppLockState for the whole app; one user's lock would freeze every remote client."
-
-[app_lock_set_secret]
-tag = "WP-20"
-reason = "hash_secret/verify_secret write the PIN record in app-lock.json (its own argon2id hash, not the secrets store, so WP-21's per-principal store does not unblock it). The FE disables app lock in a remote web session (tauri-cmd.ts appLockStatus -> null) and the daemon cannot push app-lock://changed; serving the family needs a per-child app-lock.json, an idle ticker and an FE remote mode together."
-
-[app_lock_status]
-tag = "WP-20"
-reason = "Reads single global AppLockState (one PIN gates the whole app); needs per-principal state before a multi-user daemon can serve it."
-
-[app_lock_touch]
-tag = "WP-20"
-reason = "Bumps the one global AppLockState.last_activity_ms; single-tenant idle clock, no principal dimension."
-
-[app_lock_unlock]
-tag = "WP-20"
-reason = "Verifies the PIN against the SecretRecord in app-lock.json (not the secrets store; WP-21 does not unblock it). Same gap as app_lock_set_secret: FE remote mode, a per-child app-lock.json and a daemon idle ticker are needed together."
-
 [app_lock_unlock_biometric]
 tag = "WP-20"
 reason = "OS-credential op (biometric_support/OS biometrics) explicitly named under WP-20; also single global state."
