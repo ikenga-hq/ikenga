@@ -397,6 +397,7 @@ fn device_ctx(store: &AccessStore, device_id: &str, tier: Tier) -> AccessCtx {
         share_headers: false,
         caps: tier.caps(),
         admin_strength: tier == Tier::Full,
+        is_admin: false,
         meta: RequestMeta::default(),
     }
 }

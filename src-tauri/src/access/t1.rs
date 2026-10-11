@@ -175,13 +175,21 @@ impl T1Access {
                 .map(str::to_string),
             routing_withheld_approve,
             ..Default::default()
-        }
-        .with_host_from(&parts.headers);
+        };
+        let is_admin = match self.pool.acquire().await {
+            Ok(mut conn) => accounts::by_id(&mut conn, ctx.principal.id)
+                .await
+                .ok()
+                .flatten()
+                .map_or(false, |a| a.is_admin && !a.is_disabled()),
+            Err(_) => false,
+        };
         Ok(BrokerCtx {
             access: AccessCtx {
                 principal_id: ctx.principal.id,
                 admin_strength: AccessCtx::admin_strength_of(&via, tier)
                     && !matches!(via, Via::Operator),
+                is_admin,
                 device_id,
                 via,
                 tier,
@@ -555,6 +563,9 @@ impl Narrower for AccessNarrower {
         Box::pin(async move {
             let b = self.0.access_ctx(ctx, req).await.map_err(|e| refusal(&e))?;
             let mut pairs = vec![(CAPS_HEADER, b.access.caps.to_header())];
+            if b.access.is_admin {
+                pairs.push((crate::server::broker::proxy::ADMIN_HEADER, "1".to_string()));
+            }
             if let Some(share) = &b.access.share {
                 pairs.extend(super::share::to_child_headers(share));
             }

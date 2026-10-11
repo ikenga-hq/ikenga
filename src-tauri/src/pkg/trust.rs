@@ -90,7 +90,7 @@ fn snapshot_json(perms: &PermsSummary) -> String {
     .expect("snapshot json")
 }
 
-fn snapshot_hash(perms: &PermsSummary) -> String {
+pub fn snapshot_hash(perms: &PermsSummary) -> String {
     let mut hasher = Sha256::new();
     hasher.update(snapshot_json(perms).as_bytes());
     hex::encode(hasher.finalize())
@@ -510,7 +510,7 @@ mod tests {
                 ikenga_api: "1".into(),
                 kind: None,
                 auth_bridge: None,
-            author: None,
+                author: None,
                 targets: vec![],
                 mcp: vec![],
                 sidecars: vec![],
@@ -548,8 +548,7 @@ mod tests {
     // as a generic `serde_json::Value`, never via `Package::load`.
 
     // The shared golden vector (same artifacts `signature.rs` tests against).
-    const GOLDEN_MANIFEST: &str =
-        include_str!("testdata/signature_golden_v1/manifest.json");
+    const GOLDEN_MANIFEST: &str = include_str!("testdata/signature_golden_v1/manifest.json");
     const GOLDEN_PUBKEY: &str = include_str!("testdata/signature_golden_v1/publisher.pub");
     const GOLDEN_SIG: &str = include_str!("testdata/signature_golden_v1/manifest.minisig");
 
@@ -632,10 +631,8 @@ mod tests {
     async fn g_trust_unsigned_registry_runs_but_not_elevated() {
         let pool = open_test_pool().await;
         // Golden manifest with the `signature` field removed entirely.
-        let unsigned = GOLDEN_MANIFEST.replace(
-            ",\n  \"signature\": \"PLACEHOLDER_TO_BE_STRIPPED\"",
-            "",
-        );
+        let unsigned =
+            GOLDEN_MANIFEST.replace(",\n  \"signature\": \"PLACEHOLDER_TO_BE_STRIPPED\"", "");
         assert!(!unsigned.contains("signature"), "sig must be gone");
         let (pkg, _dir) = pkg_on_disk(&unsigned, None, golden_perms());
         let state = evaluate(
@@ -832,7 +829,9 @@ mod tests {
         let counter_state = evaluate(
             &pool,
             &counter,
-            &InstallSource::Local { path: "/tmp".into() },
+            &InstallSource::Local {
+                path: "/tmp".into(),
+            },
             &PathBuf::from("/tmp"),
         )
         .await
@@ -1213,12 +1212,24 @@ mod tests {
         let pool = open_test_pool().await;
         let path = "/home/me/Projects/Album A";
 
-        assert_eq!(studio_grant_rows(&pool, path).await, 0, "no row before grant");
-        record_studio_project_grant(&pool, path).await.expect("grant");
-        assert_eq!(studio_grant_rows(&pool, path).await, 1, "one row after grant");
+        assert_eq!(
+            studio_grant_rows(&pool, path).await,
+            0,
+            "no row before grant"
+        );
+        record_studio_project_grant(&pool, path)
+            .await
+            .expect("grant");
+        assert_eq!(
+            studio_grant_rows(&pool, path).await,
+            1,
+            "one row after grant"
+        );
 
         // Re-grant the same folder — idempotent, still exactly one row.
-        record_studio_project_grant(&pool, path).await.expect("re-grant");
+        record_studio_project_grant(&pool, path)
+            .await
+            .expect("re-grant");
         assert_eq!(
             studio_grant_rows(&pool, path).await,
             1,
@@ -1237,12 +1248,18 @@ mod tests {
         let other = "/home/me/Projects/Album B";
 
         assert!(
-            !has_studio_project_grant(&pool, granted).await.expect("check"),
+            !has_studio_project_grant(&pool, granted)
+                .await
+                .expect("check"),
             "no grant before record"
         );
-        record_studio_project_grant(&pool, granted).await.expect("grant");
+        record_studio_project_grant(&pool, granted)
+            .await
+            .expect("grant");
         assert!(
-            has_studio_project_grant(&pool, granted).await.expect("check"),
+            has_studio_project_grant(&pool, granted)
+                .await
+                .expect("check"),
             "re-hit on the granted folder must short-circuit (has_grant == true)"
         );
         assert!(

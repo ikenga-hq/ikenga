@@ -62,7 +62,7 @@ fn pkgs_fixture() -> PathBuf {
     PKGS.get_or_init(|| {
         let root = std::env::temp_dir()
             .join(format!("ikenga-rpc-exec-pkgs-{}", uuid::Uuid::new_v4()))
-            .join("pkgs");
+            .join("builtin-pkgs");
         let exec = root.join(PKG);
         std::fs::create_dir_all(exec.join("bin")).unwrap();
         std::fs::write(
@@ -135,6 +135,51 @@ fn pkgs_fixture() -> PathBuf {
         )
         .unwrap();
         std::fs::set_permissions(&mcp_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let empty_mcp = root.join("com.test.empty-mcp");
+        std::fs::create_dir_all(empty_mcp.join("bin")).unwrap();
+        std::fs::write(
+            empty_mcp.join("manifest.json"),
+            json!({
+                "id": "com.test.empty-mcp", "name": "EmptyMcp", "version": "0.1.0", "ikenga_api": "1",
+                "mcp": [{ "name": "srv", "command": "bin/mcp" }],
+                "permissions": { "shell.execute": [] }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let empty_bin = empty_mcp.join("bin/mcp");
+        std::fs::write(&empty_bin, "#!/bin/sh\necho ok\n").unwrap();
+        std::fs::set_permissions(&empty_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sensitive = root.join("com.test.sensitive");
+        std::fs::create_dir_all(sensitive.join("bin")).unwrap();
+        std::fs::write(
+            sensitive.join("manifest.json"),
+            json!({
+                "id": "com.test.sensitive", "name": "Sensitive", "version": "0.1.0", "ikenga_api": "1",
+                "capabilities": { "invoke": { "commands": ["echo"] } },
+                "permissions": { "shell.execute": ["echo"] }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let sidecar_pkg = root.join("com.test.sidecar");
+        std::fs::create_dir_all(sidecar_pkg.join("bin")).unwrap();
+        std::fs::write(
+            sidecar_pkg.join("manifest.json"),
+            json!({
+                "id": "com.test.sidecar", "name": "Sidecar", "version": "0.1.0", "ikenga_api": "1",
+                "sidecars": [{ "name": "loop", "bin": "bin/loop" }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let loop_bin = sidecar_pkg.join("bin/loop");
+        std::fs::write(&loop_bin, "#!/bin/sh\nwhile true; do sleep 1; done\n").unwrap();
+        std::fs::set_permissions(&loop_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
         root.canonicalize().unwrap()
     })
     .clone()
@@ -798,4 +843,424 @@ async fn t1_pkg_invoke_and_mcp_call() {
         .as_str()
         .unwrap()
         .contains("declares no mcp servers"));
+}
+
+#[cfg(unix)]
+fn principal_child_harness() -> (Principal, crate::executor::PrincipalId, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let principal_id = crate::executor::PrincipalId::new_v7();
+    let (data, home, allowed, outside) = (
+        root.join(format!("principals/{principal_id}/data")),
+        root.join("home"),
+        root.join("allowed"),
+        root.join("outside"),
+    );
+    for d in [&data, &home, &allowed, &outside] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let roots_file = root.join("fs_roots.json");
+    std::fs::write(
+        &roots_file,
+        json!({ "roots": [allowed.to_string_lossy()] }).to_string(),
+    )
+    .unwrap();
+    let guard = PathGuard::roots(Arc::new(
+        crate::fs_roots::FsRoots::load(roots_file).unwrap(),
+    ));
+    let db = Arc::new(PaDb::new(data.join("ikenga.db")));
+    let chi = Arc::new(DaemonChi {
+        runtime: Arc::new(chi_exec::ChiRuntime::new()),
+        resolver: Arc::new(chi_exec::tests::StubResolver(chi_exec::tests::stub_claude())),
+    });
+    let access = crate::access::DaemonAccess::principal_child(Default::default());
+    let router = crate::server::router_for_exec_tests_with_access(
+        config(data, pkgs_fixture()),
+        Arc::new(PtyManager::new()),
+        Some(db.clone()),
+        Some(home.clone()),
+        guard,
+        chi,
+        access,
+    );
+    (
+        Principal {
+            _tmp: tmp,
+            home,
+            allowed,
+            outside,
+            db,
+            router,
+        },
+        principal_id,
+        root,
+    )
+}
+
+async fn rpc_as_child(
+    router: &Router,
+    principal_id: crate::executor::PrincipalId,
+    is_admin: bool,
+    cmd: &str,
+    args: Value,
+) -> Value {
+    let mut builder = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/rpc")
+        .header("authorization", "Bearer tok")
+        .header("content-type", "application/json")
+        .header("x-ikenga-principal", principal_id.to_string())
+        .header(
+            "x-ikenga-caps",
+            "files,sessions,dispatch,approve,install,settings,secrets",
+        );
+    if is_admin {
+        builder = builder.header("x-ikenga-admin", "1");
+    }
+    let res = router
+        .clone()
+        .oneshot(
+            builder
+                .body(Body::from(json!({ "cmd": cmd, "args": args }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn arm_level_unassigned_refused_and_admin_allowed() {
+    let (p, pid, root) = principal_child_harness();
+    // Configure pkg-assignments.json to NOT assign PKG
+    std::fs::write(
+        root.join("pkg-assignments.json"),
+        json!({ PKG: ["other-user-uuid"] }).to_string(),
+    )
+    .unwrap();
+
+    // 1. pkg_sidecar_call: unassigned member is refused
+    let res = rpc_as_child(
+        &p.router,
+        pid,
+        false,
+        "pkg_sidecar_call",
+        json!({ "pkgId": PKG, "name": SIDECAR }),
+    )
+    .await;
+    assert_eq!(res["ok"], true);
+    assert_eq!(res["data"]["ok"], false);
+    assert!(
+        res["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not assigned"),
+        "{res}"
+    );
+
+    // 2. pkg_mcp_call: unassigned member is refused
+    let res = rpc_as_child(
+        &p.router,
+        pid,
+        false,
+        "pkg_mcp_call",
+        json!({ "pkgId": PKG, "tool": "probe" }),
+    )
+    .await;
+    assert_eq!(res["ok"], true);
+    assert_eq!(res["data"]["ok"], false);
+    assert!(
+        res["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not assigned"),
+        "{res}"
+    );
+
+    // 3. pkg_invoke: unassigned member is refused
+    let res = rpc_as_child(
+        &p.router,
+        pid,
+        false,
+        "pkg_invoke",
+        json!({ "pkgId": PKG, "command": "echo" }),
+    )
+    .await;
+    assert_eq!(res["ok"], true);
+    assert_eq!(res["data"]["ok"], false);
+    assert!(
+        res["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not assigned"),
+        "{res}"
+    );
+
+    // 4. pkg_sidecar_rpc_send: unassigned member is refused
+    let res = rpc_as_child(
+        &p.router,
+        pid,
+        false,
+        "pkg_sidecar_rpc_send",
+        json!({ "pkgId": PKG, "name": SIDECAR, "message": "hi" }),
+    )
+    .await;
+    assert_eq!(res["ok"], false);
+    assert!(
+        res["error"].as_str().unwrap().contains("not assigned"),
+        "{res}"
+    );
+
+    // 5. Admin caller succeeds through assignment gate
+    let res_admin = rpc_as_child(
+        &p.router,
+        pid,
+        true,
+        "pkg_sidecar_call",
+        json!({ "pkgId": PKG, "name": SIDECAR }),
+    )
+    .await;
+    assert_eq!(res_admin["ok"], true);
+    assert_eq!(res_admin["data"]["ok"], true, "{res_admin}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn arm_level_unapproved_sensitive_pkg_refused() {
+    let (p, pid, root) = principal_child_harness();
+    // Assign com.test.sensitive to everyone, but do not approve in pkg-trust.json
+    std::fs::write(
+        root.join("pkg-assignments.json"),
+        json!({ "com.test.sensitive": ["*"] }).to_string(),
+    )
+    .unwrap();
+
+    // 1. pkg_invoke: unapproved sensitive pkg refused
+    let res = rpc_as_child(
+        &p.router,
+        pid,
+        false,
+        "pkg_invoke",
+        json!({ "pkgId": "com.test.sensitive", "command": "echo", "args": ["hi"] }),
+    )
+    .await;
+    assert_eq!(res["ok"], true);
+    assert_eq!(res["data"]["ok"], false);
+    assert!(
+        res["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("host.invoke requires a trusted pkg"),
+        "{res}"
+    );
+
+    // 2. pkg_sidecar_rpc_send: unapproved sensitive pkg refused
+    let res = rpc_as_child(
+        &p.router,
+        pid,
+        false,
+        "pkg_sidecar_rpc_send",
+        json!({ "pkgId": "com.test.sensitive", "name": "srv", "message": "hi" }),
+    )
+    .await;
+    assert_eq!(res["ok"], false);
+    assert!(
+        res["error"]
+            .as_str()
+            .unwrap()
+            .contains("requires admin trust approval"),
+        "{res}"
+    );
+
+    // 3. Now approve with version and snapshot hash in pkg-trust.json
+    let perms = crate::pkg::manifest::Permissions {
+        shell_execute: vec!["echo".into()],
+        ..Default::default()
+    };
+    let hash =
+        crate::pkg::trust::snapshot_hash(&crate::pkg::trust_state::summarize_sensitive(&perms));
+    std::fs::write(
+        root.join("pkg-trust.json"),
+        json!({
+            "com.test.sensitive": {
+                "version": "0.1.0",
+                "snapshot_hash": hash,
+                "trust_state": "granted"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let res_ok = rpc_as_child(
+        &p.router,
+        pid,
+        false,
+        "pkg_invoke",
+        json!({ "pkgId": "com.test.sensitive", "command": "echo", "args": ["hi"] }),
+    )
+    .await;
+    assert_eq!(res_ok["ok"], true);
+    assert_eq!(res_ok["data"]["ok"], true, "{res_ok}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn arm_level_spoofed_ikenga_prefix_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let principal_id = crate::executor::PrincipalId::new_v7();
+    let (data, home, allowed, outside) = (
+        root.join(format!("principals/{principal_id}/data")),
+        root.join("home"),
+        root.join("allowed"),
+        root.join("outside"),
+    );
+    for d in [&data, &home, &allowed, &outside] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let roots_file = root.join("fs_roots.json");
+    std::fs::write(
+        &roots_file,
+        json!({ "roots": [allowed.to_string_lossy()] }).to_string(),
+    )
+    .unwrap();
+    let guard = PathGuard::roots(Arc::new(
+        crate::fs_roots::FsRoots::load(roots_file).unwrap(),
+    ));
+    let db = Arc::new(PaDb::new(data.join("ikenga.db")));
+    let chi = Arc::new(DaemonChi {
+        runtime: Arc::new(chi_exec::ChiRuntime::new()),
+        resolver: Arc::new(chi_exec::tests::StubResolver(chi_exec::tests::stub_claude())),
+    });
+
+    // Create a sideloaded pkgs dir that does NOT contain "builtin-pkgs" in its path
+    let sideloaded_pkgs = root.join("sideloaded");
+    let spoof_pkg = sideloaded_pkgs.join("com.ikenga.spoofed");
+    std::fs::create_dir_all(spoof_pkg.join("bin")).unwrap();
+    std::fs::write(
+        spoof_pkg.join("manifest.json"),
+        json!({
+            "id": "com.ikenga.spoofed", "name": "Spoofed", "version": "0.1.0", "ikenga_api": "1",
+            "capabilities": { "invoke": { "commands": ["echo"] } },
+            "permissions": { "shell.execute": ["echo"] }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let access = crate::access::DaemonAccess::principal_child(Default::default());
+    let router = crate::server::router_for_exec_tests_with_access(
+        config(data, sideloaded_pkgs),
+        Arc::new(PtyManager::new()),
+        Some(db.clone()),
+        Some(home.clone()),
+        guard,
+        chi,
+        access,
+    );
+
+    // Call pkg_invoke: must be REFUSED because sideloaded com.ikenga.* is not auto-trusted
+    let res = rpc_as_child(
+        &router,
+        principal_id,
+        false,
+        "pkg_invoke",
+        json!({ "pkgId": "com.ikenga.spoofed", "command": "echo", "args": ["evil"] }),
+    )
+    .await;
+    assert_eq!(res["ok"], true);
+    assert_eq!(res["data"]["ok"], false);
+    assert!(
+        res["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("host.invoke requires a trusted pkg"),
+        "{res}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn arm_level_empty_shell_execute_refused() {
+    let (p, pid, root) = principal_child_harness();
+    std::fs::write(
+        root.join("pkg-assignments.json"),
+        json!({ "com.test.empty-mcp": ["*"] }).to_string(),
+    )
+    .unwrap();
+    let res = rpc_as_child(
+        &p.router,
+        pid,
+        false,
+        "pkg_mcp_call",
+        json!({ "pkgId": "com.test.empty-mcp", "tool": "anything" }),
+    )
+    .await;
+    assert_eq!(res["ok"], true);
+    assert_eq!(res["data"]["ok"], false);
+    assert!(
+        res["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("shell.execute denied"),
+        "{res}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn arm_level_cross_account_sidecar_isolation_and_process_killed() {
+    let (p, pid_a, root) = principal_child_harness();
+    let pid_b = crate::executor::PrincipalId::new_v7();
+
+    // Assign PKG to everyone
+    std::fs::write(
+        root.join("pkg-assignments.json"),
+        json!({ PKG: ["*"] }).to_string(),
+    )
+    .unwrap();
+
+    // Account A starts a streaming sidecar
+    let res_a = rpc_as_child(
+        &p.router,
+        pid_a,
+        false,
+        "pkg_sidecar_rpc_send",
+        json!({ "pkgId": PKG, "name": SIDECAR, "message": "ping" }),
+    )
+    .await;
+    assert_eq!(res_a["ok"], true, "{res_a}");
+
+    // Account B tries to shut down Account A's sidecar -> returns false (isolated!)
+    let res_b_shutdown = rpc_as_child(
+        &p.router,
+        pid_b,
+        false,
+        "pkg_sidecar_rpc_shutdown",
+        json!({ "pkgId": PKG, "name": SIDECAR }),
+    )
+    .await;
+    assert_eq!(res_b_shutdown["ok"], true);
+    assert_eq!(
+        res_b_shutdown["data"], false,
+        "Account B must not shut down Account A's sidecar"
+    );
+
+    // Account A shuts down its sidecar -> returns true and process is killed
+    let res_a_shutdown = rpc_as_child(
+        &p.router,
+        pid_a,
+        false,
+        "pkg_sidecar_rpc_shutdown",
+        json!({ "pkgId": PKG, "name": SIDECAR }),
+    )
+    .await;
+    assert_eq!(res_a_shutdown["ok"], true);
+    assert_eq!(res_a_shutdown["data"], true);
 }

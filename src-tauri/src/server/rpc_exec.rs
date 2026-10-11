@@ -300,10 +300,10 @@ pub(super) async fn pkg_invoke(
             stdin: StdioMode::Null,
             stdout: StdioMode::Piped,
             stderr: StdioMode::Piped,
-            kill_on_drop: false,
+            kill_on_drop: true,
             no_console_window: true,
             detached: false,
-            new_process_group: false,
+            new_process_group: true,
         };
 
         let child = match crate::executor::current().spawn_piped(cmd, opts) {
@@ -388,7 +388,7 @@ pub(super) async fn pkg_sidecar_rpc_send(
                     kill_on_drop: false,
                     no_console_window: true,
                     detached: false,
-                    new_process_group: false,
+                    new_process_group: true,
                 };
                 let mut child = crate::executor::current()
                     .spawn_piped(spec, opts)

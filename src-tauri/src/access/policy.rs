@@ -480,6 +480,7 @@ pub(crate) mod tests {
             share_headers: false,
             caps: CapSet::ALL,
             admin_strength: true,
+            is_admin: true,
             meta: RequestMeta::default(),
         }
     }

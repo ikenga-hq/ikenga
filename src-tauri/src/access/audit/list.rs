@@ -566,6 +566,7 @@ pub(crate) mod tests {
             share_headers: false,
             caps: tier.caps(),
             admin_strength: tier == Tier::Full,
+            is_admin: false,
             meta: RequestMeta::default(),
         }
     }

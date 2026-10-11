@@ -793,6 +793,7 @@ pub(crate) mod tests {
             share_headers: false,
             caps: CapSet::ALL,
             admin_strength: true,
+            is_admin: true,
             meta: RequestMeta::default(),
         }
     }
@@ -834,6 +835,7 @@ pub(crate) mod tests {
                 },
                 row.tier,
             ),
+            is_admin: false,
             meta: RequestMeta::default(),
         }
     }

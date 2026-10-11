@@ -1534,6 +1534,7 @@ mod tests {
             share_headers: true,
             caps: super::super::CapSet::ALL,
             admin_strength: false,
+            is_admin: false,
             meta: Default::default(),
         }
     }

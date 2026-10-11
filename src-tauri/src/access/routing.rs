@@ -376,6 +376,7 @@ mod tests {
             share: None,
             share_headers: false,
             caps: tier.caps(),
+            is_admin: false,
             meta: RequestMeta::default(),
         }
     }

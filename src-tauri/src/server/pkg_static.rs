@@ -426,7 +426,11 @@ impl PkgStaticService {
             let enc = utf8_percent_encode(pkg_id, PATH_SEGMENT);
             match resource_base.strip_prefix(&entry.dist_root) {
                 Ok(sub) if !sub.as_os_str().is_empty() => {
-                    format!("/pkgs/{}/{}/", enc, sub.to_string_lossy().replace('\\', "/"))
+                    format!(
+                        "/pkgs/{}/{}/",
+                        enc,
+                        sub.to_string_lossy().replace('\\', "/")
+                    )
                 }
                 _ => format!("/pkgs/{enc}/"),
             }
@@ -677,9 +681,7 @@ mod tests {
             if token {
                 req = req.header("authorization", "Bearer tok");
             }
-            router
-                .clone()
-                .oneshot(req.body(AxumBody::empty()).unwrap())
+            router.clone().oneshot(req.body(AxumBody::empty()).unwrap())
         };
 
         // All three URL forms must land on the pkg, not on the SPA fallback.
@@ -771,7 +773,10 @@ mod tests {
             .to_str()
             .unwrap()
             .contains("javascript"));
-        assert_eq!(res.headers().get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(
+            res.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
 
         // Unknown pkg, unknown file, and traversal all look identical.
         assert_eq!(
@@ -783,7 +788,9 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            svc.handle("com.test.good", "../../etc/passwd").await.status(),
+            svc.handle("com.test.good", "../../etc/passwd")
+                .await
+                .status(),
             StatusCode::NOT_FOUND
         );
     }
@@ -827,10 +834,20 @@ mod tests {
         write_bundle(&dir.join("dist"), "index.html");
         let svc = PkgStaticService::discover(Some(tmp.path()));
 
-        let out = svc.mint_html("com.test.good", "dist/index.html").expect("mints");
+        let out = svc
+            .mint_html("com.test.good", "dist/index.html")
+            .expect("mints");
 
-        assert!(out.html.contains("BUNDLE_BODY"), "script not inlined: {}", out.html);
-        assert!(out.html.contains("STYLE_BODY"), "stylesheet not inlined: {}", out.html);
+        assert!(
+            out.html.contains("BUNDLE_BODY"),
+            "script not inlined: {}",
+            out.html
+        );
+        assert!(
+            out.html.contains("STYLE_BODY"),
+            "stylesheet not inlined: {}",
+            out.html
+        );
         assert!(
             !out.html.contains("./assets/app.js") && !out.html.contains("./assets/app.css"),
             "a subresource ref survived and will 401 in a browser: {}",
@@ -876,7 +893,11 @@ mod tests {
             .mint_html("com.test.good", "dist/sub/index.html")
             .expect("mints");
         assert_eq!(out.base_url, "/pkgs/com.test.good/sub/");
-        assert!(out.html.contains("BUNDLE_BODY"), "nested asset not inlined: {}", out.html);
+        assert!(
+            out.html.contains("BUNDLE_BODY"),
+            "nested asset not inlined: {}",
+            out.html
+        );
     }
 
     /// The field names are hand-matched against `PkgContentHtmlHandle` in
@@ -897,8 +918,14 @@ mod tests {
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, vec!["baseUrl", "html", "token"]);
-        assert!(!obj.contains_key("supabase"), "supabase must be omitted, not null");
-        assert!(!obj.contains_key("secrets"), "secrets must be omitted, not null");
+        assert!(
+            !obj.contains_key("supabase"),
+            "supabase must be omitted, not null"
+        );
+        assert!(
+            !obj.contains_key("secrets"),
+            "secrets must be omitted, not null"
+        );
     }
 
     /// A `required` host capability the daemon cannot resolve is a refusal
@@ -924,13 +951,20 @@ mod tests {
         );
         let svc = PkgStaticService::discover(Some(tmp.path()));
 
-        let e = svc.mint_html("com.test.supa", "dist/index.html").unwrap_err();
+        let e = svc
+            .mint_html("com.test.supa", "dist/index.html")
+            .unwrap_err();
         assert!(e.contains("com.test.supa"), "{e}");
         assert!(e.contains("capabilities.supabase"), "{e}");
 
-        let e = svc.mint_html("com.test.sec", "dist/index.html").unwrap_err();
+        let e = svc
+            .mint_html("com.test.sec", "dist/index.html")
+            .unwrap_err();
         assert!(e.contains("capabilities.secrets"), "{e}");
-        assert!(e.contains("RESEND"), "error should name the declaration: {e}");
+        assert!(
+            e.contains("RESEND"),
+            "error should name the declaration: {e}"
+        );
     }
 
     /// Optional capabilities are the desktop's own fallback path (`supabase:
@@ -950,7 +984,9 @@ mod tests {
             ),
         );
         let svc = PkgStaticService::discover(Some(tmp.path()));
-        let out = svc.mint_html("com.test.opt", "dist/index.html").expect("mounts");
+        let out = svc
+            .mint_html("com.test.opt", "dist/index.html")
+            .expect("mounts");
         assert!(out.html.contains("<h1>hi</h1>"));
     }
 
@@ -963,13 +999,23 @@ mod tests {
         write_pkg(tmp.path(), "com.test.good", true);
         let svc = PkgStaticService::discover(Some(tmp.path()));
 
-        let e = svc.mint_html("com.test.absent", "dist/index.html").unwrap_err();
+        let e = svc
+            .mint_html("com.test.absent", "dist/index.html")
+            .unwrap_err();
         assert!(e.contains("com.test.absent"), "{e}");
-        assert!(e.contains("com.test.good"), "should list what it does serve: {e}");
+        assert!(
+            e.contains("com.test.good"),
+            "should list what it does serve: {e}"
+        );
 
         let empty = PkgStaticService::discover(None);
-        let e = empty.mint_html("com.test.good", "dist/index.html").unwrap_err();
-        assert!(e.contains("--pkgs-dir"), "should name the missing flag: {e}");
+        let e = empty
+            .mint_html("com.test.good", "dist/index.html")
+            .unwrap_err();
+        assert!(
+            e.contains("--pkgs-dir"),
+            "should name the missing flag: {e}"
+        );
     }
 
     /// `source` is caller-supplied and gets exactly the traversal treatment a

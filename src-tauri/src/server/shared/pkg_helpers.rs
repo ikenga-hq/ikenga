@@ -82,7 +82,21 @@ pub fn resolve_operator_dir(data_dir: Option<&Path>) -> Option<PathBuf> {
 }
 
 // ─── Pkg Assignment Gate (R4-2) ───────────────────────────────────────────────
-
+///
+/// `pkg-assignments.json` defines per-account pkg assignment policies.
+/// Location: `<operator_dir>/pkg-assignments.json` (or `<data_dir>/pkg-assignments.json`).
+///
+/// Schema:
+/// Map of package pattern (`*`, `com.ikenga.*`, or exact pkg ID) to either:
+/// - A string `"all"` or `"*"`: accessible to all authenticated accounts.
+/// - A list of principal UUID strings: `["01923456-...", ...]`: accessible only to specified principals.
+///
+/// Safe default behavior:
+/// - If `pkg-assignments.json` does not exist, built-in pkgs (`com.ikenga.*`) default to `"*"`
+///   (all authenticated accounts can run them, preserving core UX like git branch chip).
+/// - Third-party packages default to denied unless assigned or caller is an admin.
+/// - Box admins (`ctx.is_admin == true`) always bypass pkg assignment checks.
+/// - Requests without an access context (`ctx.is_none()`) are strictly denied.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum PkgAssignmentValue {
@@ -93,6 +107,8 @@ pub enum PkgAssignmentValue {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct PkgAssignments(pub HashMap<String, PkgAssignmentValue>);
 
+/// Check if `pkg_id` is assigned to `principal_id`.
+/// Supports exact matches and wildcard glob patterns (e.g. `*`, `com.ikenga.*`).
 impl PkgAssignments {
     pub fn is_assigned(
         &self,
@@ -104,54 +120,80 @@ impl PkgAssignments {
         if is_admin {
             return true;
         }
-        let Some(assignment) = self.0.get(pkg_id) else {
-            return false;
-        };
-        match assignment {
-            PkgAssignmentValue::All(s) => s == "*" || s.eq_ignore_ascii_case("all"),
-            PkgAssignmentValue::List(list) => {
-                if let Some(pid) = principal_id {
-                    let pid_str = pid.to_string();
-                    list.iter().any(|item| {
-                        item == &pid_str || item == "*" || item.eq_ignore_ascii_case("all")
-                    })
-                } else {
-                    false
+        for (pattern, assignment) in &self.0 {
+            let matched = if pattern == "*" || pattern == pkg_id {
+                true
+            } else if pattern.contains('*') {
+                glob::Pattern::new(pattern)
+                    .map(|p| p.matches(pkg_id))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            if matched {
+                let allowed = match assignment {
+                    PkgAssignmentValue::All(s) => s == "*" || s.eq_ignore_ascii_case("all"),
+                    PkgAssignmentValue::List(list) => {
+                        if let Some(pid) = principal_id {
+                            let pid_str = pid.to_string();
+                            list.iter().any(|item| {
+                                item == &pid_str || item == "*" || item.eq_ignore_ascii_case("all")
+                            })
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if allowed {
+                    return true;
                 }
             }
         }
+        false
     }
 }
 
 /// Check if `pkg_id` is assigned to the caller.
 /// Admins always allowed; otherwise default-deny against `pkg-assignments.json`.
+/// With no access context, deny.
+/// Safe default: if `pkg-assignments.json` is missing, built-in pkgs (`com.ikenga.*`)
+/// default to assigned for everyone (`"*"`), while third-party pkgs default-deny.
 pub fn check_pkg_assignment(
     data_dir: Option<&Path>,
     pkg_id: &str,
     ctx: Option<&AccessCtx>,
 ) -> Result<(), String> {
-    let is_admin = ctx.map(|c| c.admin_strength).unwrap_or(true);
-    if is_admin {
+    let ctx = ctx.ok_or_else(|| format!("pkg `{pkg_id}` denied: no access context"))?;
+    if ctx.is_admin {
         return Ok(());
     }
 
-    let principal_id = ctx.map(|c| c.principal_id);
+    let principal_id = Some(ctx.principal_id);
     let operator_dir = resolve_operator_dir(data_dir);
     let assignments_file = operator_dir
         .as_ref()
         .map(|d| d.join("pkg-assignments.json"));
 
-    let assignments = assignments_file
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<PkgAssignments>(&s).ok())
-        .unwrap_or_default();
+    let assignments = match assignments_file.as_ref() {
+        Some(path) if path.exists() => std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<PkgAssignments>(&s).ok())
+            .unwrap_or_default(),
+        _ => {
+            // Missing assignments file: safe default assigns built-ins com.ikenga.* to all
+            let mut map = HashMap::new();
+            map.insert(
+                "com.ikenga.*".to_string(),
+                PkgAssignmentValue::All("*".to_string()),
+            );
+            PkgAssignments(map)
+        }
+    };
 
-    if assignments.is_assigned(pkg_id, principal_id, is_admin) {
+    if assignments.is_assigned(pkg_id, principal_id, ctx.is_admin) {
         Ok(())
     } else {
-        let id_str = principal_id
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+        let id_str = ctx.principal_id.to_string();
         Err(format!(
             "pkg `{pkg_id}` is not assigned to account `{id_str}`"
         ))
@@ -165,6 +207,8 @@ pub struct PkgTrustRecord {
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
+    pub snapshot_hash: Option<String>,
+    #[serde(default)]
     pub trust_state: String,
     #[serde(default)]
     pub granted_at_ms: Option<i64>,
@@ -175,8 +219,6 @@ pub struct PkgTrustRecord {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum PkgTrustFormat {
-    ApprovedList { approved: Vec<String> },
-    ApprovedArray(Vec<String>),
     Map(HashMap<String, PkgTrustRecord>),
 }
 
@@ -184,13 +226,15 @@ pub enum PkgTrustFormat {
 pub struct PkgTrustRecords(pub Option<PkgTrustFormat>);
 
 impl PkgTrustRecords {
-    pub fn is_approved(&self, pkg_id: &str) -> bool {
+    pub fn is_approved(&self, pkg_id: &str, version: &str, expected_hash: &str) -> bool {
         match &self.0 {
-            Some(PkgTrustFormat::ApprovedList { approved }) => approved.iter().any(|p| p == pkg_id),
-            Some(PkgTrustFormat::ApprovedArray(arr)) => arr.iter().any(|p| p == pkg_id),
             Some(PkgTrustFormat::Map(map)) => {
                 if let Some(record) = map.get(pkg_id) {
-                    record.trust_state == "granted" || record.trust_state == "auto_trusted"
+                    let state_ok =
+                        record.trust_state == "granted" || record.trust_state == "auto_trusted";
+                    let version_ok = record.version.as_deref() == Some(version);
+                    let hash_ok = record.snapshot_hash.as_deref() == Some(expected_hash);
+                    state_ok && version_ok && hash_ok
                 } else {
                     false
                 }
@@ -200,12 +244,30 @@ impl PkgTrustRecords {
     }
 }
 
+/// Determine whether a package is a built-in by checking if its install path
+/// is located within a `builtin-pkgs` directory.
+pub fn pkg_source(pkg: &Package) -> crate::pkg::InstallSource {
+    let path = &pkg.install_path;
+    let is_builtin = path.components().any(|c| c.as_os_str() == "builtin-pkgs");
+    if is_builtin {
+        crate::pkg::InstallSource::Builtin
+    } else {
+        crate::pkg::InstallSource::Local {
+            path: path.display().to_string(),
+        }
+    }
+}
+
 /// Check if `pkg` is trusted to run on this server.
-/// Builtin pkgs (`com.ikenga.*`) and pkgs declaring no sensitive permissions are auto-trusted/granted.
-/// Pkgs with sensitive permissions require an admin approval recorded box-wide in `pkg-trust.json`.
+/// Builtin pkgs (`com.ikenga.*` installed as Builtin) and pkgs declaring no sensitive permissions
+/// are auto-trusted/granted.
+/// Pkgs with sensitive permissions require an admin approval recorded box-wide in `pkg-trust.json`
+/// bound to the pkg version and snapshot hash.
 pub fn check_pkg_trust(data_dir: Option<&Path>, pkg: &Package) -> Result<(), String> {
     let pkg_id = &pkg.manifest.id;
-    if pkg_id.starts_with("com.ikenga.") {
+    let source = pkg_source(pkg);
+
+    if crate::pkg::trust::is_auto_trusted(pkg_id, &source) {
         return Ok(());
     }
 
@@ -218,6 +280,7 @@ pub fn check_pkg_trust(data_dir: Option<&Path>, pkg: &Package) -> Result<(), Str
         return Ok(());
     }
 
+    let expected_hash = crate::pkg::trust::snapshot_hash(&sensitive);
     let operator_dir = resolve_operator_dir(data_dir);
     let trust_file = operator_dir.as_ref().map(|d| d.join("pkg-trust.json"));
     let trust_records = trust_file
@@ -225,11 +288,12 @@ pub fn check_pkg_trust(data_dir: Option<&Path>, pkg: &Package) -> Result<(), Str
         .and_then(|s| serde_json::from_str::<PkgTrustRecords>(&s).ok())
         .unwrap_or_default();
 
-    if trust_records.is_approved(pkg_id) {
+    if trust_records.is_approved(pkg_id, &pkg.manifest.version, &expected_hash) {
         Ok(())
     } else {
         Err(format!(
-            "pkg `{pkg_id}` requires admin trust approval for sensitive permissions"
+            "pkg `{pkg_id}` requires admin trust approval for sensitive permissions (version {}, hash {expected_hash})",
+            pkg.manifest.version
         ))
     }
 }
@@ -237,9 +301,14 @@ pub fn check_pkg_trust(data_dir: Option<&Path>, pkg: &Package) -> Result<(), Str
 /// Check if `pkg` is elevated-trusted for `pkg_invoke`.
 pub fn check_invoke_trust(data_dir: Option<&Path>, pkg: &Package) -> Result<(), String> {
     let pkg_id = &pkg.manifest.id;
-    if pkg_id.starts_with("com.ikenga.") {
+    let source = pkg_source(pkg);
+
+    if crate::pkg::trust::is_auto_trusted(pkg_id, &source) {
         return Ok(());
     }
+
+    let sensitive = crate::pkg::trust_state::summarize_sensitive(&pkg.manifest.permissions);
+    let expected_hash = crate::pkg::trust::snapshot_hash(&sensitive);
 
     let operator_dir = resolve_operator_dir(data_dir);
     let trust_file = operator_dir.as_ref().map(|d| d.join("pkg-trust.json"));
@@ -248,7 +317,7 @@ pub fn check_invoke_trust(data_dir: Option<&Path>, pkg: &Package) -> Result<(), 
         .and_then(|s| serde_json::from_str::<PkgTrustRecords>(&s).ok())
         .unwrap_or_default();
 
-    if trust_records.is_approved(pkg_id) {
+    if trust_records.is_approved(pkg_id, &pkg.manifest.version, &expected_hash) {
         Ok(())
     } else {
         Err(format!("pkg `{pkg_id}` host.invoke requires a trusted pkg"))
@@ -297,12 +366,8 @@ pub async fn call_mcp_tool(
     pkg_id: &str,
     shell_execute: &[String],
 ) -> anyhow::Result<Value> {
-    if !shell_execute.is_empty() && !matches_glob_list(shell_execute, &server.command) {
-        return Err(anyhow::anyhow!(
-            "shell.execute denied: pkg `{pkg_id}` cannot spawn `{}`",
-            server.command
-        ));
-    }
+    crate::pkg::permissions_check::check_shell_execute(pkg_id, shell_execute, &server.command)
+        .map_err(|denial| anyhow::anyhow!("shell.execute denied: {denial:?}"))?;
 
     let program = crate::runtime::resolve_command(&server.command);
     let mut cmd = SpawnSpec::new(program);
@@ -321,7 +386,7 @@ pub async fn call_mcp_tool(
         kill_on_drop: true,
         no_console_window: true,
         detached: false,
-        new_process_group: false,
+        new_process_group: true,
     };
 
     let mut child = crate::executor::current()
@@ -443,12 +508,38 @@ async fn write_json_line(stdin: &mut ChildStdin, msg: &Value) -> anyhow::Result<
 /// This guarantees sidecars are isolated per account (R4-3) and never shared.
 pub type SidecarKey = (Option<PrincipalId>, String, String);
 
+pub fn kill_process_group(pid: u32) {
+    #[cfg(unix)]
+    if pid > 1 {
+        unsafe {
+            let _ = libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
 pub struct SidecarChild {
     pub stdin: Arc<AsyncMutex<ChildStdin>>,
     pub pid: u32,
     pub last_activity: Arc<AsyncMutex<Instant>>,
     pub cancel: tokio::sync::watch::Sender<bool>,
 }
+
+impl std::fmt::Debug for SidecarChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SidecarChild")
+            .field("pid", &self.pid)
+            .finish()
+    }
+}
+
+impl Drop for SidecarChild {
+    fn drop(&mut self) {
+        kill_process_group(self.pid);
+    }
+}
+
+pub const MAX_SIDECARS_PER_ACCOUNT: usize = 8;
 
 #[derive(Clone, Default)]
 pub struct DaemonSidecarManager {
@@ -477,6 +568,13 @@ impl DaemonSidecarManager {
             return Ok(child.clone());
         }
 
+        let count = lock.iter().filter(|(k, _)| k.0 == key.0).count();
+        if count >= MAX_SIDECARS_PER_ACCOUNT {
+            return Err(format!(
+                "maximum concurrent sidecars per account ({MAX_SIDECARS_PER_ACCOUNT}) reached"
+            ));
+        }
+
         let (stdin, pid, stdout) = spawn_fn().await?;
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
         let last_activity = Arc::new(AsyncMutex::new(Instant::now()));
@@ -503,7 +601,9 @@ impl DaemonSidecarManager {
             }
             tracing::info!("[daemon_sidecar {:?}] stdout closed", key_for_reader);
             let mut lock = children_map.lock().await;
-            lock.remove(&key_for_reader);
+            if let Some(c) = lock.remove(&key_for_reader) {
+                kill_process_group(c.pid);
+            }
         });
 
         // Idle reaper task (5 min idle timeout, R4-3)
@@ -522,12 +622,15 @@ impl DaemonSidecarManager {
                                 elapsed
                             );
                             let mut lock = children_map.lock().await;
-                            lock.remove(&key_for_reap);
+                            if let Some(child) = lock.remove(&key_for_reap) {
+                                let _ = child.cancel.send(true);
+                                kill_process_group(child.pid);
+                            }
                             break;
                         }
                     }
-                    _ = cancel_rx.changed() => {
-                        if *cancel_rx.borrow() {
+                    res = cancel_rx.changed() => {
+                        if res.is_err() || *cancel_rx.borrow() {
                             break;
                         }
                     }
@@ -560,6 +663,7 @@ impl DaemonSidecarManager {
         let mut lock = self.children.lock().await;
         if let Some(child) = lock.remove(key) {
             let _ = child.cancel.send(true);
+            kill_process_group(child.pid);
             let mut stdin = child.stdin.lock().await;
             let _ = stdin.shutdown().await;
             true
@@ -587,6 +691,7 @@ mod tests {
             share_headers: false,
             caps: CapSet::of(&[]),
             admin_strength: admin,
+            is_admin: admin,
             meta: RequestMeta::default(),
         }
     }
@@ -604,14 +709,22 @@ mod tests {
         let tmp = tempdir().unwrap();
         let operator_dir = tmp.path();
 
+        // 0. Deny when no access context
+        assert!(check_pkg_assignment(Some(operator_dir), "pkg-a", None).is_err());
+
         // 1. Admin caller is always allowed
         let admin_ctx = mock_ctx(true);
         assert!(check_pkg_assignment(Some(operator_dir), "pkg-a", Some(&admin_ctx)).is_ok());
 
-        // 2. Non-admin caller without assignment file -> default deny (R4-2)
+        // 2. Non-admin caller without assignment file -> default deny for third-party (R4-2)
         let member_ctx = mock_ctx(false);
         let err = check_pkg_assignment(Some(operator_dir), "pkg-a", Some(&member_ctx)).unwrap_err();
         assert!(err.contains("not assigned"), "got: {err}");
+
+        // Built-ins default to assigned for everyone when assignments file is missing
+        assert!(
+            check_pkg_assignment(Some(operator_dir), "com.ikenga.git", Some(&member_ctx)).is_ok()
+        );
 
         // 3. Write pkg-assignments.json granting member_ctx's principal_id
         let assignments = json!({
@@ -648,7 +761,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let operator_dir = tmp.path();
 
-        let make_pkg = |id: &str, shell_exec: Vec<&str>| -> Package {
+        let make_pkg = |id: &str, shell_exec: Vec<&str>, is_builtin: bool| -> Package {
             let manifest: crate::pkg::manifest::Manifest = serde_json::from_value(json!({
                 "id": id,
                 "name": id,
@@ -659,31 +772,56 @@ mod tests {
                 },
             }))
             .unwrap();
+            let install_path = if is_builtin {
+                operator_dir.join("resources/builtin-pkgs").join(id)
+            } else {
+                operator_dir.join(id)
+            };
             Package {
                 manifest,
-                install_path: operator_dir.to_path_buf(),
+                install_path,
             }
         };
 
-        // 1. com.ikenga.* is auto-trusted
-        let ikenga_pkg = make_pkg("com.ikenga.official", vec!["sh"]);
-        assert!(check_pkg_trust(Some(operator_dir), &ikenga_pkg).is_ok());
+        // 1. Built-in com.ikenga.* is auto-trusted
+        let ikenga_builtin = make_pkg("com.ikenga.official", vec!["sh"], true);
+        assert!(check_pkg_trust(Some(operator_dir), &ikenga_builtin).is_ok());
+
+        // Spoofed com.ikenga.* from non-builtin source is NOT auto-trusted (R4-4 Blocker 3)
+        let ikenga_spoof = make_pkg("com.ikenga.spoofed", vec!["sh"], false);
+        assert!(check_pkg_trust(Some(operator_dir), &ikenga_spoof).is_err());
 
         // 2. Non-official pkg with non-sensitive perms -> auto-trusted
-        let benign_pkg = make_pkg("com.other.benign", vec![]);
+        let benign_pkg = make_pkg("com.other.benign", vec![], false);
         assert!(check_pkg_trust(Some(operator_dir), &benign_pkg).is_ok());
 
         // 3. Non-official pkg with sensitive perms -> unapproved without pkg-trust.json
-        let sensitive_pkg = make_pkg("com.other.sensitive", vec!["rm"]);
+        let mut sensitive_pkg = make_pkg("com.other.sensitive", vec!["rm"], false);
         let err = check_pkg_trust(Some(operator_dir), &sensitive_pkg).unwrap_err();
         assert!(err.contains("requires admin trust approval"), "got: {err}");
 
-        // 4. Admin approves sensitive pkg in pkg-trust.json (R4-4)
+        // 4. Admin approves sensitive pkg in pkg-trust.json bound to version + snapshot_hash (R4-4 Blocker 2)
+        let hash = crate::pkg::trust::snapshot_hash(&crate::pkg::trust_state::summarize_sensitive(
+            &sensitive_pkg.manifest.permissions,
+        ));
         let trust_json = json!({
-            "approved": ["com.other.sensitive"]
+            "com.other.sensitive": {
+                "version": "1.0.0",
+                "snapshot_hash": hash,
+                "trust_state": "granted"
+            }
         });
         std::fs::write(operator_dir.join("pkg-trust.json"), trust_json.to_string()).unwrap();
         assert!(check_pkg_trust(Some(operator_dir), &sensitive_pkg).is_ok());
+
+        // Version update (1.0.1) without re-approval is refused
+        sensitive_pkg.manifest.version = "1.0.1".into();
+        assert!(check_pkg_trust(Some(operator_dir), &sensitive_pkg).is_err());
+
+        // Wider permissions without re-approval is refused
+        sensitive_pkg.manifest.version = "1.0.0".into();
+        sensitive_pkg.manifest.permissions.shell_execute = vec!["rm".into(), "*".into()];
+        assert!(check_pkg_trust(Some(operator_dir), &sensitive_pkg).is_err());
     }
 
     #[tokio::test]
@@ -729,5 +867,35 @@ mod tests {
         assert!(manager.shutdown(&key_a).await);
         assert!(!manager.shutdown(&key_a).await); // already shut down
         assert!(manager.shutdown(&key_b).await); // B was still active
+    }
+
+    #[tokio::test]
+    async fn test_sidecar_per_account_cap() {
+        let manager = DaemonSidecarManager::new();
+        let acc = Some(PrincipalId::new_v7());
+
+        let spawn_cat = || async {
+            let mut cmd = tokio::process::Command::new("cat");
+            cmd.stdin(std::process::Stdio::piped());
+            cmd.stdout(std::process::Stdio::piped());
+            let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let pid = child.id().unwrap_or(0);
+            Ok((stdin, pid, stdout))
+        };
+
+        for i in 0..MAX_SIDECARS_PER_ACCOUNT {
+            let key = (acc, "pkg".to_string(), format!("s-{i}"));
+            assert!(manager.get_or_spawn(key, spawn_cat).await.is_ok());
+        }
+
+        // 9th sidecar for the same account must be rejected
+        let key_overflow = (acc, "pkg".to_string(), "overflow".to_string());
+        let err = manager
+            .get_or_spawn(key_overflow, spawn_cat)
+            .await
+            .unwrap_err();
+        assert!(err.contains("maximum concurrent sidecars"), "{err}");
     }
 }

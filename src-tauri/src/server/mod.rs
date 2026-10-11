@@ -826,6 +826,31 @@ pub(crate) fn router_for_exec_tests(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn router_for_exec_tests_with_access(
+    config: ServerConfig,
+    pty_manager: Arc<PtyManager>,
+    pa_db: Option<Arc<crate::db::PaDb>>,
+    home: Option<PathBuf>,
+    path_guard: rpc_shell::PathGuard,
+    chi: Arc<rpc_local::DaemonChi>,
+    access: Arc<crate::access::DaemonAccess>,
+) -> Router {
+    build_router(
+        config,
+        pty_manager,
+        Arc::new(EngineRegistry::new()),
+        pa_db,
+        None,
+        home,
+        path_guard,
+        crate::pkg::skill_actions::store_root(),
+        access,
+        Some(chi),
+        UpdateSource::Default,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_router(
     config: ServerConfig,

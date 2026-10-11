@@ -428,6 +428,7 @@ impl DaemonAccess {
             share_headers: false,
             caps: caps::effective(context, Tier::Full, CapSet::ALL, routing_ok),
             admin_strength: true,
+            is_admin: true,
             meta: RequestMeta {
                 routing_withheld_approve: ctx::routing_withheld_approve(
                     context,
@@ -451,6 +452,7 @@ impl DaemonAccess {
         AccessCtx {
             principal_id,
             admin_strength: AccessCtx::admin_strength_of(&via, row.tier),
+            is_admin: false,
             via,
             device_id: Some(row.device_id.clone()),
             tier: row.tier,
@@ -497,6 +499,7 @@ impl DaemonAccess {
             .unwrap_or(self.owner);
         let broker_call = header(INTERNAL_CALL_HEADER).as_deref() == Some("1")
             && !headers.contains_key("x-ikenga-caps");
+        let is_admin = header(crate::server::broker::proxy::ADMIN_HEADER).as_deref() == Some("1");
         AccessCtx {
             principal_id,
             via: if broker_call {
@@ -514,6 +517,7 @@ impl DaemonAccess {
             share_headers: share::any_share_header(headers),
             caps,
             admin_strength: false,
+            is_admin,
             meta,
         }
     }
@@ -585,8 +589,7 @@ pub fn route_requirement(path: &str) -> Option<Requirement> {
         Some(Requirement::shared(&[Cap::Files]))
     } else if path.starts_with("/__viewer/") || path == "/__viewer" {
         Some(Requirement::shared(&[Cap::Files]))
-    } else if path == crate::server::push::outbox::EVENTS_PATH
-        || path == audit::child::EVENTS_PATH
+    } else if path == crate::server::push::outbox::EVENTS_PATH || path == audit::child::EVENTS_PATH
     {
         // plans/pwa S2 §10: the broker's push long-poll, broker → child only.
         Some(Requirement::internal())
@@ -660,9 +663,11 @@ mod tests {
     use super::*;
 
     fn ctx(via: Via, tier: Tier) -> AccessCtx {
+        let is_admin = matches!(via, Via::Operator);
         AccessCtx {
             principal_id: PrincipalId::new_v7(),
             admin_strength: AccessCtx::admin_strength_of(&via, tier),
+            is_admin,
             via,
             device_id: None,
             tier,
