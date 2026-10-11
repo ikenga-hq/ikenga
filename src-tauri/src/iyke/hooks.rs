@@ -80,6 +80,9 @@ pub struct HookDecision {
 /// Pending decision for a held `PreToolUse` hook.
 struct HeldRequest {
     tx: oneshot::Sender<HookDecision>,
+    tool_name: Option<String>,
+    tool_input: Option<serde_json::Value>,
+    cwd: Option<String>,
 }
 
 static HELD_REQUESTS: OnceLock<Arc<Mutex<HashMap<String, HeldRequest>>>> = OnceLock::new();
@@ -175,7 +178,12 @@ pub async fn post_hook_event(
 
         let (tx, rx) = oneshot::channel::<HookDecision>();
         {
-            let held = HeldRequest { tx };
+            let held = HeldRequest {
+                tx,
+                tool_name: payload.tool_name.clone(),
+                tool_input: payload.tool_input.clone(),
+                cwd: payload.cwd.clone(),
+            };
             if let Ok(mut map) = get_held_requests().lock() {
                 map.insert(request_id.clone(), held);
             }
@@ -426,10 +434,17 @@ pub async fn post_hook_decision(
     // No row to decide through (the record is slow or failed, or routing
     // never installed — no `PaDb`): still never answer past the routing
     // preference (§5.1; reviews WP75-R10, WP75-RV1). The host's routing is
-    // read from the AppHandle either way, so this fails closed. This path
-    // writes no `decided_*` and no audit — there is no row to attribute.
+    // read from the AppHandle either way, so this fails closed.
     let host = crate::notifications::host_side(&app);
-    match answer_without_row(&host, || resolve_held(&app, &decision.request_id, approved)).await {
+    let held_facts = get_held_requests().lock().ok().and_then(|map| {
+        map.get(&decision.request_id)
+            .map(|h| (h.tool_name.clone(), h.tool_input.clone(), h.cwd.clone()))
+    });
+    match handle_no_row_decision(&host, approved, held_facts, || {
+        resolve_held(&app, &decision.request_id, approved)
+    })
+    .await
+    {
         Ok(was_gated) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -441,6 +456,51 @@ pub async fn post_hook_decision(
             e.code.status(),
             Json(serde_json::json!({ "recorded": false, "error": e.to_string() })),
         ),
+    }
+}
+
+async fn handle_no_row_decision(
+    host: &dyn crate::server::shared::notifications::routing::HostSide,
+    approved: bool,
+    held_facts: Option<(Option<String>, Option<serde_json::Value>, Option<String>)>,
+    answer: impl FnOnce() -> bool,
+) -> Result<bool, crate::access::AccessError> {
+    let tool_name = held_facts.as_ref().and_then(|(n, _, _)| n.as_deref());
+    let tool_input = held_facts.as_ref().and_then(|(_, i, _)| i.as_ref());
+    let cwd = held_facts.as_ref().and_then(|(_, _, c)| c.as_deref());
+    let tool = tool_name.filter(|t| !t.is_empty()).unwrap_or("a tool");
+    let target = crate::server::shared::notifications::run::truncate(
+        &format!("Claude wants to use {tool}"),
+        120,
+    );
+    let facts = crate::server::shared::notifications::hook_ask::ask_facts(
+        tool_name, tool_input, cwd, false,
+    );
+    let sensitive = crate::server::shared::notifications::hook_ask::attribution(&facts, None)
+        .sensitivity
+        .level();
+
+    match answer_without_row(host, answer).await {
+        Ok(was_gated) => {
+            if was_gated {
+                let detail = serde_json::json!({
+                    "decision": if approved { "allow_once" } else { "deny" },
+                    "sensitive": sensitive,
+                    "requested_by": null,
+                });
+                host.audit_local("permission.decided", target, detail).await;
+            }
+            Ok(was_gated)
+        }
+        Err(e) => {
+            host.audit_local(
+                "permission.refused",
+                target,
+                serde_json::json!({ "reason": "routing_refused" }),
+            )
+            .await;
+            Err(e)
+        }
     }
 }
 
@@ -634,9 +694,123 @@ mod tests {
     fn held_requests_map_isolated() {
         let map = get_held_requests();
         let (tx, _rx) = oneshot::channel::<HookDecision>();
-        map.lock()
-            .unwrap()
-            .insert("perm-123".into(), HeldRequest { tx });
+        map.lock().unwrap().insert(
+            "perm-123".into(),
+            HeldRequest {
+                tx,
+                tool_name: None,
+                tool_input: None,
+                cwd: None,
+            },
+        );
         assert!(map.lock().unwrap().contains_key("perm-123"));
+    }
+
+    struct AuditingFake {
+        routing: Result<
+            crate::server::shared::notifications::routing::HostRouting,
+            crate::access::AccessError,
+        >,
+        audited: Arc<Mutex<Vec<(&'static str, String, serde_json::Value)>>>,
+    }
+
+    impl crate::server::shared::notifications::routing::HostSide for AuditingFake {
+        fn host_routing(
+            &self,
+        ) -> futures_util::future::BoxFuture<
+            '_,
+            Result<
+                crate::server::shared::notifications::routing::HostRouting,
+                crate::access::AccessError,
+            >,
+        > {
+            let r = self.routing.clone();
+            Box::pin(async move { r })
+        }
+
+        fn audit_local(
+            &self,
+            kind: &'static str,
+            target: String,
+            detail: serde_json::Value,
+        ) -> futures_util::future::BoxFuture<'_, ()> {
+            self.audited.lock().unwrap().push((kind, target, detail));
+            Box::pin(async {})
+        }
+    }
+
+    #[tokio::test]
+    async fn no_row_decision_admitted_audits_permission_decided() {
+        use crate::server::shared::notifications::routing::HostRouting;
+
+        let audited = Arc::new(Mutex::new(Vec::new()));
+        let fake = AuditingFake {
+            routing: Ok(HostRouting {
+                routing_ok: true,
+                ..Default::default()
+            }),
+            audited: audited.clone(),
+        };
+        let facts = Some((
+            Some("Bash".to_string()),
+            Some(serde_json::json!({ "command": "cargo test" })),
+            Some("/tmp/project".to_string()),
+        ));
+        let res = handle_no_row_decision(&fake, true, facts, || true).await;
+        assert_eq!(res.unwrap(), true);
+        let entries = audited.lock().unwrap().clone();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "permission.decided");
+        assert_eq!(entries[0].1, "Claude wants to use Bash");
+        assert_eq!(entries[0].2["decision"], "allow_once");
+        assert_eq!(entries[0].2["sensitive"], 1);
+    }
+
+    #[tokio::test]
+    async fn no_row_decision_refused_audits_permission_refused() {
+        use crate::server::shared::notifications::routing::HostRouting;
+
+        let audited = Arc::new(Mutex::new(Vec::new()));
+        let fake = AuditingFake {
+            routing: Ok(HostRouting {
+                routing_ok: false,
+                ..Default::default()
+            }),
+            audited: audited.clone(),
+        };
+        let facts = Some((
+            Some("Bash".to_string()),
+            Some(serde_json::json!({ "command": "cargo test" })),
+            Some("/tmp/project".to_string()),
+        ));
+        let res = handle_no_row_decision(&fake, true, facts, || true).await;
+        assert!(res.is_err());
+        let entries = audited.lock().unwrap().clone();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "permission.refused");
+        assert_eq!(entries[0].1, "Claude wants to use Bash");
+        assert_eq!(entries[0].2["reason"], "routing_refused");
+    }
+
+    #[tokio::test]
+    async fn no_row_decision_ungated_does_not_audit_decided() {
+        use crate::server::shared::notifications::routing::HostRouting;
+
+        let audited = Arc::new(Mutex::new(Vec::new()));
+        let fake = AuditingFake {
+            routing: Ok(HostRouting {
+                routing_ok: true,
+                ..Default::default()
+            }),
+            audited: audited.clone(),
+        };
+        let facts = Some((Some("Bash".to_string()), None, None));
+        let res = handle_no_row_decision(&fake, true, facts, || false).await;
+        assert_eq!(res.unwrap(), false);
+        let entries = audited.lock().unwrap().clone();
+        assert!(
+            entries.is_empty(),
+            "ungated decision must not audit decided"
+        );
     }
 }

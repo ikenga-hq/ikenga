@@ -1617,16 +1617,28 @@ impl Relay {
 
 /// Desktop boot (review WP75-RV2): the hook / ACP asks an earlier desktop
 /// run left open. Their hold (the hook gate's parked response, the ACP
+/// What an orphaned ask was, for attribution in audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweptAsk {
+    pub id: i64,
+    pub dedupe_key: String,
+    pub title: String,
+    pub sensitive: i64,
+    pub project_id: Option<String>,
+}
+
+/// Review WP75-RV2: close the hook / ACP asks an earlier run left open.
+/// Each (the in-flight request, the hook connection, or the remote
 /// round-trip) died with that process, so none can still take a decision —
 /// including a remote decision the relay delivered just before a crash and
 /// the desktop never applied. Each is resolved here (the ask is over) and
-/// its key returned, for the desktop to report to the daemon as
+/// its record returned, for callers to audit and report to the daemon as
 /// `permission_relay_resolve {outcome: 'cancelled'}` so the daemon retracts
 /// a `permission.decided` it wrote for a decision that never took effect.
 /// `before_ms` is this process's start: an ask raised since is live.
-pub async fn sweep_orphaned_asks(pool: &sqlx::SqlitePool, before_ms: i64) -> Vec<String> {
-    let rows: Vec<(i64, String)> = match sqlx::query_as(
-        "SELECT id, dedupe_key FROM shell_notifications \
+pub async fn sweep_orphaned_asks(pool: &sqlx::SqlitePool, before_ms: i64) -> Vec<SweptAsk> {
+    let rows: Vec<(i64, String, String, i64, Option<String>)> = match sqlx::query_as(
+        "SELECT id, dedupe_key, title, sensitive, project_id FROM shell_notifications \
          WHERE kind = 'permission' AND resolved_at IS NULL AND created_at < ? \
            AND (dedupe_key LIKE 'permission:hook:%' OR dedupe_key LIKE 'permission:acp:%')",
     )
@@ -1641,8 +1653,8 @@ pub async fn sweep_orphaned_asks(pool: &sqlx::SqlitePool, before_ms: i64) -> Vec
         }
     };
     let now = now_ms();
-    let mut keys = Vec::with_capacity(rows.len());
-    for (id, key) in rows {
+    let mut swept = Vec::with_capacity(rows.len());
+    for (id, dedupe_key, title, sensitive, project_id) in rows {
         let r = sqlx::query(
             "UPDATE shell_notifications SET resolved_at = ?, read_at = COALESCE(read_at, ?) \
              WHERE id = ? AND resolved_at IS NULL",
@@ -1653,15 +1665,21 @@ pub async fn sweep_orphaned_asks(pool: &sqlx::SqlitePool, before_ms: i64) -> Vec
         .execute(pool)
         .await;
         match r {
-            Ok(done) if done.rows_affected() > 0 => keys.push(key),
+            Ok(done) if done.rows_affected() > 0 => swept.push(SweptAsk {
+                id,
+                dedupe_key,
+                title,
+                sensitive,
+                project_id,
+            }),
             Ok(_) => {}
-            Err(e) => log::warn!(target: "ikenga::notifications", "orphaned ask {key}: {e}"),
+            Err(e) => log::warn!(target: "ikenga::notifications", "orphaned ask {dedupe_key}: {e}"),
         }
     }
-    if !keys.is_empty() {
+    if !swept.is_empty() {
         super::publish(ChangeReason::Read, None);
     }
-    keys
+    swept
 }
 
 /// The daemon's resolver table: only the relay (§5.5).
@@ -3571,7 +3589,8 @@ mod tests {
             .unwrap()
             .unwrap()
             .id;
-        let mut keys = sweep_orphaned_asks(&pool, booted).await;
+        let swept = sweep_orphaned_asks(&pool, booted).await;
+        let mut keys: Vec<String> = swept.into_iter().map(|s| s.dedupe_key).collect();
         keys.sort();
         assert_eq!(keys, ["permission:acp:t1:r1", "permission:hook:crash"]);
         for (id, swept) in [

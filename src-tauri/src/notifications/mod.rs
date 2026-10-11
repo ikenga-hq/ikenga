@@ -299,9 +299,18 @@ mod routing_desktop {
         let Ok(pool) = db.ensure_pool().await else {
             return;
         };
-        let keys = core::sweep_orphaned_asks(&pool, booted_at).await;
-        for key in keys {
-            let args = json!({ "key": key, "outcome": "cancelled" });
+        let host = Host { app: app.clone() };
+        let swept = core::sweep_orphaned_asks(&pool, booted_at).await;
+        for ask in swept {
+            let target = ask.title.chars().take(120).collect::<String>();
+            let detail = json!({
+                "reason": "expired:restart",
+                "outcome": "expired:restart",
+                "sensitive": ask.sensitive,
+            });
+            host.audit_local("permission.refused", target, detail).await;
+
+            let args = json!({ "key": ask.dedupe_key, "outcome": "cancelled" });
             let mut delay = Duration::from_secs(1);
             for attempt in 0..6 {
                 match daemon_rpc(&app, "permission_relay_resolve", args.clone()).await {
@@ -309,7 +318,8 @@ mod routing_desktop {
                     Err(e) => {
                         log::debug!(
                             target: "ikenga::notifications",
-                            "orphaned ask {key}: report attempt {attempt}: {e}"
+                            "orphaned ask {}: report attempt {attempt}: {e}",
+                            ask.dedupe_key
                         );
                         tokio::time::sleep(delay).await;
                         delay = (delay * 2).min(Duration::from_secs(20));

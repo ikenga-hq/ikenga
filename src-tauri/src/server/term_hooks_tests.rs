@@ -10,11 +10,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::Router;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite;
 use tower::ServiceExt;
 
@@ -23,7 +23,7 @@ use crate::db::PaDb;
 use crate::engines::EngineRegistry;
 use crate::executor::ExecutorTier;
 use crate::pty::PtyManager;
-use crate::server::{ServerConfig, router_with_home};
+use crate::server::{router_with_home, ServerConfig};
 
 thread_local! {
     /// Per-test hold for a parked gate (read by [`TermHooks::new`]).
@@ -408,12 +408,10 @@ async fn pty_spawn_refuses_a_settings_path_it_would_not_have_chosen() {
     )
     .await;
     assert_eq!(res["ok"], false);
-    assert!(
-        res["error"]
-            .as_str()
-            .unwrap()
-            .contains("Not available on this server")
-    );
+    assert!(res["error"]
+        .as_str()
+        .unwrap()
+        .contains("Not available on this server"));
 }
 
 // ─── the credential ──────────────────────────────────────────────────────────
@@ -526,12 +524,11 @@ async fn a_secret_dies_with_its_terminal_and_a_respawn_keeps_its_own() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(
-        !d.data
-            .join(DIR_NAME)
-            .join(terminal_file_name("t-x"))
-            .exists()
-    );
+    assert!(!d
+        .data
+        .join(DIR_NAME)
+        .join(terminal_file_name("t-x"))
+        .exists());
     assert!(!d.data.join(DIR_NAME).join(header_file_name("t-x")).exists());
 
     // Respawned under the same id: the first PTY's exit must not revoke the
@@ -548,12 +545,11 @@ async fn a_secret_dies_with_its_terminal_and_a_respawn_keeps_its_own() {
     tokio::time::sleep(Duration::from_millis(1800)).await; // first PTY exits
     let (status, _) = post_json(&d.router, EVENT_PATH, "t-y", &second, json!({})).await;
     assert_eq!(status, StatusCode::OK, "the live terminal kept its hooks");
-    assert!(
-        d.data
-            .join(DIR_NAME)
-            .join(terminal_file_name("t-y"))
-            .exists()
-    );
+    assert!(d
+        .data
+        .join(DIR_NAME)
+        .join(terminal_file_name("t-y"))
+        .exists());
 }
 
 // ─── statusline ──────────────────────────────────────────────────────────────
@@ -1739,6 +1735,127 @@ async fn a_row_left_open_by_an_earlier_run_is_closed_at_boot() {
         (open == 0).then_some(())
     })
     .await;
+}
+
+/// An ask left open by an earlier run is swept at boot and audited as expired:restart.
+#[tokio::test]
+async fn swept_orphaned_asks_are_audited_at_boot_on_t0_and_t1() {
+    // 1. T0 with access store
+    let store = AccessStore::memory_t0().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let (data, home) = (root.join("data"), root.join("home"));
+    for d in [&data, &home] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let db = Arc::new(PaDb::new(data.join("ikenga.db")));
+    let pool = db.ensure_pool().await.unwrap();
+    let stale = notes::hook_ask::permission_from_hook_gate(
+        Some("Bash"),
+        None,
+        Some("t-old"),
+        None,
+        "perm-from-a-dead-run-t0",
+    );
+    notes::record(&pool, stale).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let _router = crate::server::build_router(
+        config(Some(data.clone()), PORT),
+        Arc::new(PtyManager::new()),
+        Arc::new(EngineRegistry::new()),
+        Some(db.clone()),
+        None,
+        Some(home),
+        crate::server::rpc_shell::PathGuard::allowlist(),
+        None,
+        DaemonAccess::with_store(store.clone()),
+        None,
+        crate::server::UpdateSource::Default,
+    );
+
+    until(|| async {
+        let open: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shell_notifications WHERE kind = 'permission' AND resolved_at IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        (open == 0).then_some(())
+    })
+    .await;
+
+    let rows: Vec<(String, Option<String>, Value)> = until(|| async {
+        let rows: Vec<(String, Option<String>, Value)> = sqlx::query_as(
+            "SELECT kind, target, detail FROM audit_events WHERE category = 'permission'",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        (!rows.is_empty()).then_some(rows)
+    })
+    .await;
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "permission.refused");
+    assert_eq!(rows[0].1.as_deref(), Some("Claude wants to use Bash"));
+    assert_eq!(rows[0].2["reason"], "expired:restart");
+    assert_eq!(rows[0].2["outcome"], "expired:restart");
+
+    // 2. T1 child with outbox
+    let outbox = Arc::new(audit_child::Outbox::new());
+    crate::server::hook_asks::TEST_OUTBOX.with(|t| *t.borrow_mut() = Some(outbox.clone()));
+    let tmp1 = tempfile::tempdir().unwrap();
+    let root1 = tmp1.path().canonicalize().unwrap();
+    let (data1, home1) = (root1.join("data"), root1.join("home"));
+    for d in [&data1, &home1] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let db1 = Arc::new(PaDb::new(data1.join("ikenga.db")));
+    let pool1 = db1.ensure_pool().await.unwrap();
+    let stale1 = notes::hook_ask::permission_from_hook_gate(
+        Some("Edit"),
+        None,
+        Some("t-old1"),
+        None,
+        "perm-from-a-dead-run-t1",
+    );
+    notes::record(&pool1, stale1).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let _router1 = crate::server::build_router(
+        config(Some(data1.clone()), PORT),
+        Arc::new(PtyManager::new()),
+        Arc::new(EngineRegistry::new()),
+        Some(db1.clone()),
+        None,
+        Some(home1),
+        crate::server::rpc_shell::PathGuard::allowlist(),
+        None,
+        DaemonAccess::principal_child(Default::default()),
+        None,
+        crate::server::UpdateSource::Default,
+    );
+    crate::server::hook_asks::TEST_OUTBOX.with(|t| *t.borrow_mut() = None);
+
+    until(|| async {
+        let open: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shell_notifications WHERE kind = 'permission' AND resolved_at IS NULL",
+        )
+        .fetch_one(&pool1)
+        .await
+        .unwrap();
+        (open == 0).then_some(())
+    })
+    .await;
+
+    let batch = outbox.take(Duration::from_millis(500)).await;
+    assert_eq!(batch.notes.len(), 1);
+    let n = &batch.notes[0];
+    assert_eq!(n.kind, Some(audit_child::NoteKind::Refused));
+    assert_eq!(n.target.as_deref(), Some("Claude wants to use Edit"));
+    assert_eq!(n.reason.as_deref(), Some("expired:restart"));
+    assert_eq!(n.outcome.as_deref(), Some("expired:restart"));
 }
 
 // ─── principals ──────────────────────────────────────────────────────────────

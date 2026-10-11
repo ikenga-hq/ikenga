@@ -90,6 +90,8 @@ pub(crate) enum Outcome {
     TerminalEnded,
     /// The hook's HTTP connection went away with the ask held.
     HookDisconnected,
+    /// An earlier run left the ask open and crashed/restarted.
+    ExpiredRestart,
 }
 
 impl Outcome {
@@ -100,6 +102,7 @@ impl Outcome {
             Outcome::TableFull => "held_table_full",
             Outcome::TerminalEnded => "terminal_ended",
             Outcome::HookDisconnected => "hook_disconnected",
+            Outcome::ExpiredRestart => "expired:restart",
         }
     }
 }
@@ -268,11 +271,42 @@ impl HookAsks {
                     let swept = routing::sweep_orphaned_asks(&pool, before).await;
                     if !swept.is_empty() {
                         debug!("hook asks: closed {} rows from an earlier run", swept.len());
+                        for ask in swept {
+                            me.audit_swept_ask(&ask).await;
+                        }
                     }
                 }
                 Err(e) => debug!("hook asks: no pool for the boot sweep: {e}"),
             }
         });
+    }
+
+    async fn audit_swept_ask(&self, ask: &routing::SweptAsk) {
+        let note = Note {
+            kind: Some(NoteKind::Refused),
+            target: Some(ask.title.clone()),
+            decision: None,
+            outcome: Some(Outcome::ExpiredRestart.as_str().to_string()),
+            reason: Some("expired:restart".to_string()),
+            sensitive: ask.sensitive,
+            requested_by: None,
+            project_key: ask
+                .project_id
+                .as_ref()
+                .map(|p| format!("{}/{p}", self.owner)),
+            by: None,
+        };
+        match &self.audit {
+            AuditSink::Store(store) => match child::system_event(self.owner, &note) {
+                Some(ev) => routing::append_audit(store, &ev).await,
+                None => warn!("hook asks: an outcome note failed its own vocabulary"),
+            },
+            AuditSink::Outbox(outbox) => outbox.push(note),
+            AuditSink::Off => debug!(
+                "hook asks: no audit sink; {} not recorded",
+                Outcome::ExpiredRestart.as_str()
+            ),
+        }
     }
 
     /// Write the ask's row (after it is parked). Never fails the ask: a row
@@ -399,6 +433,9 @@ impl HookAsks {
                 None,
                 Some("hook_disconnected".to_string()),
             ),
+            Outcome::ExpiredRestart => {
+                (NoteKind::Refused, None, Some("expired:restart".to_string()))
+            }
         };
         let (sensitive, project_id) = rec.facts();
         let note = Note {

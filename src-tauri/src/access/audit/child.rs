@@ -111,6 +111,7 @@ pub const OUTCOMES: &[&str] = &[
     "terminal_ended",
     "hook_disconnected",
     "held_table_full",
+    "expired:restart",
 ];
 /// `permission.refused` reasons: the §6.5 ones the decide core records, plus
 /// the daemon hold's own ("the ask ended and nothing was delivered").
@@ -120,6 +121,7 @@ pub const REASONS: &[&str] = &[
     "forbidden",
     "not_applied",
     "hook_disconnected",
+    "expired:restart",
 ];
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -615,6 +617,36 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&row.3).unwrap()["outcome"],
             json!("timed_out")
         );
+    }
+
+    #[tokio::test]
+    async fn expired_restart_reaches_the_chain() {
+        let store = AccessStore::memory_t0().await;
+        let me = PrincipalId::new_v7();
+        let expired = Note {
+            kind: Some(NoteKind::Refused),
+            target: Some("Claude wants to use Bash".into()),
+            decision: None,
+            outcome: Some("expired:restart".into()),
+            reason: Some("expired:restart".into()),
+            sensitive: 1,
+            requested_by: None,
+            project_key: None,
+            by: None,
+        };
+        let ev = accept(&store, me, &expired).await.unwrap();
+        assert_eq!(ev.kind, "permission.refused");
+        assert_eq!(ev.via, AuditVia::System);
+        assert_eq!(ev.detail["reason"], "expired:restart");
+        assert_eq!(ev.detail["outcome"], "expired:restart");
+        crate::server::shared::notifications::routing::append_audit(&store, &ev).await;
+        let rows = rows(&store).await;
+        let row = rows.last().unwrap();
+        assert_eq!(row.0, "permission.refused");
+        assert_eq!(row.2, "system");
+        let detail: serde_json::Value = serde_json::from_str(&row.3).unwrap();
+        assert_eq!(detail["reason"], "expired:restart");
+        assert_eq!(detail["outcome"], "expired:restart");
     }
 
     #[tokio::test]
