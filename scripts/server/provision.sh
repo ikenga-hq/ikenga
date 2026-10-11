@@ -2129,7 +2129,7 @@ sync_projects() {
   local a
   for a in "${MEMBERS[@]}"; do
     has_account "$a" || continue
-    for e in "${PROJECTS[@]}"; do ensure_account_clone "$a" "${e%%=*}"; done
+    for e in "${PROJECTS[@]}"; do ensure_account_clone "$a" "${e%%=*}" "${e#*=}"; done
   done
   rm -rf -- "$GIT_HOME"; GIT_HOME=""; ASKPASS_FILE=""
 }
@@ -2206,12 +2206,43 @@ ensure_mirror() {
   [[ "$before" == "$after" ]] || changed "project $name fetched new commits"
 }
 
-# An account's own clone: created once, as the account, and then never touched.
+# The push URL an account clone gets: the project's upstream, so `git push`
+# goes there with the account's own credentials (`gh auth login` +
+# `gh auth setup-git`). Fetch stays on the read-only local mirror. Empty when
+# the upstream carries credentials, which must never land in a clone's config.
+clone_push_url() {
+  local url="${1%%#*}"
+  [[ "$url" =~ ^[a-z+]+://[^/]*@ ]] && return 0
+  printf '%s' "$url"
+}
+
+# Older clones were made with origin's push URL left at the mirror, which is
+# read-only, so every push failed. Repoint origin's push URL only while it
+# still equals that mirror path; anything the account set itself is kept.
+converge_clone_push_url() {
+  local a="$1" name="$2" wt="$3" repo="$4" push="$5" cur
+  [[ -n "$push" && -d "$wt/.git" && ! -L "$wt" ]] || return 0
+  cur="$(as_account "$a" git -C "$wt" config --get remote.origin.pushurl 2>/dev/null || true)"
+  [[ -z "$cur" ]] || return 0
+  cur="$(as_account "$a" git -C "$wt" config --get remote.origin.url 2>/dev/null || true)"
+  [[ "$cur" == "$repo" ]] || return 0
+  if [[ $DRY_RUN -eq 1 ]]; then changed "clone ik-$a:$name: push URL -> $push"; return; fi
+  as_account "$a" git -C "$wt" remote set-url --push origin "$push" \
+    && changed "clone ik-$a:$name: push URL -> $push" \
+    || soft_fail "ik-$a:$name: cannot set the push URL"
+}
+
+# An account's own clone: created once, as the account, and then never touched
+# (beyond pointing an untouched push URL at the upstream, above).
 ensure_account_clone() {
-  local a="$1" name="$2" repo wt branch def home out
+  local a="$1" name="$2" spec="${3:-}" repo wt branch def home out push
   repo="$PROJECTS_DIR/$name.git"; home="${ACCT_HOME[$a]}"; wt="$home/projects/$name"
   branch="${PROJECTS_BRANCH_PREFIX}${a}/main"
-  [[ ! -e "$wt" && ! -L "$wt" ]] || return 0           # never touch an existing clone
+  push="$(clone_push_url "$spec")"
+  if [[ -e "$wt" || -L "$wt" ]]; then
+    converge_clone_push_url "$a" "$name" "$wt" "$repo" "$push"
+    return 0
+  fi
   if [[ $DRY_RUN -eq 1 ]]; then
     [[ -d "$repo" ]] && changed "clone ik-$a:$name on $branch" || changed "clone ik-$a:$name on $branch (after the mirror)"
     return
@@ -2233,7 +2264,11 @@ ensure_account_clone() {
   if ! out="$(as_account "$a" git -C "$wt" checkout --quiet --no-track -b "$branch" "refs/remotes/origin/$def" 2>&1)"; then
     soft_fail "ik-$a:$name: cannot create $branch: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"; return
   fi
-  changed "clone ik-$a:$name on $branch"
+  if [[ -n "$push" ]]; then
+    as_account "$a" git -C "$wt" remote set-url --push origin "$push" \
+      || soft_fail "ik-$a:$name: cannot set the push URL"
+  fi
+  changed "clone ik-$a:$name on $branch${push:+ (push: $push)}"
 }
 
 # ---- scoped secrets (D-B3)
