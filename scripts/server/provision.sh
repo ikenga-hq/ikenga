@@ -4308,6 +4308,8 @@ sync_swap() {
 SENDER_ENV_FILE="$SECRETS_DIR/ikenga-sender.env"
 SENDER_UNIT="ikenga-sender.service"
 SENDER_TIMER="ikenga-sender.timer"
+SENDER_APPROVER_GROUP="${SENDER_APPROVER_GROUP:-ikenga-approver}"
+SENDER_RUN_DIR="${SENDER_RUN_DIR:-/run/ikenga-sender}"
 SND_UID=0; SND_GID=0; SND_GROUP="$SENDER_USER"
 RUBY_PRINCIPAL_DIR=""; RUBY_DATA_DIR=""; RUBY_DB=""
 
@@ -4351,6 +4353,10 @@ sender_ensure_user() {
     run useradd --system --user-group --no-create-home --home-dir "$SENDER_STATE_DIR" --shell /usr/sbin/nologin \
       --comment "Ikenga outbox sender" "$SENDER_USER"
     changed "system user $SENDER_USER created (no login, home $SENDER_STATE_DIR)"
+  fi
+  if ! getent group "$SENDER_APPROVER_GROUP" >/dev/null 2>&1; then
+    run groupadd --system "$SENDER_APPROVER_GROUP"
+    changed "system group $SENDER_APPROVER_GROUP created for bridge IPC"
   fi
   if id "$SENDER_USER" >/dev/null 2>&1; then
     SND_UID="$(id -u "$SENDER_USER")"; SND_GID="$(id -g "$SENDER_USER")"; SND_GROUP="$(id -gn "$SENDER_USER")"
@@ -4551,7 +4557,9 @@ LockPersonality=true
 CapabilityBoundingSet=
 
 # Paths:
-ReadWritePaths=$SENDER_STATE_DIR $RUBY_DATA_DIR
+RuntimeDirectory=ikenga-sender
+RuntimeDirectoryMode=0750
+ReadWritePaths=$SENDER_STATE_DIR $RUBY_DATA_DIR /run/ikenga-sender
 InaccessiblePaths=-/root -/etc/ikenga/secrets/ik-*.env
 EOF
 }
@@ -4652,6 +4660,9 @@ sync_sender_enabled() {
 
   sender_ensure_user
   backup_safe_dir 0700 "$SENDER_USER" "$SND_GROUP" "$SND_UID" "$SENDER_STATE_DIR"
+  if [[ -d /run ]]; then
+    ensure_dir 0750 "$SENDER_USER" "$SENDER_APPROVER_GROUP" "$SENDER_RUN_DIR"
+  fi
   sender_install_worker
   sync_sender_secrets
   sender_reapply_acls

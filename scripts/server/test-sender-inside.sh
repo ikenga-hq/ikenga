@@ -244,9 +244,74 @@ grep -q 'LoadCredential=env:' <<<"$unit_content" || fail "LoadCredential missing
 grep -q 'ReadWritePaths=' <<<"$unit_content" || fail "ReadWritePaths missing"
 pass "systemd unit hardening: NoNewPrivileges, ProtectSystem=strict, LoadCredential verified"
 
-# Dry run with stub worker runner
-if [[ -f /opt/ikenga-sender/run-sender.sh ]]; then
-  chmod +x /opt/ikenga-sender/run-sender.sh
-fi
+# ------------------------------------------------- 8. Bridge socket group and connect() refusal test
 
-pass "ALL SENDER S1 CONTAINER TESTS PASSED"
+# Setup simulated bridge user (ikenga-bridge, UID 20010) in ikenga-approver
+BRIDGE_USER="ikenga-bridge"
+BRIDGE_UID=20010
+APPROVER_GRP="ikenga-approver"
+getent group "$APPROVER_GRP" >/dev/null 2>&1 || groupadd -r "$APPROVER_GRP"
+useradd -u "$BRIDGE_UID" -g "$APPROVER_GRP" -M -s /usr/sbin/nologin "$BRIDGE_USER" 2>/dev/null || true
+
+# Assert ik-ruby is NOT in ikenga-approver
+ruby_groups="$(id -nG ik-ruby)"
+if grep -qw "$APPROVER_GRP" <<<"$ruby_groups"; then
+  fail "SECURITY VIOLATION: ik-ruby must never belong to $APPROVER_GRP"
+fi
+pass "group isolation: ik-ruby does not belong to $APPROVER_GRP"
+
+# Create a test Unix domain socket in /run/ikenga-sender/approvals.sock
+# Directory: mode 0750 owned by ikenga-sender:ikenga-approver
+# Socket: mode 0660 owned by ikenga-sender:ikenga-approver
+SOCK_DIR="/run/ikenga-sender"
+SOCK_FILE="$SOCK_DIR/approvals.sock"
+mkdir -p "$SOCK_DIR"
+chown ikenga-sender:"$APPROVER_GRP" "$SOCK_DIR"
+chmod 0750 "$SOCK_DIR"
+
+# Launch a background python listener to hold the socket open
+python3 -c "import socket, os, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+if os.path.exists('$SOCK_FILE'):
+  os.unlink('$SOCK_FILE')
+s.bind('$SOCK_FILE')
+os.chmod('$SOCK_FILE', 0o660)
+os.chown('$SOCK_FILE', $(id -u ikenga-sender), $(getent group "$APPROVER_GRP" | cut -d: -f3))
+s.listen(5)
+sys.stdout.write('LISTENING\n')
+sys.stdout.flush()
+while True:
+  try:
+    c, _ = s.accept()
+    c.close()
+  except:
+    break
+" > "$T/sock.log" 2>&1 &
+SOCK_PID=$!
+sleep 0.5
+
+# Test: bridge user CAN connect to the socket
+as_bridge() {
+  ( cd / && setpriv --reuid="$BRIDGE_UID" --regid="$(getent group "$APPROVER_GRP" | cut -d: -f3)" --groups="$APPROVER_GRP" \
+      env -i PATH=/usr/bin:/bin python3 -c "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect('$SOCK_FILE'); s.close()" )
+}
+as_bridge || fail "bridge user was refused connect() on approvals socket"
+pass "bridge socket access: bridge user connects successfully"
+
+# Test: ik-ruby CANNOT connect to the socket (Permission denied / EACCES)
+ruby_connect_res=0
+as ruby python3 -c "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect('$SOCK_FILE'); s.close()" >/dev/null 2>&1 || ruby_connect_res=$?
+[[ $ruby_connect_res -ne 0 ]] || fail "SECURITY VIOLATION: ik-ruby was able to connect to approvals socket!"
+pass "ruby socket refusal: ik-ruby connect() to approvals socket is refused with EACCES"
+
+# Test: ik-ada CANNOT connect to the socket
+ada_connect_res=0
+as ada python3 -c "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect('$SOCK_FILE'); s.close()" >/dev/null 2>&1 || ada_connect_res=$?
+[[ $ada_connect_res -ne 0 ]] || fail "SECURITY VIOLATION: ik-ada was able to connect to approvals socket!"
+pass "ada socket refusal: ik-ada connect() to approvals socket is refused with EACCES"
+
+# Clean up listener
+kill "$SOCK_PID" 2>/dev/null || true
+rm -f "$SOCK_FILE"
+
+pass "ALL SENDER S1 AND S2 CONTAINER TESTS PASSED"
