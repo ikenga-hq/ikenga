@@ -58,8 +58,9 @@ use super::rpc_shell::targ;
 use super::shared::claude_config::{self, ClaudeConfig, ScanError};
 use super::shared::claude_sessions::{self, projects_root_in};
 use super::shared::claude_store::{self, DaemonChecks, Vault};
-use super::shared::ngwa::{self, NotServed, PkgInput, SnapshotInputs, UsageInput};
+use super::shared::ngwa::{self, NotServed, PkgInput, SnapshotInputs};
 use super::shared::projects::{self, FsReach};
+use super::shared::transcript_usage;
 use super::shared::{
     agent_config, agent_projects, agents, engine_layout, settings_cascade, shell_detect,
 };
@@ -857,8 +858,9 @@ pub(super) async fn oba_auto_update_all(state: &AppState, args: &Value) -> RpcRe
 // and its Ngwa store. What it cannot see is named in `sources` with a reason
 // carrying `ngwa::NOT_AVAILABLE_ON_SERVER`, never an empty or zeroed set:
 // pkg runtime (no sidecar supervisor), `engine_assets` placements (no such
-// registry), trust (no trust store; `pkg_trust_list` refuses with the same
-// reason) and transcript usage (the corpus is not scanned here).
+// registry) and trust (no trust store; `pkg_trust_list` refuses with the same
+// reason). Transcript usage IS served: `shared::transcript_usage` scans the
+// router principal's own `~/.claude/projects`, bounded and read-only.
 
 /// Why trust reads unavailable — the snapshot's `sources.trust` and the
 /// `pkg_trust_list` refusal.
@@ -868,8 +870,6 @@ const RUNTIME_NOT_SERVED: &str = "pkg runtime state is not available on this ser
      daemon runs no sidecar supervisor, so no pkg process is started or tracked";
 const ENGINE_ASSETS_NOT_SERVED: &str = "engine asset placements are not available on this server: \
      the headless daemon runs no engine_assets registry";
-const USAGE_NOT_SERVED: &str = "transcript usage is not available on this server: the headless \
-     daemon does not scan ~/.claude/projects";
 
 pub(super) async fn ngwa_snapshot(state: &AppState) -> RpcResponse {
     let r = async {
@@ -915,6 +915,11 @@ pub(super) async fn ngwa_snapshot(state: &AppState) -> RpcResponse {
         .await
         .map_err(|e| format!("manifest load task failed: {e}"))?;
 
+        // Transcript usage: a bounded, read-only, in-memory scan of THIS
+        // principal's `~/.claude/projects` (`state.home`) — never another
+        // account's home, no argument reaches it. See `shared::transcript_usage`.
+        let usage = transcript_usage::usage_for_home(state.home.clone()).await;
+
         Ok::<_, String>(ngwa::build_snapshot(SnapshotInputs {
             now_ms,
             projects,
@@ -923,7 +928,7 @@ pub(super) async fn ngwa_snapshot(state: &AppState) -> RpcResponse {
             oba,
             config,
             trust_pending: Ok(HashSet::new()),
-            usage: UsageInput::unavailable(USAGE_NOT_SERVED),
+            usage,
             not_served: NotServed {
                 runtime: Some(RUNTIME_NOT_SERVED.to_string()),
                 engine_assets: Some(ENGINE_ASSETS_NOT_SERVED.to_string()),

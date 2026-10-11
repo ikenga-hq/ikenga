@@ -457,14 +457,40 @@ pub struct NgwaSourceHealth {
     pub ok: bool,
     pub error: Option<String>,
     pub count: usize,
+    /// `true` = this host does not run the source at all ([`NotServed`]), as
+    /// opposed to running it and failing: an expected limitation, not an
+    /// error. The typed signal the UI reads instead of matching `error`'s
+    /// prose. Absent from the wire when `false`, so the desktop's snapshot is
+    /// byte-for-byte what it was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unavailable: bool,
 }
 
 impl NgwaSourceHealth {
     fn ok(count: usize) -> Self {
-        NgwaSourceHealth { ok: true, error: None, count }
+        NgwaSourceHealth {
+            ok: true,
+            error: None,
+            count,
+            unavailable: false,
+        }
     }
     fn failed(error: impl Into<String>) -> Self {
-        NgwaSourceHealth { ok: false, error: Some(error.into()), count: 0 }
+        NgwaSourceHealth {
+            ok: false,
+            error: Some(error.into()),
+            count: 0,
+            unavailable: false,
+        }
+    }
+    /// A source this host does not run ([`NotServed`]), with its reason.
+    fn not_served(reason: impl Into<String>, count: usize) -> Self {
+        NgwaSourceHealth {
+            ok: false,
+            error: Some(reason.into()),
+            count,
+            unavailable: true,
+        }
     }
 }
 
@@ -995,7 +1021,7 @@ pub fn build_snapshot(inputs: SnapshotInputs) -> NgwaSnapshot {
         .collect();
 
     let (assets, engine_assets_health) = match &not_served.engine_assets {
-        Some(reason) => (Vec::new(), NgwaSourceHealth::failed(reason.clone())),
+        Some(reason) => (Vec::new(), NgwaSourceHealth::not_served(reason.clone(), 0)),
         None => parse_engine_assets(&registries),
     };
     let supervisor = match &not_served.runtime {
@@ -1020,6 +1046,7 @@ pub fn build_snapshot(inputs: SnapshotInputs) -> NgwaSnapshot {
                     ok: false,
                     error: Some(partial_scan_error(&c.errors, &projects)),
                     count: rows.len(),
+                    unavailable: false,
                 }
             };
             (rows, health)
@@ -1177,6 +1204,7 @@ pub fn build_snapshot(inputs: SnapshotInputs) -> NgwaSnapshot {
             ok: false,
             error: Some(e.clone()),
             count: kernel_count,
+            unavailable: not_served.runtime.is_some(),
         },
     };
     let supervisor = supervisor.unwrap_or_default();
@@ -1312,7 +1340,7 @@ pub fn build_snapshot(inputs: SnapshotInputs) -> NgwaSnapshot {
     }
 
     let trust_health = if let Some(reason) = &not_served.trust {
-        NgwaSourceHealth::failed(reason.clone())
+        NgwaSourceHealth::not_served(reason.clone(), 0)
     } else if trust_errors.is_empty() {
         NgwaSourceHealth::ok(trust_count)
     } else {
@@ -1320,12 +1348,14 @@ pub fn build_snapshot(inputs: SnapshotInputs) -> NgwaSnapshot {
             ok: false,
             error: Some(trust_errors.join("; ")),
             count: trust_count,
+            unavailable: false,
         }
     };
     let usage_health = NgwaSourceHealth {
         ok: snap.is_available(),
         error: usage.error.clone(),
         count: snap.total_sessions(),
+        unavailable: false,
     };
 
     NgwaSnapshot {
@@ -1438,6 +1468,17 @@ mod tests {
                 h.error
             );
         }
+        // The typed signal — what the UI reads — is set by `NotServed`, not
+        // inferred from the prose: usage here merely FAILED with a message
+        // that happens to use the same words.
+        for (name, h) in [
+            ("kernel", &s.kernel),
+            ("engine_assets", &s.engine_assets),
+            ("trust", &s.trust),
+        ] {
+            assert!(h.unavailable, "{name} is unavailable by design");
+        }
+        assert!(!s.usage.unavailable, "a failure is not a limitation");
         assert_eq!(s.kernel.count, 2, "the pkgs themselves are known");
         assert_eq!(s.trust.count, 0, "trust_pending is ignored, not counted");
         assert!(s.engine_config.ok && s.oba.ok);
@@ -1513,6 +1554,32 @@ mod tests {
         );
         assert!(e.contains("unreadable: `/x/near/.claude/settings.json`"), "{e}");
         assert!(!e.contains("`/x/near`"), "the readable project is not named: {e}");
+    }
+
+    /// A failed read is `unavailable: false` however its message reads, and
+    /// the flag is absent from the wire unless set — the desktop's JSON is
+    /// unchanged.
+    #[test]
+    fn unavailable_is_typed_and_absent_from_the_desktop_wire() {
+        let mut i = inputs(NotServed::default());
+        i.config = Err("boom: not available on this server".to_string());
+        let snap = build_snapshot(i);
+        assert!(!snap.sources.engine_config.ok);
+        assert!(!snap.sources.engine_config.unavailable, "prose does not decide");
+        let wire = serde_json::to_value(&snap.sources).unwrap();
+        for (name, h) in wire.as_object().unwrap() {
+            assert!(h.get("unavailable").is_none(), "{name}: {h}");
+        }
+
+        let served = build_snapshot(inputs(NotServed {
+            trust: reason("trust"),
+            ..NotServed::default()
+        }));
+        let wire = serde_json::to_value(&served.sources).unwrap();
+        assert_eq!(wire["trust"]["unavailable"], true);
+        assert!(wire["kernel"].get("unavailable").is_none());
+        let back: NgwaSourcesHealth = serde_json::from_value(wire).unwrap();
+        assert!(back.trust.unavailable && !back.kernel.unavailable);
     }
 
     /// `NotServed::default()` is the desktop: the same inputs join exactly as

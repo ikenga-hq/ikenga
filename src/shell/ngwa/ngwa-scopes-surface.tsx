@@ -12,7 +12,8 @@ import { useCallback, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, ArrowRight, Bot, Circle, CircleDot, HelpCircle, Minus } from 'lucide-react';
 import type { NgwaItem } from '@ikenga/contract';
 import type { EngineId } from '@/lib/tauri-cmd';
-import { NOT_AVAILABLE_ON_SERVER_LABEL } from '@/lib/transport/unavailable';
+import { serverLimits } from '@/lib/ngwa/server-limits';
+import { NgwaServerLimits } from './ngwa-server-limits';
 import { fullyDown } from '@/lib/ngwa/scan-coverage';
 import { kindIcon } from './ngwa-list';
 import {
@@ -160,7 +161,7 @@ export function NgwaScopesSurface({
 	// A source the server does not run (the headless daemon: trust, usage, pkg
 	// runtime, engine-asset placements) is named apart from one that failed.
 	const unreadable = unreadableSources.filter((s) => !s.unavailable);
-	const notServed = unreadableSources.filter((s) => s.unavailable);
+	const limits = serverLimits(unreadableSources);
 
 	const searchedRows = useMemo(() => {
 		const q = search?.trim().toLowerCase();
@@ -514,15 +515,7 @@ export function NgwaScopesSurface({
 					</span>
 				</div>
 			)}
-			{notServed.length > 0 && (
-				<div className="source-banner" role="status" data-unavailable>
-					<AlertTriangle className="h-4 w-4" />
-					<span>
-						{NOT_AVAILABLE_ON_SERVER_LABEL}:{' '}
-						{notServed.map((s) => `${s.source}${s.error ? ` (${s.error})` : ''}`).join('; ')}.
-					</span>
-				</div>
-			)}
+			<NgwaServerLimits limits={limits} />
 			{/* ── Facet Bar ── */}
 			<div className="facetbar">
 				<div className="frow2">

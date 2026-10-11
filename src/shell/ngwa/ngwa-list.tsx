@@ -16,6 +16,8 @@ import { NgwaPopMenu, type PopItem } from './ngwa-scope-ops';
 import type { NgwaAct, NgwaActionStatus, NgwaItemActionSet } from '@/lib/ngwa/use-ngwa-actions';
 import { formatUsageDisplay, formatUsageTooltip, resolveTrustFacet } from '@/lib/ngwa/enrichment';
 import { kindIcon } from '@/lib/ngwa/kind-icon';
+import { serverLimits } from '@/lib/ngwa/server-limits';
+import { NgwaServerLimits } from './ngwa-server-limits';
 import './ngwa.css';
 
 export { kindIcon };
@@ -94,6 +96,7 @@ export function NgwaList({
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const [menu, setMenu] = useState<RowMenu | null>(null);
 	const closeMenu = useCallback(() => setMenu(null), []);
+	const limits = useMemo(() => serverLimits(unreadableSources), [unreadableSources]);
 
 	// Filter items according to active facets
 	const filteredItems = useMemo(() => {
@@ -186,18 +189,13 @@ export function NgwaList({
 
 	return (
 		<div className="view-ngwa flex-1 min-h-0 flex flex-col">
-			{/* ── Unreadable Source Banners (Gate §2) ── */}
-			{unreadableSources.map((s) =>
-				// A source the server does not run is stated, not alarmed: the
-				// reason already says "not available on this server".
-				s.unavailable ? (
-					<div key={s.source} className="source-banner" role="status" data-unavailable={s.source}>
-						<AlertTriangle className="h-4 w-4 flex-none" />
-						<span>
-							<strong>{s.source}</strong>: {s.error}
-						</span>
-					</div>
-				) : (
+			{/* ── Unreadable Source Banners (Gate §2) ──
+			    A source this server does not run is ONE muted note, not an
+			    alarm per capability; only real failures stay red. */}
+			<NgwaServerLimits limits={limits} />
+			{unreadableSources
+				.filter((s) => s.unavailable !== true)
+				.map((s) => (
 					<div key={s.source} className="source-banner" role="alert">
 						<AlertTriangle className="h-4 w-4 flex-none" />
 						<span>
@@ -205,8 +203,7 @@ export function NgwaList({
 							{s.error ? `: ${s.error}` : ' — could not scan subsystem'}
 						</span>
 					</div>
-				)
-			)}
+				))}
 
 			{/* ── Facet Bar ── */}
 			<NgwaFacetBar items={items} facets={facets} onChange={setFacets} />

@@ -251,7 +251,13 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("oba_resolve_source", req!(owner[Install])),
     ("oba_check_update", req!(owner[Install])),
     // ── Ngwa snapshot: reads the Owner's personal `~/.claude` scan (as
-    // `claude_config_load` does), so owner-class like it ──
+    // `claude_config_load` does), so owner-class like it. It also carries the
+    // principal's transcript USAGE (per-item session counts and tokens from
+    // `~/.claude/projects`, `shared::transcript_usage`): aggregates, no
+    // transcript text, but still the Owner's activity, so a share member must
+    // not read it. Owner class keeps it off every share route; `claude_*`
+    // transcript reads stay `shared[Sessions]` (confined to the share's cwd),
+    // this one is not confinable to a project and so is never shared. ──
     ("ngwa_snapshot", req!(owner[Files])),
     // ── actions / trust ──
     ("actions_read_files", req!(shared[Files])),
@@ -450,6 +456,16 @@ mod tests {
             requirement("fs_write").caps.contains(super::Dispatch),
             "P-2"
         );
+    }
+
+    /// The Ngwa snapshot carries the principal's transcript usage, so it is
+    /// owner-class (never shared) and needs `files` — mapped deliberately, not
+    /// left to the unmapped default of all seven caps.
+    #[test]
+    fn ngwa_snapshot_is_owner_class_over_files() {
+        let r = requirement("ngwa_snapshot");
+        assert_eq!(r.class, ArmClass::Owner);
+        assert_eq!(r.caps, CapSet::of(&[Files]));
     }
 
     #[test]

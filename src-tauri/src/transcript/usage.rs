@@ -121,9 +121,52 @@ pub struct SubagentContext {
     pub agent_type: Option<String>,
 }
 
+/// Whether reading a transcript may follow a symlink at the path's last
+/// component. The desktop reads its own `~/.claude/projects` and follows
+/// ([`Reach::Follow`], unchanged); the daemon never does ([`Reach::NoFollow`]):
+/// a link planted in the corpus must not make a scan read a file outside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    Follow,
+    NoFollow,
+}
+
+/// Open `path` for reading. [`Reach::NoFollow`] refuses a symlink (`O_NOFOLLOW`
+/// on unix; a `symlink_metadata` check elsewhere) and anything that is not a
+/// regular file once open, so a FIFO or device cannot stall a scan.
+pub fn open_read(path: &Path, reach: Reach) -> std::io::Result<File> {
+    if reach == Reach::Follow {
+        return File::open(path);
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = {
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(std::io::Error::other("refusing to follow a symlink"));
+        }
+        File::open(path)?
+    };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(file)
+}
+
 /// Classify a transcript path. A subagent run is `agent-<id>.jsonl` under a
 /// `subagents` directory; its type is read from the sibling `.meta.json`.
 pub fn file_context(path: &Path) -> FileContext {
+    file_context_reach(path, Reach::Follow)
+}
+
+/// [`file_context`] with a chosen [`Reach`] for the `.meta.json` read.
+pub fn file_context_reach(path: &Path, reach: Reach) -> FileContext {
     let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
         return FileContext::default();
     };
@@ -138,18 +181,31 @@ pub fn file_context(path: &Path) -> FileContext {
         (true, Some(id)) if !id.is_empty() => FileContext {
             subagent: Some(SubagentContext {
                 agent_id: id.to_string(),
-                agent_type: read_subagent_meta_type(path),
+                agent_type: read_subagent_meta_type(path, reach),
             }),
         },
         _ => FileContext::default(),
     }
 }
 
-fn read_subagent_meta_type(jsonl_path: &Path) -> Option<String> {
+/// A `.meta.json` is a few dozen bytes; a bigger one is not read.
+const META_MAX_BYTES: u64 = 64 * 1024;
+
+fn read_subagent_meta_type(jsonl_path: &Path, reach: Reach) -> Option<String> {
     let file_name = jsonl_path.file_name()?.to_str()?;
     let stem = file_name.strip_suffix(".jsonl")?;
     let meta_path = jsonl_path.with_file_name(format!("{stem}.meta.json"));
-    let raw = std::fs::read_to_string(meta_path).ok()?;
+    let raw = if reach == Reach::Follow {
+        std::fs::read_to_string(meta_path).ok()?
+    } else {
+        let mut raw = String::new();
+        open_read(&meta_path, reach)
+            .ok()?
+            .take(META_MAX_BYTES)
+            .read_to_string(&mut raw)
+            .ok()?;
+        raw
+    };
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     v.get("agentType")
         .and_then(|t| t.as_str())
@@ -405,7 +461,12 @@ fn file_mtime_ms(meta: &std::fs::Metadata) -> i64 {
 
 /// SHA-256 (hex) of the first `len` bytes of `path`.
 pub fn hash_head(path: &Path, len: u64) -> std::io::Result<String> {
-    let mut f = File::open(path)?;
+    hash_head_reach(path, len, Reach::Follow)
+}
+
+/// [`hash_head`] with a chosen [`Reach`].
+pub fn hash_head_reach(path: &Path, len: u64, reach: Reach) -> std::io::Result<String> {
+    let mut f = open_read(path, reach)?;
     let mut buf = Vec::with_capacity(len as usize);
     (&mut f).take(len).read_to_end(&mut buf)?;
     if (buf.len() as u64) < len {
@@ -419,7 +480,22 @@ pub fn hash_head(path: &Path, len: u64) -> std::io::Result<String> {
 
 /// Read whatever is new in `path` since `wm`. `None` = unchanged (or vanished).
 pub fn scan_file(path: &Path, wm: Option<&Watermark>) -> Option<FileScan> {
-    let meta = std::fs::metadata(path).ok()?;
+    scan_file_reach(path, wm, Reach::Follow)
+}
+
+/// [`scan_file`] with a chosen [`Reach`]. With [`Reach::NoFollow`] a symlink
+/// (or a non-regular file) is treated as vanished: `None`.
+pub fn scan_file_reach(path: &Path, wm: Option<&Watermark>, reach: Reach) -> Option<FileScan> {
+    let meta = match reach {
+        Reach::Follow => std::fs::metadata(path).ok()?,
+        Reach::NoFollow => {
+            let m = std::fs::symlink_metadata(path).ok()?;
+            if !m.file_type().is_file() {
+                return None;
+            }
+            m
+        }
+    };
     let size = meta.len();
     let mtime_ms = file_mtime_ms(&meta);
     let path_str = path.to_string_lossy().to_string();
@@ -436,7 +512,7 @@ pub fn scan_file(path: &Path, wm: Option<&Watermark>) -> Option<FileScan> {
         if size < w.byte_offset {
             reset = true;
         } else {
-            match hash_head(path, w.head_len) {
+            match hash_head_reach(path, w.head_len, reach) {
                 Ok(h) if h == w.head_hash => start = w.byte_offset,
                 Ok(_) => reset = true,
                 Err(e) => {
@@ -447,14 +523,14 @@ pub fn scan_file(path: &Path, wm: Option<&Watermark>) -> Option<FileScan> {
         }
     }
 
-    let ctx = file_context(path);
+    let ctx = file_context_reach(path, reach);
     let mut offset = start;
     let mut read_error: Option<String> = None;
     let mut messages: HashMap<(UsageKind, String, String, String), i64> = HashMap::new();
     let mut starts: HashMap<String, i64> = HashMap::new();
     let mut turns: HashMap<(UsageKind, String, String), (String, i64, i64)> = HashMap::new();
 
-    let open = File::open(path).and_then(|mut f| {
+    let open = open_read(path, reach).and_then(|mut f| {
         f.seek(SeekFrom::Start(start))?;
         Ok(f)
     });
@@ -524,7 +600,7 @@ pub fn scan_file(path: &Path, wm: Option<&Watermark>) -> Option<FileScan> {
     }
 
     let head_len = offset.min(HEAD_HASH_LEN);
-    let head_hash = match hash_head(path, head_len) {
+    let head_hash = match hash_head_reach(path, head_len, reach) {
         Ok(h) => h,
         Err(e) => {
             log::warn!("[ngwa usage] head hash of {path_str} failed: {e}");
@@ -1066,6 +1142,73 @@ pub async fn load_usage_snapshot(pool: &SqlitePool, now_ms: i64) -> Result<Usage
     Ok(UsageSnapshot::from_rows(now_ms, window_start_ms, sessions, tokens, mcp_turns))
 }
 
+/// The same [`UsageSnapshot`] [`load_usage_snapshot`] builds from the mirror,
+/// computed straight from file scans with no SQLite: the headless daemon keeps
+/// no per-account mirror (a shared database would mix accounts), so it scans
+/// on demand and folds the result here. The folds mirror the mirror's upserts:
+/// a holding is keyed `(kind, name, session_key, message_id)` and a turn
+/// `(kind, name, message_id)`, each keeping the MAX timestamp (and tokens),
+/// and a session's start is the MIN across files.
+pub fn snapshot_from_scans(now_ms: i64, scans: &[FileScan]) -> UsageSnapshot {
+    let d30 = now_ms - 30 * DAY_MS;
+    let mut messages: HashMap<(UsageKind, &str, &str, &str), i64> = HashMap::new();
+    let mut starts: HashMap<String, i64> = HashMap::new();
+    let mut turns: HashMap<(UsageKind, &str, &str), (i64, i64)> = HashMap::new();
+    for scan in scans.iter().filter(|s| s.commit) {
+        for m in &scan.messages {
+            let e = messages
+                .entry((m.kind, &m.name, &m.session_key, &m.message_id))
+                .or_insert(m.timestamp_ms);
+            *e = (*e).max(m.timestamp_ms);
+        }
+        for st in &scan.starts {
+            let e = starts.entry(st.session_key.clone()).or_insert(st.start_ms);
+            *e = (*e).min(st.start_ms);
+        }
+        for t in &scan.turns {
+            let e = turns
+                .entry((t.kind, &t.name, &t.message_id))
+                .or_insert((t.timestamp_ms, t.tokens));
+            e.0 = e.0.max(t.timestamp_ms);
+            e.1 = e.1.max(t.tokens);
+        }
+    }
+    let rows: Vec<MessageRow> = messages
+        .iter()
+        .map(
+            |(&(kind, name, session_key, message_id), &timestamp_ms)| MessageRow {
+                kind,
+                name: name.to_string(),
+                session_key: session_key.to_string(),
+                message_id: message_id.to_string(),
+                timestamp_ms,
+            },
+        )
+        .collect();
+    let sessions = resolve_owned_sessions(&rows, &starts);
+
+    let mut tokens: HashMap<(UsageKind, String), i64> = HashMap::new();
+    let mut mcp_turns: Vec<(String, String, i64)> = Vec::new();
+    for (&(kind, name, message_id), &(ts, t)) in &turns {
+        if ts < d30 {
+            continue;
+        }
+        if kind == UsageKind::McpServer {
+            mcp_turns.push((name.to_string(), message_id.to_string(), t));
+        } else {
+            *tokens.entry((kind, name.to_string())).or_insert(0) += t;
+        }
+    }
+    let window_start_ms = messages.values().copied().min().unwrap_or(now_ms);
+    UsageSnapshot::from_rows(
+        now_ms,
+        window_start_ms,
+        sessions,
+        tokens.into_iter().map(|((k, n), t)| (k, n, t)).collect(),
+        mcp_turns,
+    )
+}
+
 /// Returns current unix timestamp in milliseconds.
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -1239,6 +1382,83 @@ mod tests {
         .await
         .expect("turns");
         (s, st, t)
+    }
+
+    /// `snapshot_from_scans` (the daemon's SQLite-free fold) answers exactly
+    /// what the mirror does for the same files: resumed-session ownership,
+    /// MCP-server tokens, the 30-day window and the earliest-seen instant.
+    #[tokio::test]
+    async fn in_memory_fold_matches_the_sqlite_mirror() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (parent, child) = fixtures::write_fork_pair_with(tmp.path(), true, true);
+        let now = parse_timestamp_ms("2026-10-01T00:00:00Z").expect("now");
+
+        let (_db, pool) = temp_pool().await;
+        scan_and_mirror_transcripts(&pool, tmp.path())
+            .await
+            .expect("mirror");
+        let mirrored = load_usage_snapshot(&pool, now).await.expect("load");
+
+        let scans: Vec<FileScan> = [&parent, &child]
+            .iter()
+            .map(|p| scan_file_reach(p, None, Reach::NoFollow).expect("scan"))
+            .collect();
+        let folded = snapshot_from_scans(now, &scans);
+        // Fold order must not matter either.
+        let rev: Vec<FileScan> = scans.iter().rev().cloned().collect();
+        let folded_rev = snapshot_from_scans(now, &rev);
+
+        assert_eq!(folded.total_sessions(), mirrored.total_sessions());
+        assert!(folded.total_sessions() > 0);
+        let servers = ["iyke".to_string()];
+        for snap in [&folded, &folded_rev] {
+            for (kind, name) in [
+                (UsageKind::Skill, "skill-x"),
+                (UsageKind::Skill, "skill-y"),
+                (UsageKind::Skill, "skill-z"),
+                (UsageKind::Skill, "absent"),
+            ] {
+                assert_eq!(
+                    snap.for_primitive(kind, name),
+                    mirrored.for_primitive(kind, name),
+                    "{name}"
+                );
+            }
+            assert_eq!(snap.for_servers(&servers), mirrored.for_servers(&servers));
+        }
+        assert!(
+            mirrored
+                .for_primitive(UsageKind::Skill, "skill-x")
+                .expect("x")
+                .tokens_30d
+                > 0
+        );
+    }
+
+    /// `Reach::NoFollow` treats a symlink as vanished and refuses to open it;
+    /// `Reach::Follow` (the desktop) is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn no_follow_refuses_a_symlink_and_a_fifo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("real.jsonl");
+        std::fs::write(&real, "{}\n").expect("write");
+        let link = tmp.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert!(scan_file_reach(&link, None, Reach::NoFollow).is_none());
+        assert!(scan_file_reach(&link, None, Reach::Follow).is_some());
+        assert!(open_read(&link, Reach::NoFollow).is_err());
+        assert!(open_read(&link, Reach::Follow).is_ok());
+        assert!(open_read(&real, Reach::NoFollow).is_ok());
+        let fifo = tmp.path().join("pipe.jsonl");
+        let c = std::ffi::CString::new(fifo.to_str().expect("utf8")).expect("cstr");
+        // SAFETY: `c` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(
+            open_read(&fifo, Reach::NoFollow).is_err(),
+            "a FIFO is not a regular file"
+        );
+        assert!(scan_file_reach(&fifo, None, Reach::NoFollow).is_none());
     }
 
     #[test]

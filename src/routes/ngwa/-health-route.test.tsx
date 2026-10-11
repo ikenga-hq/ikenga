@@ -518,7 +518,9 @@ describe('/ngwa/health — auditline and ?section=', () => {
 describe('/ngwa/health — a remote web session on the headless daemon', () => {
 	const RECORDS = 'install-record health is not available on this server: no install records here.';
 	const TRUST = 'trust evaluation is not available on this server: no trust store';
-	const na = (what: string) => ({ ok: false, error: `${what} is not available on this server`, count: 0 });
+	// The daemon marks a source it does not run with the typed `unavailable`.
+	const limit = (error: string) => ({ ok: false, error, count: 0, unavailable: true });
+	const na = (what: string) => limit(`${what} is not available on this server`);
 	const ok = { ok: true, error: null, count: 1 };
 	const RECORDS_ROW: cmd.PkgHealthIssue = {
 		id: 'install-records',
@@ -553,7 +555,7 @@ describe('/ngwa/health — a remote web session on the headless daemon', () => {
 					oba: ok,
 					engine_config: ok,
 					engine_assets: na('engine asset placements'),
-					trust: { ok: false, error: TRUST, count: 0 },
+					trust: limit(TRUST),
 					usage: na('transcript usage'),
 				},
 			})

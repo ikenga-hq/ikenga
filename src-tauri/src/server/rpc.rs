@@ -801,8 +801,10 @@ pub async fn rpc_handler(
         // The desktop's own join over the projects, `--pkgs-dir` index,
         // config scan and Ọba store this router can see, read as its
         // principal (router home, router store). Pkg runtime, engine-asset
-        // placements, trust and transcript usage are reported unavailable in
-        // `sources`, never as an empty or zeroed set. Body in `rpc_claude`.
+        // placements and trust are reported unavailable in `sources`
+        // (`unavailable: true`), never as an empty or zeroed set. Transcript
+        // usage is served from the principal's own `~/.claude/projects`
+        // (bounded, read-only, symlinks not followed). Body in `rpc_claude`.
         "ngwa_snapshot" => rpc_claude::ngwa_snapshot(&state).await,
 
         // --- fs family + actions / keybindings / trust (WP-19 slice 5a) ---

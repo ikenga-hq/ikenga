@@ -115,6 +115,74 @@ describe('NgwaList component (D-02 / WP-15)', () => {
 		expect(banner.textContent).toContain('permission denied reading store');
 	});
 
+	describe('capabilities this server does not run', () => {
+		const NA = (what: string) =>
+			`${what} is not available on this server: the headless daemon runs no ${what} service`;
+		const limited = [
+			{ source: 'kernel', error: NA('pkg runtime state'), unavailable: true },
+			{ source: 'trust', error: NA('trust evaluation'), unavailable: true },
+			{ source: 'engine_assets', error: NA('engine asset placements'), unavailable: true },
+			{ source: 'usage', error: 'transcript scan failed: EIO', unavailable: false },
+		];
+
+		it('is ONE muted info line, not an error banner per capability', () => {
+			const { container } = render(
+				<NgwaList items={[makeItem({ id: 'skill-1' })]} unreadableSources={limited} />
+			);
+			const notes = container.querySelectorAll('[data-server-limits]');
+			expect(notes.length).toBe(1);
+			expect(notes[0]?.getAttribute('role')).toBe('status');
+			expect(notes[0]?.querySelector('[data-server-limits-line]')?.textContent).toBe(
+				'On this server: package runtime, trust and engine placement are desktop-only'
+			);
+			// Nothing about them is styled or announced as an error.
+			expect(notes[0]?.className).not.toContain('source-banner');
+			const text = notes[0]?.textContent ?? '';
+			expect(text).not.toContain('unreadable');
+		});
+
+		it('lists each item with its one-line reason in a Details disclosure', () => {
+			const { container } = render(
+				<NgwaList items={[makeItem({ id: 'skill-1' })]} unreadableSources={limited} />
+			);
+			const details = container.querySelector('[data-server-limits] details');
+			expect(details).not.toBeNull();
+			expect(details?.querySelector('summary')?.textContent).toBe('Details');
+			const rows = [...(details?.querySelectorAll('li[data-unavailable]') ?? [])];
+			expect(rows.map((r) => r.getAttribute('data-unavailable'))).toEqual([
+				'kernel',
+				'trust',
+				'engine_assets',
+			]);
+			expect(rows[0]?.textContent).toContain('package runtime');
+			expect(rows[0]?.textContent).toContain(
+				'The headless daemon runs no pkg runtime state service'
+			);
+		});
+
+		it('a real failure stays a red alert beside the muted line', () => {
+			render(<NgwaList items={[makeItem({ id: 'skill-1' })]} unreadableSources={limited} />);
+			const alerts = screen.getAllByRole('alert');
+			expect(alerts.length).toBe(1);
+			expect(alerts[0]?.textContent).toContain('usage unreadable');
+			expect(alerts[0]?.textContent).toContain('transcript scan failed: EIO');
+			expect(alerts[0]?.className).toContain('source-banner');
+		});
+
+		it('the desktop (nothing unavailable) renders no limits note at all', () => {
+			const { container } = render(
+				<NgwaList
+					items={[makeItem({ id: 'skill-1' })]}
+					unreadableSources={[{ source: 'oba', error: 'permission denied', unavailable: false }]}
+				/>
+			);
+			expect(container.querySelector('[data-server-limits]')).toBeNull();
+			expect(screen.getByRole('alert').textContent).toContain('oba unreadable');
+			const { container: clean } = render(<NgwaList items={[makeItem({ id: 'skill-2' })]} />);
+			expect(clean.querySelector('[data-server-limits]')).toBeNull();
+		});
+	});
+
 	it('groups closure child items under parent pkg and shows group chip', () => {
 		const parent = makeItem({
 			id: 'pkg-git',
