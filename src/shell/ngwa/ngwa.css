@@ -878,6 +878,49 @@
 	gap: var(--space-2);
 }
 
+/* What this server does not run: a neutral note, not an error. */
+.view-ngwa .server-limits {
+	padding: var(--space-2) var(--space-3);
+	background: var(--bg-sunken);
+	color: var(--fg-muted);
+	font-size: var(--text-caption);
+	border-bottom: 1px solid var(--border-soft);
+	display: flex;
+	align-items: flex-start;
+	gap: var(--space-2);
+}
+
+.view-ngwa .server-limits-body {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	column-gap: var(--space-3);
+	min-width: 0;
+}
+
+.view-ngwa .server-limits-details {
+	font-size: var(--text-micro);
+}
+
+.view-ngwa .server-limits-details > summary {
+	cursor: pointer;
+	user-select: none;
+	color: var(--fg-muted);
+	text-decoration: underline;
+	text-underline-offset: 2px;
+}
+
+.view-ngwa .server-limits-details > ul {
+	margin: var(--space-1) 0 0;
+	padding-left: var(--space-4);
+	flex-basis: 100%;
+}
+
+.view-ngwa .server-limits-details strong {
+	color: var(--fg);
+	font-weight: 500;
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
    Scopes Matrix (WP-16 / locked D-02)
    ══════════════════════════════════════════════════════════════════════════ */

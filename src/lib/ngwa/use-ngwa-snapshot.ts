@@ -10,7 +10,7 @@ import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { ngwaSnapshot } from '@/lib/tauri-cmd';
 import { useRegistryIndex } from '@/lib/registry/use-registry';
-import { isNotAvailableOnServer } from '@/lib/transport/unavailable';
+import { isServerLimit, type NgwaSourceHealthView } from './server-limits';
 import {
 	enrichNgwaItems,
 	markTrustUnavailable,
@@ -27,8 +27,8 @@ export interface UseNgwaSnapshotResult {
 	storeCatalog: NgwaStoreEntry[];
 	sources: NgwaSnapshot['sources'] | null;
 	/** Sources whose `ok` is false. `unavailable` = the server does not run
-	 *  that source at all (its reason says "not available on this server"),
-	 *  as opposed to one that failed to read. */
+	 *  that source at all (the daemon's typed `unavailable` marker), as
+	 *  opposed to one that failed to read. */
 	unreadableSources: Array<{ source: string; error: string | null; unavailable: boolean }>;
 	isLoading: boolean;
 	error: Error | null;
@@ -49,11 +49,9 @@ export function useNgwaSnapshot(): UseNgwaSnapshotResult {
 	const registryEntries = registryQuery.data?.index.pkgs ?? [];
 
 	const rawItems = snapshotQuery.data?.items ?? [];
-	const trustHealth = snapshotQuery.data?.sources.trust;
+	const trustHealth = snapshotQuery.data?.sources.trust as NgwaSourceHealthView | undefined;
 	const trustUnavailable =
-		trustHealth && !trustHealth.ok && isNotAvailableOnServer(trustHealth.error)
-			? trustHealth.error
-			: null;
+		trustHealth && !trustHealth.ok && isServerLimit(trustHealth) ? trustHealth.error : null;
 
 	const items = useMemo(() => {
 		return markTrustUnavailable(enrichNgwaItems(rawItems, registryEntries), trustUnavailable);
@@ -67,12 +65,12 @@ export function useNgwaSnapshot(): UseNgwaSnapshotResult {
 
 	const unreadableSources = useMemo(() => {
 		if (!sources) return [];
-		return (Object.entries(sources) as Array<[keyof NgwaSnapshot['sources'], { ok: boolean; error: string | null; count: number }]>)
+		return (Object.entries(sources) as Array<[keyof NgwaSnapshot['sources'], NgwaSourceHealthView]>)
 			.filter(([_, health]) => !health.ok)
 			.map(([source, health]) => ({
 				source,
 				error: health.error,
-				unavailable: isNotAvailableOnServer(health.error),
+				unavailable: isServerLimit(health),
 			}));
 	}, [sources]);
 

@@ -43,6 +43,25 @@ fn manifest(id: &str, api: &str, extra: Value) -> String {
     m.to_string()
 }
 
+/// One assistant turn (an hour ago, so inside every usage window) attributed
+/// to `skill` in `session`.
+fn transcript(session: &str, skill: &str) -> String {
+    let ts = (chrono::Utc::now() - chrono::Duration::hours(1))
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    json!({
+        "type": "assistant", "sessionId": session, "uuid": format!("u-{session}"),
+        "timestamp": ts, "attributionSkill": skill,
+        "message": {
+            "id": format!("m-{session}"),
+            "usage": { "input_tokens": 10, "output_tokens": 20 },
+            "content": [],
+        },
+    })
+    .to_string()
+        + "\n"
+}
+
 /// What `--pkgs-dir` the daemon is given.
 #[derive(Clone, Copy, PartialEq)]
 enum Pkgs {
@@ -100,6 +119,30 @@ async fn daemon_with(home_skill: &str, with_data: bool, pkgs_mode: Pkgs) -> Ng {
         &store.join("agents/helper.md"),
         "---\nname: helper\ndescription: store agent\n---\nYou help.\n",
     );
+    // ~/.claude/projects: two sessions that used the home skill, one file
+    // that is a symlink to a transcript OUTSIDE the corpus (a third session
+    // using the same skill — counted if the link were followed), and a
+    // symlinked directory out to the same place.
+    let projects = home.join(".claude/projects");
+    for (n, session) in [("s1", "sess-1"), ("s2", "sess-2")] {
+        write(
+            &projects.join(format!("-p/{n}.jsonl")),
+            &transcript(session, home_skill),
+        );
+    }
+    write(
+        &outside.join("planted/leak.jsonl"),
+        &transcript("sess-leak", home_skill),
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            outside.join("planted/leak.jsonl"),
+            projects.join("-p/leak.jsonl"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.join("planted"), projects.join("-linked")).unwrap();
+    }
     let proj = allowed.join("proj");
     write(
         &proj.join(".claude/agents/local.md"),
@@ -251,8 +294,32 @@ async fn ngwa_snapshot_serves_what_the_daemon_sees_and_names_the_rest() {
     let snap = ok(&d.router, "ngwa_snapshot").await;
     let src = &snap["sources"];
 
-    for name in ["kernel", "engine_assets", "trust", "usage"] {
+    for name in ["kernel", "engine_assets", "trust"] {
         assert!(unavailable(&src[name]), "{name}: {}", src[name]);
+        assert_eq!(
+            src[name]["unavailable"], true,
+            "{name}: the typed by-design signal, not just prose"
+        );
+    }
+    // Usage is served: measured from the principal's own corpus, so it is
+    // healthy and carries no unavailable marker.
+    assert_eq!(src["usage"]["ok"], true, "{}", src["usage"]);
+    assert!(
+        src["usage"].get("unavailable").is_none(),
+        "{}",
+        src["usage"]
+    );
+    assert_eq!(
+        src["usage"]["count"], 2,
+        "two sessions used the skill; the symlinked transcript is not read"
+    );
+    assert!(src["usage"]["error"].is_null(), "{}", src["usage"]);
+    for name in ["oba", "engine_config"] {
+        assert!(
+            src[name].get("unavailable").is_none(),
+            "{name}: {}",
+            src[name]
+        );
     }
     assert_eq!(src["kernel"]["count"], 2, "live + incompatible are listed");
     assert_eq!(src["trust"]["count"], 0);
@@ -288,7 +355,9 @@ async fn ngwa_snapshot_serves_what_the_daemon_sees_and_names_the_rest() {
     assert_eq!(live["trust"]["perms"]["shell_execute"], json!(["git *"]));
     assert_eq!(live["trust"]["perms"]["vault_keys"], json!([]));
     assert!(live["runtime"].is_null(), "unknown, not stopped");
-    assert!(live["usage"].is_null(), "unknown, not zero");
+    // Usage is measured now: a pkg with an MCP server that no transcript
+    // touched reads a measured zero (no pkg without one has any usage).
+    assert_eq!(live["usage"]["count_30d"], 0, "{}", live["usage"]);
     assert_eq!(item(&snap, "com.test.future")["state"], "broken");
     assert_eq!(
         item(&snap, "schedule:personal:com.test.live:tick")["owner_pkg_id"],
@@ -297,7 +366,34 @@ async fn ngwa_snapshot_serves_what_the_daemon_sees_and_names_the_rest() {
 
     // Config: the router home's skill, the allowlisted project's agent keyed
     // by its registered id, and nothing from the project outside the allowlist.
-    assert!(item(&snap, "skill:personal:tidy")["usage"].is_null());
+    let tidy = &item(&snap, "skill:personal:tidy")["usage"];
+    assert_eq!(tidy["source"], "transcript", "{tidy}");
+    assert_eq!(
+        tidy["count_30d"], 2,
+        "{tidy}: the symlinked third session is not counted"
+    );
+    assert_eq!(tidy["count_7d"], 2);
+    assert!(tidy["last_used_ms"].is_number());
+    assert!(tidy["tokens_30d"].as_i64().unwrap() > 0, "{tidy}");
+    // The wire shape `NgwaUsage` in the contract / tauri-cmd.ts declares.
+    let mut keys: Vec<&str> = tidy
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "count_30d",
+            "count_7d",
+            "last_used_ms",
+            "source",
+            "tokens_30d",
+            "window_start_ms"
+        ]
+    );
     item(&snap, "agent:project:proj:local");
     assert!(
         !ids(&snap).iter().any(|i| i.contains("secret")),
@@ -330,6 +426,11 @@ async fn ngwa_snapshot_reads_the_router_principals_home() {
     assert!(!ids(&sa).contains(&"skill:personal:beta".to_string()));
     assert!(ids(&sb).contains(&"skill:personal:beta".to_string()));
     assert!(!ids(&sb).contains(&"skill:personal:alpha".to_string()));
+    // Usage is the principal's too: each daemon counted its own corpus only.
+    assert_eq!(item(&sa, "skill:personal:alpha")["usage"]["count_30d"], 2);
+    assert_eq!(item(&sb, "skill:personal:beta")["usage"]["count_30d"], 2);
+    assert_eq!(sa["sources"]["usage"]["count"], 2);
+    assert_eq!(sb["sources"]["usage"]["count"], 2);
     assert_eq!(
         sa["sources"]["kernel"]["count"], 0,
         "no --pkgs-dir, no pkgs"

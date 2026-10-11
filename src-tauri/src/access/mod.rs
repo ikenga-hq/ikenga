@@ -896,6 +896,32 @@ mod tests {
         assert!(authorize(&c, "share_project_info").is_ok());
     }
 
+    /// A share member (any role, owner approval or not) is refused the Ngwa
+    /// snapshot, which carries the Owner's transcript usage; the Owner's own
+    /// principal is not.
+    #[test]
+    fn a_share_member_cannot_read_the_owners_ngwa_snapshot_usage() {
+        let mut c = ctx(Via::ChildToken, Tier::Full);
+        c.caps = CapSet::ALL;
+        assert!(authorize(&c, "ngwa_snapshot").is_ok(), "the owner reads it");
+        for role in [Role::Operator, Role::Reviewer, Role::Guest] {
+            c.share = Some(ShareCtx {
+                project_key: "o/p".into(),
+                project_id: "p".into(),
+                member_principal_id: None,
+                member_device_id: None,
+                role: Some(role),
+                artifact_path: None,
+                owner_approval: true,
+            });
+            assert_eq!(
+                authorize(&c, "ngwa_snapshot").unwrap_err().message,
+                "class=owner",
+                "{role:?}"
+            );
+        }
+    }
+
     #[test]
     fn route_requirements_cover_the_protected_routes() {
         for p in [

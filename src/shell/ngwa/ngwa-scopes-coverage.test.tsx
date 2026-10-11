@@ -33,7 +33,9 @@ const SCOPES = [
 const PARTIAL =
 	'partially unreadable — project roots not scanned: `/x/far` (path outside allowlist: /x/far)';
 
-function mount(error: string) {
+type Source = { source: string; error: string | null; unavailable?: boolean };
+
+function mount(error: string, extra: Source[] = []) {
 	const items = [
 		mkItem({
 			id: 'skill:personal:tidy',
@@ -51,7 +53,7 @@ function mount(error: string) {
 				scopes={SCOPES}
 				homeDir="/home/u"
 				actions={actions}
-				unreadableSources={[{ source: 'engine_config', error, unavailable: false }]}
+				unreadableSources={[{ source: 'engine_config', error, unavailable: false }, ...extra]}
 			/>
 		</QueryClientProvider>
 	);
@@ -90,5 +92,31 @@ describe('Scopes — a project the config scan did not read', () => {
 		expect(mark(container, 'prim:skill:tidy|project:near')).toBe('unknown');
 		expect(container.querySelector('[data-notscanned]')).toBeNull();
 		expect(container.querySelector('[data-conflicts-unknown]')).not.toBeNull();
+	});
+});
+
+describe('Scopes — what this server does not run', () => {
+	it('is one muted note beside (not inside) the red unreadable alert', () => {
+		const { container } = mount(PARTIAL, [
+			{
+				source: 'kernel',
+				error: 'pkg runtime state is not available on this server: no supervisor',
+				unavailable: true,
+			},
+			{
+				source: 'trust',
+				error: 'trust evaluation is not available on this server: no store',
+				unavailable: true,
+			},
+		]);
+		const notes = container.querySelectorAll('[data-server-limits]');
+		expect(notes.length).toBe(1);
+		expect(notes[0]?.textContent).toContain(
+			'On this server: package runtime and trust are desktop-only'
+		);
+		const alert = container.querySelector('[data-unreadable]');
+		expect(alert?.textContent).toContain('engine_config');
+		expect(alert?.textContent).not.toContain('trust');
+		expect(alert?.textContent).not.toContain('kernel');
 	});
 });
