@@ -60,7 +60,7 @@ UPDATE_RETRY_COOLDOWN="${UPDATE_RETRY_COOLDOWN:-3600}"
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
 
 case "${1:-}" in
-  upgrade|check-update|apply-request|install-update-units|install-agent-cli-updates|sync-accounts|backups|tunnels|swap) ACTION="$1"; shift ;;
+  upgrade|check-update|apply-request|install-update-units|install-agent-cli-updates|sync-accounts|backups|tunnels|swap|sender|verify-sender-acls) ACTION="$1"; shift ;;
 esac
 
 while [[ $# -gt 0 ]]; do
@@ -92,7 +92,7 @@ while [[ $# -gt 0 ]]; do
         exit 0
       fi
       if [[ "$ACTION" != "provision" ]]; then
-        printf 'Usage: %s check-update | apply-request | install-update-units | install-agent-cli-updates | sync-accounts | backups | tunnels | swap [--profile <file>] [--dry-run]\n\n' "${BASH_SOURCE[0]}"
+        printf 'Usage: %s check-update | apply-request | install-update-units | install-agent-cli-updates | sync-accounts | backups | tunnels | swap | sender [--profile <file>] [--dry-run]\n\n' "${BASH_SOURCE[0]}"
         printf '  check-update          read the release manifest and write %s/available.json (installs nothing)\n' "$STATE_DIR"
         printf '  apply-request         claim and apply an admin update request (run by ikenga-update.service)\n'
         printf '  install-update-units  install %s and the update timer, path and service units\n' "$STABLE_COPY"
@@ -105,6 +105,8 @@ while [[ $# -gt 0 ]]; do
         printf '                        per tunnel; prints the authorized_keys line to install on each remote host (runs before backups)\n'
         printf '  swap                  converge the swap file (SWAP_SIZE, SWAPPINESS, SWAP_FILE): one managed fstab line, vm.swappiness\n'
         printf '                        in a sysctl drop-in; does nothing when other swap is already active (the full provision run does it too)\n'
+        printf '  sender                converge the separate outbox send worker (SENDER_ENABLED): dedicated user, option (i) ACLs\n'
+        printf '                        on Ruby'"'"'s DB tree, scoped secrets, systemd service and timer (the full provision run does it too)\n'
         exit 0
       fi
       sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -212,6 +214,14 @@ SWAP_SIZE="auto"                # auto | <n>M | <n>G | off | 0
 SWAPPINESS="10"                 # vm.swappiness (0-100): use swap as an overflow, not eagerly
 SWAP_FILE="/swapfile"           # an absolute path on a local ext4/xfs/f2fs filesystem
 
+# Outbound send worker as a separate system identity (D-B13). See README "Separate sender".
+SENDER_ENABLED=0
+SENDER_USER="ikenga-sender"       # a plain system user, NOT an Ikenga principal
+SENDER_ACCOUNT="ruby"             # the Ikenga principal that owns the outbox (default: ruby, Unix user ik-ruby)
+SENDER_INSTALL_DIR="/opt/ikenga-sender"
+SENDER_STATE_DIR="/var/lib/ikenga-sender"
+SENDER_SCHEDULE="*:0/1"           # systemd OnCalendar expression for the timer (default: every minute)
+
 if [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$PROFILE_FILE"
@@ -268,6 +278,7 @@ validate_profile() {
   validate_tunnels_profile
   validate_backups_profile
   validate_swap_profile
+  validate_sender_profile
 }
 
 # --------------------------------------------------------------- preflight
@@ -1818,7 +1829,7 @@ secret_name_ok() {
   esac
 }
 
-is_reserved_scope() { [[ "$1" == everyone || "$1" == agents || "$1" == root || "$1" == backup ]]; }
+is_reserved_scope() { [[ "$1" == everyone || "$1" == agents || "$1" == root || "$1" == backup || "$1" == sender ]]; }
 
 validate_accounts_profile() {
   local a e name rest
@@ -2285,7 +2296,7 @@ ensure_account_clone() {
 # Blank lines and lines starting with # are skipped. A secret with no scope is
 # an error: there is no default audience.
 
-declare -A ROOT_VALUE=() ROOT_COUNT=() ROOT_SCOPE=() SEC_BODY=() SEC_SEEN=() BACKUP_VALUE=()
+declare -A ROOT_VALUE=() ROOT_COUNT=() ROOT_SCOPE=() SEC_BODY=() SEC_SEEN=() BACKUP_VALUE=() SENDER_VALUE=()
 SECRETS_UNREADABLE=0
 
 secrets_file_ok() {
@@ -2301,7 +2312,7 @@ secrets_file_ok() {
 }
 
 load_secrets() {
-  SEC_BODY=(); SEC_SEEN=(); ROOT_VALUE=(); ROOT_COUNT=(); ROOT_SCOPE=(); BACKUP_VALUE=(); SECRETS_UNREADABLE=0
+  SEC_BODY=(); SEC_SEEN=(); ROOT_VALUE=(); ROOT_COUNT=(); ROOT_SCOPE=(); BACKUP_VALUE=(); SENDER_VALUE=(); SECRETS_UNREADABLE=0
   [[ -n "$SECRETS_FILE" ]] || return 0
   if [[ ! -r "$SECRETS_FILE" ]]; then
     [[ $DRY_RUN -eq 1 ]] || die "cannot read SECRETS_FILE $SECRETS_FILE"
@@ -2310,7 +2321,7 @@ load_secrets() {
   fi
   secrets_file_ok "$SECRETS_FILE"
   local re='^\[([^]]+)\][[:space:]]+([A-Za-z_][A-Za-z0-9_]*)=(.*)$'
-  local n=0 line scope name value tok a toks targets declared is_backup
+  local n=0 line scope name value tok a toks targets declared is_backup is_sender
   while IFS= read -r line || [[ -n "$line" ]]; do
     n=$((n+1))
     [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
@@ -2321,7 +2332,7 @@ load_secrets() {
     [[ -n "$value" ]] || die "$SECRETS_FILE line $n: $name has an empty value"
     [[ "$value" != *$'\r'* ]] || die "$SECRETS_FILE line $n: carriage return in the value of $name (CRLF file?)"
 
-    targets=" "; declared=" "; is_backup=0
+    targets=" "; declared=" "; is_backup=0; is_sender=0
     IFS=',' read -ra toks <<<"$scope"
     for tok in "${toks[@]}"; do
       tok="${tok//[[:space:]]/}"
@@ -2335,6 +2346,7 @@ load_secrets() {
           for a in "${AGENT_ACCOUNTS[@]}"; do [[ "$targets" == *" $a "* ]] || targets+="$a "; done ;;
         root) ;;
         backup) is_backup=1 ;;
+        sender) is_sender=1 ;;
         *)
           [[ " ${ACCT_LOGINS[*]} " == *" $tok "* ]] || die "$SECRETS_FILE line $n: scope names '$tok', which is not a managed account (typo? or add it to ACCOUNTS)"
           [[ "$targets" == *" $tok "* ]] || targets+="$tok " ;;
@@ -2346,6 +2358,13 @@ load_secrets() {
       [[ ${#toks[@]} -eq 1 ]] || die "$SECRETS_FILE line $n: scope 'backup' cannot be combined with other scopes ($name)"
       [[ -z "${BACKUP_VALUE[$name]+x}" ]] || die "$SECRETS_FILE line $n: $name is already set for the backup user by an earlier line"
       BACKUP_VALUE[$name]="$value"
+    fi
+    if [[ $is_sender -eq 1 ]]; then
+      # Scope `sender` is the dedicated sender user's and nobody else's: it may
+      # not be combined with any other scope, so no Ikenga account can get it.
+      [[ ${#toks[@]} -eq 1 ]] || die "$SECRETS_FILE line $n: scope 'sender' cannot be combined with other scopes ($name)"
+      [[ -z "${SENDER_VALUE[$name]+x}" ]] || die "$SECRETS_FILE line $n: $name is already set for the sender user by an earlier line"
+      SENDER_VALUE[$name]="$value"
     fi
     ROOT_VALUE[$name]="$value"; ROOT_COUNT[$name]=$(( ${ROOT_COUNT[$name]:-0} + 1 )); ROOT_SCOPE[$name]="$scope"
     for a in $targets; do
@@ -2461,17 +2480,19 @@ sync_secrets() {
   if [[ -d "$SECRETS_DIR" ]]; then
     for f in "$SECRETS_DIR"/ik-*.env; do
       [[ -e "$f" ]] || continue
+      [[ "$f" == "$SECRETS_DIR/ikenga-sender.env" ]] && continue
       line="$(basename -- "$f" .env)"; a="${line#ik-}"
       if [[ " ${ACCT_LOGINS[*]} " == *" $a "* ]] && has_account "$a"; then continue; fi
       [[ $DRY_RUN -eq 1 ]] || { backup_secret_file "$f"; rm -f -- "$f"; }
       changed "secrets ik-$a: file removed (account no longer managed)"
     done
   fi
+  sync_sender_secrets
 }
 
 sync_accounts() {
-  if [[ ${#PROJECTS[@]} -eq 0 && -z "$SECRETS_FILE" ]]; then
-    [[ "$ACTION" != sync-accounts ]] || note "nothing to do: the profile sets no PROJECTS and no SECRETS_FILE"
+  if [[ ${#PROJECTS[@]} -eq 0 && -z "$SECRETS_FILE" && $SENDER_ENABLED -eq 0 ]]; then
+    [[ "$ACTION" != sync-accounts ]] || note "nothing to do: the profile sets no PROJECTS, no SECRETS_FILE, and sender is disabled"
     return 0
   fi
   log "Accounts: shared projects and scoped secrets"
@@ -2480,6 +2501,7 @@ sync_accounts() {
   load_secrets
   [[ ${#PROJECTS[@]} -eq 0 ]] || sync_projects
   [[ -z "$SECRETS_FILE" ]] || sync_secrets
+  [[ $SENDER_ENABLED -eq 0 ]] || sender_reapply_acls
 }
 
 # ------------------------------------------------- database backups (D-B10)
@@ -4267,6 +4289,395 @@ sync_swap() {
   swap_sysctl
 }
 
+# -------------------------------------------------- separate sender (D-B13)
+#
+# The outbox send worker runs as a dedicated system user (SENDER_USER, default
+# ikenga-sender), NOT as the ik-ruby principal. Approval integrity (D-B13)
+# requires that Ruby's agent cannot access send credentials or write to the
+# sender's approvals ledger.
+#
+# Option (i) ACLs: pa_action_drafts stays in Ruby's ikenga.db. Traversal (--x)
+# on Ruby's principal dir and rwx on data/ are granted to the sender only.
+# Default ACL on data/ ensures files SQLite creates later carry rw for the sender.
+# ikenga.db mode is kept at 0660 so SQLite's fchmod() sets an rw mask.
+#
+# Secrets scoped `[sender]` in SECRETS_FILE render to
+# /etc/ikenga/secrets/ikenga-sender.env (0600 root:root) and are delivered via
+# systemd LoadCredential.
+
+SENDER_ENV_FILE="$SECRETS_DIR/ikenga-sender.env"
+SENDER_UNIT="ikenga-sender.service"
+SENDER_TIMER="ikenga-sender.timer"
+SND_UID=0; SND_GID=0; SND_GROUP="$SENDER_USER"
+RUBY_PRINCIPAL_DIR=""; RUBY_DATA_DIR=""; RUBY_DB=""
+
+validate_sender_profile() {
+  [[ "$SENDER_ENABLED" == 0 || "$SENDER_ENABLED" == 1 ]] || die "SENDER_ENABLED must be 0 or 1 (got '$SENDER_ENABLED')"
+  [[ "$SENDER_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "SENDER_USER '$SENDER_USER' is not a valid unix user name"
+  case "$SENDER_USER" in
+    root|ikenga|nobody|postgres|"$ADMIN_USER"|ik-*) die "SENDER_USER '$SENDER_USER' is not allowed: it must be its own plain system user (not root, the admin, the T0 'ikenga' user, or an ik-* Ikenga account)" ;;
+  esac
+  [[ "$SENDER_ACCOUNT" =~ ^[a-z][a-z0-9_-]{0,30}$ ]] || die "SENDER_ACCOUNT '$SENDER_ACCOUNT' is not a valid account name"
+  [[ "$SENDER_SCHEDULE" =~ ^[A-Za-z0-9*/:,.~\ -]+$ ]] || die "SENDER_SCHEDULE has characters a systemd OnCalendar does not need"
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    systemd-analyze calendar "$SENDER_SCHEDULE" >/dev/null 2>&1 || die "SENDER_SCHEDULE: systemd cannot parse the calendar expression '$SENDER_SCHEDULE'"
+  fi
+}
+
+sender_load_ids() {
+  [[ $EUID -eq 0 ]] || return 1
+  id "$SENDER_USER" >/dev/null 2>&1 || return 1
+  SND_UID="$(id -u "$SENDER_USER")"; SND_GID="$(id -g "$SENDER_USER")"; SND_GROUP="$(id -gn "$SENDER_USER")"
+}
+
+sender_ensure_user() {
+  local line uid lo hi shell home
+  lo="${UID_RANGE%-*}"; hi="${UID_RANGE#*-}"
+  if line="$(getent passwd "$SENDER_USER")"; then
+    IFS=: read -r _ _ uid _ _ home shell <<<"$line"
+    (( uid > 0 )) || die "SENDER_USER $SENDER_USER has uid 0"
+    (( uid < lo || uid >= hi )) || die "SENDER_USER $SENDER_USER has uid $uid, inside the Ikenga account range $UID_RANGE; it must be a plain system user"
+    if [[ "$home" != "$SENDER_STATE_DIR" ]]; then
+      run usermod -d "$SENDER_STATE_DIR" "$SENDER_USER"; changed "user $SENDER_USER: home -> $SENDER_STATE_DIR"
+    fi
+    if [[ "$shell" != /usr/sbin/nologin ]]; then
+      run usermod -s /usr/sbin/nologin "$SENDER_USER"; changed "user $SENDER_USER: login shell -> nologin"
+    fi
+    # No supplementary groups
+    if [[ "$(id -nG "$SENDER_USER")" != "$(id -gn "$SENDER_USER")" ]]; then
+      run usermod -G "" "$SENDER_USER"; changed "user $SENDER_USER: supplementary groups removed"
+    fi
+  else
+    run useradd --system --user-group --no-create-home --home-dir "$SENDER_STATE_DIR" --shell /usr/sbin/nologin \
+      --comment "Ikenga outbox sender" "$SENDER_USER"
+    changed "system user $SENDER_USER created (no login, home $SENDER_STATE_DIR)"
+  fi
+  if id "$SENDER_USER" >/dev/null 2>&1; then
+    SND_UID="$(id -u "$SENDER_USER")"; SND_GID="$(id -g "$SENDER_USER")"; SND_GROUP="$(id -gn "$SENDER_USER")"
+  else
+    SND_UID=0; SND_GID=0; SND_GROUP="$SENDER_USER"
+  fi
+}
+
+resolve_sender_paths() {
+  local a="$SENDER_ACCOUNT" home=""
+  home="${ACCT_HOME[$a]:-}"
+  if [[ -z "$home" ]]; then
+    local line
+    if line="$(getent passwd "ik-$a")"; then
+      IFS=: read -r _ _ _ _ _ home _ <<<"$line"
+    fi
+  fi
+  if [[ -n "$home" ]]; then
+    RUBY_PRINCIPAL_DIR="$(dirname "$home")"
+    RUBY_DATA_DIR="$RUBY_PRINCIPAL_DIR/data"
+    RUBY_DB="$RUBY_DATA_DIR/ikenga.db"
+  else
+    RUBY_PRINCIPAL_DIR=""
+    RUBY_DATA_DIR=""
+    RUBY_DB=""
+  fi
+}
+
+sender_reapply_acls() {
+  resolve_sender_paths
+  [[ -n "$RUBY_PRINCIPAL_DIR" && -d "$RUBY_PRINCIPAL_DIR" ]] || {
+    note "principal ik-$SENDER_ACCOUNT directory not present yet; sender ACLs skipped until account exists"
+    return 0
+  }
+  id "$SENDER_USER" >/dev/null 2>&1 || return 0
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    changed "sender ACLs on $RUBY_PRINCIPAL_DIR and $RUBY_DATA_DIR (would apply)"
+    return 0
+  fi
+
+  # 1. Traversal on principal dir: --x for sender only
+  run setfacl -m "u:$SENDER_USER:--x" "$RUBY_PRINCIPAL_DIR"
+
+  # 2. Access on data dir: rwx for sender
+  if [[ ! -d "$RUBY_DATA_DIR" ]]; then
+    run install -d -m 0700 -o "ik-$SENDER_ACCOUNT" -g "ik-$SENDER_ACCOUNT" "$RUBY_DATA_DIR"
+  fi
+  run setfacl -m "u:$SENDER_USER:rwx" "$RUBY_DATA_DIR"
+
+  # 3. Default ACL on data dir:
+  # So files SQLite creates later carry user:ikenga-sender:rw and user:ik-<acct>:rw
+  run setfacl -d -m "u:$SENDER_USER:rw,u:ik-$SENDER_ACCOUNT:rw,m::rw" "$RUBY_DATA_DIR"
+
+  # 4. If ikenga.db exists: mode 0660 and rw ACL
+  if [[ -f "$RUBY_DB" ]]; then
+    local cur_mode
+    cur_mode="$(stat -c '%a' "$RUBY_DB")"
+    if [[ "$cur_mode" != "660" ]]; then
+      run chmod 0660 "$RUBY_DB"
+    fi
+    run setfacl -m "u:$SENDER_USER:rw" "$RUBY_DB"
+    local f
+    for f in "$RUBY_DATA_DIR"/ikenga.db-*; do
+      [[ -e "$f" ]] || continue
+      run chmod 0660 "$f"
+      run setfacl -m "u:$SENDER_USER:rw" "$f"
+    done
+  fi
+  changed "sender ACLs applied on $RUBY_PRINCIPAL_DIR"
+}
+
+sender_verify_acls() {
+  resolve_sender_paths
+  [[ -n "$RUBY_PRINCIPAL_DIR" && -d "$RUBY_PRINCIPAL_DIR" ]] || return 0
+  [[ $DRY_RUN -eq 0 ]] || return 0
+
+  # Check traversal on principal dir
+  local p_facl; p_facl="$(getfacl -p "$RUBY_PRINCIPAL_DIR" 2>/dev/null || true)"
+  grep -Eq "user:$SENDER_USER:[r-][w-]x" <<<"$p_facl" \
+    || die "sender ACL verify failed: $RUBY_PRINCIPAL_DIR does not grant execution to $SENDER_USER"
+
+  # Check access on data dir
+  local d_facl; d_facl="$(getfacl -p "$RUBY_DATA_DIR" 2>/dev/null || true)"
+  grep -Eq "user:$SENDER_USER:rwx" <<<"$d_facl" \
+    || die "sender ACL verify failed: $RUBY_DATA_DIR does not grant rwx to $SENDER_USER"
+
+  # Check default ACL on data dir
+  grep -Eq "default:user:$SENDER_USER:rw" <<<"$d_facl" \
+    || die "sender ACL verify failed: $RUBY_DATA_DIR does not have default ACL for $SENDER_USER"
+  grep -Eq "default:mask::r[w-]" <<<"$d_facl" \
+    || die "sender ACL verify failed: $RUBY_DATA_DIR default mask does not permit rw"
+
+  # If DB exists, verify mode has group rw (0660) and sender effective rights
+  if [[ -f "$RUBY_DB" ]]; then
+    local db_mode; db_mode="$(stat -c '%a' "$RUBY_DB")"
+    (( (8#$db_mode & 0060) == 0060 )) \
+      || die "sender ACL verify failed: $RUBY_DB mode is $db_mode, must have group rw (0660) for SQLite fchmod WAL mask"
+    local db_facl; db_facl="$(getfacl -p "$RUBY_DB" 2>/dev/null || true)"
+    grep -Eq "user:$SENDER_USER:rw" <<<"$db_facl" \
+      || die "sender ACL verify failed: $RUBY_DB does not grant rw to $SENDER_USER"
+  fi
+  note "sender ACL verification OK"
+}
+
+sync_sender_secrets() {
+  local f="$SENDER_ENV_FILE"
+  local desired="" k diff="" cur=""
+  for k in $(printf '%s\n' "${!SENDER_VALUE[@]}" | sort); do
+    desired+="$k=${SENDER_VALUE[$k]}"$'\n'
+  done
+
+  if [[ ! -d "$SECRETS_DIR" ]]; then
+    if [[ $DRY_RUN -eq 0 ]]; then
+      install -d -m 0755 -o root -g root "$(dirname "$SECRETS_DIR")"
+      install -d -m 0711 -o root -g root "$SECRETS_DIR"
+    fi
+    changed "$SECRETS_DIR created"
+  fi
+
+  if [[ -f "$f" ]]; then
+    cur="$(cat -- "$f" 2>/dev/null || true)"
+  fi
+  parse_kv "$cur" OLD_KV
+  parse_kv "$desired" NEW_KV
+  for k in $(printf '%s\n' "${!NEW_KV[@]}" | sort); do
+    if [[ -z "${OLD_KV[$k]+x}" ]]; then diff+=" +$k"
+    elif [[ "${OLD_KV[$k]}" != "${NEW_KV[$k]}" ]]; then diff+=" ~$k"; fi
+  done
+  for k in $(printf '%s\n' "${!OLD_KV[@]}" | sort); do
+    [[ -n "${NEW_KV[$k]+x}" ]] || diff+=" -$k"
+  done
+
+  if [[ -z "$desired" ]]; then
+    if [[ -f "$f" ]]; then
+      if [[ $DRY_RUN -eq 0 ]]; then backup_secret_file "$f"; rm -f -- "$f"; fi
+      changed "secrets $SENDER_USER: file removed (no [sender] secrets)"
+    fi
+    return 0
+  fi
+
+  if [[ -n "$diff" ]]; then
+    if [[ $DRY_RUN -eq 0 ]]; then
+      [[ ! -f "$f" ]] || backup_secret_file "$f"
+      local tmp; tmp="$(mktemp "$SECRETS_DIR/.tmp.XXXXXX")"
+      { printf '%s\n' "# ikenga: managed by provision.sh from SECRETS_FILE ([sender] scope); edits are overwritten"; printf '%s' "$desired"; } > "$tmp"
+      chown 0:0 "$tmp"; chmod 0600 "$tmp"; mv -f -- "$tmp" "$f"
+    fi
+    changed "secrets $SENDER_USER:$diff"
+  else
+    local o g m; read -r o g m < <(stat -c '%u %g %a' -- "$f")
+    if [[ "$o" != 0 || "$g" != 0 || "$m" != 600 ]]; then
+      run chown 0:0 "$f"; run chmod 0600 "$f"; changed "secrets $SENDER_USER: file owner/mode restored"
+    fi
+  fi
+}
+
+sender_service_unit() {
+  local node_bin; node_bin="$(command -v node 2>/dev/null || echo /usr/bin/node)"
+  local exec_cmd="$node_bin $SENDER_INSTALL_DIR/dist/lib/send-worker.js"
+  if [[ -x "$SENDER_INSTALL_DIR/run-sender.sh" ]]; then
+    exec_cmd="$SENDER_INSTALL_DIR/run-sender.sh"
+  fi
+  cat <<EOF
+[Unit]
+Description=Ikenga Outbox Send Worker (separate system sender)
+After=network.target
+
+[Service]
+Type=oneshot
+User=$SENDER_USER
+Group=$SND_GROUP
+WorkingDirectory=$SENDER_INSTALL_DIR
+ExecStart=$exec_cmd
+SyslogIdentifier=ikenga-sender
+TimeoutStartSec=120
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+
+# Secrets delivered through LoadCredential (systemd creates %d/env mode 0400):
+LoadCredential=env:$SENDER_ENV_FILE
+Environment=PA_ACTIONS_ENV_FILE=%d/env
+Environment=IKENGA_DB=$RUBY_DB
+Environment=NODE_ENV=production
+
+# Privilege & Sandboxing:
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+
+# Paths:
+ReadWritePaths=$SENDER_STATE_DIR $RUBY_DATA_DIR
+InaccessiblePaths=-/root -/etc/ikenga/secrets/ik-*.env
+EOF
+}
+
+sender_timer_unit() {
+  cat <<EOF
+[Unit]
+Description=Ikenga Outbox Send Worker Timer
+After=network.target
+
+[Timer]
+OnCalendar=$SENDER_SCHEDULE
+RandomizedDelaySec=5
+AccuracySec=5s
+Persistent=true
+Unit=$SENDER_UNIT
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+sender_installed() {
+  [[ -e "$SYSTEMD_DIR/$SENDER_UNIT" || -e "$SYSTEMD_DIR/$SENDER_TIMER" ]]
+}
+
+sender_remove_units() {
+  local any=0
+  if [[ -e "$SYSTEMD_DIR/$SENDER_TIMER" ]]; then
+    if [[ $DRY_RUN -eq 0 ]]; then sc disable --now "$SENDER_TIMER" >/dev/null 2>&1 || true; rm -f -- "$SYSTEMD_DIR/$SENDER_TIMER"; fi
+    changed "timer $SENDER_TIMER removed"; any=1
+  fi
+  if [[ -e "$SYSTEMD_DIR/$SENDER_UNIT" ]]; then
+    if [[ $DRY_RUN -eq 0 ]]; then rm -f -- "$SYSTEMD_DIR/$SENDER_UNIT"; fi
+    changed "unit $SENDER_UNIT removed"; any=1
+  fi
+  if [[ $any -eq 1 && $DRY_RUN -eq 0 ]]; then sc daemon-reload 2>/dev/null || true; fi
+}
+
+sender_install_worker() {
+  local src="${SENDER_SRC_DIR:-$SCRIPT_DIR/sender}"
+  ensure_dir 0755 root root "$SENDER_INSTALL_DIR"
+  if [[ -d "$src" ]]; then
+    if [[ $DRY_RUN -eq 1 ]]; then
+      note "[dry-run] would install sender worker from $src to $SENDER_INSTALL_DIR"
+      return 0
+    fi
+    cp -r "$src/"* "$SENDER_INSTALL_DIR/" 2>/dev/null || true
+    [[ ! -f "$SENDER_INSTALL_DIR/run-sender.sh" ]] || chmod 0755 "$SENDER_INSTALL_DIR/run-sender.sh"
+    if [[ -f "$SENDER_INSTALL_DIR/package.json" ]]; then
+      sed -i -E 's/"node":\s*"20\.x"/"node": ">=20"/' "$SENDER_INSTALL_DIR/package.json"
+    fi
+    if command -v node >/dev/null 2>&1 && [[ -f "$SENDER_INSTALL_DIR/package.json" ]]; then
+      local need_rebuild=0
+      if ! node -e 'import("better-sqlite3").catch(() => process.exit(1))' >/dev/null 2>&1; then
+        need_rebuild=1
+      fi
+      if [[ $need_rebuild -eq 1 && -f "$SENDER_INSTALL_DIR/node_modules/better-sqlite3/package.json" ]]; then
+        ( cd "$SENDER_INSTALL_DIR" && npm rebuild better-sqlite3 >/dev/null 2>&1 ) || note "WARNING: npm rebuild better-sqlite3 failed"
+        changed "better-sqlite3 rebuilt for current Node ABI"
+      fi
+    fi
+    changed "sender worker installed to $SENDER_INSTALL_DIR"
+  elif [[ ! -f "$SENDER_INSTALL_DIR/dist/lib/send-worker.js" ]]; then
+    if [[ $DRY_RUN -eq 0 ]]; then
+      install -d -m 0755 "$SENDER_INSTALL_DIR/dist/lib"
+      cat <<'EOF' > "$SENDER_INSTALL_DIR/dist/lib/send-worker.js"
+console.log("[send-worker] stub runner initialized");
+EOF
+      changed "sender stub worker installed to $SENDER_INSTALL_DIR"
+    fi
+  fi
+}
+
+sender_sync_units() {
+  local unit_reload=0
+  if write_unit "$SENDER_UNIT" "$(sender_service_unit)"; then unit_reload=1; fi
+  if write_unit "$SENDER_TIMER" "$(sender_timer_unit)"; then unit_reload=1; fi
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    note "[dry-run] systemctl daemon-reload; enable --now $SENDER_TIMER"
+    return 0
+  fi
+
+  [[ $unit_reload -eq 0 ]] || sc daemon-reload
+  if ! sc is-enabled --quiet "$SENDER_TIMER" 2>/dev/null || ! sc is-active --quiet "$SENDER_TIMER" 2>/dev/null; then
+    sc enable --now "$SENDER_TIMER" >/dev/null 2>&1 || soft_fail "could not enable $SENDER_TIMER"
+    changed "timer $SENDER_TIMER enabled"
+  elif [[ $unit_reload -eq 1 ]]; then
+    sc restart "$SENDER_TIMER" >/dev/null 2>&1 || soft_fail "could not restart $SENDER_TIMER"
+    changed "timer $SENDER_TIMER restarted"
+  fi
+}
+
+sync_sender_enabled() {
+  log "Separate outbox sender (user $SENDER_USER, account $SENDER_ACCOUNT, schedule $SENDER_SCHEDULE)"
+  [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo)"
+
+  sender_ensure_user
+  backup_safe_dir 0700 "$SENDER_USER" "$SND_GROUP" "$SND_UID" "$SENDER_STATE_DIR"
+  sender_install_worker
+  sync_sender_secrets
+  sender_reapply_acls
+  sender_verify_acls
+  sender_sync_units
+}
+
+sync_sender_disabled() {
+  sender_installed || [[ -d "$SENDER_STATE_DIR" || -f "$SENDER_ENV_FILE" ]] || return 0
+  log "Outbox send worker (disabled: timers and credentials removed, state kept)"
+  [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo)"
+  sender_remove_units
+  if [[ -f "$SENDER_ENV_FILE" ]]; then
+    if [[ $DRY_RUN -eq 0 ]]; then backup_secret_file "$SENDER_ENV_FILE"; rm -f -- "$SENDER_ENV_FILE"; fi
+    changed "$(basename -- "$SENDER_ENV_FILE") removed"
+  fi
+}
+
+sync_sender() {
+  if [[ "$SENDER_ENABLED" == 1 ]]; then
+    sync_sender_enabled
+  else
+    sync_sender_disabled
+  fi
+}
+
 # ------------------------------------------------------------------ main
 
 case "$ACTION" in
@@ -4314,6 +4725,25 @@ case "$ACTION" in
     summary
     [[ $FAILED -eq 0 ]] || { echo "error: some backup steps failed; see the warnings above" >&2; exit 1; }
     exit 0 ;;
+  sender)
+    [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || die "sender needs a profile: pass --profile <file> (or provision once so $INSTALL_DIR/.profile.env exists)"
+    validate_accounts_profile
+    validate_sender_profile
+    resolve_accounts
+    load_secrets
+    sync_sender
+    summary
+    [[ $FAILED -eq 0 ]] || { echo "error: some sender steps failed; see the warnings above" >&2; exit 1; }
+    exit 0 ;;
+  verify-sender-acls)
+    [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || die "verify-sender-acls needs a profile: pass --profile <file> (or provision once so $INSTALL_DIR/.profile.env exists)"
+    validate_accounts_profile
+    validate_sender_profile
+    resolve_accounts
+    sender_verify_acls
+    summary
+    [[ $FAILED -eq 0 ]] || { echo "error: sender ACL verification failed" >&2; exit 1; }
+    exit 0 ;;
 esac
 
 validate_profile
@@ -4339,6 +4769,8 @@ verify
 sync_accounts
 sync_tunnels
 sync_backups
+sync_sender
 sync_tunnel_lock
 summary
-[[ $FAILED -eq 0 ]] || { echo "error: some swap, account, tunnel or backup steps failed; see the warnings above" >&2; exit 1; }
+[[ $FAILED -eq 0 ]] || { echo "error: some swap, account, tunnel, backup or sender steps failed; see the warnings above" >&2; exit 1; }
+

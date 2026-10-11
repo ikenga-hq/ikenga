@@ -1,0 +1,19 @@
+{
+  "name": "ikenga-sender",
+  "version": "1.0.0",
+  "description": "Separate outbox send worker for Ikenga",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node dist/lib/send-worker.js",
+    "rebuild:native": "npm rebuild better-sqlite3"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "dotenv": "^16.4.0",
+    "nodemailer": "^8.0.10",
+    "resend": "^6.12.4"
+  }
+}
