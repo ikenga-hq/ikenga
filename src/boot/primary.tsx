@@ -124,12 +124,14 @@ export async function bootPrimary(): Promise<void> {
 		}
 		if (bootsIntoRemote(access) || path === '/remote' || path === '/remote/') {
 			if (path !== '/remote') window.history.replaceState(null, '', '/remote');
+			await useAppLockStore.getState().refresh();
 			const { RemoteClient } = await import('@/routes/remote/-components/remote-client');
 			installIkengaDomSync();
 			createRoot(document.getElementById('root')!).render(
 				<React.StrictMode>
 					<RemoteClient />
 					<ReauthOverlay />
+					<AppLockOverlay />
 				</React.StrictMode>
 			);
 			return;

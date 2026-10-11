@@ -148,7 +148,7 @@ impl Topic {
             Topic::HooksEvent | Topic::HooksDecision | Topic::StatuslineSnapshot => {
                 "pty_terminal_list"
             }
-            Topic::AppLockChanged => "app_lock_status",
+            Topic::AppLockChanged => "app_lock_touch",
         }
     }
 

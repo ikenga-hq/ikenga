@@ -290,6 +290,58 @@ impl Inner {
         Ok(true)
     }
 
+    pub fn begin_check(&mut self, now: u64) -> Result<Option<SecretRecord>, String> {
+        if self.locked {
+            return Err("Unlock first.".into());
+        }
+        if let Some(at) = self.retry_at_ms {
+            if at > now {
+                let secs = (at - now + 999) / 1000;
+                return Err(format!("Too many wrong entries. Try again in {secs} s."));
+            }
+            self.retry_at_ms = None;
+        }
+        if self.verifying {
+            return Err("Still checking the last entry.".into());
+        }
+        self.verifying = true;
+        Ok(self.config.secret.clone())
+    }
+
+    pub fn finish_check(&mut self, ok: bool, now: u64) -> Option<String> {
+        self.verifying = false;
+        if ok {
+            self.failed_attempts = 0;
+            self.retry_at_ms = None;
+            self.backoff_round = 0;
+            self.persist();
+            return None;
+        }
+        self.failed_attempts += 1;
+        if self.failed_attempts >= MAX_ATTEMPTS {
+            let wait = backoff_ms(self.backoff_round);
+            self.failed_attempts = 0;
+            self.backoff_round = self.backoff_round.saturating_add(1);
+            self.retry_at_ms = Some(now + wait);
+            self.persist();
+            return Some(format!(
+                "Wrong PIN. Wait {} before trying again.",
+                wait_label(wait)
+            ));
+        }
+        self.persist();
+        let left = MAX_ATTEMPTS - self.failed_attempts;
+        Some(format!(
+            "Wrong PIN. {} before a {} wait.",
+            match left {
+                1 => "One attempt left".to_string(),
+                2 => "Two attempts left".to_string(),
+                n => format!("{n} attempts left"),
+            },
+            wait_label(backoff_ms(self.backoff_round))
+        ))
+    }
+
     pub fn begin_unlock(&mut self, now: u64) -> UnlockGate {
         if !self.locked {
             return UnlockGate::NotLocked;
@@ -552,25 +604,41 @@ impl AppLockState {
         let current = current.map(Zeroizing::new);
         let next = Zeroizing::new(next);
         validate_secret(next.as_str())?;
-        let existing = self.with(|inner| {
-            if inner.locked {
-                return Err("Unlock first.".to_string());
+        let now = now_ms();
+        let existing = self.with(|inner| inner.begin_check(now))?;
+        let check_res = if let Some(existing) = existing.as_ref() {
+            let Some(current) = current.as_ref() else {
+                self.with(|inner| inner.verifying = false);
+                return Err("Enter the current PIN to change it.".into());
+            };
+            let current_clone = current.clone();
+            let existing_clone = existing.clone();
+            tokio::task::spawn_blocking(move || {
+                verify_secret(current_clone.as_str(), &existing_clone)
+            })
+            .await
+            .map_err(|e| format!("join: {e}"))
+            .and_then(|r| r)
+        } else {
+            Ok(true)
+        };
+
+        let verified = match check_res {
+            Ok(ok) => ok,
+            Err(e) => {
+                self.with(|inner| inner.verifying = false);
+                return Err(e);
             }
-            Ok(inner.config.secret.clone())
-        })?;
-        let record = tokio::task::spawn_blocking(move || -> Result<SecretRecord, String> {
-            if let Some(existing) = existing.as_ref() {
-                let Some(current) = current.as_ref() else {
-                    return Err("Enter the current PIN to change it.".into());
-                };
-                if !verify_secret(current.as_str(), existing)? {
-                    return Err("The current PIN is wrong.".into());
-                }
-            }
-            hash_secret(next.as_str())
-        })
-        .await
-        .map_err(|e| format!("join: {e}"))??;
+        };
+
+        let error = self.with(|inner| inner.finish_check(verified, now_ms()));
+        if !verified {
+            return Err(error.unwrap_or_else(|| "The current PIN is wrong.".into()));
+        }
+
+        let record = tokio::task::spawn_blocking(move || hash_secret(next.as_str()))
+            .await
+            .map_err(|e| format!("join: {e}"))??;
         let now = now_ms();
         self.with(|inner| {
             let previous = inner.config.clone();
@@ -586,21 +654,31 @@ impl AppLockState {
     /// Remove the PIN. Also turns idle lock off.
     pub async fn clear_secret(&self, current: String) -> Result<AppLockStatus, String> {
         let current = Zeroizing::new(current);
-        let existing = self.with(|inner| {
-            if inner.locked {
-                return Err("Unlock first.".to_string());
-            }
-            Ok(inner.config.secret.clone())
-        })?;
+        let now = now_ms();
+        let existing = self.with(|inner| inner.begin_check(now))?;
         let Some(existing) = existing else {
+            self.with(|inner| inner.verifying = false);
             return Ok(self.with(|inner| inner.status(now_ms())));
         };
-        let ok = tokio::task::spawn_blocking(move || verify_secret(current.as_str(), &existing))
-            .await
-            .map_err(|e| format!("join: {e}"))??;
+        let verified =
+            tokio::task::spawn_blocking(move || verify_secret(current.as_str(), &existing))
+                .await
+                .map_err(|e| format!("join: {e}"))
+                .and_then(|r| r);
+
+        let ok = match verified {
+            Ok(ok) => ok,
+            Err(e) => {
+                self.with(|inner| inner.verifying = false);
+                return Err(e);
+            }
+        };
+
+        let error = self.with(|inner| inner.finish_check(ok, now_ms()));
         if !ok {
-            return Err("The current PIN is wrong.".into());
+            return Err(error.unwrap_or_else(|| "The current PIN is wrong.".into()));
         }
+
         let now = now_ms();
         self.with(|inner| {
             let previous = inner.config.clone();

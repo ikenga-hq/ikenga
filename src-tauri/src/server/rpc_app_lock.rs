@@ -324,6 +324,9 @@ mod tests {
 
     #[tokio::test]
     async fn event_bus_broadcasts_on_app_lock_changes() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
         let dir = tempdir().unwrap();
         let state = test_app_state(dir.path());
         let mut rx = state.events.subscribe();
@@ -337,17 +340,85 @@ mod tests {
         )
         .await;
 
-        let ev1 = rx.recv().await.unwrap();
+        let ev1 = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for set_secret AppLockChanged event")
+            .unwrap();
         assert_eq!(ev1.topic, Topic::AppLockChanged);
 
         // Locking publishes AppLockChanged
         app_lock_lock(&state);
-        let ev2 = rx.recv().await.unwrap();
+        let ev2 = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for lock AppLockChanged event")
+            .unwrap();
         assert_eq!(ev2.topic, Topic::AppLockChanged);
 
         // Unlocking publishes AppLockChanged
         app_lock_unlock(&state, &serde_json::json!({ "secret": "1234" })).await;
-        let ev3 = rx.recv().await.unwrap();
+        let ev3 = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for unlock AppLockChanged event")
+            .unwrap();
         assert_eq!(ev3.topic, Topic::AppLockChanged);
+    }
+
+    #[tokio::test]
+    async fn set_secret_wrong_guesses_hit_backoff_and_lock_rate_limit() {
+        let dir = tempdir().unwrap();
+        let state = test_app_state(dir.path());
+
+        // Set initial PIN
+        let set_res = app_lock_set_secret(
+            &state,
+            &serde_json::json!({
+                "next": "1234"
+            }),
+        )
+        .await;
+        assert!(set_res.ok);
+
+        // Run 100 parallel requests with wrong current PIN
+        let mut tasks = Vec::new();
+        for i in 0..100 {
+            let state_clone = state.clone();
+            tasks.push(tokio::spawn(async move {
+                app_lock_set_secret(
+                    &state_clone,
+                    &serde_json::json!({
+                        "current": format!("wrong_{i}"),
+                        "next": "5678"
+                    }),
+                )
+                .await
+            }));
+        }
+
+        let mut errors = Vec::new();
+        for t in tasks {
+            let res = t.await.unwrap();
+            assert!(!res.ok, "wrong PIN guess must be rejected");
+            errors.push(res.error.unwrap());
+        }
+
+        assert_eq!(errors.len(), 100);
+        // The guesses must either hit wrong PIN, busy ("Still checking"), or wait backoff
+        let hit_backoff_or_busy = errors.iter().any(|e| {
+            e.contains("Wait ")
+                || e.contains("Still checking")
+                || e.contains("Too many wrong entries")
+        });
+        assert!(
+            hit_backoff_or_busy,
+            "100 parallel guesses must trigger rate-limiting / busy / backoff"
+        );
+
+        // Lock status must reflect failed attempts and/or backoff
+        let status_res = app_lock_status(&state);
+        let status: AppLockStatus = serde_json::from_value(status_res.data.unwrap()).unwrap();
+        assert!(
+            status.attempts_left < 3 || status.retry_in_ms.is_some(),
+            "attemptsLeft must decrease or retryInMs must be set after wrong guesses"
+        );
     }
 }
