@@ -56,9 +56,17 @@ import {
 	AddUrlSheet,
 	CatalogSheet,
 	CatalogStoreRow,
+	ClosureRows,
 	InstallSplit,
 	consentBlockedReason,
+	depProvenance,
+	extraConsentDeps,
 } from './ngwa-store-primitives';
+import {
+	storeInstallRoute,
+	type StoreInstallRoute,
+	type StoreRouteCaps,
+} from '@/lib/ngwa/store-install-route';
 import {
 	asksLabel,
 	closureLabel,
@@ -369,10 +377,23 @@ export function NgwaStoreSurface({
 		lastAttempt.current[entry.id] = go;
 		go();
 	}
-	const install = onInstall
-		? (entry: NgwaStoreEntry, scope: StoreInstallScope) =>
-				attempt(entry, 'install', () => onInstall(entry, scope))
-		: undefined;
+	// Where a registry row installs from on this host: the pkg kernel (the
+	// desktop), the Ọba path for a skill / bundle the signed catalog also lists
+	// (a browser session), or nowhere (see `store-install-route.ts`).
+	const routeCaps = useMemo<StoreRouteCaps>(
+		() => ({ pkg: Boolean(onInstall), oba: Boolean(onInstallPrimitive), reason: disabledReason }),
+		[onInstall, onInstallPrimitive, disabledReason]
+	);
+	const install =
+		onInstall || onInstallPrimitive
+			? (entry: NgwaStoreEntry, scope: StoreInstallScope) =>
+					attempt(entry, 'install', () => {
+						const route = storeInstallRoute(entry, routeCaps, null, vault);
+						if (route.via === 'oba') return onInstallPrimitive?.(route.row, scope, () => {});
+						if (route.via === 'pkg') return onInstall?.(entry, scope);
+						throw new Error(route.reason);
+					})
+			: undefined;
 	const update = onUpdate
 		? (entry: NgwaStoreEntry) => {
 				// The foot is where progress and failures read, so open the row.
@@ -769,6 +790,8 @@ export function NgwaStoreSurface({
 									busy={Boolean(pending[entry.id])}
 									onRetry={lastAttempt.current[entry.id] ? () => retry(entry) : undefined}
 									disabledReason={disabledReason}
+									routeCaps={routeCaps}
+									vault={vault}
 								/>
 							))}
 
@@ -857,6 +880,10 @@ export function NgwaStoreSurface({
 							}
 							onReviewTrust={setTrustReviewItem}
 							disabledReason={disabledReason}
+							routeCaps={routeCaps}
+							vault={vault}
+							catalogEntries={catalogEntries}
+							installedKeys={installedKeys}
 						/>
 					) : (
 						<div className="sheetbody sc">
@@ -901,6 +928,8 @@ function StoreRow({
 	busy,
 	onRetry,
 	disabledReason,
+	routeCaps,
+	vault,
 }: {
 	entry: NgwaStoreEntry;
 	selected: boolean;
@@ -910,6 +939,8 @@ function StoreRow({
 	busy: boolean;
 	onRetry?: () => void;
 	disabledReason?: string;
+	routeCaps: StoreRouteCaps;
+	vault: readonly ClaudeStoreEntry[];
 }) {
 	// This row's install / update progress, when the Store hook is driving
 	// one: concurrent installs and Update all each show on their own row.
@@ -920,6 +951,11 @@ function StoreRow({
 	const { data: detail } = useStoreDetail(entry, loadDetail, false);
 	const manifest = manifestOf(detail);
 	const publisher = manifest?.author?.name ?? null;
+	// Whether Install can run here, and from where — read from the cached
+	// manifest when there is one, so a row the sheet has not opened yet is
+	// still honest about what it can do.
+	const route = storeInstallRoute(entry, routeCaps, manifest, vault);
+	const obaInstalled = route.via === 'oba' && route.row.installed !== null;
 
 	return (
 		<div
@@ -969,6 +1005,12 @@ function StoreRow({
 							also: {entry.alsoFrom.source}
 						</span>
 					)}
+					{route.via === 'oba' && (
+						// Browser session: this installs the catalog twin, not the package.
+						<span className="tagp mono" data-oba-route title={route.note}>
+							installs from {route.row.source} · {route.pinned ? 'pinned' : 'unpinned'}
+						</span>
+					)}
 				</div>
 			</div>
 
@@ -1015,16 +1057,21 @@ function StoreRow({
 							Reinstall
 						</button>
 					</>
-				) : entry.installedItem ? (
+				) : entry.installedItem || obaInstalled ? (
 					<span className="badge t-builtin">
 						<Check className="h-3 w-3" /> installed
 					</span>
 				) : (
 					// D-02: Install opens the sheet — consent happens there, never
-					// straight from the list.
+					// straight from the list. A row that cannot install on this host
+					// (a package in a browser session) says so here, not only in the sheet.
 					<button
 						type="button"
 						className="btn primary"
+						disabled={route.via === 'blocked'}
+						title={
+							route.via === 'blocked' ? route.reason : route.via === 'oba' ? route.note : undefined
+						}
 						onClick={(e) => {
 							e.stopPropagation();
 							onSelect();
@@ -1053,6 +1100,10 @@ function StoreSheet({
 	onReviewApproval,
 	onReviewTrust,
 	disabledReason,
+	routeCaps,
+	vault,
+	catalogEntries,
+	installedKeys,
 }: {
 	entry: NgwaStoreEntry;
 	loadDetail: StoreDetailLoader | undefined;
@@ -1071,11 +1122,45 @@ function StoreSheet({
 	onReviewApproval?: () => void;
 	onReviewTrust: (item: NgwaItem) => void;
 	disabledReason?: string;
+	/** What this host can install (pkg kernel / Ọba path). */
+	routeCaps: StoreRouteCaps;
+	/** The vault as listed now (an Ọba install shows as installed from it). */
+	vault: readonly ClaudeStoreEntry[];
+	/** The whole signed catalog, for the Ọba route's closure. */
+	catalogEntries: readonly PrimitiveCatalogEntry[];
+	installedKeys: ReadonlySet<string>;
 }) {
 	const detailQuery = useStoreDetail(entry, loadDetail, true);
 	const version = detailQuery.data ?? null;
 	const manifest = version?.manifest ?? null;
-	const consents = useMemo(() => (manifest ? consentGroups(manifest) : []), [manifest]);
+	// Re-asked once the manifest is in: a "skill" pkg that ships a sidecar, MCP
+	// server or UI is a real package and is blocked before any consent.
+	const route = storeInstallRoute(entry, routeCaps, manifest, vault);
+	const oba = route.via === 'oba' ? route : null;
+	const obaInstalled = oba !== null && oba.row.installed !== null;
+	const altClosure = useMemo(
+		() => (oba ? resolveCatalogClosure(oba.row.entry, catalogEntries, installedKeys) : []),
+		[oba, catalogEntries, installedKeys]
+	);
+	const pkgConsents = useMemo(() => (manifest ? consentGroups(manifest) : []), [manifest]);
+	// The Ọba route installs the catalog twin, so what it asks consent for is
+	// the twin's: each dep from outside the catalog, and an unpinned source.
+	const consents = useMemo(() => {
+		if (!oba) return pkgConsents;
+		const out = extraConsentDeps(altClosure).map((d) => ({
+			id: `dep:${d.name}`,
+			label: d.name,
+			detail: `is not in the signed catalog. It is fetched from the source ${oba.row.name} names for it (${depProvenance(d)}), which nothing here has reviewed.`,
+		}));
+		if (!oba.pinned) {
+			out.unshift({
+				id: 'unpinned',
+				label: `${oba.row.name} (unpinned)`,
+				detail: `has no pin in the signed catalog. It installs whatever ${oba.row.source} serves today, which nothing here has reviewed.`,
+			});
+		}
+		return out;
+	}, [oba, pkgConsents, altClosure]);
 	const [ticked, setTicked] = useState<Record<string, boolean>>({});
 	const busy = pendingAction !== null;
 	const storeRun = useInstallRun(entry.id);
@@ -1089,6 +1174,7 @@ function StoreSheet({
 
 	let installBlocked: string | null = null;
 	if (!onInstall) installBlocked = disabledReason ?? NOT_AVAILABLE_ON_SERVER_YET;
+	else if (route.via === 'blocked') installBlocked = route.reason;
 	else if (!loadDetail) installBlocked = 'Permissions not read — the registry index has not loaded';
 	else if (detailQuery.isLoading) installBlocked = 'Reading the manifest…';
 	else if (!manifest) installBlocked = 'Permissions could not be read — retry first';
@@ -1139,6 +1225,12 @@ function StoreSheet({
 				<p className="note" style={{ fontSize: 'var(--text-caption)' }}>
 					{entry.description ?? 'No package description.'}
 				</p>
+				{oba && (
+					<p className="note" data-oba-note>
+						{oba.note}. A browser session has no package kernel, so it installs this {entry.kind}{' '}
+						from the signed catalog’s {oba.row.source} source instead of the package.
+					</p>
+				)}
 
 				{detailQuery.isLoading && (
 					<LoadingState data-state="ngwa-store-detail-loading" heading="Reading the manifest" />
@@ -1171,7 +1263,28 @@ function StoreSheet({
 
 				{manifest && (
 					<>
-						{requires.length > 0 ? (
+						{oba ? (
+							// The closure the Ọba path installs: the catalog twin's, read from
+							// the signed catalog before anything is fetched.
+							altClosure.length > 0 ? (
+								<div data-requires>
+									<div className="subhead">Requires — the closure, before you consent</div>
+									<ClosureRows deps={altClosure} />
+									<p className="consentnote">
+										Read from the catalog, before anything is fetched. The installer re-reads each
+										fetched manifest and has the last word.
+									</p>
+								</div>
+							) : (
+								<>
+									<div className="subhead">Requires</div>
+									<div className="drow">
+										<span className="k2">Closure</span>
+										<span className="val no">nothing — this installs alone</span>
+									</div>
+								</>
+							)
+						) : requires.length > 0 ? (
 							<div data-requires>
 								<div className="subhead">Requires — the closure, before you consent</div>
 								{requires.map((r) => (
@@ -1200,7 +1313,9 @@ function StoreSheet({
 							<div data-consents>
 								<p className="kola">Share kola</p>
 								<p className="note" style={{ marginBottom: 'var(--space-2)' }}>
-									{title} asks for these before it runs. Tick each one to enable Install.
+									{oba
+										? `A ${entry.kind} declares intent and never grants itself anything. Tick each one to enable Install.`
+										: `${title} asks for these before it runs. Tick each one to enable Install.`}
 								</p>
 								{consents.map((c) => (
 									<div className="consent" key={c.id}>
@@ -1217,9 +1332,11 @@ function StoreSheet({
 										</label>
 									</div>
 								))}
-								<p className="consentnote">
-									Consent is per install, because manifests are not signed yet.
-								</p>
+								{!oba && (
+									<p className="consentnote">
+										Consent is per install, because manifests are not signed yet.
+									</p>
+								)}
 							</div>
 						) : (
 							<p className="note">
@@ -1230,34 +1347,43 @@ function StoreSheet({
 						)}
 
 						<div className="subhead">Trust</div>
-						<div className="drow">
-							<span className="k2">Signature</span>
-							{manifest.signature ? (
-								<span className="val yes">present — ed25519, verified at install</span>
-							) : (
-								<span className="val warn">
-									absent — this manifest carries no ed25519 signature
-								</span>
-							)}
-						</div>
-						{manifest.author?.key && (
-							<div className="drow">
-								<span className="k2">Publisher key</span>
-								<span className="val mono">{manifest.author.key}</span>
-								<span className="rt meta">declared, unverified</span>
-							</div>
-						)}
-						<div className="drow">
-							<span className="k2">Registry index</span>
-							<span className="val yes">signed · fetched over TLS</span>
-						</div>
-						{version?.integrity && (
-							<div className="drow">
-								<span className="k2">Integrity</span>
-								<span className="val mono" style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
-									{version.integrity}
-								</span>
-							</div>
+						{oba ? (
+							<ObaTrustRows route={oba} />
+						) : (
+							<>
+								<div className="drow">
+									<span className="k2">Signature</span>
+									{manifest.signature ? (
+										<span className="val yes">present — ed25519, verified at install</span>
+									) : (
+										<span className="val warn">
+											absent — this manifest carries no ed25519 signature
+										</span>
+									)}
+								</div>
+								{manifest.author?.key && (
+									<div className="drow">
+										<span className="k2">Publisher key</span>
+										<span className="val mono">{manifest.author.key}</span>
+										<span className="rt meta">declared, unverified</span>
+									</div>
+								)}
+								<div className="drow">
+									<span className="k2">Registry index</span>
+									<span className="val yes">signed · fetched over TLS</span>
+								</div>
+								{version?.integrity && (
+									<div className="drow">
+										<span className="k2">Integrity</span>
+										<span
+											className="val mono"
+											style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}
+										>
+											{version.integrity}
+										</span>
+									</div>
+								)}
+							</>
 						)}
 
 						<div className="subhead">Settings</div>
@@ -1337,7 +1463,7 @@ function StoreSheet({
 							verb="Reinstall"
 						/>
 					</>
-				) : entry.installedItem ? (
+				) : entry.installedItem || obaInstalled ? (
 					<>
 						<span className="badge t-builtin">
 							<Check className="h-3 w-3" /> installed
@@ -1345,12 +1471,19 @@ function StoreSheet({
 						<span className="note">Remove or move it from the Installed tab.</span>
 					</>
 				) : (
-					<InstallSplit
-						projectLabel={projectLabel}
-						blocked={installBlocked}
-						busy={busy}
-						onInstall={install}
-					/>
+					<>
+						<InstallSplit
+							projectLabel={projectLabel}
+							blocked={installBlocked}
+							busy={busy}
+							onInstall={install}
+						/>
+						{oba && !installBlocked && (
+							<span className="note" data-oba-foot>
+								{oba.note}
+							</span>
+						)}
+					</>
 				)}
 				{size && (
 					<span className="note" style={{ marginLeft: 'auto' }}>
@@ -1359,6 +1492,55 @@ function StoreSheet({
 				)}
 			</div>
 		</>
+	);
+}
+
+/**
+ * The Trust block for an Ọba-routed install. The package's own signature does
+ * not apply — the package is not what is installed — so this says what does:
+ * the catalog entry is signed, the files are not, and whether the catalog pins
+ * them (a pin is verified against the fetch, and a mismatch writes nothing).
+ */
+function ObaTrustRows({ route }: { route: Extract<StoreInstallRoute, { via: 'oba' }> }) {
+	const e = route.row.entry;
+	const pin = catalogPin(e);
+	return (
+		<div data-oba-trust>
+			<div className="drow">
+				<span className="k2">Catalog entry</span>
+				<span className="val yes">signed — vouches for the name and where it comes from</span>
+			</div>
+			<div className="drow">
+				<span className="k2">Install source</span>
+				<span className="val mono">
+					{e.source} · {e.url}
+				</span>
+			</div>
+			<div className="drow">
+				<span className="k2">Files</span>
+				<span className="val warn">unsigned — fetched from {e.source} at install</span>
+			</div>
+			<div className="drow" data-pinned-version>
+				<span className="k2">Pinned version</span>
+				{pin?.sha ? (
+					<>
+						<span className="val mono yes">{shortSha(pin.sha)}</span>
+						<span className="rt meta">
+							{pin.hash ? 'SHA + content hash, signed' : 'signed with the entry'}
+						</span>
+					</>
+				) : pin?.hash ? (
+					<>
+						<span className="val mono yes">{pin.hash.slice(0, 19)}…</span>
+						<span className="rt meta">content hash, verified at install</span>
+					</>
+				) : (
+					<span className="val warn">
+						none — unpinned, installs whatever the source serves today
+					</span>
+				)}
+			</div>
+		</div>
 	);
 }
 
