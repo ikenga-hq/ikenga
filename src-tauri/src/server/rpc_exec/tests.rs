@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::StatusCode;
@@ -171,13 +172,13 @@ fn pkgs_fixture() -> PathBuf {
             sidecar_pkg.join("manifest.json"),
             json!({
                 "id": "com.test.sidecar", "name": "Sidecar", "version": "0.1.0", "ikenga_api": "1",
-                "sidecars": [{ "name": "loop", "bin": "bin/loop" }]
+                "sidecars": [{ "name": "pa-com-test-sidecar-loop", "bin": "bin/loop" }]
             })
             .to_string(),
         )
         .unwrap();
         let loop_bin = sidecar_pkg.join("bin/loop");
-        std::fs::write(&loop_bin, "#!/bin/sh\nwhile true; do sleep 1; done\n").unwrap();
+        std::fs::write(&loop_bin, "#!/bin/sh\necho $$ > sidecar.pid\nwhile true; do sleep 1; done\n").unwrap();
         std::fs::set_permissions(&loop_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         root.canonicalize().unwrap()
@@ -1219,10 +1220,14 @@ async fn arm_level_cross_account_sidecar_isolation_and_process_killed() {
     let (p, pid_a, root) = principal_child_harness();
     let pid_b = crate::executor::PrincipalId::new_v7();
 
-    // Assign PKG to everyone
+    let sidecar_dir = pkgs_fixture().join("com.test.sidecar");
+    let pid_file = sidecar_dir.join("sidecar.pid");
+    let _ = std::fs::remove_file(&pid_file);
+
+    // Assign com.test.sidecar to everyone
     std::fs::write(
         root.join("pkg-assignments.json"),
-        json!({ PKG: ["*"] }).to_string(),
+        json!({ "com.test.sidecar": ["*"] }).to_string(),
     )
     .unwrap();
 
@@ -1232,10 +1237,30 @@ async fn arm_level_cross_account_sidecar_isolation_and_process_killed() {
         pid_a,
         false,
         "pkg_sidecar_rpc_send",
-        json!({ "pkgId": PKG, "name": SIDECAR, "message": "ping" }),
+        json!({ "pkgId": "com.test.sidecar", "name": "pa-com-test-sidecar-loop", "message": "ping" }),
     )
     .await;
     assert_eq!(res_a["ok"], true, "{res_a}");
+
+    // Wait for the sidecar process to write its pid
+    let mut sidecar_pid: u32 = 0;
+    for _ in 0..50 {
+        if let Ok(content) = std::fs::read_to_string(&pid_file) {
+            if let Ok(val) = content.trim().parse::<u32>() {
+                sidecar_pid = val;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(sidecar_pid > 0, "sidecar must have written its pid");
+    unsafe {
+        assert_eq!(
+            libc::kill(sidecar_pid as libc::pid_t, 0),
+            0,
+            "sidecar process must be alive"
+        );
+    }
 
     // Account B tries to shut down Account A's sidecar -> returns false (isolated!)
     let res_b_shutdown = rpc_as_child(
@@ -1243,7 +1268,7 @@ async fn arm_level_cross_account_sidecar_isolation_and_process_killed() {
         pid_b,
         false,
         "pkg_sidecar_rpc_shutdown",
-        json!({ "pkgId": PKG, "name": SIDECAR }),
+        json!({ "pkgId": "com.test.sidecar", "name": "pa-com-test-sidecar-loop" }),
     )
     .await;
     assert_eq!(res_b_shutdown["ok"], true);
@@ -1251,6 +1276,13 @@ async fn arm_level_cross_account_sidecar_isolation_and_process_killed() {
         res_b_shutdown["data"], false,
         "Account B must not shut down Account A's sidecar"
     );
+    unsafe {
+        assert_eq!(
+            libc::kill(sidecar_pid as libc::pid_t, 0),
+            0,
+            "sidecar process must still be alive"
+        );
+    }
 
     // Account A shuts down its sidecar -> returns true and process is killed
     let res_a_shutdown = rpc_as_child(
@@ -1258,9 +1290,18 @@ async fn arm_level_cross_account_sidecar_isolation_and_process_killed() {
         pid_a,
         false,
         "pkg_sidecar_rpc_shutdown",
-        json!({ "pkgId": PKG, "name": SIDECAR }),
+        json!({ "pkgId": "com.test.sidecar", "name": "pa-com-test-sidecar-loop" }),
     )
     .await;
     assert_eq!(res_a_shutdown["ok"], true);
     assert_eq!(res_a_shutdown["data"], true);
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    unsafe {
+        assert_ne!(
+            libc::kill(sidecar_pid as libc::pid_t, 0),
+            0,
+            "sidecar process must be killed"
+        );
+    }
 }

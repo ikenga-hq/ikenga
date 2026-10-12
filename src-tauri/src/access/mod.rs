@@ -452,7 +452,7 @@ impl DaemonAccess {
         AccessCtx {
             principal_id,
             admin_strength: AccessCtx::admin_strength_of(&via, row.tier),
-            is_admin: false,
+            is_admin: principal_id == self.owner,
             via,
             device_id: Some(row.device_id.clone()),
             tier: row.tier,
@@ -1003,4 +1003,46 @@ mod tests {
         drop((a, b));
         assert_eq!(keepalive_count(), before);
     }
+
+    #[tokio::test]
+    async fn t0_owner_device_is_admin() {
+        let access = DaemonAccess::boot_t0(None, None, AccessOptions::default()).await;
+        let owner = access.owner;
+        let row = devices::DeviceRow {
+            device_id: "dev-owner".into(),
+            principal_id: owner.to_string(),
+            kind: "phone".into(),
+            name: "owner phone".into(),
+            platform: None,
+            tier: Tier::Full,
+            grant_epoch: 0,
+            paired_at: 0,
+            last_seen_at: None,
+            last_seen_addr: None,
+            secret_rotated_at: None,
+            revoked_at: None,
+        };
+        let ctx = access.device_ctx(&row, RequestMeta::default()).await;
+        assert!(ctx.is_admin, "T0 owner device must be admin");
+
+        let other_id = PrincipalId::new_v7();
+        let non_owner_row = devices::DeviceRow {
+            device_id: "dev-other".into(),
+            principal_id: other_id.to_string(),
+            kind: "phone".into(),
+            name: "other phone".into(),
+            platform: None,
+            tier: Tier::Full,
+            grant_epoch: 0,
+            paired_at: 0,
+            last_seen_at: None,
+            last_seen_addr: None,
+            secret_rotated_at: None,
+            revoked_at: None,
+        };
+        let non_owner_ctx = access.device_ctx(&non_owner_row, RequestMeta::default()).await;
+        assert!(!non_owner_ctx.is_admin, "non-owner device must not be admin");
+    }
 }
+
+

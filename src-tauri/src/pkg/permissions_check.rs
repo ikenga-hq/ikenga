@@ -22,51 +22,8 @@
 //! decision.
 
 use anyhow::{anyhow, Result};
-use glob::Pattern;
 
-/// Outcome of a denied spawn — the caller hands this to the audit recorder.
-#[derive(Debug, Clone)]
-pub struct ShellExecuteDenied {
-    pub pkg_id: String,
-    pub command: String,
-    /// Comma-joined snapshot of the manifest's allowlist at attempt time.
-    /// Stored verbatim in the audit row so a later allowlist edit doesn't
-    /// rewrite history.
-    pub declared: String,
-}
-
-/// Returns `Ok(())` if `command` matches any glob in `shell_execute`.
-/// Returns `Err(ShellExecuteDenied)` otherwise — caller should record the
-/// denial and refuse to spawn.
-///
-/// Malformed globs are skipped (logged at warn) so a single bad pattern
-/// doesn't lock the pkg out of all its other valid entries.
-pub fn check_shell_execute(
-    pkg_id: &str,
-    shell_execute: &[String],
-    command: &str,
-) -> std::result::Result<(), ShellExecuteDenied> {
-    for raw in shell_execute {
-        match Pattern::new(raw) {
-            Ok(pat) => {
-                if pat.matches(command) {
-                    return Ok(());
-                }
-            }
-            Err(e) => {
-                log::warn!(
-                    "[pkg.permissions_check] pkg `{pkg_id}` shell.execute entry `{raw}` \
-                     is not a valid glob: {e}"
-                );
-            }
-        }
-    }
-    Err(ShellExecuteDenied {
-        pkg_id: pkg_id.into(),
-        command: command.into(),
-        declared: shell_execute.join(","),
-    })
-}
+pub use super::trust_state::{check_shell_execute, ShellExecuteDenied};
 
 /// Persist a denial to `pkg_permission_violations`. Best-effort: returns Err
 /// only if the SQL itself fails; callers log and proceed regardless.

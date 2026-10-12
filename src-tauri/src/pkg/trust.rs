@@ -30,7 +30,6 @@
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
-use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 use crate::pkg::manifest::{Package, Permissions};
@@ -42,12 +41,10 @@ use crate::pkg::source::InstallSource;
 // so every `crate::pkg::trust::…` path is unchanged.
 #[cfg(test)]
 use super::trust_state::fs_write_is_sensitive;
-pub use super::trust_state::{summarize_sensitive, NeedsApprovalReason, PermsSummary, TrustState};
-
-/// Sentinel scope_kind reserved for manifest trust grants. Never appears in
-/// the manifest's declared `permissions.*` blocks; the permissions registry
-/// only writes `fs.read`/`fs.write`/`shell.execute` rows.
-const TRUST_SCOPE_KIND: &str = "__manifest_trust";
+pub use super::trust_state::{
+    id_in_ikenga_namespace, is_auto_trusted, snapshot_hash, summarize_sensitive,
+    NeedsApprovalReason, PermsSummary, TrustState, TRUST_SCOPE_KIND,
+};
 
 /// Sentinel scope_kind reserved for per-folder Studio project-access grants
 /// (WP-04). Double-underscored + project-scoped so it never collides with a
@@ -69,33 +66,6 @@ pub const STUDIO_PKG_ID: &str = "com.ikenga.studio";
 /// the pkg's other grants on unregister/uninstall (`registries::permissions`).
 pub const WEBVIEW_ORIGIN_SCOPE_KIND: &str = "__webview_origin";
 
-/// Stable wire form for a sensitive-perms snapshot. The hex sha256 of this
-/// string is what we store in `scope_value`; mismatch ⇒ permissions changed.
-fn snapshot_json(perms: &PermsSummary) -> String {
-    // Sort each list so reordering doesn't invalidate trust.
-    let mut shell = perms.shell_execute.clone();
-    let mut fsw = perms.fs_write_outside_sandbox.clone();
-    let mut net = perms.net.clone();
-    let mut vk = perms.vault_keys.clone();
-    shell.sort();
-    fsw.sort();
-    net.sort();
-    vk.sort();
-    serde_json::to_string(&serde_json::json!({
-        "shell_execute": shell,
-        "fs_write_outside_sandbox": fsw,
-        "net": net,
-        "vault_keys": vk,
-    }))
-    .expect("snapshot json")
-}
-
-pub fn snapshot_hash(perms: &PermsSummary) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(snapshot_json(perms).as_bytes());
-    hex::encode(hasher.finalize())
-}
-
 /// Resolve `$pkg_data` for a given pkg id under the supplied app data root.
 /// Mirrors the path computed by `permissions::resolve_path` so the "outside
 /// sandbox" check stays consistent with what the kernel actually grants.
@@ -107,29 +77,6 @@ fn pkg_data_dir(app_data_dir: &PathBuf, pkg_id: &str) -> PathBuf {
 pub fn requires_trust(perms: &Permissions) -> bool {
     let s = summarize_sensitive(perms);
     !s.shell_execute.is_empty() || !s.fs_write_outside_sandbox.is_empty()
-}
-
-/// Same as `pkg_id.starts_with("com.ikenga.")` — but explicit so the call
-/// site reads as the policy decision, not a string check.
-fn id_in_ikenga_namespace(pkg_id: &str) -> bool {
-    pkg_id.starts_with("com.ikenga.")
-}
-
-/// Auto-trust policy:
-///
-/// - `source.kind = "builtin"` AND id in `com.ikenga.*` namespace, OR
-/// - `source.kind = "dev"` — dev-mode mounts via `ikenga dev` bypass the
-///   modal regardless of pkg id (sensitive perms still log::warn).
-///
-/// Neither path alone is insufficient for the builtin case: an attacker
-/// who got their pkg into `builtin-pkgs/` still can't masquerade as
-/// `com.ikenga.*`, and a sideloaded pkg that names itself `com.ikenga.X`
-/// doesn't count.
-pub fn is_auto_trusted(pkg_id: &str, source: &InstallSource) -> bool {
-    if source.is_dev() {
-        return true;
-    }
-    source.is_builtin() && id_in_ikenga_namespace(pkg_id)
 }
 
 /// Pull the latest trust row for a pkg, if any.

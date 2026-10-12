@@ -174,21 +174,17 @@ pub fn check_pkg_assignment(
         .as_ref()
         .map(|d| d.join("pkg-assignments.json"));
 
-    let assignments = match assignments_file.as_ref() {
+    let mut assignments = match assignments_file.as_ref() {
         Some(path) if path.exists() => std::fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_json::from_str::<PkgAssignments>(&s).ok())
             .unwrap_or_default(),
-        _ => {
-            // Missing assignments file: safe default assigns built-ins com.ikenga.* to all
-            let mut map = HashMap::new();
-            map.insert(
-                "com.ikenga.*".to_string(),
-                PkgAssignmentValue::All("*".to_string()),
-            );
-            PkgAssignments(map)
-        }
+        _ => PkgAssignments::default(),
     };
+    assignments
+        .0
+        .entry("com.ikenga.*".to_string())
+        .or_insert_with(|| PkgAssignmentValue::All("*".to_string()));
 
     if assignments.is_assigned(pkg_id, principal_id, ctx.is_admin) {
         Ok(())
@@ -248,7 +244,8 @@ impl PkgTrustRecords {
 /// is located within a `builtin-pkgs` directory.
 pub fn pkg_source(pkg: &Package) -> crate::pkg::InstallSource {
     let path = &pkg.install_path;
-    let is_builtin = path.components().any(|c| c.as_os_str() == "builtin-pkgs");
+    let is_builtin = path.components().any(|c| c.as_os_str() == "builtin-pkgs")
+        || path.starts_with("/opt/ikenga/pkgs");
     if is_builtin {
         crate::pkg::InstallSource::Builtin
     } else {
@@ -267,7 +264,7 @@ pub fn check_pkg_trust(data_dir: Option<&Path>, pkg: &Package) -> Result<(), Str
     let pkg_id = &pkg.manifest.id;
     let source = pkg_source(pkg);
 
-    if crate::pkg::trust::is_auto_trusted(pkg_id, &source) {
+    if crate::pkg::trust_state::is_auto_trusted(pkg_id, &source) {
         return Ok(());
     }
 
@@ -280,7 +277,7 @@ pub fn check_pkg_trust(data_dir: Option<&Path>, pkg: &Package) -> Result<(), Str
         return Ok(());
     }
 
-    let expected_hash = crate::pkg::trust::snapshot_hash(&sensitive);
+    let expected_hash = crate::pkg::trust_state::snapshot_hash(&sensitive);
     let operator_dir = resolve_operator_dir(data_dir);
     let trust_file = operator_dir.as_ref().map(|d| d.join("pkg-trust.json"));
     let trust_records = trust_file
@@ -303,12 +300,12 @@ pub fn check_invoke_trust(data_dir: Option<&Path>, pkg: &Package) -> Result<(), 
     let pkg_id = &pkg.manifest.id;
     let source = pkg_source(pkg);
 
-    if crate::pkg::trust::is_auto_trusted(pkg_id, &source) {
+    if crate::pkg::trust_state::is_auto_trusted(pkg_id, &source) {
         return Ok(());
     }
 
     let sensitive = crate::pkg::trust_state::summarize_sensitive(&pkg.manifest.permissions);
-    let expected_hash = crate::pkg::trust::snapshot_hash(&sensitive);
+    let expected_hash = crate::pkg::trust_state::snapshot_hash(&sensitive);
 
     let operator_dir = resolve_operator_dir(data_dir);
     let trust_file = operator_dir.as_ref().map(|d| d.join("pkg-trust.json"));
@@ -366,7 +363,7 @@ pub async fn call_mcp_tool(
     pkg_id: &str,
     shell_execute: &[String],
 ) -> anyhow::Result<Value> {
-    crate::pkg::permissions_check::check_shell_execute(pkg_id, shell_execute, &server.command)
+    crate::pkg::trust_state::check_shell_execute(pkg_id, shell_execute, &server.command)
         .map_err(|denial| anyhow::anyhow!("shell.execute denied: {denial:?}"))?;
 
     let program = crate::runtime::resolve_command(&server.command);
@@ -591,6 +588,7 @@ impl DaemonSidecarManager {
         // Background stdout reader task
         let children_map = self.children.clone();
         let key_for_reader = key.clone();
+        let child_for_reader = child.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
@@ -601,8 +599,13 @@ impl DaemonSidecarManager {
             }
             tracing::info!("[daemon_sidecar {:?}] stdout closed", key_for_reader);
             let mut lock = children_map.lock().await;
-            if let Some(c) = lock.remove(&key_for_reader) {
-                kill_process_group(c.pid);
+            if let Some(c) = lock.get(&key_for_reader) {
+                if Arc::ptr_eq(c, &child_for_reader) {
+                    if let Some(removed) = lock.remove(&key_for_reader) {
+                        let _ = removed.cancel.send(true);
+                        kill_process_group(removed.pid);
+                    }
+                }
             }
         });
 
@@ -610,6 +613,7 @@ impl DaemonSidecarManager {
         let children_map = self.children.clone();
         let key_for_reap = key.clone();
         let last_act = last_activity.clone();
+        let child_weak = Arc::downgrade(&child);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -621,10 +625,16 @@ impl DaemonSidecarManager {
                                 key_for_reap,
                                 elapsed
                             );
-                            let mut lock = children_map.lock().await;
-                            if let Some(child) = lock.remove(&key_for_reap) {
-                                let _ = child.cancel.send(true);
-                                kill_process_group(child.pid);
+                            if let Some(child_for_reap) = child_weak.upgrade() {
+                                let mut lock = children_map.lock().await;
+                                if let Some(c) = lock.get(&key_for_reap) {
+                                    if Arc::ptr_eq(c, &child_for_reap) {
+                                        if let Some(child) = lock.remove(&key_for_reap) {
+                                            let _ = child.cancel.send(true);
+                                            kill_process_group(child.pid);
+                                        }
+                                    }
+                                }
                             }
                             break;
                         }
@@ -897,5 +907,228 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("maximum concurrent sidecars"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_sidecar_shutdown_kills_group_including_grandchild() {
+        let manager = DaemonSidecarManager::new();
+        let acc = Some(PrincipalId::new_v7());
+        let key = (acc, "pkg".to_string(), "sidecar".to_string());
+
+        let spawn_tree = || async {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c").arg("sleep 1000 & wait");
+            cmd.stdin(std::process::Stdio::piped());
+            cmd.stdout(std::process::Stdio::piped());
+            #[cfg(unix)]
+            cmd.process_group(0);
+            let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let pid = child.id().unwrap_or(0);
+            Ok((stdin, pid, stdout))
+        };
+
+        let child = manager.get_or_spawn(key.clone(), spawn_tree).await.unwrap();
+        let pid = child.pid;
+        #[cfg(unix)]
+        unsafe {
+            assert_eq!(libc::kill(pid as libc::pid_t, 0), 0, "child must be alive");
+        }
+
+        assert!(manager.shutdown(&key).await);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        #[cfg(unix)]
+        unsafe {
+            assert_ne!(libc::kill(pid as libc::pid_t, 0), 0, "child should be killed");
+            assert_ne!(
+                libc::kill(-(pid as libc::pid_t), 0),
+                0,
+                "child process group should be killed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sidecar_restart_not_killed_by_stale_reader() {
+        let manager = DaemonSidecarManager::new();
+        let acc = Some(PrincipalId::new_v7());
+        let key = (acc, "pkg".to_string(), "sidecar".to_string());
+
+        let spawn_inst1 = || async {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c").arg("read line; sleep 0.05");
+            cmd.stdin(std::process::Stdio::piped());
+            cmd.stdout(std::process::Stdio::piped());
+            #[cfg(unix)]
+            cmd.process_group(0);
+            let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let pid = child.id().unwrap_or(0);
+            Ok((stdin, pid, stdout))
+        };
+
+        let child_1 = manager.get_or_spawn(key.clone(), spawn_inst1).await.unwrap();
+        let pid_1 = child_1.pid;
+
+        // Shutdown instance 1: closes stdin, so inst 1 will wake up, sleep 50ms, and exit
+        assert!(manager.shutdown(&key).await);
+
+        // Immediately spawn instance 2 under same key while instance 1's stdout is still open
+        let spawn_inst2 = || async {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c").arg("while true; do sleep 1; done");
+            cmd.stdin(std::process::Stdio::piped());
+            cmd.stdout(std::process::Stdio::piped());
+            #[cfg(unix)]
+            cmd.process_group(0);
+            let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let pid = child.id().unwrap_or(0);
+            Ok((stdin, pid, stdout))
+        };
+
+        let child_2 = manager.get_or_spawn(key.clone(), spawn_inst2).await.unwrap();
+        let pid_2 = child_2.pid;
+        assert_ne!(pid_1, pid_2);
+
+        // Wait 150ms for instance 1 to finish sleeping, exit, and its reader task to hit EOF
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Instance 2 must NOT have been killed by instance 1's stale stdout reader!
+        #[cfg(unix)]
+        unsafe {
+            assert_eq!(libc::kill(pid_2 as libc::pid_t, 0), 0, "child 2 must still be alive");
+        }
+
+        // And instance 2 must still be in the manager map
+        assert!(manager.shutdown(&key).await, "child 2 must be in manager map");
+    }
+
+    #[tokio::test]
+    async fn test_reaper_no_spin_after_natural_exit() {
+        let manager = DaemonSidecarManager::new();
+        let acc = Some(PrincipalId::new_v7());
+
+        let spawn_exit = || async {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c").arg("exit 0");
+            cmd.stdin(std::process::Stdio::piped());
+            cmd.stdout(std::process::Stdio::piped());
+            #[cfg(unix)]
+            cmd.process_group(0);
+            let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let pid = child.id().unwrap_or(0);
+            Ok((stdin, pid, stdout))
+        };
+
+        for i in 0..4 {
+            let key = (acc, "pkg".to_string(), format!("s-{i}"));
+            let child = manager.get_or_spawn(key, spawn_exit).await.unwrap();
+            drop(child);
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        #[cfg(unix)]
+        {
+            let mut ts_start = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts_start); }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let mut ts_end = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts_end); }
+
+            let cpu_ms = ((ts_end.tv_sec - ts_start.tv_sec) as u64) * 1000
+                + ((ts_end.tv_nsec - ts_start.tv_nsec) as u64) / 1_000_000;
+            assert!(
+                cpu_ms < 50,
+                "reaper tasks must terminate and not spin; used {cpu_ms}ms CPU in 300ms"
+            );
+        }
+    }
+
+    #[test]
+    fn test_t0_owner_device_is_admin_for_assignment() {
+        let tmp = tempdir().unwrap();
+        let operator_dir = tmp.path();
+
+        let owner_id = PrincipalId::new_v7();
+        let other_id = PrincipalId::new_v7();
+
+        // T0 owner device context has is_admin = true
+        let owner_device_ctx = AccessCtx {
+            principal_id: owner_id,
+            via: Via::Device {
+                device_id: "dev-owner".into(),
+            },
+            device_id: Some("dev-owner".into()),
+            tier: Tier::Full,
+            share: None,
+            share_headers: false,
+            caps: CapSet::of(&[]),
+            admin_strength: true,
+            is_admin: true,
+            meta: RequestMeta::default(),
+        };
+
+        // Non-owner device context has is_admin = false
+        let non_owner_device_ctx = AccessCtx {
+            principal_id: other_id,
+            via: Via::Device {
+                device_id: "dev-other".into(),
+            },
+            device_id: Some("dev-other".into()),
+            tier: Tier::Full,
+            share: None,
+            share_headers: false,
+            caps: CapSet::of(&[]),
+            admin_strength: false,
+            is_admin: false,
+            meta: RequestMeta::default(),
+        };
+
+        // Owner device is allowed to access third-party pkg even without assignments file
+        assert!(check_pkg_assignment(Some(operator_dir), "com.acme.tool", Some(&owner_device_ctx)).is_ok());
+
+        // Non-owner device is denied
+        assert!(check_pkg_assignment(Some(operator_dir), "com.acme.tool", Some(&non_owner_device_ctx)).is_err());
+    }
+
+    #[test]
+    fn test_assignment_merges_builtins_when_file_exists() {
+        let tmp = tempdir().unwrap();
+        let operator_dir = tmp.path();
+
+        let member_ctx = mock_ctx(false);
+
+        // Write pkg-assignments.json granting only a third-party pkg
+        let assignments = json!({
+            "com.acme.tool": [member_ctx.principal_id.to_string()]
+        });
+        std::fs::write(
+            operator_dir.join("pkg-assignments.json"),
+            assignments.to_string(),
+        )
+        .unwrap();
+
+        // Built-ins (com.ikenga.*) MUST remain assigned even when assignments file exists
+        assert!(
+            check_pkg_assignment(Some(operator_dir), "com.ikenga.git", Some(&member_ctx)).is_ok(),
+            "com.ikenga.* must remain assigned even when pkg-assignments.json exists"
+        );
+        // Explicitly assigned third-party pkg is allowed
+        assert!(
+            check_pkg_assignment(Some(operator_dir), "com.acme.tool", Some(&member_ctx)).is_ok()
+        );
+        // Unassigned third-party pkg is denied
+        assert!(
+            check_pkg_assignment(Some(operator_dir), "com.acme.other", Some(&member_ctx)).is_err()
+        );
     }
 }
