@@ -4462,6 +4462,15 @@ sender_verify_acls() {
   note "sender ACL verification OK"
 }
 
+sender_verify_unit() {
+  [[ $DRY_RUN -eq 0 ]] || return 0
+  local unit_path="$SYSTEMD_DIR/$SENDER_UNIT"
+  [[ -f "$unit_path" ]] || die "sender unit verify failed: unit file $unit_path does not exist"
+  grep -Eq 'Environment=.*SENDER_REQUIRE_APPROVALS=1' "$unit_path" \
+    || die "sender unit verify failed: $unit_path lacks SENDER_REQUIRE_APPROVALS=1"
+  note "sender unit verification OK (SENDER_REQUIRE_APPROVALS=1 present)"
+}
+
 sync_sender_secrets() {
   local f="$SENDER_ENV_FILE"
   local desired="" k diff="" cur=""
@@ -4542,6 +4551,7 @@ LoadCredential=env:$SENDER_ENV_FILE
 Environment=PA_ACTIONS_ENV_FILE=%d/env
 Environment=IKENGA_DB=$RUBY_DB
 Environment=NODE_ENV=production
+Environment=SENDER_REQUIRE_APPROVALS=1
 
 # Privilege & Sandboxing:
 NoNewPrivileges=true
@@ -4660,6 +4670,12 @@ sync_sender_enabled() {
 
   sender_ensure_user
   backup_safe_dir 0700 "$SENDER_USER" "$SND_GROUP" "$SND_UID" "$SENDER_STATE_DIR"
+  local approvals_db="$SENDER_STATE_DIR/approvals.db"
+  if [[ ! -f "$approvals_db" && $DRY_RUN -eq 0 ]]; then
+    touch "$approvals_db"
+    chmod 0600 "$approvals_db"
+    chown "$SENDER_USER:$SND_GROUP" "$approvals_db"
+  fi
   if [[ -d /run ]]; then
     ensure_dir 0750 "$SENDER_USER" "$SENDER_APPROVER_GROUP" "$SENDER_RUN_DIR"
   fi
@@ -4668,6 +4684,7 @@ sync_sender_enabled() {
   sender_reapply_acls
   sender_verify_acls
   sender_sync_units
+  sender_verify_unit
 }
 
 sync_sender_disabled() {
@@ -4752,6 +4769,7 @@ case "$ACTION" in
     validate_sender_profile
     resolve_accounts
     sender_verify_acls
+    sender_verify_unit
     summary
     [[ $FAILED -eq 0 ]] || { echo "error: sender ACL verification failed" >&2; exit 1; }
     exit 0 ;;

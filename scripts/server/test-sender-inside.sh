@@ -242,7 +242,20 @@ grep -q 'NoNewPrivileges=true' <<<"$unit_content" || fail "NoNewPrivileges missi
 grep -q 'ProtectSystem=strict' <<<"$unit_content" || fail "ProtectSystem missing"
 grep -q 'LoadCredential=env:' <<<"$unit_content" || fail "LoadCredential missing"
 grep -q 'ReadWritePaths=' <<<"$unit_content" || fail "ReadWritePaths missing"
-pass "systemd unit hardening: NoNewPrivileges, ProtectSystem=strict, LoadCredential verified"
+grep -q 'Environment=SENDER_REQUIRE_APPROVALS=1' <<<"$unit_content" || fail "SENDER_REQUIRE_APPROVALS=1 missing"
+pass "systemd unit hardening: NoNewPrivileges, ProtectSystem=strict, LoadCredential, SENDER_REQUIRE_APPROVALS=1 verified"
+
+# Mutation test: verify-sender-acls must fail loud if SENDER_REQUIRE_APPROVALS=1 is missing from unit
+cp /etc/systemd/system/ikenga-sender.service /tmp/ikenga-sender.service.bak
+sed -i '/SENDER_REQUIRE_APPROVALS=1/d' /etc/systemd/system/ikenga-sender.service
+prov verify-sender-acls
+[[ $RC -ne 0 ]] || fail "MUTATION CHECK FAILED: verify-sender-acls passed without SENDER_REQUIRE_APPROVALS=1 in unit"
+grep -q 'lacks SENDER_REQUIRE_APPROVALS=1' "$OUT" || fail "verify error message did not explain SENDER_REQUIRE_APPROVALS=1 requirement"
+cp /tmp/ikenga-sender.service.bak /etc/systemd/system/ikenga-sender.service
+rm -f /tmp/ikenga-sender.service.bak
+prov verify-sender-acls
+[[ $RC -eq 0 ]] || fail "verify-sender-acls failed after restoring unit"
+pass "mutation test: missing SENDER_REQUIRE_APPROVALS=1 in unit fails loud in verify"
 
 # ------------------------------------------------- 8. Bridge socket group and connect() refusal test
 
