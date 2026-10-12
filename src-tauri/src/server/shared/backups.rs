@@ -19,6 +19,10 @@ pub const STAGED_DB_NAME: &str = "ikenga.db.new";
 pub const LIVE_DB_NAME: &str = "ikenga.db";
 pub const HOME_TOKEN: &str = "${IKENGA_HOME}";
 
+#[cfg(test)]
+pub static TEST_INJECT_POST_SWAP_FAULT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PathMode {
@@ -803,10 +807,30 @@ pub async fn import_backup_zip(
     // 2. Run migrations on staged db copy first (Blocker 2)
     {
         let staged_pa_db = crate::db::PaDb::new(staged_db.clone());
-        let _staged_writer = staged_pa_db
+        let staged_writer = staged_pa_db
             .ensure_pool()
             .await
             .map_err(|e| format!("run migrations on staged db failed: {e}"))?;
+
+        // Validate that staged db has all expected tables matching a freshly migrated reference (Blocker 3)
+        let ref_tables = crate::db::reference_tables().await?;
+        let staged_tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        )
+        .fetch_all(&staged_writer)
+        .await
+        .map_err(|e| format!("query staged tables: {e}"))?;
+        let staged_set: std::collections::HashSet<String> = staged_tables.into_iter().collect();
+
+        for expected in &ref_tables {
+            if !staged_set.contains(expected) {
+                staged_pa_db.close().await;
+                return Err(format!(
+                    "staged database schema is incomplete: missing required table `{expected}`"
+                ));
+            }
+        }
+
         staged_pa_db.close().await;
     }
 
@@ -855,6 +879,11 @@ pub async fn import_backup_zip(
 
     // Post-swap: path rewrites and ensure live pool
     let post_swap_res = async {
+        #[cfg(test)]
+        if TEST_INJECT_POST_SWAP_FAULT.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("injected post-swap fault".to_string());
+        }
+
         if matches!(manifest.path_mode, PathMode::Tokenized) {
             if let Some(home) = current_home_dir() {
                 apply_path_rewrites_to_db(&live_db, HOME_TOKEN, &home).await?;
@@ -888,6 +917,12 @@ pub async fn import_backup_zip(
         return Err(format!(
             "restore failed post-swap, rolled back to previous database: {e}"
         ));
+    }
+
+    // Prune .prev files after successful restore
+    let _ = fs::remove_file(&prev_db);
+    for ext in ["-wal", "-shm", "-journal"] {
+        let _ = fs::remove_file(data_dir.join(format!("{LIVE_DB_NAME}.prev{ext}")));
     }
 
     let res = ImportResult {

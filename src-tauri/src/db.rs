@@ -651,9 +651,32 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
 /// `ensure_pool` fails outright. `busy_timeout` does not help: it serializes
 /// individual statements, not a read-then-write sequence.
 ///
-/// This is documented rather than fixed because the daemon and the desktop
-/// app are not meant to share one `ikenga.db`. `server::run_server` warns at
-/// startup when its `--data-dir` already holds a desktop profile.
+/// Return the complete set of user tables created by a full migration run.
+/// Cached in a OnceCell after migrating an in-memory database once.
+pub async fn reference_tables() -> Result<std::collections::HashSet<String>, String> {
+    static CACHE: tokio::sync::OnceCell<std::collections::HashSet<String>> =
+        tokio::sync::OnceCell::const_new();
+    CACHE
+        .get_or_try_init(|| async {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .map_err(|e| format!("connect memory sqlite: {e}"))?;
+            ensure_schema(&pool).await?;
+            let tables: Vec<String> = sqlx::query_scalar(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| format!("query reference tables: {e}"))?;
+            pool.close().await;
+            Ok(tables.into_iter().collect())
+        })
+        .await
+        .cloned()
+}
+
 async fn ensure_schema(pool: &sqlx::SqlitePool) -> Result<(), String> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS _pa_migrations (

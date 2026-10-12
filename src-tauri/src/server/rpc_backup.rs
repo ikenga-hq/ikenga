@@ -62,29 +62,29 @@ fn resolve_confined_path(
                 if raw.contains("..") {
                     return Err(format!("path `{raw}` contains invalid directory traversal"));
                 }
-                let target = base.join(raw);
                 let canon_base = base
                     .canonicalize()
                     .map_err(|e| format!("canon base {}: {e}", base.display()))?;
-                let canon_target = if target.exists() {
-                    target
-                        .canonicalize()
-                        .map_err(|e| format!("canonicalize target: {e}"))?
-                } else if let Some(parent) = target.parent() {
-                    if parent.exists() {
-                        let canon_parent = parent
-                            .canonicalize()
-                            .map_err(|e| format!("canonicalize parent: {e}"))?;
-                        let fname = target
-                            .file_name()
-                            .ok_or_else(|| format!("invalid filename: {raw}"))?;
-                        canon_parent.join(fname)
+                let target = base.join(raw);
+                let mut existing = target.as_path();
+                let mut tail = Vec::new();
+                while !existing.exists() {
+                    if let Some(parent) = existing.parent() {
+                        if let Some(name) = existing.file_name() {
+                            tail.push(name);
+                        }
+                        existing = parent;
                     } else {
-                        target
+                        break;
                     }
-                } else {
-                    target
-                };
+                }
+                let canon_existing = existing
+                    .canonicalize()
+                    .map_err(|e| format!("canonicalize {}: {e}", existing.display()))?;
+                let mut canon_target = canon_existing;
+                for comp in tail.into_iter().rev() {
+                    canon_target = canon_target.join(comp);
+                }
                 if !canon_target.starts_with(&canon_base) {
                     return Err(format!(
                         "refusing unconfined relative path outside account {subdir} directory: {raw}"
@@ -95,22 +95,25 @@ fn resolve_confined_path(
                 let canon_base = base
                     .canonicalize()
                     .map_err(|e| format!("canon base {}: {e}", base.display()))?;
-                let canon_target = match p.canonicalize() {
-                    Ok(c) => c,
-                    Err(_) => {
-                        if let Some(parent) = p.parent() {
-                            let canon_parent = parent
-                                .canonicalize()
-                                .map_err(|e| format!("canonicalize parent: {e}"))?;
-                            let fname = p
-                                .file_name()
-                                .ok_or_else(|| format!("invalid filename: {raw}"))?;
-                            canon_parent.join(fname)
-                        } else {
-                            return Err(format!("invalid path: {raw}"));
+                let mut existing = p;
+                let mut tail = Vec::new();
+                while !existing.exists() {
+                    if let Some(parent) = existing.parent() {
+                        if let Some(name) = existing.file_name() {
+                            tail.push(name);
                         }
+                        existing = parent;
+                    } else {
+                        break;
                     }
-                };
+                }
+                let canon_existing = existing
+                    .canonicalize()
+                    .map_err(|e| format!("canonicalize {}: {e}", existing.display()))?;
+                let mut canon_target = canon_existing;
+                for comp in tail.into_iter().rev() {
+                    canon_target = canon_target.join(comp);
+                }
                 if !canon_target.starts_with(&canon_base) {
                     return Err(format!(
                         "refusing unconfined path outside account {subdir} directory: {raw}"
@@ -211,8 +214,10 @@ pub(super) async fn backup_import(state: &AppState, args: &Value) -> RpcResponse
 
         let result = backups::import_backup_zip(data_dir, db, &zip_path, dry_run).await;
         // Clean up temporary upload file if it was written
-        if zip_path.starts_with(data_dir.join(backups::STAGED_DIR)) && zip_path.exists() {
+        let staged_base = data_dir.join(backups::STAGED_DIR);
+        if zip_path.starts_with(&staged_base) && zip_path.exists() {
             let _ = std::fs::remove_file(&zip_path);
+            let _ = std::fs::remove_dir(&staged_base);
         }
         result
     }
@@ -390,6 +395,7 @@ pub(crate) async fn http_backup_import(
 
     let res = backups::import_backup_zip(data_dir, db, &temp_zip, false).await;
     let _ = std::fs::remove_file(&temp_zip);
+    let _ = std::fs::remove_dir(&staged_dir);
 
     match res {
         Ok(v) => Ok(Json(json!({ "ok": true, "data": v })).into_response()),
@@ -759,7 +765,8 @@ mod tests {
         .await
         .unwrap();
 
-        // Create a corrupted backup holding invalid _pa_migrations
+        // Create a backup passing initial schema check (has _pa_migrations(id) and layout_state)
+        // but whose migrations fail because _pa_migrations lacks applied_at column!
         let bad_zip = d.data.join("bad_migrations.ikbak");
         let bad_db_file = d.data.join("bad_migrations.db");
         {
@@ -768,7 +775,7 @@ mod tests {
                 .create_if_missing(true);
             let bad_pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
             sqlx::query(
-                "CREATE TABLE _pa_migrations(nonsense TEXT);
+                "CREATE TABLE _pa_migrations(id INTEGER PRIMARY KEY);
                  CREATE TABLE layout_state(id TEXT PRIMARY KEY, value TEXT);",
             )
             .execute(&bad_pool)
@@ -808,8 +815,8 @@ mod tests {
         )
         .await;
         assert!(
-            e.contains("missing `id` column") || e.contains("migrations"),
-            "expected error, got: {e}"
+            e.contains("run migrations on staged db failed") || e.contains("applied_at"),
+            "expected migration failure error, got: {e}"
         );
 
         // Verify live DB was NOT destroyed: project row is still present!
@@ -822,6 +829,176 @@ mod tests {
         assert_eq!(
             count, 1,
             "original project row was preserved after failed restore"
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_level_post_swap_failure_rolls_back_to_previous_db() {
+        let d = test_daemon();
+        let r = &d.router;
+
+        // Seed project row in live DB
+        let pool = d.db.ensure_pool().await.unwrap();
+        sqlx::query(
+            "INSERT INTO projects (id, display_name, root_path, position, is_default, created_at) \
+             VALUES ('proj_post_swap_survives', 'Surviving Post-Swap Project', '/home/proj', 1, 0, 100)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Export a valid backup
+        let _ = ok(
+            r,
+            "backup_export",
+            json!({ "destPath": "valid.ikbak", "pathMode": "raw" }),
+        )
+        .await;
+
+        // Inject post-swap failure
+        crate::server::shared::backups::TEST_INJECT_POST_SWAP_FAULT
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Attempt restore of valid backup
+        let e = err(
+            r,
+            "backup_import",
+            json!({ "srcPath": "valid.ikbak", "dryRun": false }),
+        )
+        .await;
+
+        // Reset fault flag
+        crate::server::shared::backups::TEST_INJECT_POST_SWAP_FAULT
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            e.contains("rolled back to previous database"),
+            "expected rollback error message, got: {e}"
+        );
+
+        // Verify live DB was rolled back: project row is still present!
+        let pool_after = d.db.ensure_pool().await.unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM projects WHERE id = 'proj_post_swap_survives'",
+        )
+        .fetch_one(&pool_after)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 1,
+            "original project row was preserved by rollback after post-swap failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_level_incomplete_schema_backup_refused() {
+        let d = test_daemon();
+        let r = &d.router;
+
+        // Seed project row in live DB
+        let pool = d.db.ensure_pool().await.unwrap();
+        sqlx::query(
+            "INSERT INTO projects (id, display_name, root_path, position, is_default, created_at) \
+             VALUES ('proj_survives_incomplete', 'Surviving Incomplete Project', '/home/proj', 1, 0, 100)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Export a valid backup to a file
+        let _ = ok(
+            r,
+            "backup_export",
+            json!({ "destPath": "complete.ikbak", "pathMode": "raw" }),
+        )
+        .await;
+
+        // Now create a backup based on a fully migrated db, but with pkg_installed dropped!
+        let complete_path = d.data.join("backups/complete.ikbak");
+        let incomplete_zip = d.data.join("backups/incomplete_schema.ikbak");
+        let tmp_db = d.data.join("tmp_incomplete.db");
+
+        {
+            let file = std::fs::File::open(&complete_path).unwrap();
+            let mut archive = zip::ZipArchive::new(file).unwrap();
+            let mut entry = archive.by_name("app.db").unwrap();
+            let mut out = std::fs::File::create(&tmp_db).unwrap();
+            std::io::copy(&mut entry, &mut out).unwrap();
+        }
+
+        // Drop pkg_installed table from tmp_db
+        {
+            let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&tmp_db);
+            let p = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+            sqlx::query("DROP TABLE pkg_installed").execute(&p).await.unwrap();
+            p.close().await;
+        }
+
+        // Re-package into incomplete_schema.ikbak
+        {
+            let file = std::fs::File::create(&incomplete_zip).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file::<_, ()>("manifest.json", zip::write::SimpleFileOptions::default()).unwrap();
+            writer.write_all(
+                json!({
+                    "format_version": 3, "schema_version": 7, "created_at": "2026-01-01T00:00:00Z",
+                    "hostname": "h", "username": "u", "path_mode": "raw", "has_secrets": false, "pkg_count": 0
+                })
+                .to_string()
+                .as_bytes(),
+            ).unwrap();
+            writer.start_file::<_, ()>("app.db", zip::write::SimpleFileOptions::default()).unwrap();
+            let bytes = std::fs::read(&tmp_db).unwrap();
+            writer.write_all(&bytes).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let e = err(
+            r,
+            "backup_import",
+            json!({ "srcPath": "incomplete_schema.ikbak", "dryRun": false }),
+        )
+        .await;
+        assert!(
+            e.contains("missing required table `pkg_installed`"),
+            "expected missing required table error, got: {e}"
+        );
+
+        // Verify user's live data survived
+        let pool_after = d.db.ensure_pool().await.unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM projects WHERE id = 'proj_survives_incomplete'",
+        )
+        .fetch_one(&pool_after)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn arm_level_nested_symlink_under_missing_subfolder_refused() {
+        let d = test_daemon();
+        let r = &d.router;
+
+        // Place a symlink inside backups/ pointing outside backups/
+        let backups_dir = d.data.join("backups");
+        std::fs::create_dir_all(&backups_dir).unwrap();
+        let outside_dir = d.data.join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let link_path = backups_dir.join("lnk");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_dir, &link_path).unwrap();
+
+        // Attempt export through missing subfolder under the symlink
+        let e = err(
+            r,
+            "backup_export",
+            json!({ "destPath": "lnk/newsub/esc2.ikbak" }),
+        )
+        .await;
+        assert!(
+            e.contains("refusing unconfined relative path"),
+            "expected confinement error, got: {e}"
         );
     }
 
