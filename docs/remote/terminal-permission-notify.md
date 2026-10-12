@@ -1,6 +1,6 @@
 # Terminal Permission Notifications (T0/T1 Daemon)
 
-**Gate:** WP-D (#452 Follow-up) · **Status:** DESIGN NOTE & ARCHITECTURAL PROPOSAL · **Date:** 2026-10-11
+**Gate:** WP-D (#452 Follow-up) · **Status:** DESIGN NOTE & ARCHITECTURAL PROPOSAL · **Date:** 2026-10-12
 
 ---
 
@@ -19,10 +19,11 @@ The goal of this design note is to evaluate mechanisms for reliably intercepting
 
 ## 2. Evaluation of Architectural Approaches
 
-We evaluate three potential approaches:
+We evaluate four potential approaches:
 1. **Approach A:** PTY Output Scraping (terminal buffer inspection)
-2. **Approach B:** Claude Code Plugin via `CLAUDE_CODE_PLUGIN_DIRS`
-3. **Approach C:** Process Wrapper / Shim / Ptrace Interception
+2. **Approach B:** Config Overlays (`CLAUDE_CONFIG_DIR`, `--settings`, `~/.claude/settings.json`)
+3. **Approach C:** In-Terminal Prompt Tracking (`TerminalPrompts`, #452 Desktop Port)
+4. **Approach D:** Native Claude Code Plugin Hooks (via WP-09 Consolidated Plugin)
 
 ---
 
@@ -48,99 +49,106 @@ The daemon PTY supervisor (`pty::manager` or `PtySession`) reads the raw master 
 
 ---
 
-### 2.2 Approach B: Claude Code Plugin via `CLAUDE_CODE_PLUGIN_DIRS`
+### 2.2 Approach B: Configuration Overlays (`CLAUDE_CONFIG_DIR`, `--settings`, `~/.claude/settings.json`)
 
 #### Mechanism
-Claude Code includes a native plugin and hook mechanism. Rather than modifying mutable user configuration files (such as `~/.claude/settings.json` or `--settings` flags, which can be overwritten by user edits or agent actions), Ikenga's process executor injects the environment variable `CLAUDE_CODE_PLUGIN_DIRS` when spawning the agent PTY.
+Overriding configuration directories or command-line flags to inject hook definitions into Claude Code's startup configuration.
 
-This environment variable points to a daemon-managed, read-only directory containing an Ikenga permission bridge plugin:
-- The plugin registers Claude Code extension hooks: `PreToolUse`, `PostToolUse`, `Notification`, and `PermissionRequest`.
-- On `PreToolUse` or `PermissionRequest`, the plugin pauses tool execution and transmits structured JSON metadata over an authenticated local IPC transport (Unix domain socket or loopback HTTP) to `ikenga-server`.
-- The daemon holds the request in `server::hook_asks`, generates a `shell_notifications` row, emits events to connected clients and push notification channels, and waits for a decision.
-- Once decided (`allow_once`, `allow_always_project`, `deny`), the daemon responds over the IPC connection, and the plugin returns `{ continue: true }` or `{ continue: false, error: ... }` to Claude Code.
+#### Rejection of `CLAUDE_CONFIG_DIR` Overlay (G-05, v0.8.2)
+- **Login Session Breakage:** In Claude Code v0.8.2, setting a `CLAUDE_CONFIG_DIR` overlay caused the runtime to lose the user's primary login tokens and OAuth session state, forcing interactive re-login prompts.
+- **Architectural Prohibition:** Principle G-05 explicitly prohibits `CLAUDE_CONFIG_DIR` overlays for this exact reason.
+- **User Config Drift:** Global overrides in `~/.claude/settings.json` or mutable `--settings` arguments conflict with user customizations, get overwritten during agent git cleanups, and leave dangling hook definitions after Ikenga daemon shutdown.
 
-#### Why `CLAUDE_CODE_PLUGIN_DIRS` over Config Overlays
-1. **Immutability & Zero Drift:**
-   - Config overlays written to user home directories (`~/.claude/settings.json`) suffer from drift, user collisions, and deletion during agent git cleans.
-   - Environment variables injected at process launch are atomic, read-only to the child shell unless explicitly unset, and do not persist stale state on disk across runs.
-2. **Deterministic Versioning:**
-   - The plugin code is packaged with the Ikenga release binary (`/usr/lib/ikenga/plugins/claude-bridge` or alongside the daemon asset root). Upgrading Ikenga upgrades the bridge atomically.
+#### Reconciliation with Daemon Hook Settings
+The daemon avoids global config overlays by generating a dedicated, per-terminal settings file (`hook_settings`) stored in a private runtime directory, scoped specifically to the individual session without altering the user's persistent `~/.claude/` state or overriding `CLAUDE_CONFIG_DIR`.
 
-#### T1 Multi-Account Isolation
-In T1 mode, multiple system users (`ik-user-1`, `ik-user-2`) run concurrently on the same host, each mapped to a distinct Unix UID and principal ID:
-1. **Per-Principal Socket / Port Isolation:**
-   - Each terminal session is provided with a dedicated Unix Domain Socket in its private runtime directory (e.g. `/run/user/<uid>/ikenga/hook-<session_id>.sock` with mode `0600` owned by that principal's UID).
-   - Alternatively, communications route to the principal's own child daemon (`ikenga-server` running under that user's UID), which listens on a private loopback socket or inherits the connection.
-   - Principals cannot connect to or read another user's hook sockets due to standard Linux DAC permissions.
-2. **Unguessable Per-Session Hook Bearer Token:**
-   - The daemon mints a high-entropy secret token (`IKENGA_HOOK_TOKEN`) per terminal spawn.
-   - The plugin includes this token in all IPC headers (`Authorization: Bearer <token>`).
-   - The daemon rejects any hook payload whose token does not match the active session.
-
-#### Anti-Spoofing Guarantees
-- Terminal output (stdout/stderr) is completely decoupled from the permission control plane.
-- An untrusted bash command outputting fake permission text has zero capability to trigger an Ikenga notification, because notifications are strictly generated from structured JSON events received over the authenticated IPC channel.
-
-**Assessment:** Highly recommended. Robust, secure, and aligns with standard agent architecture.
+**Assessment:** Strictly rejected for configuration overlays; private per-terminal hook settings used where necessary.
 
 ---
 
-### 2.3 Approach C: Shell / Binary Wrapper (Shim / LD_PRELOAD)
+### 2.3 Approach C: Existing Desktop `TerminalPrompts` Path (#452 Follow-up)
 
 #### Mechanism
-Installing a wrapper script in `PATH` (e.g. `/usr/local/bin/claude`) or injecting an `LD_PRELOAD` shared object that hooks libc `read`/`write`/`connect` calls.
+The Ikenga desktop already implements structured in-terminal prompt detection and tracking: `TerminalPrompts` (`src-tauri/src/iyke/hooks.rs:310`).
+- It tracks active prompt state directly within the terminal subsystem.
+- When Claude Code prompts for input, `TerminalPrompts` records the prompt as an active row in the permission system.
+- Issue #452 explicitly identified porting `TerminalPrompts` to the headless daemon as an operational path.
 
-#### Drawbacks
-- Bypassed if the user or agent executes Claude via alternative binaries or package managers (`npx @anthropic-ai/claude-code`, `/home/user/.nvm/.../bin/claude`, or direct `node` invocation).
-- High maintenance overhead and fragility across Node.js runtime updates.
+#### Evaluation
+- **Strengths:**
+  - Zero external plugin dependencies or filesystem overlay requirements.
+  - Tightly coupled with the terminal session lifecycle; prompt state naturally expires when the terminal closes.
+  - Battle-tested in the desktop application.
+- **Headless Requirements:**
+  - On a headless daemon, `TerminalPrompts` must interface directly with `server::hook_asks` and `server::shared::notifications::routing` rather than desktop Tauri events.
+  - Must deliver prompt notifications out-of-band to Web Push and companion devices, and ensure that unattended prompts cleanly time out and record audit entries.
 
-**Assessment:** Inferior to native plugin integration.
-
----
-
-## 3. Comparison Matrix
-
-| Criterion | (a) PTY Output Scraping | (b) `CLAUDE_CODE_PLUGIN_DIRS` Plugin | (c) Wrapper / Shim |
-| :--- | :--- | :--- | :--- |
-| **Reliability** | Very low (fragile ANSI, resize, spinners) | High (structured JSON events) | Medium (bypassed by path) |
-| **Spoofing Resistance** | **None** (untrusted stdout can spoof prompt) | **High** (authenticated IPC bearer token) | Medium |
-| **T1 Multi-Account Isolation** | Low (relies on PTY session mapping) | **High** (UID-isolated sockets + session tokens) | Medium |
-| **Configuration Cleanliness** | Zero config required | **Clean** (injected env var, no disk pollution) | Intrusive (PATH or LD_PRELOAD) |
-| **Audit Fidelity** | Poor (text heuristic only) | **Full** (exact tool name, arguments, cwd) | Poor |
-| **Upstream Compatibility** | Breaks on any UI/CSS update | Stable across Claude Code versions | Fragile to Node/runtime changes |
+**Assessment:** A primary, viable native path for daemon-side terminal prompt tracking.
 
 ---
 
-## 4. Concrete Recommendation and Architecture
+### 2.4 Approach D: Native Claude Code Plugin Hooks (via WP-09 Consolidated Plugin)
 
-### 4.1 Recommendation
-We recommend implementing **Approach B: Claude Code Plugin via `CLAUDE_CODE_PLUGIN_DIRS`**.
+#### Mechanism and Consolidation Under WP-09 (G-07)
+Claude Code supports hook declarations via plugin manifests. Rather than creating a disjoint standalone `ikenga-claude-hook` package, principle **G-07 establishes that all Ikenga agent tools and extensions are consolidated into a single Ikenga plugin** (WP-09). The terminal hook functionality must ride inside WP-09's single plugin.
 
-### 4.2 Proposed Implementation Architecture
-
-1. **Plugin Distribution:**
-   - Package a minimal, zero-dependency Node.js plugin inside `ikenga-server` distribution assets at `<install_dir>/plugins/ikenga-claude-hook/`:
-     - `package.json`
-     - `index.js`
-   - The plugin hooks into Claude Code's extension points:
-     - `PreToolUse`: For shell commands and sensitive tool calls.
-     - `PermissionRequest`: When Claude explicitly yields for human permission.
-
-2. **Terminal Spawning Configuration (`src-tauri/src/pty/mod.rs` & `src-tauri/src/server/`):**
-   - When spawning an interactive terminal or Claude Code session, the executor injects:
-     ```bash
-     CLAUDE_CODE_PLUGIN_DIRS="<install_dir>/plugins/ikenga-claude-hook"
-     IKENGA_HOOK_IPC_PATH="/run/user/<uid>/ikenga/hooks-<terminal_id>.sock"
-     IKENGA_HOOK_TOKEN="<minted_uuidv7_token>"
-     IKENGA_TERMINAL_ID="<terminal_id>"
+#### Correct Hook Mechanics: `hooks.json` and `PreToolUse`
+1. **Manifest Declaration:**
+   - Plugins declare hooks in `hooks.json` (not through custom Node wrapper scripts or `package.json` entry points).
+   - The manifest declares listeners for events such as `PreToolUse`.
+2. **Permission Decision Protocol:**
+   - In `PreToolUse`, tool gating is handled via the `permissionDecision` field in `hookSpecificOutput`:
+     ```json
+     {
+       "continue": true,
+       "hookSpecificOutput": {
+         "hookEventName": "PreToolUse",
+         "permissionDecision": "allow" | "deny"
+       }
+     }
      ```
+   - **Critical Invariant:** The hook response must set `"continue": true`. Setting `"continue": false` aborts the entire Claude conversation / session. To deny an individual tool call (such as a Bash command), the hook returns `"continue": true` with `"permissionDecision": "deny"` and an explanatory message Claude can respond to.
 
-3. **IPC Transport & Daemon Handler:**
-   - In T0: The daemon listens on a local Unix domain socket or verifies the bearer token on `/iyke/hooks/event`.
-   - In T1: The principal child process owns the socket at `/run/user/<uid>/ikenga/hooks-<terminal_id>.sock` (mode `0600`).
-   - The payload format matches `HookPayload` handled by `src-tauri/src/server/hook_asks.rs` and `src-tauri/src/iyke/hooks.rs`.
+---
 
-4. **Integration with Existing Subsystems:**
-   - **Notification Center:** Every held ask produces a row in `shell_notifications` with `kind = 'permission'` and `dedupe_key = 'permission:hook:<request_id>'`.
-   - **Remote Decisions:** Web and Companion clients call `permission_decide` or `term_hooks_decide`.
-   - **Audit Chain:** Successful decisions append `permission.decided` to `audit_events`. Timeouts, crashes, or refusals append `permission.refused` with their exact outcome (`timed_out`, `expired:restart`, `hook_disconnected`).
+## 3. Threat Model and Anti-Spoofing Analysis
+
+### 3.1 PTY Environment Token Exposure
+Any environment variable placed into the PTY environment (such as `IKENGA_HOOK_TOKEN` or a Unix socket path) is **inherited by every process spawned within that terminal**:
+- Commands run by the agent (e.g. `bash`, `python`, `npm test`, arbitrary build scripts) can inspect their own environment (`/proc/self/environ` or `env`).
+- A rogue script or untrusted build process running inside the terminal PTY can read `IKENGA_HOOK_TOKEN` and the socket path, and construct an authenticated, syntactically valid `PermissionRequest` to the daemon's IPC socket.
+- **Conclusion:** Environment variable bearer tokens in the PTY environment do **not** form an impenetrable boundary against malicious code executing within that same PTY.
+
+### 3.2 Spoofing Mitigations
+To maintain defense-in-depth:
+1. **Operation Binding:** The daemon must correlate incoming hook requests with active tool execution state in the terminal supervisor.
+2. **Short-Lived Ephemeral Nonces:** Use single-use interaction nonces tied to specific, un-gated operations rather than long-lived static tokens.
+3. **Transparent Audit Trails:** Prompts and decisions are logged with full command arguments and working directories, ensuring any prompt generated inside the PTY is visible in the immutable audit ledger.
+4. **Owner Verification:** In multi-tenant systems, prompts cannot elevate privileges beyond the session owner's capability set.
+
+---
+
+## 4. T1 Multi-Principal Isolation and Shared-Project Routing
+
+In T1 multi-user mode, multiple principals share a host, and projects may be shared across team members.
+
+### 4.1 UID and Socket Isolation
+- Each principal child runs under its own Linux UID (`ik-<user>`).
+- Hook sockets are created in private per-principal runtime directories (`/run/user/<uid>/ikenga/`) with permissions `0700` / `0600`.
+- Linux DAC prevents cross-principal access to sockets and IPC channels.
+
+### 4.2 Shared-Project Owner Routing
+When an agent executes within a project shared between members (e.g. member A works within owner O's project):
+- The ask record includes `requested_by` (member A) and `project_id` (owner O's project).
+- Per G-ACCESS §5.7, sensitive tool operations (sensitivity >= 1) require project owner authorization and cannot be approved by a tenant member alone.
+- The daemon's routing subsystem (`server::shared::notifications::routing::route_ask` and `decide_with`) directs the prompt to the authorized decider (the project owner or authorized delegates) and records the deciding principal in `audit_events`.
+- Prompts never leak to unrelated projects or tenant principals.
+
+---
+
+## 5. Summary Recommendation
+
+1. **Reject Config Overlays:** Strictly uphold G-05; do not use `CLAUDE_CONFIG_DIR` or global `~/.claude/settings.json` overlays.
+2. **Consolidate with WP-09:** Ride on WP-09's single consolidated Ikenga plugin (G-07) using standard `hooks.json` and `PreToolUse` `permissionDecision` semantics (`continue: true`).
+3. **Bridge with `TerminalPrompts`:** Combine native in-terminal prompt tracking (`TerminalPrompts`, #452) with daemon out-of-band notification routing (`server::hook_asks`).
+4. **Acknowledge PTY Environment Visibility:** Treat in-terminal tokens as process-level credentials, mitigated by active command correlation, DAC isolation, and project-owner routing in T1 shared projects.

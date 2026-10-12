@@ -298,7 +298,12 @@ impl HookAsks {
         };
         match &self.audit {
             AuditSink::Store(store) => match child::system_event(self.owner, &note) {
-                Some(ev) => routing::append_audit(store, &ev).await,
+                Some(ev) => {
+                    routing::append_audit(store, &ev).await;
+                    if let Ok(pool) = self.pool().await {
+                        routing::mark_swept_audited(&pool, ask.id).await;
+                    }
+                }
                 None => warn!("hook asks: an outcome note failed its own vocabulary"),
             },
             AuditSink::Outbox(outbox) => outbox.push(note),

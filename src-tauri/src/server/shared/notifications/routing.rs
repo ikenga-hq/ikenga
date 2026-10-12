@@ -1615,8 +1615,6 @@ impl Relay {
     }
 }
 
-/// Desktop boot (review WP75-RV2): the hook / ACP asks an earlier desktop
-/// run left open. Their hold (the hook gate's parked response, the ACP
 /// What an orphaned ask was, for attribution in audit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweptAsk {
@@ -1625,6 +1623,28 @@ pub struct SweptAsk {
     pub title: String,
     pub sensitive: i64,
     pub project_id: Option<String>,
+}
+
+/// Mark a swept ask as audited in the database so subsequent restarts will not
+/// derive its expiry again.
+pub async fn mark_swept_audited(pool: &sqlx::SqlitePool, id: i64) {
+    let _ = sqlx::query(
+        "UPDATE shell_notifications SET decided_via = 'swept' \
+         WHERE id = ? AND decided_via = 'swept-unaudited'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await;
+}
+
+/// Mark all swept-unaudited asks as audited.
+pub async fn mark_all_swept_audited(pool: &sqlx::SqlitePool) {
+    let _ = sqlx::query(
+        "UPDATE shell_notifications SET decided_via = 'swept' \
+         WHERE decided_via = 'swept-unaudited'",
+    )
+    .execute(pool)
+    .await;
 }
 
 /// Review WP75-RV2: close the hook / ACP asks an earlier run left open.
@@ -1639,9 +1659,12 @@ pub struct SweptAsk {
 pub async fn sweep_orphaned_asks(pool: &sqlx::SqlitePool, before_ms: i64) -> Vec<SweptAsk> {
     let rows: Vec<(i64, String, String, i64, Option<String>)> = match sqlx::query_as(
         "SELECT id, dedupe_key, title, sensitive, project_id FROM shell_notifications \
-         WHERE kind = 'permission' AND resolved_at IS NULL AND created_at < ? \
+         WHERE kind = 'permission' \
+           AND ((resolved_at IS NULL AND created_at < ?) \
+                OR (decided_via = 'swept-unaudited' AND resolved_at < ?)) \
            AND (dedupe_key LIKE 'permission:hook:%' OR dedupe_key LIKE 'permission:acp:%')",
     )
+    .bind(before_ms)
     .bind(before_ms)
     .fetch_all(pool)
     .await
@@ -1656,8 +1679,9 @@ pub async fn sweep_orphaned_asks(pool: &sqlx::SqlitePool, before_ms: i64) -> Vec
     let mut swept = Vec::with_capacity(rows.len());
     for (id, dedupe_key, title, sensitive, project_id) in rows {
         let r = sqlx::query(
-            "UPDATE shell_notifications SET resolved_at = ?, read_at = COALESCE(read_at, ?) \
-             WHERE id = ? AND resolved_at IS NULL",
+            "UPDATE shell_notifications SET resolved_at = ?, read_at = COALESCE(read_at, ?), \
+             decided_via = 'swept-unaudited' \
+             WHERE id = ? AND (resolved_at IS NULL OR decided_via = 'swept-unaudited')",
         )
         .bind(now)
         .bind(now)

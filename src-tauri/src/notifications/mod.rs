@@ -299,7 +299,6 @@ mod routing_desktop {
         let Ok(pool) = db.ensure_pool().await else {
             return;
         };
-        let host = Host { app: app.clone() };
         let swept = core::sweep_orphaned_asks(&pool, booted_at).await;
         for ask in swept {
             let target = ask.title.chars().take(120).collect::<String>();
@@ -308,23 +307,49 @@ mod routing_desktop {
                 "outcome": "expired:restart",
                 "sensitive": ask.sensitive,
             });
-            host.audit_local("permission.refused", target, detail).await;
+            let audit_args = json!({
+                "kind": "permission.refused",
+                "target": target,
+                "detail": detail,
+            });
 
             let args = json!({ "key": ask.dedupe_key, "outcome": "cancelled" });
             let mut delay = Duration::from_secs(1);
+            let mut audited = false;
+            let mut resolved = false;
             for attempt in 0..6 {
-                match daemon_rpc(&app, "permission_relay_resolve", args.clone()).await {
-                    Ok(_) => break,
-                    Err(e) => {
-                        log::debug!(
-                            target: "ikenga::notifications",
-                            "orphaned ask {}: report attempt {attempt}: {e}",
-                            ask.dedupe_key
-                        );
-                        tokio::time::sleep(delay).await;
-                        delay = (delay * 2).min(Duration::from_secs(20));
+                if !audited {
+                    match daemon_rpc(&app, "access_audit_record_local", audit_args.clone()).await {
+                        Ok(_) => {
+                            audited = true;
+                            core::mark_swept_audited(&pool, ask.id).await;
+                        }
+                        Err(e) => {
+                            log::debug!(
+                                target: "ikenga::notifications",
+                                "orphaned ask {}: audit attempt {attempt}: {e}",
+                                ask.dedupe_key
+                            );
+                        }
                     }
                 }
+                if !resolved {
+                    match daemon_rpc(&app, "permission_relay_resolve", args.clone()).await {
+                        Ok(_) => resolved = true,
+                        Err(e) => {
+                            log::debug!(
+                                target: "ikenga::notifications",
+                                "orphaned ask {}: report attempt {attempt}: {e}",
+                                ask.dedupe_key
+                            );
+                        }
+                    }
+                }
+                if audited && resolved {
+                    break;
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(20));
             }
         }
     }

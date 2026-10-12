@@ -48,6 +48,7 @@ use crate::executor::PrincipalId;
 /// The route the broker long-polls (`internal` class: the per-child token plus
 /// the broker's internal-call header; the broker never proxies `/internal/*`).
 pub const EVENTS_PATH: &str = "/internal/audit/events";
+pub const ACK_PATH: &str = "/internal/audit/events/ack";
 pub const CAPACITY: usize = 256;
 /// The longest a poll may hold.
 pub const MAX_WAIT: Duration = Duration::from_secs(25);
@@ -196,16 +197,39 @@ pub fn outbox() -> Option<Arc<Outbox>> {
 pub struct WaitQuery {
     #[serde(rename = "waitMs")]
     pub wait_ms: Option<u64>,
+    pub ack: Option<bool>,
 }
 
 /// `GET /internal/audit/events` (principal child only; the route's `internal`
 /// requirement was checked by `auth_middleware`).
-pub async fn events_handler(Query(q): Query<WaitQuery>) -> Response {
+pub async fn events_handler(
+    axum::extract::State(state): axum::extract::State<Arc<crate::server::AppState>>,
+    Query(q): Query<WaitQuery>,
+) -> Response {
+    if q.ack == Some(true) {
+        if let Some(pa_db) = &state.pa_db {
+            if let Ok(pool) = pa_db.ensure_pool().await {
+                crate::server::shared::notifications::routing::mark_all_swept_audited(&pool).await;
+            }
+        }
+    }
     let Some(outbox) = outbox() else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let wait = Duration::from_millis(q.wait_ms.unwrap_or(0)).min(MAX_WAIT);
     Json(outbox.take(wait).await).into_response()
+}
+
+/// `POST /internal/audit/events/ack` (principal child only).
+pub async fn ack_handler(
+    axum::extract::State(state): axum::extract::State<Arc<crate::server::AppState>>,
+) -> StatusCode {
+    if let Some(pa_db) = &state.pa_db {
+        if let Ok(pool) = pa_db.ensure_pool().await {
+            crate::server::shared::notifications::routing::mark_all_swept_audited(&pool).await;
+        }
+    }
+    StatusCode::OK
 }
 
 // ─── the broker's side ──────────────────────────────────────────────────────
@@ -446,6 +470,19 @@ pub fn spawn(children: Arc<crate::server::broker::children::Children>, store: Ac
                                  vocabulary; dropped"
                             ),
                         }
+                    }
+                    if !b.notes.is_empty() {
+                        let ack_url = format!("http://{}{ACK_PATH}", endpoint.addr);
+                        let _ = client
+                            .post(&ack_url)
+                            .bearer_auth(&*endpoint.token)
+                            .header(
+                                crate::server::broker::proxy::PRINCIPAL_HEADER,
+                                principal.to_string(),
+                            )
+                            .header(crate::access::INTERNAL_CALL_HEADER, "1")
+                            .send()
+                            .await;
                     }
                 }
                 None => {

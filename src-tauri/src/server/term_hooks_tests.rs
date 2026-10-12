@@ -2245,3 +2245,143 @@ async fn the_brokers_audit_poll_is_internal_and_serves_the_childs_queue() {
     assert_eq!(notes[0]["decision"], "deny");
     assert_eq!(batch["dropped"], 0);
 }
+
+#[tokio::test]
+async fn the_legacy_arm_audits_raw_decision_when_there_is_no_open_row() {
+    let a = t0().await;
+    let p = park_on(&a, &a.operator, "t-legacy-no-row", 30, "Bash", Some("/")).await;
+    let row = row_of(&a.operator, &p.request_id).await;
+    let id = row["id"].as_i64().unwrap();
+    let pool = a.db.ensure_pool().await.unwrap();
+    sqlx::query("DELETE FROM shell_notifications WHERE id = ?")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let r = a
+        .operator
+        .ok(
+            "term_hooks_decide",
+            json!({ "requestId": p.request_id, "decision": "approved" }),
+        )
+        .await;
+    assert_eq!(r, json!({ "recorded": true, "gated": true }));
+    let (_, body) = p.call.await.unwrap();
+    assert_eq!(decision_of(&body), "allow");
+
+    let audit = a.audit().await;
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    let (kind, principal, via, target, detail) = &audit[0];
+    assert_eq!(kind, "permission.decided");
+    assert_eq!(via, "operator");
+    assert!(principal.is_some());
+    assert_eq!(target.as_deref(), Some("Claude wants to use Bash"));
+    assert_eq!(detail["decision"], "allow_once");
+    assert_eq!(detail["sensitive"], 1);
+}
+
+async fn child_on_dir(
+    data_dir: std::path::PathBuf,
+    outbox: Arc<audit_child::Outbox>,
+) -> (Asks, PrincipalId) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let home = root.join("home");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let db = Arc::new(PaDb::new(data_dir.join("ikenga.db")));
+    db.ensure_pool().await.unwrap();
+    crate::server::hook_asks::TEST_OUTBOX.with(|t| *t.borrow_mut() = Some(outbox.clone()));
+    let router = crate::server::build_router(
+        config(Some(data_dir.clone()), PORT),
+        Arc::new(PtyManager::new()),
+        Arc::new(EngineRegistry::new()),
+        Some(db.clone()),
+        None,
+        Some(home),
+        crate::server::rpc_shell::PathGuard::allowlist(),
+        None,
+        DaemonAccess::principal_child(Default::default()),
+        None,
+        crate::server::UpdateSource::Default,
+    );
+    crate::server::hook_asks::TEST_OUTBOX.with(|t| *t.borrow_mut() = None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = router.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            served.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
+    });
+    let d = Daemon {
+        _tmp: tmp,
+        data: data_dir,
+        router: router.clone(),
+        addr,
+    };
+    let a = Asks {
+        operator: Caller {
+            router,
+            headers: vec![],
+        },
+        d,
+        db,
+        store: None,
+        outbox: Some(outbox),
+    };
+    (a, PrincipalId::new_v7())
+}
+
+#[tokio::test]
+async fn t1_child_death_before_audit_poll_does_not_lose_expired_ask() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().canonicalize().unwrap().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let db = Arc::new(PaDb::new(data_dir.join("ikenga.db")));
+    let pool = db.ensure_pool().await.unwrap();
+
+    // Seed an ask from an earlier run (created 10s ago)
+    let booted = chrono::Utc::now().timestamp_millis();
+    let ask_time = booted - 10_000;
+    sqlx::query(
+        "INSERT INTO shell_notifications \
+         (kind, title, source, dedupe_key, created_at, updated_at, sensitive) \
+         VALUES ('permission', 'Claude wants to use Bash', 'test', 'permission:hook:stale-1', ?, ?, 1)",
+    )
+    .bind(ask_time)
+    .bind(ask_time)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Child run 1 sweeps the ask and queues note into outbox 1.
+    let outbox1 = Arc::new(audit_child::Outbox::new());
+    let (a1, _) = child_on_dir(data_dir.clone(), outbox1.clone()).await;
+    // Simulate child 1 dying before the broker's poll: drop outbox1 and a1 without acking.
+    drop(a1);
+    drop(outbox1);
+
+    // Child run 2 starts on the same database. Its boot sweep must derive the expiry again!
+    let outbox2 = Arc::new(audit_child::Outbox::new());
+    let (a2, _) = child_on_dir(data_dir.clone(), outbox2.clone()).await;
+    let batch2 = outbox2.take(Duration::from_millis(1500)).await;
+    assert_eq!(batch2.notes.len(), 1, "child 2 must receive the unacknowledged swept note");
+    assert_eq!(batch2.notes[0].outcome.as_deref(), Some("expired:restart"));
+
+    // Now the broker acknowledges the note.
+    let pool2 = a2.db.ensure_pool().await.unwrap();
+    crate::server::shared::notifications::routing::mark_all_swept_audited(&pool2).await;
+    drop(a2);
+    drop(outbox2);
+
+    // Child run 3 starts: since it was acknowledged, it must not be swept again.
+    let outbox3 = Arc::new(audit_child::Outbox::new());
+    let (_a3, _) = child_on_dir(data_dir.clone(), outbox3.clone()).await;
+    let batch3 = outbox3.take(Duration::from_millis(300)).await;
+    assert_eq!(batch3.notes.len(), 0, "acknowledged ask must not be queued again");
+}

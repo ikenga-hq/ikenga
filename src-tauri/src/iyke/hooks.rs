@@ -269,6 +269,19 @@ pub async fn post_hook_event(
                         decision: "denied".into(),
                     },
                 );
+                let host = crate::notifications::host_side(&app);
+                let tool_name = payload.tool_name.clone();
+                let tool_input = payload.tool_input.clone();
+                let cwd = payload.cwd.clone();
+                tauri::async_runtime::spawn(async move {
+                    audit_hook_gate_timeout(
+                        &host,
+                        tool_name.as_deref(),
+                        tool_input.as_ref(),
+                        cwd.as_deref(),
+                    )
+                    .await;
+                });
                 false
             }
         };
@@ -502,6 +515,36 @@ async fn handle_no_row_decision(
             Err(e)
         }
     }
+}
+
+/// Audit a desktop hook gate timeout (§5.5, review WP-D).
+pub(crate) async fn audit_hook_gate_timeout(
+    host: &dyn crate::server::shared::notifications::routing::HostSide,
+    tool_name: Option<&str>,
+    tool_input: Option<&serde_json::Value>,
+    cwd: Option<&str>,
+) {
+    let tool = tool_name.filter(|t| !t.is_empty()).unwrap_or("a tool");
+    let target = crate::server::shared::notifications::run::truncate(
+        &format!("Claude wants to use {tool}"),
+        120,
+    );
+    let facts = crate::notifications::producers::ask_facts(
+        tool_name,
+        tool_input,
+        cwd,
+        false,
+    );
+    let sensitive = crate::server::shared::notifications::hook_ask::attribution(&facts, None)
+        .sensitivity
+        .level();
+    let detail = serde_json::json!({
+        "decision": "deny",
+        "outcome": "timed_out",
+        "sensitive": sensitive,
+        "requested_by": null,
+    });
+    host.audit_local("permission.decided", target, detail).await;
 }
 
 /// The no-row fallback (review WP75-RV1): reads the host's routing from
@@ -812,5 +855,24 @@ mod tests {
             entries.is_empty(),
             "ungated decision must not audit decided"
         );
+    }
+
+    #[tokio::test]
+    async fn hook_gate_timeout_audits_permission_decided_with_timed_out() {
+        let audited = Arc::new(Mutex::new(Vec::new()));
+        let fake = AuditingFake {
+            routing: Ok(Default::default()),
+            audited: audited.clone(),
+        };
+        let input = serde_json::json!({ "command": "cargo test" });
+        audit_hook_gate_timeout(&fake, Some("Bash"), Some(&input), Some("/tmp/project")).await;
+
+        let entries = audited.lock().unwrap().clone();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "permission.decided");
+        assert_eq!(entries[0].1, "Claude wants to use Bash");
+        assert_eq!(entries[0].2["decision"], "deny");
+        assert_eq!(entries[0].2["outcome"], "timed_out");
+        assert_eq!(entries[0].2["sensitive"], 1);
     }
 }
