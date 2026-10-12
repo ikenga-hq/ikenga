@@ -102,6 +102,11 @@ function NgwaStorePage() {
 	// daemon serves (WP-18b part c): their handlers stay on. A source the
 	// server would refuse (a local path, a non-https URL) is stopped in the
 	// Add-from-URL sheet with its own reason (`remoteSourceBlock`).
+	// A registry SKILL or BUNDLE that the signed catalog also lists ("also:
+	// npx") is the bridge between the two: with `onInstall` off, the surface
+	// installs such a row through `onInstallPrimitive` (the catalog twin, at
+	// the catalog's pin), and every other package row stays disabled, in the
+	// list as well as the sheet (`lib/ngwa/store-install-route.ts`).
 	const installReason = pkgInstallUnavailableReason();
 	const installBlocked = installReason !== false;
 

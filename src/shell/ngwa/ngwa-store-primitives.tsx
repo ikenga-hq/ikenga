@@ -83,7 +83,7 @@ export function catalogClosureLabel(deps: readonly ConsentDep[]): string {
 	return `also installs ${fetched.length} ${noun}`;
 }
 
-function ClosureRows({ deps }: { deps: readonly ConsentDep[] }) {
+export function ClosureRows({ deps }: { deps: readonly ConsentDep[] }) {
 	return (
 		<div data-closure-rows>
 			{deps.map((d) => {
@@ -218,7 +218,7 @@ export function InstallSplit({
 }
 
 /** One Share-kola checkbox. */
-function Consent({
+export function Consent({
 	id,
 	b,
 	d,

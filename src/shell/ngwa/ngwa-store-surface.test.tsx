@@ -765,3 +765,130 @@ describe('NgwaStoreSurface — disabledReason (WP-S)', () => {
 		});
 	});
 });
+
+describe('NgwaStoreSurface — skill pkgs installed through the Ọba path', () => {
+	const SHA = '9c41e07a1b2c3d4e5f60718293a4b5c6d7e8f901';
+	const twin = (over: Record<string, unknown> = {}) => ({
+		kind: 'skill' as const,
+		name: 'groundwork',
+		version: '0.3.0',
+		description: null,
+		source: 'npx' as const,
+		url: 'royalti-io/groundwork',
+		ref: SHA,
+		...over,
+	});
+	const skillPkg = (alsoEntry: ReturnType<typeof twin> | null): NgwaStoreEntry => ({
+		...mockCatalog[1],
+		id: '@ikenga/skill-groundwork',
+		name: '@ikenga/skill-groundwork',
+		displayName: 'skill-groundwork',
+		alsoFrom: alsoEntry ? { source: alsoEntry.source, url: alsoEntry.url } : null,
+		alsoEntry,
+	});
+	const REASON = 'Packages are installed by the server operator';
+	const outcome = {
+		scope: 'workspace' as const,
+		placed: [],
+		alsoEnabled: [],
+		leftInPlace: [],
+	};
+
+	it('an unpinned twin needs its own consent before Install enables, then installs unpinned', async () => {
+		const entry = skillPkg(twin({ ref: undefined }));
+		const onInstallPrimitive = vi.fn().mockResolvedValue(outcome);
+		renderWithClient(
+			<NgwaStoreSurface
+				catalog={[entry]}
+				initialSelectedId={entry.id}
+				loadDetail={vi.fn().mockResolvedValue(detailVersion({}))}
+				disabledReason={REASON}
+				onInstallPrimitive={onInstallPrimitive}
+			/>
+		);
+		const install = await waitFor(() => {
+			const b = document.querySelector<HTMLButtonElement>('[data-storesheet] [data-install]');
+			expect(b).not.toBeNull();
+			expect(document.querySelector('[data-consent="unpinned"]')).not.toBeNull();
+			return b as HTMLButtonElement;
+		});
+		expect(install.disabled).toBe(true);
+		expect(document.querySelector('[data-pinned-version]')?.textContent).toMatch(/unpinned/);
+		fireEvent.click(document.querySelector('[data-consent="unpinned"]') as Element);
+		expect(install.disabled).toBe(false);
+		fireEvent.click(install);
+		await waitFor(() => expect(onInstallPrimitive).toHaveBeenCalledTimes(1));
+		const [row, scope] = onInstallPrimitive.mock.calls[0];
+		expect(row.entry.ref).toBeUndefined();
+		expect(row.entry.hash).toBeUndefined();
+		expect(scope).toBe('project');
+	});
+
+	it('a pinned twin passes the catalog entry (its ref) to the Ọba handler', async () => {
+		const entry = skillPkg(twin());
+		const onInstallPrimitive = vi.fn().mockResolvedValue(outcome);
+		renderWithClient(
+			<NgwaStoreSurface
+				catalog={[entry]}
+				initialSelectedId={entry.id}
+				loadDetail={vi.fn().mockResolvedValue(detailVersion({}))}
+				disabledReason={REASON}
+				onInstallPrimitive={onInstallPrimitive}
+			/>
+		);
+		const install = await waitFor(() => {
+			const b = document.querySelector<HTMLButtonElement>('[data-storesheet] [data-install]');
+			expect(b?.disabled).toBe(false);
+			return b as HTMLButtonElement;
+		});
+		fireEvent.click(install);
+		await waitFor(() => expect(onInstallPrimitive).toHaveBeenCalledTimes(1));
+		expect(onInstallPrimitive.mock.calls[0][0].entry.ref).toBe(SHA);
+	});
+
+	it('without an Ọba handler the same row is disabled with the reason, in the row and the sheet', async () => {
+		const entry = skillPkg(twin());
+		const { container } = renderWithClient(
+			<NgwaStoreSurface
+				catalog={[entry]}
+				initialSelectedId={entry.id}
+				loadDetail={vi.fn().mockResolvedValue(detailVersion({}))}
+				disabledReason={REASON}
+			/>
+		);
+		const rowBtn = container.querySelector<HTMLButtonElement>(
+			`.srow[data-id="${entry.id}"] .rt button`
+		);
+		expect(rowBtn?.disabled).toBe(true);
+		expect(rowBtn?.title).toBe(REASON);
+		await waitFor(() =>
+			expect(document.querySelector('[data-storesheet] [data-install-blocked]')?.textContent).toBe(
+				REASON
+			)
+		);
+	});
+
+	it('a desktop surface (onInstall given) installs the package, not the twin', async () => {
+		const entry = skillPkg(twin());
+		const onInstall = vi.fn().mockResolvedValue(undefined);
+		const onInstallPrimitive = vi.fn();
+		renderWithClient(
+			<NgwaStoreSurface
+				catalog={[entry]}
+				initialSelectedId={entry.id}
+				loadDetail={vi.fn().mockResolvedValue(detailVersion({}))}
+				onInstall={onInstall}
+				onInstallPrimitive={onInstallPrimitive}
+			/>
+		);
+		const install = await waitFor(() => {
+			const b = document.querySelector<HTMLButtonElement>('[data-storesheet] [data-install]');
+			expect(b?.disabled).toBe(false);
+			return b as HTMLButtonElement;
+		});
+		expect(document.querySelector('[data-oba-note]')).toBeNull();
+		fireEvent.click(install);
+		await waitFor(() => expect(onInstall).toHaveBeenCalledTimes(1));
+		expect(onInstallPrimitive).not.toHaveBeenCalled();
+	});
+});
