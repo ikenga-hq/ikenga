@@ -273,6 +273,13 @@ if grep -qw "$APPROVER_GRP" <<<"$ruby_groups"; then
 fi
 pass "group isolation: ik-ruby does not belong to $APPROVER_GRP"
 
+# Mutation test: adding ik-ruby to approver group must fail verify-sender-acls loudly
+usermod -a -G "$APPROVER_GRP" ik-ruby
+prov verify-sender-acls
+gpasswd -d ik-ruby "$APPROVER_GRP" >/dev/null 2>&1 || true
+[[ $RC -ne 0 ]] || fail "mutation test failed: verify-sender-acls did not fail when ik-ruby was in $APPROVER_GRP"
+pass "mutation test: ik-ruby in approver group fails verify loudly"
+
 # Create a test Unix domain socket in /run/ikenga-sender/approvals.sock
 # Directory: mode 0750 owned by ikenga-sender:ikenga-approver
 # Socket: mode 0660 owned by ikenga-sender:ikenga-approver

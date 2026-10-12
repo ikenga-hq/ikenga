@@ -4309,6 +4309,7 @@ SENDER_ENV_FILE="$SECRETS_DIR/ikenga-sender.env"
 SENDER_UNIT="ikenga-sender.service"
 SENDER_TIMER="ikenga-sender.timer"
 SENDER_APPROVER_GROUP="${SENDER_APPROVER_GROUP:-ikenga-approver}"
+BRIDGE_USER="${BRIDGE_USER:-ikenga-bridge}"
 SENDER_RUN_DIR="${SENDER_RUN_DIR:-/run/ikenga-sender}"
 SND_UID=0; SND_GID=0; SND_GROUP="$SENDER_USER"
 RUBY_PRINCIPAL_DIR=""; RUBY_DATA_DIR=""; RUBY_DB=""
@@ -4357,6 +4358,11 @@ sender_ensure_user() {
   if ! getent group "$SENDER_APPROVER_GROUP" >/dev/null 2>&1; then
     run groupadd --system "$SENDER_APPROVER_GROUP"
     changed "system group $SENDER_APPROVER_GROUP created for bridge IPC"
+  fi
+  if ! getent passwd "$BRIDGE_USER" >/dev/null 2>&1; then
+    run useradd --system --no-create-home --gid "$SENDER_APPROVER_GROUP" --shell /usr/sbin/nologin \
+      --comment "Ikenga Mattermost bridge sidecar" "$BRIDGE_USER"
+    changed "system user $BRIDGE_USER created for bridge sidecar (group $SENDER_APPROVER_GROUP)"
   fi
   if id "$SENDER_USER" >/dev/null 2>&1; then
     SND_UID="$(id -u "$SENDER_USER")"; SND_GID="$(id -g "$SENDER_USER")"; SND_GROUP="$(id -gn "$SENDER_USER")"
@@ -4459,6 +4465,21 @@ sender_verify_acls() {
     grep -Eq "user:$SENDER_USER:rw" <<<"$db_facl" \
       || die "sender ACL verify failed: $RUBY_DB does not grant rw to $SENDER_USER"
   fi
+
+  # Check socket approver group isolation: ik-ruby and ik-* accounts must NEVER belong to it
+  local ruby_grps; ruby_grps="$(id -nG "ik-$SENDER_ACCOUNT" 2>/dev/null || true)"
+  if grep -qw "$SENDER_APPROVER_GROUP" <<<"$ruby_grps"; then
+    die "sender group verify failed: ik-$SENDER_ACCOUNT belongs to $SENDER_APPROVER_GROUP"
+  fi
+  local grp_line grp_members
+  if grp_line="$(getent group "$SENDER_APPROVER_GROUP" 2>/dev/null)"; then
+    grp_members="$(cut -d: -f4 <<<"$grp_line")"
+    local m
+    for m in ${grp_members//,/ }; do
+      [[ ! "$m" =~ ^ik- ]] || die "sender group verify failed: Ikenga account '$m' belongs to $SENDER_APPROVER_GROUP"
+    done
+  fi
+
   note "sender ACL verification OK"
 }
 
