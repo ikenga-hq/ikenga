@@ -74,6 +74,22 @@ describe('storeInstallRoute', () => {
 		expect(r.row.id).toBe('cat:skill:groundwork');
 	});
 
+	it.each([
+		'hook',
+		'agent',
+		'command',
+		'mcp',
+	] as const)('browser: a registry %s with a same-kind catalog twin never takes the Ọba route', (kind) => {
+		// Only skills and bundles may fall back to their catalog twin: a hook or MCP
+		// twin would install without the "runs" consent the catalog sheet asks for.
+		const e = entry({
+			kind,
+			alsoEntry: alt({ kind, name: 'groundwork' }),
+		} as Partial<NgwaStoreEntry>);
+		expect(altCatalogRow(e, [])).toBeNull();
+		expect(storeInstallRoute(e, BROWSER, null, []).via).toBe('blocked');
+	});
+
 	it('browser: a bundle with a twin installs through Ọba too', () => {
 		const r = storeInstallRoute(
 			entry({ kind: 'bundle', alsoEntry: alt({ kind: 'bundle', name: 'studio-archetypes' }) }),
