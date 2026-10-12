@@ -4432,6 +4432,21 @@ sender_reapply_acls() {
       run setfacl -m "u:$SENDER_USER:rw" "$f"
     done
   fi
+
+  # Option (i) read-only ACLs for draft announcer (running as BRIDGE_USER)
+  if id "$BRIDGE_USER" >/dev/null 2>&1; then
+    run setfacl -m "u:$BRIDGE_USER:--x" "$RUBY_PRINCIPAL_DIR"
+    run setfacl -m "u:$BRIDGE_USER:r-x" "$RUBY_DATA_DIR"
+    run setfacl -d -m "u:$BRIDGE_USER:r--" "$RUBY_DATA_DIR"
+    if [[ -f "$RUBY_DB" ]]; then
+      run setfacl -m "u:$BRIDGE_USER:r--" "$RUBY_DB"
+      local f
+      for f in "$RUBY_DATA_DIR"/ikenga.db-*; do
+        [[ -e "$f" ]] || continue
+        run setfacl -m "u:$BRIDGE_USER:r--" "$f"
+      done
+    fi
+  fi
   changed "sender ACLs applied on $RUBY_PRINCIPAL_DIR"
 }
 
@@ -4464,6 +4479,21 @@ sender_verify_acls() {
     local db_facl; db_facl="$(getfacl -p "$RUBY_DB" 2>/dev/null || true)"
     grep -Eq "user:$SENDER_USER:rw" <<<"$db_facl" \
       || die "sender ACL verify failed: $RUBY_DB does not grant rw to $SENDER_USER"
+  fi
+
+  # Check option (i) read-only access for bridge announcer
+  if id "$BRIDGE_USER" >/dev/null 2>&1; then
+    grep -Eq "user:$BRIDGE_USER:[r-][w-]x" <<<"$p_facl" \
+      || die "sender ACL verify failed: $RUBY_PRINCIPAL_DIR does not grant execution to $BRIDGE_USER"
+    grep -Eq "user:$BRIDGE_USER:r[w-]x" <<<"$d_facl" \
+      || die "sender ACL verify failed: $RUBY_DATA_DIR does not grant r-x to $BRIDGE_USER"
+    if [[ -f "$RUBY_DB" ]]; then
+      local b_db_facl; b_db_facl="$(getfacl -p "$RUBY_DB" 2>/dev/null || true)"
+      ! grep -Eq "user:$BRIDGE_USER:.*w.*" <<<"$b_db_facl" \
+        || die "SECURITY VIOLATION: $BRIDGE_USER must never have write access to $RUBY_DB"
+      grep -Eq "user:$BRIDGE_USER:r--" <<<"$b_db_facl" \
+        || die "sender ACL verify failed: $RUBY_DB does not grant read-only to $BRIDGE_USER"
+    fi
   fi
 
   # Check socket approver group isolation: ik-ruby and ik-* accounts must NEVER belong to it

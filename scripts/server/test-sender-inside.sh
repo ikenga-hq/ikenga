@@ -310,12 +310,18 @@ while True:
 SOCK_PID=$!
 sleep 0.5
 
-# Test: bridge user CAN connect to the socket
+# Bridge execution helper
 as_bridge() {
-  ( cd / && setpriv --reuid="$BRIDGE_UID" --regid="$(getent group "$APPROVER_GRP" | cut -d: -f3)" --groups="$APPROVER_GRP" \
-      env -i PATH=/usr/bin:/bin python3 -c "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect('$SOCK_FILE'); s.close()" )
+  local u g
+  u="$(id -u "$BRIDGE_USER")"
+  g="$(getent group "$APPROVER_GRP" | cut -d: -f3)"
+  ( cd / && setpriv --reuid="$u" --regid="$g" --groups="$APPROVER_GRP" \
+      env -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 "$@" )
 }
-as_bridge || fail "bridge user was refused connect() on approvals socket"
+
+# Test: bridge user CAN connect to the socket
+as_bridge python3 -c "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect('$SOCK_FILE'); s.close()" \
+  || fail "bridge user was refused connect() on approvals socket"
 pass "bridge socket access: bridge user connects successfully"
 
 # Test: ik-ruby CANNOT connect to the socket (Permission denied / EACCES)
@@ -334,4 +340,56 @@ pass "ada socket refusal: ik-ada connect() to approvals socket is refused with E
 kill "$SOCK_PID" 2>/dev/null || true
 rm -f "$SOCK_FILE"
 
-pass "ALL SENDER S1 AND S2 CONTAINER TESTS PASSED"
+# ------------------------------------------------- 9. Bridge announcer read-only ACL tests (S2b)
+
+# Test: bridge user CAN read pa_action_drafts from Ruby's DB in read-only mode
+bridge_draft="$(as_bridge python3 -c "
+import sqlite3, sys
+con = sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True)
+cur = con.cursor()
+res = cur.execute('SELECT id, channel FROM pa_action_drafts WHERE status=\"committed\"').fetchall()
+print(res[0][0])
+con.close()
+" "$RUBY_DB")"
+[[ "$bridge_draft" == "d1" ]] || fail "bridge announcer could not read draft from Ruby DB: $bridge_draft"
+pass "bridge announcer read: bridge user can read pa_action_drafts from Ruby DB in read-only mode"
+
+# Test: bridge user CANNOT write to Ruby's DB (fails with readonly or EACCES)
+bridge_write_res=0
+as_bridge python3 -c "
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+cur = con.cursor()
+cur.execute('INSERT INTO pa_action_drafts (id, channel) VALUES (\"d_bad\", \"stub\")')
+con.commit()
+con.close()
+" "$RUBY_DB" >/dev/null 2>&1 || bridge_write_res=$?
+[[ $bridge_write_res -ne 0 ]] || fail "SECURITY VIOLATION: bridge user was able to write to Ruby DB!"
+pass "bridge announcer write refusal: bridge user cannot write to Ruby DB"
+
+# Test: bridge user CANNOT list or enter Ruby's home directory
+if as_bridge ls "$PRINC/20004/home" >/dev/null 2>&1; then
+  fail "SECURITY VIOLATION: bridge user accessed Ruby home dir"
+fi
+pass "negative test: bridge user cannot access Ruby home dir"
+
+# Mutation test: removing bridge read ACL from Ruby DB causes verify-sender-acls to fail
+setfacl -x "u:$BRIDGE_USER" "$RUBY_DB"
+prov verify-sender-acls
+[[ $RC -ne 0 ]] || fail "MUTATION CHECK FAILED: verify-sender-acls passed without bridge read ACL"
+grep -q 'does not grant read-only to ikenga-bridge' "$OUT" || fail "verify error message did not explain bridge read requirement"
+
+# Mutation test: giving bridge user write ACL on Ruby DB causes verify-sender-acls to fail
+setfacl -m "u:$BRIDGE_USER:rw-" "$RUBY_DB"
+prov verify-sender-acls
+[[ $RC -ne 0 ]] || fail "MUTATION CHECK FAILED: verify-sender-acls passed with bridge write ACL on DB"
+grep -q 'must never have write access' "$OUT" || fail "verify error message did not explain bridge write prohibition"
+
+# Restore read-only ACL and confirm verify passes
+setfacl -m "u:$BRIDGE_USER:r--" "$RUBY_DB"
+prov verify-sender-acls
+[[ $RC -eq 0 ]] || fail "verify-sender-acls failed after restoring bridge read-only ACL"
+pass "mutation test: verify gate enforces read-only ACL for bridge announcer on Ruby DB"
+
+pass "ALL SENDER S1, S2 AND S2B CONTAINER TESTS PASSED"
+
