@@ -128,7 +128,10 @@ fn stop_reason_wire(reason: agent_client_protocol::schema::StopReason) -> String
         .unwrap_or_else(|| "end_turn".to_string())
 }
 
-async fn send(ws_tx: &WsSink, payload: String) {
+async fn send(app_lock: &crate::server::shared::app_lock::AppLockState, ws_tx: &WsSink, payload: String) {
+    if app_lock.is_locked() {
+        app_lock.wait_unlocked().await;
+    }
     let _ = ws_tx.lock().await.send(Message::Text(payload)).await;
 }
 
@@ -145,15 +148,16 @@ async fn run_turn(
     model: Option<String>,
     ctx: Option<AccessCtx>,
 ) {
-    send(&ws_tx, status_event(&thread_id, "running", None)).await;
+    send(&state.app_lock, &ws_tx, status_event(&thread_id, "running", None)).await;
 
     let Some(engine_handle) = state.engine_registry.get(&engine_name).await else {
         send(
+            &state.app_lock,
             &ws_tx,
             error_event(&thread_id, format!("Unknown engine: {engine_name}")),
         )
         .await;
-        send(&ws_tx, status_event(&thread_id, "idle", Some("refusal"))).await;
+        send(&state.app_lock, &ws_tx, status_event(&thread_id, "idle", Some("refusal"))).await;
         return;
     };
 
@@ -188,12 +192,13 @@ async fn run_turn(
             let drain = {
                 let ws_tx = ws_tx.clone();
                 let thread_id = thread_id.clone();
+                let state = state.clone();
                 async move {
                     while let Some(update) = rx_chan.recv().await {
                         let update =
                             serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
                         if let Some(event) = outbound_update(ctx.as_ref(), &thread_id, update) {
-                            send(&ws_tx, event).await;
+                            send(&state.app_lock, &ws_tx, event).await;
                         }
                     }
                 }
@@ -208,12 +213,12 @@ async fn run_turn(
                     // gets; reporting a bare `end_turn` here presents a failed
                     // turn as a successful empty one.
                     tracing::warn!(thread = %thread_id, "antigravity prompt failed: {e}");
-                    send(&ws_tx, error_event(&thread_id, e)).await;
+                    send(&state.app_lock, &ws_tx, error_event(&thread_id, e)).await;
                     "refusal".to_string()
                 }
             };
 
-            send(&ws_tx, status_event(&thread_id, "idle", Some(&stop_reason))).await;
+            send(&state.app_lock, &ws_tx, status_event(&thread_id, "idle", Some(&stop_reason))).await;
         }
         // Only reachable in the desktop build; headless `EngineHandle` has the
         // single Antigravity variant, so this arm would be an unreachable
@@ -227,6 +232,7 @@ async fn run_turn(
                 "engine has no headless daemon driver; refusing the turn"
             );
             send(
+                &state.app_lock,
                 &ws_tx,
                 error_event(
                     &thread_id,
@@ -237,7 +243,7 @@ async fn run_turn(
                 ),
             )
             .await;
-            send(&ws_tx, status_event(&thread_id, "idle", Some("refusal"))).await;
+            send(&state.app_lock, &ws_tx, status_event(&thread_id, "idle", Some("refusal"))).await;
         }
     }
 }
@@ -265,20 +271,28 @@ async fn handle_chat_socket(
     // its own id, so another socket on the thread never overwrites it.
     let prompt_socket = routing::prompt_socket();
 
-    send(&ws_tx, status_event(&thread_id, "idle", None)).await;
+    send(&state.app_lock, &ws_tx, status_event(&thread_id, "idle", None)).await;
 
     // The engine driving the current turn, and its task handle. Tracking the
     // engine (rather than assuming the default) means cancel reaches whichever
     // adapter actually started the turn.
     let mut in_flight: Option<(tokio::task::JoinHandle<()>, String)> = None;
+    let mut lock_rx = state.app_lock.subscribe_lock();
 
     loop {
+        if *lock_rx.borrow() {
+            state.app_lock.wait_unlocked().await;
+        }
+
         let msg = tokio::select! {
             // G-ACCESS §3.10: revoked (4401) / caps changed (4403). The turn
             // in flight is cancelled below, as on any disconnect.
             close = &mut closed_fut => {
                 let _ = ws_tx.lock().await.send(close_message(&close)).await;
                 break;
+            }
+            Ok(_) = lock_rx.changed() => {
+                continue;
             }
             next = ws_rx.next() => match next {
                 Some(Ok(msg)) => msg,
@@ -290,7 +304,7 @@ async fn handle_chat_socket(
                 // G-ACCESS §1.6: `Prompt` / `Cancel` need `dispatch`; a
                 // refused frame is dropped and answered, the socket stays.
                 if let Err(refusal) = guard.check(Route::Chat, Frame::Text(&text)) {
-                    let _ = ws_tx.lock().await.send(Message::Text(refusal)).await;
+                    send(&state.app_lock, &ws_tx, refusal).await;
                     continue;
                 }
                 let Ok(client_msg) = serde_json::from_str::<ChatClientMessage>(&text) else {
@@ -314,7 +328,7 @@ async fn handle_chat_socket(
                             None => cwd,
                             Some(Ok(cwd)) => cwd,
                             Some(Err(e)) => {
-                                send(&ws_tx, error_event(&thread_id, e.to_string())).await;
+                                send(&state.app_lock, &ws_tx, error_event(&thread_id, e.to_string())).await;
                                 continue;
                             }
                         };
@@ -334,6 +348,7 @@ async fn handle_chat_socket(
                         }
                         if in_flight.is_some() {
                             send(
+                                &state.app_lock,
                                 &ws_tx,
                                 error_event(
                                     &thread_id,
@@ -378,7 +393,7 @@ async fn handle_chat_socket(
 
                         // The ack always goes out, so the client can tell
                         // "received and acted on" from "socket is wedged".
-                        send(&ws_tx, cancel_ack_event(&thread_id)).await;
+                        send(&state.app_lock, &ws_tx, cancel_ack_event(&thread_id)).await;
 
                         match in_flight.as_ref() {
                             // A live turn owns its own terminal status —
@@ -391,7 +406,7 @@ async fn handle_chat_socket(
                             // a terminal status for this thread.
                             None => {
                                 cancel_turn(&state, DEFAULT_ENGINE, &thread_id).await;
-                                send(&ws_tx, status_event(&thread_id, "idle", Some("cancelled")))
+                                send(&state.app_lock, &ws_tx, status_event(&thread_id, "idle", Some("cancelled")))
                                     .await;
                             }
                         }

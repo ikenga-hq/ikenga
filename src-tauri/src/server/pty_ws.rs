@@ -324,13 +324,19 @@ async fn handle_pty_socket(
     // exists to remove.
     let exit_manager = state.pty_manager.clone();
     let exit_watch_id = pty_id.clone();
+    let send_app_lock = state.app_lock.clone();
     let mut send_task = tokio::spawn(async move {
         let exit_fut = exit_manager.wait_for_exit(&exit_watch_id);
         tokio::pin!(exit_fut);
         let closed_fut = closed(closed_rx);
         tokio::pin!(closed_fut);
+        let mut lock_rx = send_app_lock.subscribe_lock();
 
         loop {
+            if *lock_rx.borrow() {
+                send_app_lock.wait_unlocked().await;
+            }
+
             tokio::select! {
                 // Bias toward draining output: on exit there is usually a
                 // final chunk still in flight, and losing the last line of a
@@ -344,8 +350,15 @@ async fn handle_pty_socket(
                     break;
                 }
 
+                Ok(_) = lock_rx.changed() => {
+                    continue;
+                }
+
                 // A refused input frame's control-frame answer.
                 Some(text) = refuse_rx.recv() => {
+                    if *lock_rx.borrow() {
+                        send_app_lock.wait_unlocked().await;
+                    }
                     if ws_tx.send(Message::Text(text)).await.is_err() {
                         break;
                     }
@@ -353,6 +366,9 @@ async fn handle_pty_socket(
 
                 recv = pty_rx.recv() => match recv {
                     Ok(bytes) => {
+                        if *lock_rx.borrow() {
+                            send_app_lock.wait_unlocked().await;
+                        }
                         if ws_tx.send(Message::Binary(bytes)).await.is_err() {
                             break;
                         }
@@ -367,6 +383,9 @@ async fn handle_pty_socket(
                 },
 
                 code = &mut exit_fut => {
+                    if *lock_rx.borrow() {
+                        send_app_lock.wait_unlocked().await;
+                    }
                     // Flush whatever the shell emitted on its way out before
                     // announcing the exit.
                     while let Ok(bytes) = pty_rx.try_recv() {
@@ -387,10 +406,14 @@ async fn handle_pty_socket(
     });
 
     // Task 2: Pump WebSocket input -> PTY stdin / control commands
+    let recv_app_lock = state.app_lock.clone();
     let mut recv_task = tokio::spawn(async move {
         // Held for the socket's life: dropping it unregisters (§3.10).
         let guard = guard;
         while let Some(Ok(msg)) = ws_rx.next().await {
+            if recv_app_lock.is_locked() {
+                recv_app_lock.wait_unlocked().await;
+            }
             // G-ACCESS §1.6: every PTY input frame needs `dispatch`; a
             // refused one is dropped and answered, the socket stays open.
             let verdict = match &msg {

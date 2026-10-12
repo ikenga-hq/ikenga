@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use argon2::{self, Config, Variant, Version};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 use zeroize::Zeroizing;
 
 /// Broadcast to every webview/browser session when the lock state or its config changes.
@@ -459,9 +460,34 @@ pub fn sanitize(mut config: AppLockConfig) -> AppLockConfig {
 }
 
 /// Shared lock state.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AppLockState {
     inner: Mutex<Inner>,
+    lock_tx: watch::Sender<bool>,
+    _rx: watch::Receiver<bool>,
+}
+
+impl Default for AppLockState {
+    fn default() -> Self {
+        let (lock_tx, _rx) = watch::channel(false);
+        Self {
+            inner: Mutex::new(Inner::default()),
+            lock_tx,
+            _rx,
+        }
+    }
+}
+
+struct VerifyingGuard<'a>(&'a AppLockState);
+
+impl<'a> Drop for VerifyingGuard<'a> {
+    fn drop(&mut self) {
+        self.0.with(|inner| {
+            if inner.verifying {
+                inner.verifying = false;
+            }
+        });
+    }
 }
 
 impl AppLockState {
@@ -479,7 +505,30 @@ impl AppLockState {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        f(&mut *guard)
+        let was_locked = guard.locked;
+        let res = f(&mut *guard);
+        let is_locked = guard.locked;
+        if was_locked != is_locked {
+            let _ = self.lock_tx.send(is_locked);
+        }
+        res
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.with(|inner| inner.locked)
+    }
+
+    pub fn subscribe_lock(&self) -> watch::Receiver<bool> {
+        self.lock_tx.subscribe()
+    }
+
+    pub async fn wait_unlocked(&self) {
+        let mut rx = self.subscribe_lock();
+        while *rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
     }
 
     pub fn status(&self) -> AppLockStatus {
@@ -544,6 +593,7 @@ impl AppLockState {
             UnlockGate::Check(record) => record,
         };
 
+        let _guard = VerifyingGuard(self);
         let verified = tokio::task::spawn_blocking(move || verify_secret(secret.as_str(), &record))
             .await
             .map_err(|e| format!("join: {e}"))
@@ -551,7 +601,6 @@ impl AppLockState {
         let ok = match verified {
             Ok(ok) => ok,
             Err(error) => {
-                self.with(|inner| inner.verifying = false);
                 return Err(error);
             }
         };
@@ -606,9 +655,9 @@ impl AppLockState {
         validate_secret(next.as_str())?;
         let now = now_ms();
         let existing = self.with(|inner| inner.begin_check(now))?;
+        let _guard = VerifyingGuard(self);
         let check_res = if let Some(existing) = existing.as_ref() {
             let Some(current) = current.as_ref() else {
-                self.with(|inner| inner.verifying = false);
                 return Err("Enter the current PIN to change it.".into());
             };
             let current_clone = current.clone();
@@ -626,7 +675,6 @@ impl AppLockState {
         let verified = match check_res {
             Ok(ok) => ok,
             Err(e) => {
-                self.with(|inner| inner.verifying = false);
                 return Err(e);
             }
         };
@@ -656,8 +704,8 @@ impl AppLockState {
         let current = Zeroizing::new(current);
         let now = now_ms();
         let existing = self.with(|inner| inner.begin_check(now))?;
+        let _guard = VerifyingGuard(self);
         let Some(existing) = existing else {
-            self.with(|inner| inner.verifying = false);
             return Ok(self.with(|inner| inner.status(now_ms())));
         };
         let verified =
@@ -669,7 +717,6 @@ impl AppLockState {
         let ok = match verified {
             Ok(ok) => ok,
             Err(e) => {
-                self.with(|inner| inner.verifying = false);
                 return Err(e);
             }
         };

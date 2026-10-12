@@ -137,6 +137,16 @@ impl RpcResponse {
     }
 }
 
+pub fn is_app_lock_exempt_cmd(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "app_lock_status"
+            | "app_lock_unlock"
+            | "server_health"
+            | "health"
+    ) || cmd.starts_with("auth")
+}
+
 pub async fn rpc_handler(
     State(state): State<Arc<AppState>>,
     access: Option<Extension<Arc<crate::access::DaemonAccess>>>,
@@ -144,6 +154,13 @@ pub async fn rpc_handler(
     Json(payload): Json<RpcRequest>,
 ) -> impl IntoResponse {
     debug!("RPC request: cmd={}", payload.cmd);
+
+    // WP-C: Server-side app lock enforcement (DECIDED 2026-10-12, ENFORCE R4-6a)
+    // While an account is locked, its child refuses every RPC except app_lock_status,
+    // app_lock_unlock, auth and health.
+    if state.app_lock.is_locked() && !is_app_lock_exempt_cmd(&payload.cmd) {
+        return Json(RpcResponse::error("Account is locked. Unlock first."));
+    }
 
     // G-ACCESS §9.2 pre-hook: class + caps for this command (§1.6), and in
     // share mode a narrowed `AppState` (WP-76). One call, before any arm.

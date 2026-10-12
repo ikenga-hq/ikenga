@@ -354,10 +354,10 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("app_lock_status", req!(owner[])),
     ("app_lock_clear_secret", req!(owner[Settings])),
     ("app_lock_configure", req!(owner[Settings])),
-    ("app_lock_lock", req!(owner[Settings])),
+    ("app_lock_lock", req!(owner[Sessions])),
     ("app_lock_set_secret", req!(owner[Settings])),
-    ("app_lock_touch", req!(owner[Settings])),
-    ("app_lock_unlock", req!(owner[Settings])),
+    ("app_lock_touch", req!(owner[Sessions])),
+    ("app_lock_unlock", req!(owner[Sessions])),
 ];
 
 /// The §1.6 defaults for the `WP-20`-tagged verbs WP-21 did **not** serve.

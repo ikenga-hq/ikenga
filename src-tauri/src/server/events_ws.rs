@@ -156,6 +156,8 @@ async fn handle_events_socket(socket: WebSocket, state: Arc<AppState>, mut guard
     let permitted = permitted(guard.ctx.as_ref());
     let mut bus = state.events.subscribe();
     let mut subscribed: HashSet<Topic> = HashSet::new();
+    let mut lock_rx = state.app_lock.subscribe_lock();
+    let mut held_events: std::collections::VecDeque<Message> = std::collections::VecDeque::new();
 
     info!("Events WebSocket client connected");
     if ws_tx.send(ready_frame(&permitted)).await.is_err() {
@@ -163,14 +165,28 @@ async fn handle_events_socket(socket: WebSocket, state: Arc<AppState>, mut guard
     }
 
     loop {
+        while !*lock_rx.borrow() && !held_events.is_empty() {
+            if let Some(msg) = held_events.pop_front() {
+                if ws_tx.send(msg).await.is_err() {
+                    return;
+                }
+            }
+        }
+
         let out = tokio::select! {
             // G-ACCESS §3.10: revoked (4401) / caps changed (4403).
             close = &mut closed_fut => {
                 let _ = ws_tx.send(close_message(&close)).await;
                 break;
             }
+            Ok(_) = lock_rx.changed() => {
+                continue;
+            }
             next = ws_rx.next() => match next {
                 Some(Ok(Message::Text(text))) => {
+                    if *lock_rx.borrow() {
+                        state.app_lock.wait_unlocked().await;
+                    }
                     handle_control(&text, &mut subscribed)
                 }
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
@@ -180,7 +196,13 @@ async fn handle_events_socket(socket: WebSocket, state: Arc<AppState>, mut guard
             },
             ev = bus.recv() => match ev {
                 Ok(ev) if subscribed.contains(&ev.topic) && permitted.contains(&ev.topic) => {
-                    Some(event_frame(&ev))
+                    let frame = event_frame(&ev);
+                    if ev.topic == Topic::AppLockChanged || !*lock_rx.borrow() {
+                        Some(frame)
+                    } else {
+                        held_events.push_back(frame);
+                        None
+                    }
                 }
                 Ok(_) => None,
                 Err(RecvError::Lagged(skipped)) => {
@@ -310,6 +332,19 @@ mod tests {
         assert!(files.contains(&Topic::ActionsChanged));
         assert!(!files.contains(&Topic::NotificationsChanged));
         assert!(!files.contains(&Topic::PaActionCommitted));
+        assert!(!files.contains(&Topic::AppLockChanged));
+
+        let sessions = permitted(Some(&ctx(CapSet::of(&[Cap::Sessions]))));
+        assert!(sessions.contains(&Topic::AppLockChanged));
+
+        // Every paired tier has Cap::Sessions and therefore receives AppLockChanged
+        for (tier, caps) in crate::access::caps::TIER_CAPS {
+            let perm = permitted(Some(&ctx(CapSet::of(caps))));
+            assert!(
+                perm.contains(&Topic::AppLockChanged),
+                "paired tier {tier} must receive AppLockChanged"
+            );
+        }
 
         let all = permitted(Some(&ctx(CapSet::ALL)));
         assert!(Topic::ALL
