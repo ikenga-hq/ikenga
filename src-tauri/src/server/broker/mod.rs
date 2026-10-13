@@ -112,6 +112,53 @@ pub struct BrokerState {
     /// The access layer, for the update routes' admin-strength check and
     /// audit row. `None` in unit tests: then only a password session counts.
     pub access_t1: Option<Arc<crate::access::t1::T1Access>>,
+    /// Limits on `POST /api/backup/import` uploads buffered by the broker.
+    pub uploads: UploadGate,
+}
+
+/// How many backup uploads one account may have in flight at once, and how
+/// long the broker waits for one body. Per account, so one account holding
+/// stalled uploads cannot make every other account's import answer 429.
+pub struct UploadGate {
+    pub per_account: usize,
+    pub read_timeout: Duration,
+    slots: std::sync::Mutex<
+        std::collections::HashMap<crate::executor::PrincipalId, Arc<tokio::sync::Semaphore>>,
+    >,
+}
+
+impl UploadGate {
+    pub fn new(per_account: usize, read_timeout: Duration) -> Self {
+        Self {
+            per_account,
+            read_timeout,
+            slots: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// A slot for `id`, or `None` when the account is at its cap.
+    pub fn try_acquire(
+        &self,
+        id: crate::executor::PrincipalId,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let sem = {
+            let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+            slots
+                .entry(id)
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.per_account)))
+                .clone()
+        };
+        sem.try_acquire_owned().ok()
+    }
+
+    /// Uploads `id` has in flight right now.
+    #[cfg(test)]
+    pub fn in_flight(&self, id: crate::executor::PrincipalId) -> usize {
+        let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        slots.get(&id).map_or(0, |s| {
+            self.per_account.saturating_sub(s.available_permits())
+        })
+    }
 }
 
 impl BrokerState {
@@ -135,6 +182,7 @@ impl BrokerState {
             http,
             update: None,
             access_t1: None,
+            uploads: UploadGate::new(2, Duration::from_secs(600)),
         })
     }
 }

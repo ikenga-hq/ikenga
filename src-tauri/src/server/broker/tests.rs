@@ -1922,7 +1922,11 @@ async fn viewer_token_routes_to_the_running_child_without_a_cookie_and_never_lau
         format!("/__viewer/{ada_tok}/../api/rpc"),
         format!("/__viewer/{ada_tok}/%2e%2e/api/rpc"),
     ] {
-        let (status, _, _) = send(&h.app, request("GET", &path).body(Body::empty()).unwrap()).await;
+        let (status, _, _) = send(
+            &h.app,
+            request("GET", &path).body(Body::empty()).unwrap(),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
     }
     let (status, _, _) = send(
@@ -1986,6 +1990,96 @@ async fn arm_level_t1_broker_proxies_backup_export_and_import() {
     assert_eq!(status, StatusCode::OK, "import route was proxied");
     assert_eq!(body["ok"], true);
     assert_eq!(body["data"]["path"], "/api/backup/import");
+}
+
+/// A `POST /api/backup/import` whose body never finishes.
+fn stalled_upload(cookie: &str) -> Request<Body> {
+    request("POST", "/api/backup/import")
+        .header("cookie", cookie)
+        .header("content-type", "application/zip")
+        .body(Body::from_stream(futures_util::stream::pending::<
+            Result<axum::body::Bytes, std::io::Error>,
+        >()))
+        .unwrap()
+}
+
+fn small_upload(cookie: &str) -> Request<Body> {
+    request("POST", "/api/backup/import")
+        .header("cookie", cookie)
+        .header("content-type", "application/zip")
+        .body(Body::from(b"zip".to_vec()))
+        .unwrap()
+}
+
+/// Wait until `id` has exactly `n` uploads in flight.
+async fn wait_in_flight(h: &Harness, id: PrincipalId, n: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while h.state.uploads.in_flight(id) != n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never reached {n} uploads in flight (at {})",
+            h.state.uploads.in_flight(id)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn arm_level_backup_upload_cap_is_per_account() {
+    let h = harness().await;
+    let ada_id = insert_account(&h.pool, "ada", 20_001, false).await;
+    insert_account(&h.pool, "bob", 20_002, false).await;
+    let ada = login_cookie(&h.app, "ada").await;
+    let bob = login_cookie(&h.app, "bob").await;
+
+    // Ada holds two stalled uploads (the per-account cap).
+    let held: Vec<_> = (0..2)
+        .map(|_| {
+            let (app, req) = (h.app.clone(), stalled_upload(&ada));
+            tokio::spawn(async move { app.oneshot(req).await })
+        })
+        .collect();
+    wait_in_flight(&h, ada_id, 2).await;
+
+    // Her next one is refused.
+    let (status, _, _) = send(&h.app, small_upload(&ada)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "ada is over her cap");
+
+    // Bob is not blocked by ada's stalled uploads.
+    let (status, _, _) = send(&h.app, small_upload(&bob)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "one account's uploads block another's"
+    );
+
+    // Dropping ada's uploads frees her slots.
+    for t in held {
+        t.abort();
+    }
+    wait_in_flight(&h, ada_id, 0).await;
+    let (status, _, _) = send(&h.app, small_upload(&ada)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn arm_level_backup_upload_body_read_times_out() {
+    let h = harness_state(false, |state, _| {
+        state.uploads.read_timeout = Duration::from_millis(200);
+    })
+    .await;
+    insert_account(&h.pool, "ada", 20_001, false).await;
+    let ada = login_cookie(&h.app, "ada").await;
+
+    let (status, _, _) =
+        tokio::time::timeout(Duration::from_secs(10), send(&h.app, stalled_upload(&ada)))
+            .await
+            .expect("a stalled upload must be cut off by the body-read timeout");
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+
+    // The slot it held is free again.
+    let (status, _, _) = send(&h.app, small_upload(&ada)).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 /// `/ws/events` under T1 (principal isolation through the proxy).

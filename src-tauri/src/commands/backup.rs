@@ -523,7 +523,8 @@ async fn migrate_one_db_name<'a>(
 /// FE re-derives an empty terminal-sessions store, which is acceptable.
 pub async fn migrate_legacy_db_names(data_dir: &Path) -> &'static str {
     let main = migrate_one_db_name(data_dir, LEGACY_DB_NAME, DB_NAME).await;
-    let _terminal = migrate_one_db_name(data_dir, LEGACY_TERMINAL_DB_NAME, TERMINAL_DB_NAME).await;
+    let _terminal =
+        migrate_one_db_name(data_dir, LEGACY_TERMINAL_DB_NAME, TERMINAL_DB_NAME).await;
     main
 }
 
@@ -1185,13 +1186,6 @@ fn local_backups_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PathBuf, S
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
-}
-
-fn hostname_or_unknown() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .or_else(|| std::env::var("COMPUTERNAME").ok())
-        .unwrap_or_else(|| "unknown".into())
 }
 
 fn load_pending_kvs(path: &Path) -> Result<BTreeMap<String, String>, String> {

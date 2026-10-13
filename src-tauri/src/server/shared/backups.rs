@@ -19,9 +19,11 @@ pub const STAGED_DB_NAME: &str = "ikenga.db.new";
 pub const LIVE_DB_NAME: &str = "ikenga.db";
 pub const HOME_TOKEN: &str = "${IKENGA_HOME}";
 
+/// Test-only fault trigger: when this file exists in a data dir, the restore
+/// into that data dir fails right after the swap. Per data dir, so a test that
+/// plants it cannot affect another test running in the same process.
 #[cfg(test)]
-pub static TEST_INJECT_POST_SWAP_FAULT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub const TEST_POST_SWAP_FAULT_MARKER: &str = ".test-inject-post-swap-fault";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -813,7 +815,7 @@ pub async fn import_backup_zip(
             .map_err(|e| format!("run migrations on staged db failed: {e}"))?;
 
         // Validate that staged db has all expected tables matching a freshly migrated reference (Blocker 3)
-        let ref_tables = crate::db::reference_tables().await?;
+        let ref_schema = crate::db::reference_schema().await?;
         let staged_tables: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
         )
@@ -822,12 +824,37 @@ pub async fn import_backup_zip(
         .map_err(|e| format!("query staged tables: {e}"))?;
         let staged_set: std::collections::HashSet<String> = staged_tables.into_iter().collect();
 
-        for expected in &ref_tables {
+        // Sorted so the refusal names the same table every run.
+        let mut expected_tables: Vec<&String> = ref_schema.keys().collect();
+        expected_tables.sort();
+        for expected in expected_tables {
             if !staged_set.contains(expected) {
                 staged_pa_db.close().await;
                 return Err(format!(
                     "staged database schema is incomplete: missing required table `{expected}`"
                 ));
+            }
+            // A table with the right name but other columns would pass the
+            // check above and then fail on first use, with the old database
+            // already pruned. Extra columns are tolerated.
+            let quoted = expected.replace('"', "\"\"");
+            let rows = sqlx::query(&format!("PRAGMA table_info(\"{quoted}\")"))
+                .fetch_all(&staged_writer)
+                .await
+                .map_err(|e| format!("table_info({expected}): {e}"))?;
+            let have: std::collections::HashSet<String> = rows
+                .iter()
+                .map(|r| sqlx::Row::get::<String, _>(r, "name"))
+                .collect();
+            let mut want: Vec<&String> = ref_schema[expected].iter().collect();
+            want.sort();
+            for col in want {
+                if !have.contains(col) {
+                    staged_pa_db.close().await;
+                    return Err(format!(
+                        "staged database schema is incomplete: table `{expected}` is missing required column `{col}`"
+                    ));
+                }
             }
         }
 
@@ -880,7 +907,7 @@ pub async fn import_backup_zip(
     // Post-swap: path rewrites and ensure live pool
     let post_swap_res = async {
         #[cfg(test)]
-        if TEST_INJECT_POST_SWAP_FAULT.load(std::sync::atomic::Ordering::SeqCst) {
+        if data_dir.join(TEST_POST_SWAP_FAULT_MARKER).exists() {
             return Err("injected post-swap fault".to_string());
         }
 

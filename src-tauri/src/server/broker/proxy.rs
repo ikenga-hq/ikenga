@@ -767,14 +767,18 @@ pub async fn backup_import_proxy(
         Ok(n) => n,
         Err(r) => return refused(r),
     };
-    static CONCURRENT_UPLOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-    let _permit = match CONCURRENT_UPLOADS.try_acquire() {
-        Ok(p) => p,
-        Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+    let Some(_permit) = state.uploads.try_acquire(ctx.principal.id) else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
     };
-    let bytes = match axum::body::to_bytes(body, 100 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    let bytes = match tokio::time::timeout(
+        state.uploads.read_timeout,
+        axum::body::to_bytes(body, 100 * 1024 * 1024),
+    )
+    .await
+    {
+        Ok(Ok(b)) => b,
+        Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
     };
     forward(
         &state,

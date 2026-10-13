@@ -41,6 +41,13 @@ fn get_data_dir(state: &AppState) -> Result<&Path, String> {
         .ok_or_else(|| "no data directory configured for this server".to_string())
 }
 
+/// Whether `p` names anything on disk, counting a dangling symlink. `exists()`
+/// follows links and reports false for a dangling one, which let the walk below
+/// treat it as a missing path and `File::create` then wrote through it.
+fn exists_no_follow(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok()
+}
+
 /// Resolve a path confined to `<data-dir>/<subdir>`.
 /// Relative paths are placed under that subdir; traversal (`..`) is rejected;
 /// absolute paths must canonicalize inside the subdir.
@@ -68,7 +75,7 @@ fn resolve_confined_path(
                 let target = base.join(raw);
                 let mut existing = target.as_path();
                 let mut tail = Vec::new();
-                while !existing.exists() {
+                while !exists_no_follow(existing) {
                     if let Some(parent) = existing.parent() {
                         if let Some(name) = existing.file_name() {
                             tail.push(name);
@@ -78,9 +85,12 @@ fn resolve_confined_path(
                         break;
                     }
                 }
-                let canon_existing = existing
-                    .canonicalize()
-                    .map_err(|e| format!("canonicalize {}: {e}", existing.display()))?;
+                let canon_existing = existing.canonicalize().map_err(|e| {
+                    format!(
+                        "refusing path through a dangling or unreadable link {}: {e}",
+                        existing.display()
+                    )
+                })?;
                 let mut canon_target = canon_existing;
                 for comp in tail.into_iter().rev() {
                     canon_target = canon_target.join(comp);
@@ -97,7 +107,7 @@ fn resolve_confined_path(
                     .map_err(|e| format!("canon base {}: {e}", base.display()))?;
                 let mut existing = p;
                 let mut tail = Vec::new();
-                while !existing.exists() {
+                while !exists_no_follow(existing) {
                     if let Some(parent) = existing.parent() {
                         if let Some(name) = existing.file_name() {
                             tail.push(name);
@@ -107,9 +117,12 @@ fn resolve_confined_path(
                         break;
                     }
                 }
-                let canon_existing = existing
-                    .canonicalize()
-                    .map_err(|e| format!("canonicalize {}: {e}", existing.display()))?;
+                let canon_existing = existing.canonicalize().map_err(|e| {
+                    format!(
+                        "refusing path through a dangling or unreadable link {}: {e}",
+                        existing.display()
+                    )
+                })?;
                 let mut canon_target = canon_existing;
                 for comp in tail.into_iter().rev() {
                     canon_target = canon_target.join(comp);
@@ -420,7 +433,6 @@ mod tests {
     struct TestDaemon {
         _tmp: tempfile::TempDir,
         data: PathBuf,
-        home: PathBuf,
         db: Arc<PaDb>,
         router: axum::Router,
     }
@@ -457,7 +469,6 @@ mod tests {
         TestDaemon {
             _tmp: tmp,
             data,
-            home,
             db,
             router,
         }
@@ -496,6 +507,56 @@ mod tests {
         let res = rpc(router, cmd, args.clone()).await;
         assert_eq!(res["ok"], false, "{cmd} {args} should fail → {res}");
         res["error"].as_str().unwrap().to_string()
+    }
+
+    /// Names in `data` that a finished import must not leave: the previous
+    /// db (`ikenga.db.prev*`) and any `staged-restore*` folder.
+    fn data_dir_leftovers(data: &Path) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(data)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("ikenga.db.prev") || n.starts_with("staged-restore"))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Copy `backups/<src>` to `backups/<dst>` with its `app.db` rewritten by
+    /// `sql` (run against a throwaway copy of the embedded db).
+    async fn tamper_backup(d: &TestDaemon, src: &str, dst: &str, sql: &str) {
+        let tmp_db = d.data.join(format!("tamper-{dst}.db"));
+        {
+            let file = std::fs::File::open(d.data.join("backups").join(src)).unwrap();
+            let mut archive = zip::ZipArchive::new(file).unwrap();
+            let mut entry = archive.by_name("app.db").unwrap();
+            let mut out = std::fs::File::create(&tmp_db).unwrap();
+            std::io::copy(&mut entry, &mut out).unwrap();
+        }
+        {
+            let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&tmp_db);
+            let p = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+            sqlx::raw_sql(sql).execute(&p).await.unwrap();
+            p.close().await;
+        }
+        let file = std::fs::File::create(d.data.join("backups").join(dst)).unwrap();
+        let mut w = zip::ZipWriter::new(file);
+        w.start_file::<_, ()>("manifest.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        w.write_all(
+            json!({
+                "format_version": 3, "schema_version": 7, "created_at": "2026-01-01T00:00:00Z",
+                "hostname": "h", "username": "u", "path_mode": "raw", "has_secrets": false, "pkg_count": 0
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        w.start_file::<_, ()>("app.db", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        w.write_all(&std::fs::read(&tmp_db).unwrap()).unwrap();
+        w.finish().unwrap();
+        let _ = std::fs::remove_file(&tmp_db);
     }
 
     #[tokio::test]
@@ -814,9 +875,20 @@ mod tests {
             json!({ "bytesBase64": b64, "dryRun": false }),
         )
         .await;
+        // The refusal must come from the staged step, before the swap. A
+        // bad db swapped in and rolled back would say "rolled back" instead.
         assert!(
-            e.contains("run migrations on staged db failed") || e.contains("applied_at"),
-            "expected migration failure error, got: {e}"
+            e.contains("run migrations on staged db failed"),
+            "expected the staged-migration refusal, got: {e}"
+        );
+        assert!(
+            !e.contains("rolled back"),
+            "refused before the swap, not rolled back after it: {e}"
+        );
+        assert_eq!(
+            data_dir_leftovers(&d.data),
+            Vec::<String>::new(),
+            "a refused import leaves nothing behind"
         );
 
         // Verify live DB was NOT destroyed: project row is still present!
@@ -836,18 +908,16 @@ mod tests {
     async fn arm_level_post_swap_failure_rolls_back_to_previous_db() {
         let d = test_daemon();
         let r = &d.router;
-
-        // Seed project row in live DB
         let pool = d.db.ensure_pool().await.unwrap();
+
+        // The backup holds `proj_in_backup` only.
         sqlx::query(
             "INSERT INTO projects (id, display_name, root_path, position, is_default, created_at) \
-             VALUES ('proj_post_swap_survives', 'Surviving Post-Swap Project', '/home/proj', 1, 0, 100)",
+             VALUES ('proj_in_backup', 'In Backup', '/home/proj', 1, 0, 100)",
         )
         .execute(&pool)
         .await
         .unwrap();
-
-        // Export a valid backup
         let _ = ok(
             r,
             "backup_export",
@@ -855,39 +925,52 @@ mod tests {
         )
         .await;
 
-        // Inject post-swap failure
-        crate::server::shared::backups::TEST_INJECT_POST_SWAP_FAULT
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Written AFTER the export: only the live db has it. If the rollback
+        // does not put the previous file back, the restored backup (which
+        // lacks this row) stays live and the row is gone.
+        sqlx::query(
+            "INSERT INTO projects (id, display_name, root_path, position, is_default, created_at) \
+             VALUES ('proj_after_export', 'After Export', '/home/proj', 2, 0, 200)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        // Attempt restore of valid backup
+        // Fail this data dir's restore right after the swap (per data dir, so
+        // no other test in the process sees it).
+        std::fs::write(
+            d.data
+                .join(crate::server::shared::backups::TEST_POST_SWAP_FAULT_MARKER),
+            b"",
+        )
+        .unwrap();
+
         let e = err(
             r,
             "backup_import",
             json!({ "srcPath": "valid.ikbak", "dryRun": false }),
         )
         .await;
-
-        // Reset fault flag
-        crate::server::shared::backups::TEST_INJECT_POST_SWAP_FAULT
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-
         assert!(
             e.contains("rolled back to previous database"),
             "expected rollback error message, got: {e}"
         );
 
-        // Verify live DB was rolled back: project row is still present!
         let pool_after = d.db.ensure_pool().await.unwrap();
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM projects WHERE id = 'proj_post_swap_survives'",
-        )
-        .fetch_one(&pool_after)
-        .await
-        .unwrap();
+        let after_export: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE id = 'proj_after_export'")
+                .fetch_one(&pool_after)
+                .await
+                .unwrap();
         assert_eq!(
-            count, 1,
-            "original project row was preserved by rollback after post-swap failure"
+            after_export, 1,
+            "the row written after the export must survive the rollback"
         );
+        // And the rolled-back db is writable through the reopened pool.
+        sqlx::query("DELETE FROM projects WHERE id = 'proj_after_export'")
+            .execute(&pool_after)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -930,7 +1013,10 @@ mod tests {
         {
             let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&tmp_db);
             let p = sqlx::SqlitePool::connect_with(opts).await.unwrap();
-            sqlx::query("DROP TABLE pkg_installed").execute(&p).await.unwrap();
+            sqlx::query("DROP TABLE pkg_installed")
+                .execute(&p)
+                .await
+                .unwrap();
             p.close().await;
         }
 
@@ -938,7 +1024,9 @@ mod tests {
         {
             let file = std::fs::File::create(&incomplete_zip).unwrap();
             let mut writer = zip::ZipWriter::new(file);
-            writer.start_file::<_, ()>("manifest.json", zip::write::SimpleFileOptions::default()).unwrap();
+            writer
+                .start_file::<_, ()>("manifest.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
             writer.write_all(
                 json!({
                     "format_version": 3, "schema_version": 7, "created_at": "2026-01-01T00:00:00Z",
@@ -947,7 +1035,9 @@ mod tests {
                 .to_string()
                 .as_bytes(),
             ).unwrap();
-            writer.start_file::<_, ()>("app.db", zip::write::SimpleFileOptions::default()).unwrap();
+            writer
+                .start_file::<_, ()>("app.db", zip::write::SimpleFileOptions::default())
+                .unwrap();
             let bytes = std::fs::read(&tmp_db).unwrap();
             writer.write_all(&bytes).unwrap();
             writer.finish().unwrap();
@@ -1078,5 +1168,179 @@ mod tests {
             count, 1,
             "original project row was preserved after wrong-schema restore"
         );
+    }
+
+    #[tokio::test]
+    async fn arm_level_staged_schema_with_wrong_columns_is_refused() {
+        let d = test_daemon();
+        let r = &d.router;
+        let pool = d.db.ensure_pool().await.unwrap();
+        sqlx::query(
+            "INSERT INTO projects (id, display_name, root_path, position, is_default, created_at) \
+             VALUES ('proj_survives_cols', 'Survives', '/home/proj', 1, 0, 100)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let _ = ok(r, "backup_export", json!({ "destPath": "good.ikbak" })).await;
+
+        // Same table name, different columns.
+        tamper_backup(
+            &d,
+            "good.ikbak",
+            "wrongcols.ikbak",
+            "DROP TABLE pkg_installed; CREATE TABLE pkg_installed(x TEXT);",
+        )
+        .await;
+
+        let e = err(
+            r,
+            "backup_import",
+            json!({ "srcPath": "wrongcols.ikbak", "dryRun": false }),
+        )
+        .await;
+        assert!(
+            e.contains("table `pkg_installed` is missing required column"),
+            "expected a column refusal, got: {e}"
+        );
+        let pool_after = d.db.ensure_pool().await.unwrap();
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE id = 'proj_survives_cols'")
+                .fetch_one(&pool_after)
+                .await
+                .unwrap();
+        assert_eq!(n, 1, "live data survives a refused import");
+        assert_eq!(data_dir_leftovers(&d.data), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn arm_level_dangling_symlink_export_destination_is_refused() {
+        let d = test_daemon();
+        let r = &d.router;
+        // A live db, so an unconfined export would succeed.
+        d.db.ensure_pool().await.unwrap();
+        let backups_dir = d.data.join("backups");
+        std::fs::create_dir_all(&backups_dir).unwrap();
+        let outside = d.data.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("escaped.ikbak");
+        // `dang` points at a file that does not exist yet.
+        std::os::unix::fs::symlink(&target, backups_dir.join("dang")).unwrap();
+
+        let e = err(r, "backup_export", json!({ "destPath": "dang" })).await;
+        assert!(
+            e.contains("dangling or unreadable link"),
+            "expected a symlink refusal, got: {e}"
+        );
+        assert!(
+            !target.exists(),
+            "export must not write through a dangling link"
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_level_successful_restore_leaves_no_prev_or_staged_dirs() {
+        let d = test_daemon();
+        let r = &d.router;
+        let pool = d.db.ensure_pool().await.unwrap();
+        sqlx::query(
+            "INSERT INTO projects (id, display_name, root_path, position, is_default, created_at) \
+             VALUES ('proj_leftovers', 'Leftovers', '/home/proj', 1, 0, 100)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let export = ok(
+            r,
+            "backup_export",
+            json!({ "destPath": "keep.ikbak", "returnBytes": true }),
+        )
+        .await;
+        let b64 = export["bytes_base64"].as_str().unwrap().to_string();
+
+        // srcPath import: no upload folder, but the previous db must be pruned.
+        let _ = ok(r, "backup_import", json!({ "srcPath": "keep.ikbak" })).await;
+        assert_eq!(
+            data_dir_leftovers(&d.data),
+            Vec::<String>::new(),
+            "srcPath import"
+        );
+
+        // base64 import: the temp upload lives in `staged-restore/`.
+        let _ = ok(r, "backup_import", json!({ "bytesBase64": b64 })).await;
+        assert_eq!(
+            data_dir_leftovers(&d.data),
+            Vec::<String>::new(),
+            "base64 import"
+        );
+
+        // dry run over base64 stages the upload too.
+        let _ = ok(
+            r,
+            "backup_import",
+            json!({ "bytesBase64": b64, "dryRun": true }),
+        )
+        .await;
+        assert_eq!(
+            data_dir_leftovers(&d.data),
+            Vec::<String>::new(),
+            "dry-run import"
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_level_http_import_leaves_no_staged_dir() {
+        use base64::Engine as _;
+        let d = test_daemon();
+        let r = &d.router;
+        let pool = d.db.ensure_pool().await.unwrap();
+        sqlx::query(
+            "INSERT INTO projects (id, display_name, root_path, position, is_default, created_at) \
+             VALUES ('proj_http', 'Http', '/home/proj', 1, 0, 100)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let export = ok(r, "backup_export", json!({ "returnBytes": true })).await;
+        let zip = base64::engine::general_purpose::STANDARD
+            .decode(export["bytes_base64"].as_str().unwrap())
+            .unwrap();
+
+        let res = r
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/backup/import")
+                    .header("authorization", "Bearer tok")
+                    .body(Body::from(zip))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(data_dir_leftovers(&d.data), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn arm_level_post_swap_fault_is_scoped_to_its_data_dir() {
+        // Two daemons in one process: a fault planted in A's data dir must not
+        // reach B (a process-wide flag made `t0_round_trip...` flaky).
+        let a = test_daemon();
+        let b = test_daemon();
+        for d in [&a, &b] {
+            d.db.ensure_pool().await.unwrap();
+            let _ = ok(&d.router, "backup_export", json!({ "destPath": "x.ikbak" })).await;
+        }
+        std::fs::write(
+            a.data
+                .join(crate::server::shared::backups::TEST_POST_SWAP_FAULT_MARKER),
+            b"",
+        )
+        .unwrap();
+
+        let e = err(&a.router, "backup_import", json!({ "srcPath": "x.ikbak" })).await;
+        assert!(e.contains("injected post-swap fault"), "{e}");
+        let _ = ok(&b.router, "backup_import", json!({ "srcPath": "x.ikbak" })).await;
     }
 }
