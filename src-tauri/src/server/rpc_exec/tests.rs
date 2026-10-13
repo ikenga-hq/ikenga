@@ -63,7 +63,7 @@ fn pkgs_fixture() -> PathBuf {
     PKGS.get_or_init(|| {
         let root = std::env::temp_dir()
             .join(format!("ikenga-rpc-exec-pkgs-{}", uuid::Uuid::new_v4()))
-            .join("builtin-pkgs");
+            .join("pkgs");
         let exec = root.join(PKG);
         std::fs::create_dir_all(exec.join("bin")).unwrap();
         std::fs::write(
@@ -181,9 +181,48 @@ fn pkgs_fixture() -> PathBuf {
         std::fs::write(&loop_bin, "#!/bin/sh\necho $$ > sidecar.pid\nwhile true; do sleep 1; done\n").unwrap();
         std::fs::set_permissions(&loop_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+        // The fixture lives in a process-wide `OnceLock`, which never drops, so
+        // remove its directory when the test process exits.
+        extern "C" fn remove_pkgs_fixture() {
+            if let Some(parent) = PKGS.get().and_then(|root| root.parent()) {
+                let _ = std::fs::remove_dir_all(parent);
+            }
+        }
+        // SAFETY: `remove_pkgs_fixture` is a plain `extern "C" fn` that only
+        // touches the filesystem.
+        unsafe {
+            libc::atexit(remove_pkgs_fixture);
+        }
+
         root.canonicalize().unwrap()
     })
     .clone()
+}
+
+/// Kills the `com.test.sidecar` loop (and anything it spawned) and removes the
+/// pid file it wrote, however the test ends: an assertion failing before the
+/// test's own shutdown would otherwise leave `bin/loop` running for good.
+#[cfg(unix)]
+struct SidecarLoopGuard {
+    pid_file: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for SidecarLoopGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = std::fs::read_to_string(&self.pid_file)
+            .ok()
+            .and_then(|c| c.trim().parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 1)
+        {
+            // The sidecar is its own process-group leader (`process_group(0)`).
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        let _ = std::fs::remove_file(&self.pid_file);
+    }
 }
 
 /// One principal's daemon: its own home, data dir and PTYs, an allowlist of
@@ -1140,10 +1179,15 @@ async fn arm_level_spoofed_ikenga_prefix_refused() {
         resolver: Arc::new(chi_exec::tests::StubResolver(chi_exec::tests::stub_claude())),
     });
 
-    // Create a sideloaded pkgs dir that does NOT contain "builtin-pkgs" in its path
+    // A com.ikenga.* pkg whose files live OUTSIDE the configured pkgs dir and
+    // are only reachable through a symlink inside it. It loads, but it is not
+    // "loaded from --pkgs-dir", so it must not be auto-trusted.
     let sideloaded_pkgs = root.join("sideloaded");
-    let spoof_pkg = sideloaded_pkgs.join("com.ikenga.spoofed");
+    let external = root.join("external-elsewhere");
+    let spoof_pkg = external.join("com.ikenga.spoofed");
     std::fs::create_dir_all(spoof_pkg.join("bin")).unwrap();
+    std::fs::create_dir_all(&sideloaded_pkgs).unwrap();
+    std::os::unix::fs::symlink(&spoof_pkg, sideloaded_pkgs.join("com.ikenga.spoofed")).unwrap();
     std::fs::write(
         spoof_pkg.join("manifest.json"),
         json!({
@@ -1223,6 +1267,9 @@ async fn arm_level_cross_account_sidecar_isolation_and_process_killed() {
     let sidecar_dir = pkgs_fixture().join("com.test.sidecar");
     let pid_file = sidecar_dir.join("sidecar.pid");
     let _ = std::fs::remove_file(&pid_file);
+    let _cleanup = SidecarLoopGuard {
+        pid_file: pid_file.clone(),
+    };
 
     // Assign com.test.sidecar to everyone
     std::fs::write(
@@ -1304,4 +1351,41 @@ async fn arm_level_cross_account_sidecar_isolation_and_process_killed() {
             "sidecar process must be killed"
         );
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sidecar_loop_guard_kills_group_and_removes_pid_file() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pid_file = tmp.path().join("sidecar.pid");
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "echo $$ > {}; while true; do sleep 1; done",
+            pid_file.display()
+        ))
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if std::fs::read_to_string(&pid_file).is_ok_and(|c| c.trim().parse::<u32>().is_ok()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    drop(SidecarLoopGuard {
+        pid_file: pid_file.clone(),
+    });
+
+    // `wait` reaps it; a guard that kills nothing leaves this timing out.
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("the guard must kill the sidecar")
+        .unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    assert!(!pid_file.exists(), "the guard must remove the pid file");
 }

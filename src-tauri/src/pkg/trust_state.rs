@@ -232,4 +232,3 @@ pub fn check_shell_execute(
         declared: shell_execute.join(","),
     })
 }
-

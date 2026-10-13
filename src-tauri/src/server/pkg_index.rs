@@ -66,7 +66,9 @@ use std::time::UNIX_EPOCH;
 use serde::Serialize;
 use tracing::{info, warn};
 
-use crate::pkg::manifest::{Package, SettingsField, IKENGA_API_MIN_SUPPORTED, IKENGA_API_VERSION};
+use crate::pkg::manifest::{
+    Package, SettingsField, IKENGA_API_MIN_SUPPORTED, IKENGA_API_VERSION,
+};
 use crate::pkg::registries::{
     ActivityBarBadge, ActivityBarRegistry, UiRoutesRegistry, ViewsRegistry,
 };
@@ -601,11 +603,7 @@ mod tests {
         assert_eq!(scan.pkgs.len(), 1);
         assert!(scan.pkgs[0].install_path.ends_with("m-hello"));
         let kind_of = |dir: &str| {
-            let row = scan
-                .skipped
-                .iter()
-                .find(|i| i.install_path.ends_with(dir))
-                .unwrap();
+            let row = scan.skipped.iter().find(|i| i.install_path.ends_with(dir)).unwrap();
             (row.id.clone(), row.issue.clone())
         };
         for dir in ["a-broken-copy", "z-broken-copy"] {
@@ -618,10 +616,7 @@ mod tests {
         }
         let (id, issue) = kind_of("lonely");
         assert_eq!(id, "com.test.lonely");
-        assert!(
-            matches!(issue, HealthIssueKind::PkgsDirUnloadable),
-            "{issue:?}"
-        );
+        assert!(matches!(issue, HealthIssueKind::PkgsDirUnloadable), "{issue:?}");
     }
 
     /// `settings_schema` holds what the desktop `SettingsRegistry` would: the

@@ -1264,7 +1264,9 @@ mod tests {
         let (_tmp, t1, ada) = setup().await;
         let (_, tok) = pair(&t1, ada, Tier::Full).await;
         let mut parts = parts_with("authorization", &format!("Bearer {tok}"));
-        parts.headers.insert("host", "box.example.net".parse().unwrap());
+        parts
+            .headers
+            .insert("host", "box.example.net".parse().unwrap());
         let Resolution::Resolved { ctx, .. } = DeviceGrantResolver(t1.clone())
             .resolve(&parts)
             .await
@@ -1286,4 +1288,3 @@ mod tests {
         assert!(b_admin.access.is_admin);
     }
 }
-

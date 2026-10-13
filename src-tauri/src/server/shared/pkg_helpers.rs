@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -240,12 +241,24 @@ impl PkgTrustRecords {
     }
 }
 
-/// Determine whether a package is a built-in by checking if its install path
-/// is located within a `builtin-pkgs` directory.
-pub fn pkg_source(pkg: &Package) -> crate::pkg::InstallSource {
+/// True when `path` resolves to somewhere inside `dir`.
+///
+/// Both sides are canonicalized, so `..` segments and symlinks cannot make a
+/// path outside `dir` look like it is inside. If either side cannot be
+/// resolved (missing, unreadable) the answer is no.
+fn is_within_dir(dir: &Path, path: &Path) -> bool {
+    match (std::fs::canonicalize(dir), std::fs::canonicalize(path)) {
+        (Ok(dir), Ok(path)) => path != dir && path.starts_with(dir),
+        _ => false,
+    }
+}
+
+/// Determine whether a package is a built-in: it was loaded from the
+/// configured `--pkgs-dir` (and its directory really resolves inside it).
+/// With no `--pkgs-dir` nothing is built-in.
+pub fn pkg_source(pkgs_dir: Option<&Path>, pkg: &Package) -> crate::pkg::InstallSource {
     let path = &pkg.install_path;
-    let is_builtin = path.components().any(|c| c.as_os_str() == "builtin-pkgs")
-        || path.starts_with("/opt/ikenga/pkgs");
+    let is_builtin = pkgs_dir.is_some_and(|dir| is_within_dir(dir, path));
     if is_builtin {
         crate::pkg::InstallSource::Builtin
     } else {
@@ -260,9 +273,13 @@ pub fn pkg_source(pkg: &Package) -> crate::pkg::InstallSource {
 /// are auto-trusted/granted.
 /// Pkgs with sensitive permissions require an admin approval recorded box-wide in `pkg-trust.json`
 /// bound to the pkg version and snapshot hash.
-pub fn check_pkg_trust(data_dir: Option<&Path>, pkg: &Package) -> Result<(), String> {
+pub fn check_pkg_trust(
+    data_dir: Option<&Path>,
+    pkgs_dir: Option<&Path>,
+    pkg: &Package,
+) -> Result<(), String> {
     let pkg_id = &pkg.manifest.id;
-    let source = pkg_source(pkg);
+    let source = pkg_source(pkgs_dir, pkg);
 
     if crate::pkg::trust_state::is_auto_trusted(pkg_id, &source) {
         return Ok(());
@@ -296,9 +313,13 @@ pub fn check_pkg_trust(data_dir: Option<&Path>, pkg: &Package) -> Result<(), Str
 }
 
 /// Check if `pkg` is elevated-trusted for `pkg_invoke`.
-pub fn check_invoke_trust(data_dir: Option<&Path>, pkg: &Package) -> Result<(), String> {
+pub fn check_invoke_trust(
+    data_dir: Option<&Path>,
+    pkgs_dir: Option<&Path>,
+    pkg: &Package,
+) -> Result<(), String> {
     let pkg_id = &pkg.manifest.id;
-    let source = pkg_source(pkg);
+    let source = pkg_source(pkgs_dir, pkg);
 
     if crate::pkg::trust_state::is_auto_trusted(pkg_id, &source) {
         return Ok(());
@@ -541,11 +562,21 @@ pub const MAX_SIDECARS_PER_ACCOUNT: usize = 8;
 #[derive(Clone, Default)]
 pub struct DaemonSidecarManager {
     children: Arc<AsyncMutex<HashMap<SidecarKey, Arc<SidecarChild>>>>,
+    /// Number of times any idle reaper owned by this manager (and its clones)
+    /// has gone round its loop. A healthy reaper wakes once on spawn and then
+    /// every 10s; a reaper that spins shows up as thousands. Per-manager, so
+    /// parallel tests cannot see each other's reapers.
+    reaper_wakeups: Arc<AtomicU64>,
 }
 
 impl DaemonSidecarManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Total reaper loop iterations so far (see `reaper_wakeups`).
+    pub fn reaper_wakeups(&self) -> u64 {
+        self.reaper_wakeups.load(Ordering::Relaxed)
     }
 
     pub async fn get_or_spawn<F, Fut>(
@@ -614,8 +645,10 @@ impl DaemonSidecarManager {
         let key_for_reap = key.clone();
         let last_act = last_activity.clone();
         let child_weak = Arc::downgrade(&child);
+        let wakeups = self.reaper_wakeups.clone();
         tokio::spawn(async move {
             loop {
+                wakeups.fetch_add(1, Ordering::Relaxed);
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(10)) => {
                         let elapsed = last_act.lock().await.elapsed();
@@ -767,9 +800,92 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_means_inside_configured_pkgs_dir() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let pkgs_dir = root.join("pkgs");
+        std::fs::create_dir_all(&pkgs_dir).unwrap();
+
+        let pkg_at = |id: &str, install_path: PathBuf| -> Package {
+            std::fs::create_dir_all(&install_path).unwrap();
+            let manifest: crate::pkg::manifest::Manifest = serde_json::from_value(json!({
+                "id": id, "name": id, "version": "1.0.0", "ikenga_api": "1",
+                "permissions": { "shell.execute": ["*"] },
+            }))
+            .unwrap();
+            Package {
+                manifest,
+                install_path,
+            }
+        };
+        let is_builtin = |pkg: &Package| {
+            matches!(
+                pkg_source(Some(&pkgs_dir), pkg),
+                crate::pkg::InstallSource::Builtin
+            )
+        };
+
+        // Loaded from the configured pkgs dir: built-in.
+        let inside = pkg_at("com.ikenga.git", pkgs_dir.join("com.ikenga.git"));
+        assert!(is_builtin(&inside));
+        assert!(check_pkg_trust(Some(&root), Some(&pkgs_dir), &inside).is_ok());
+        assert!(check_invoke_trust(Some(&root), Some(&pkgs_dir), &inside).is_ok());
+
+        // A directory merely NAMED `builtin-pkgs`, elsewhere on disk.
+        let named = pkg_at(
+            "com.ikenga.evil",
+            root.join("x/builtin-pkgs/com.ikenga.evil"),
+        );
+        assert!(
+            !is_builtin(&named),
+            "a `builtin-pkgs` path component proves nothing"
+        );
+        assert!(check_pkg_trust(Some(&root), Some(&pkgs_dir), &named).is_err());
+        assert!(check_invoke_trust(Some(&root), Some(&pkgs_dir), &named).is_err());
+
+        // The old hard-coded location, which is not the configured dir.
+        let opt = root.join("opt/ikenga/pkgs/com.ikenga.evil");
+        assert!(!is_builtin(&pkg_at("com.ikenga.evil", opt)));
+
+        // `..` that starts inside the pkgs dir and climbs out of it.
+        let outside = root.join("outside/com.ikenga.evil");
+        std::fs::create_dir_all(&outside).unwrap();
+        let dotdot = pkg_at(
+            "com.ikenga.evil",
+            pkgs_dir.join("../outside/com.ikenga.evil"),
+        );
+        assert!(!is_builtin(&dotdot), "`..` must not smuggle a path in");
+        assert!(check_pkg_trust(Some(&root), Some(&pkgs_dir), &dotdot).is_err());
+
+        // A symlink inside the pkgs dir that points out of it.
+        #[cfg(unix)]
+        {
+            let link = pkgs_dir.join("com.ikenga.linked");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            let linked = pkg_at("com.ikenga.evil", link);
+            assert!(
+                !is_builtin(&linked),
+                "a symlink out of the pkgs dir is not built-in"
+            );
+            assert!(check_invoke_trust(Some(&root), Some(&pkgs_dir), &linked).is_err());
+        }
+
+        // No pkgs dir configured: nothing is built-in.
+        assert!(!matches!(
+            pkg_source(None, &inside),
+            crate::pkg::InstallSource::Builtin
+        ));
+        // The pkgs dir itself is not a pkg inside it.
+        let itself = pkg_at("com.ikenga.evil", pkgs_dir.clone());
+        assert!(!is_builtin(&itself));
+    }
+
+    #[test]
     fn test_trust_gate() {
         let tmp = tempdir().unwrap();
         let operator_dir = tmp.path();
+        let pkgs_dir = operator_dir.join("pkgs");
+        std::fs::create_dir_all(&pkgs_dir).unwrap();
 
         let make_pkg = |id: &str, shell_exec: Vec<&str>, is_builtin: bool| -> Package {
             let manifest: crate::pkg::manifest::Manifest = serde_json::from_value(json!({
@@ -783,10 +899,11 @@ mod tests {
             }))
             .unwrap();
             let install_path = if is_builtin {
-                operator_dir.join("resources/builtin-pkgs").join(id)
+                pkgs_dir.join(id)
             } else {
                 operator_dir.join(id)
             };
+            std::fs::create_dir_all(&install_path).unwrap();
             Package {
                 manifest,
                 install_path,
@@ -795,19 +912,19 @@ mod tests {
 
         // 1. Built-in com.ikenga.* is auto-trusted
         let ikenga_builtin = make_pkg("com.ikenga.official", vec!["sh"], true);
-        assert!(check_pkg_trust(Some(operator_dir), &ikenga_builtin).is_ok());
+        assert!(check_pkg_trust(Some(operator_dir), Some(&pkgs_dir), &ikenga_builtin).is_ok());
 
         // Spoofed com.ikenga.* from non-builtin source is NOT auto-trusted (R4-4 Blocker 3)
         let ikenga_spoof = make_pkg("com.ikenga.spoofed", vec!["sh"], false);
-        assert!(check_pkg_trust(Some(operator_dir), &ikenga_spoof).is_err());
+        assert!(check_pkg_trust(Some(operator_dir), Some(&pkgs_dir), &ikenga_spoof).is_err());
 
         // 2. Non-official pkg with non-sensitive perms -> auto-trusted
         let benign_pkg = make_pkg("com.other.benign", vec![], false);
-        assert!(check_pkg_trust(Some(operator_dir), &benign_pkg).is_ok());
+        assert!(check_pkg_trust(Some(operator_dir), Some(&pkgs_dir), &benign_pkg).is_ok());
 
         // 3. Non-official pkg with sensitive perms -> unapproved without pkg-trust.json
         let mut sensitive_pkg = make_pkg("com.other.sensitive", vec!["rm"], false);
-        let err = check_pkg_trust(Some(operator_dir), &sensitive_pkg).unwrap_err();
+        let err = check_pkg_trust(Some(operator_dir), Some(&pkgs_dir), &sensitive_pkg).unwrap_err();
         assert!(err.contains("requires admin trust approval"), "got: {err}");
 
         // 4. Admin approves sensitive pkg in pkg-trust.json bound to version + snapshot_hash (R4-4 Blocker 2)
@@ -822,16 +939,16 @@ mod tests {
             }
         });
         std::fs::write(operator_dir.join("pkg-trust.json"), trust_json.to_string()).unwrap();
-        assert!(check_pkg_trust(Some(operator_dir), &sensitive_pkg).is_ok());
+        assert!(check_pkg_trust(Some(operator_dir), Some(&pkgs_dir), &sensitive_pkg).is_ok());
 
         // Version update (1.0.1) without re-approval is refused
         sensitive_pkg.manifest.version = "1.0.1".into();
-        assert!(check_pkg_trust(Some(operator_dir), &sensitive_pkg).is_err());
+        assert!(check_pkg_trust(Some(operator_dir), Some(&pkgs_dir), &sensitive_pkg).is_err());
 
         // Wider permissions without re-approval is refused
         sensitive_pkg.manifest.version = "1.0.0".into();
         sensitive_pkg.manifest.permissions.shell_execute = vec!["rm".into(), "*".into()];
-        assert!(check_pkg_trust(Some(operator_dir), &sensitive_pkg).is_err());
+        assert!(check_pkg_trust(Some(operator_dir), Some(&pkgs_dir), &sensitive_pkg).is_err());
     }
 
     #[tokio::test]
@@ -942,7 +1059,11 @@ mod tests {
 
         #[cfg(unix)]
         unsafe {
-            assert_ne!(libc::kill(pid as libc::pid_t, 0), 0, "child should be killed");
+            assert_ne!(
+                libc::kill(pid as libc::pid_t, 0),
+                0,
+                "child should be killed"
+            );
             assert_ne!(
                 libc::kill(-(pid as libc::pid_t), 0),
                 0,
@@ -971,7 +1092,10 @@ mod tests {
             Ok((stdin, pid, stdout))
         };
 
-        let child_1 = manager.get_or_spawn(key.clone(), spawn_inst1).await.unwrap();
+        let child_1 = manager
+            .get_or_spawn(key.clone(), spawn_inst1)
+            .await
+            .unwrap();
         let pid_1 = child_1.pid;
 
         // Shutdown instance 1: closes stdin, so inst 1 will wake up, sleep 50ms, and exit
@@ -992,7 +1116,10 @@ mod tests {
             Ok((stdin, pid, stdout))
         };
 
-        let child_2 = manager.get_or_spawn(key.clone(), spawn_inst2).await.unwrap();
+        let child_2 = manager
+            .get_or_spawn(key.clone(), spawn_inst2)
+            .await
+            .unwrap();
         let pid_2 = child_2.pid;
         assert_ne!(pid_1, pid_2);
 
@@ -1002,11 +1129,18 @@ mod tests {
         // Instance 2 must NOT have been killed by instance 1's stale stdout reader!
         #[cfg(unix)]
         unsafe {
-            assert_eq!(libc::kill(pid_2 as libc::pid_t, 0), 0, "child 2 must still be alive");
+            assert_eq!(
+                libc::kill(pid_2 as libc::pid_t, 0),
+                0,
+                "child 2 must still be alive"
+            );
         }
 
         // And instance 2 must still be in the manager map
-        assert!(manager.shutdown(&key).await, "child 2 must be in manager map");
+        assert!(
+            manager.shutdown(&key).await,
+            "child 2 must be in manager map"
+        );
     }
 
     #[tokio::test]
@@ -1034,23 +1168,18 @@ mod tests {
             drop(child);
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Let every sidecar exit, its reader cancel the reaper, and the
+        // reaper finish. A reaper that treats a closed cancel channel as
+        // "keep going" would instead loop here without ever sleeping.
+        tokio::time::sleep(Duration::from_millis(400)).await;
 
-        #[cfg(unix)]
-        {
-            let mut ts_start = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts_start); }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            let mut ts_end = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts_end); }
-
-            let cpu_ms = ((ts_end.tv_sec - ts_start.tv_sec) as u64) * 1000
-                + ((ts_end.tv_nsec - ts_start.tv_nsec) as u64) / 1_000_000;
-            assert!(
-                cpu_ms < 50,
-                "reaper tasks must terminate and not spin; used {cpu_ms}ms CPU in 300ms"
-            );
-        }
+        // Healthy: one wakeup per reaper on spawn (4 reapers), plus at most
+        // one more each for the cancel signal. Spinning: thousands.
+        let wakeups = manager.reaper_wakeups();
+        assert!(
+            wakeups <= 8,
+            "reaper tasks must terminate and not spin; {wakeups} wakeups for 4 reapers in 400ms"
+        );
     }
 
     #[test]
@@ -1094,10 +1223,18 @@ mod tests {
         };
 
         // Owner device is allowed to access third-party pkg even without assignments file
-        assert!(check_pkg_assignment(Some(operator_dir), "com.acme.tool", Some(&owner_device_ctx)).is_ok());
+        assert!(
+            check_pkg_assignment(Some(operator_dir), "com.acme.tool", Some(&owner_device_ctx))
+                .is_ok()
+        );
 
         // Non-owner device is denied
-        assert!(check_pkg_assignment(Some(operator_dir), "com.acme.tool", Some(&non_owner_device_ctx)).is_err());
+        assert!(check_pkg_assignment(
+            Some(operator_dir),
+            "com.acme.tool",
+            Some(&non_owner_device_ctx)
+        )
+        .is_err());
     }
 
     #[test]

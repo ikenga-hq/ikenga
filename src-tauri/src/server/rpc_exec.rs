@@ -184,7 +184,11 @@ pub(super) async fn pkg_mcp_call(
         }
 
         // 3. Trust gate (R4-4)
-        if let Err(e) = pkg_helpers::check_pkg_trust(state.config.data_dir.as_deref(), pkg) {
+        if let Err(e) = pkg_helpers::check_pkg_trust(
+            state.config.data_dir.as_deref(),
+            state.config.pkgs_dir.as_deref(),
+            pkg,
+        ) {
             return Ok(pkg_helpers::PkgMcpCallResult {
                 ok: false,
                 error: Some(e),
@@ -278,7 +282,11 @@ pub(super) async fn pkg_invoke(
         };
 
         // 4. Trust gate (R4-4)
-        if let Err(e) = pkg_helpers::check_invoke_trust(state.config.data_dir.as_deref(), pkg) {
+        if let Err(e) = pkg_helpers::check_invoke_trust(
+            state.config.data_dir.as_deref(),
+            state.config.pkgs_dir.as_deref(),
+            pkg,
+        ) {
             return Ok(pkg_helpers::PkgInvokeResult::err(e));
         }
 
@@ -367,7 +375,11 @@ pub(super) async fn pkg_sidecar_rpc_send(
             .live_pkg(&pkg_id)
             .ok_or_else(|| format!("pkg `{pkg_id}` is not installed on this server"))?;
 
-        pkg_helpers::check_pkg_trust(state.config.data_dir.as_deref(), pkg)?;
+        pkg_helpers::check_pkg_trust(
+            state.config.data_dir.as_deref(),
+            state.config.pkgs_dir.as_deref(),
+            pkg,
+        )?;
 
         let resolved = state.pkg_index.sidecar(&pkg_id, &name)?;
 

@@ -589,7 +589,8 @@ pub fn route_requirement(path: &str) -> Option<Requirement> {
         Some(Requirement::shared(&[Cap::Files]))
     } else if path.starts_with("/__viewer/") || path == "/__viewer" {
         Some(Requirement::shared(&[Cap::Files]))
-    } else if path == crate::server::push::outbox::EVENTS_PATH || path == audit::child::EVENTS_PATH
+    } else if path == crate::server::push::outbox::EVENTS_PATH
+        || path == audit::child::EVENTS_PATH
     {
         // plans/pwa S2 §10: the broker's push long-poll, broker → child only.
         Some(Requirement::internal())
@@ -1040,9 +1041,12 @@ mod tests {
             secret_rotated_at: None,
             revoked_at: None,
         };
-        let non_owner_ctx = access.device_ctx(&non_owner_row, RequestMeta::default()).await;
-        assert!(!non_owner_ctx.is_admin, "non-owner device must not be admin");
+        let non_owner_ctx = access
+            .device_ctx(&non_owner_row, RequestMeta::default())
+            .await;
+        assert!(
+            !non_owner_ctx.is_admin,
+            "non-owner device must not be admin"
+        );
     }
 }
-
-
