@@ -182,6 +182,7 @@ mod tests {
         let access = AccessCtx {
             principal_id: PrincipalId::new_v7(),
             admin_strength: AccessCtx::admin_strength_of(&via, device_tier),
+            is_admin: true,
             via,
             device_id: Some("d1".into()),
             tier: device_tier,

@@ -653,6 +653,7 @@ mod tests {
             share_headers: false,
             caps: CapSet::of(&[crate::access::Cap::Files]),
             admin_strength: false,
+            is_admin: false,
             meta: Default::default(),
         }
     }

@@ -502,7 +502,9 @@ pub async fn rpc_handler(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
             if pkg_id.is_empty() {
-                return Json(RpcResponse::error("pkg_activity_bar_set_badge: `pkgId` is required"));
+                return Json(RpcResponse::error(
+                    "pkg_activity_bar_set_badge: `pkgId` is required",
+                ));
             }
             // Absent or null clears the badge; anything else must parse.
             let badge: Option<crate::pkg::registries::ActivityBarBadge> =
@@ -521,7 +523,9 @@ pub async fn rpc_handler(
             // `activity_bar` registry; the server has no desktop event to emit.
             match state.pkg_index.set_badge(pkg_id, badge) {
                 Ok(true) => RpcResponse::success(()),
-                Ok(false) => RpcResponse::error(format!("no activity-bar entry for pkg `{pkg_id}`")),
+                Ok(false) => {
+                    RpcResponse::error(format!("no activity-bar entry for pkg `{pkg_id}`"))
+                }
                 Err(e) => RpcResponse::error(format!("{e:#}")),
             }
         }
@@ -531,10 +535,9 @@ pub async fn rpc_handler(
         // No trust store, so no pkg's trust can be evaluated. An empty list
         // would read as "nothing to trust"; the refusal names why, and the
         // frontend renders it as "not available on this server".
-        "pkg_trust_list" => RpcResponse::error(format!(
-            "pkg_trust_list: {}",
-            rpc_claude::TRUST_NOT_SERVED
-        )),
+        "pkg_trust_list" => {
+            RpcResponse::error(format!("pkg_trust_list: {}", rpc_claude::TRUST_NOT_SERVED))
+        }
         // What the daemon can see: `--pkgs-dir` entries that failed to load,
         // are api-incompatible, or a registry rejected — plus one
         // `records_unavailable` row saying install-record health is not
@@ -920,11 +923,19 @@ pub async fn rpc_handler(
         // agent-ops daemon; a setting only for a declared key. The kernel
         // verbs (`pkg_set_enabled`, `pkg_uninstall`, `pkg_supervisor_restart`)
         // stay in `desktop_only.toml`: the daemon has no kernel to run them.
-        "pkg_sidecar_call" => rpc_exec::pkg_sidecar_call(&state, &payload.args).await,
+        "pkg_sidecar_call" => rpc_exec::pkg_sidecar_call(&state, ctx.as_ref(), &payload.args).await,
         "action_exec" => rpc_exec::action_exec(&state, &payload.args).await,
         "comment_route" => rpc_exec::comment_route(&state, &payload.args).await,
         "agent_ops_run_now" => rpc_exec::agent_ops_run_now(&state, &payload.args).await,
         "pkg_settings_set" => rpc_exec::pkg_settings_set(&state, &payload.args).await,
+        "pkg_mcp_call" => rpc_exec::pkg_mcp_call(&state, ctx.as_ref(), &payload.args).await,
+        "pkg_invoke" => rpc_exec::pkg_invoke(&state, ctx.as_ref(), &payload.args).await,
+        "pkg_sidecar_rpc_send" => {
+            rpc_exec::pkg_sidecar_rpc_send(&state, ctx.as_ref(), &payload.args).await
+        }
+        "pkg_sidecar_rpc_shutdown" => {
+            rpc_exec::pkg_sidecar_rpc_shutdown(&state, ctx.as_ref(), &payload.args).await
+        }
 
         // `permission_decide` on a daemon (T0 or a T1 child): the decide core
         // with the hook resolver beside the relay's, audited where this tier
@@ -993,12 +1004,11 @@ pub async fn rpc_handler(
         // `claude_procs`: how many processes of this child's own uid are a
         // `claude` (a count — never a name, argument or another uid's).
         "server_open_terminals" => {
-            let claude_procs = tokio::task::spawn_blocking(|| {
-                super::host_health::count_own_processes("claude")
-            })
-            .await
-            .ok()
-            .flatten();
+            let claude_procs =
+                tokio::task::spawn_blocking(|| super::host_health::count_own_processes("claude"))
+                    .await
+                    .ok()
+                    .flatten();
             RpcResponse::success(serde_json::json!({
                 "open": state.pty_manager.active_session_count(),
                 "claude_procs": claude_procs,

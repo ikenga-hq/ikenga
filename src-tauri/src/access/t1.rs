@@ -177,11 +177,20 @@ impl T1Access {
             ..Default::default()
         }
         .with_host_from(&parts.headers);
+        let is_admin = match self.pool.acquire().await {
+            Ok(mut conn) => accounts::by_id(&mut conn, ctx.principal.id)
+                .await
+                .ok()
+                .flatten()
+                .map_or(false, |a| a.is_admin && !a.is_disabled()),
+            Err(_) => false,
+        };
         Ok(BrokerCtx {
             access: AccessCtx {
                 principal_id: ctx.principal.id,
                 admin_strength: AccessCtx::admin_strength_of(&via, tier)
                     && !matches!(via, Via::Operator),
+                is_admin,
                 device_id,
                 via,
                 tier,
@@ -555,6 +564,9 @@ impl Narrower for AccessNarrower {
         Box::pin(async move {
             let b = self.0.access_ctx(ctx, req).await.map_err(|e| refusal(&e))?;
             let mut pairs = vec![(CAPS_HEADER, b.access.caps.to_header())];
+            if b.access.is_admin {
+                pairs.push((crate::server::broker::proxy::ADMIN_HEADER, "1".to_string()));
+            }
             if let Some(share) = &b.access.share {
                 pairs.extend(super::share::to_child_headers(share));
             }
@@ -1245,5 +1257,34 @@ mod tests {
                 .await,
             Decision::Deny { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn host_header_and_admin_status_in_access_ctx() {
+        let (_tmp, t1, ada) = setup().await;
+        let (_, tok) = pair(&t1, ada, Tier::Full).await;
+        let mut parts = parts_with("authorization", &format!("Bearer {tok}"));
+        parts
+            .headers
+            .insert("host", "box.example.net".parse().unwrap());
+        let Resolution::Resolved { ctx, .. } = DeviceGrantResolver(t1.clone())
+            .resolve(&parts)
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        let b = t1.access_ctx(&ctx, &parts).await.unwrap();
+        assert_eq!(b.access.meta.host.as_deref(), Some("box.example.net"));
+        assert!(!b.access.is_admin);
+
+        // Update account to admin
+        sqlx::query("UPDATE accounts SET is_admin = 1 WHERE principal_id = ?")
+            .bind(ada.to_string())
+            .execute(&t1.pool)
+            .await
+            .unwrap();
+        let b_admin = t1.access_ctx(&ctx, &parts).await.unwrap();
+        assert!(b_admin.access.is_admin);
     }
 }

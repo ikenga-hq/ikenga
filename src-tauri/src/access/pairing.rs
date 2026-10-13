@@ -2272,6 +2272,7 @@ mod tests {
             share_headers: false,
             caps: Tier::Approve.caps(),
             admin_strength: false,
+            is_admin: false,
             meta: RequestMeta::default(),
         };
         for cmd in [
@@ -2345,6 +2346,7 @@ mod tests {
             share_headers: false,
             caps: CapSet::ALL,
             admin_strength: true,
+            is_admin: true,
             meta: RequestMeta {
                 host: Some("127.0.0.1:4000".into()),
                 ..Default::default()

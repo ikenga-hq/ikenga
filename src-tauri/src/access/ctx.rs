@@ -150,6 +150,8 @@ pub struct AccessCtx {
     pub caps: CapSet,
     /// `via ∈ {Session, OperatorBearer} || tier == Full` (P-26).
     pub admin_strength: bool,
+    /// Account's actual admin role (R4-2: accounts.is_admin under T1, operator on T0).
+    pub is_admin: bool,
     pub meta: RequestMeta,
 }
 

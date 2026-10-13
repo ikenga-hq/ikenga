@@ -293,6 +293,10 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     // principal, and neither a sidecar's inputs, an action's run, a pin's
     // PTY / chi run nor an agent-ops job is share-root-confined. ──
     ("pkg_sidecar_call", req!(owner[Dispatch])),
+    ("pkg_mcp_call", req!(owner[Dispatch])),
+    ("pkg_invoke", req!(owner[Dispatch])),
+    ("pkg_sidecar_rpc_send", req!(owner[Dispatch])),
+    ("pkg_sidecar_rpc_shutdown", req!(owner[Dispatch])),
     ("action_exec", req!(owner[Dispatch])),
     ("comment_route", req!(owner[Dispatch])),
     ("agent_ops_run_now", req!(owner[Dispatch])),

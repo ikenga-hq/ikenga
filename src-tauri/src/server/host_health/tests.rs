@@ -389,12 +389,13 @@ fn ctx(via: Via, tier: Tier) -> AccessCtx {
     AccessCtx {
         principal_id: PrincipalId::new_v7(),
         admin_strength: AccessCtx::admin_strength_of(&via, tier),
-        via,
+        via: via.clone(),
         device_id: None,
         tier,
         share: None,
         share_headers: false,
         caps: CapSet::ALL,
+        is_admin: matches!(via, Via::Operator),
         meta: RequestMeta::default(),
     }
 }

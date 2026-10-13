@@ -251,6 +251,7 @@ mod tests {
             share_headers: false,
             caps,
             admin_strength: false,
+            is_admin: false,
             meta: RequestMeta::default(),
         }
     }

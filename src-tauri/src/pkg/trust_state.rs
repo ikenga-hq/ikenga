@@ -8,9 +8,12 @@
 //! Moved verbatim out of `pkg/trust.rs`, which re-exports everything here, so
 //! every `crate::pkg::trust::…` path is unchanged.
 
+use glob::Pattern;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::pkg::manifest::Permissions;
+use crate::pkg::source::InstallSource;
 
 /// Plain-English summary of one declared permission set, for the trust
 /// dialog and the `iyke_pkg_trust_*` MCP tools. Lists only the entries
@@ -134,4 +137,98 @@ pub fn summarize_sensitive(perms: &Permissions) -> PermsSummary {
         net: perms.net.clone(),
         vault_keys: perms.vault_keys.clone(),
     }
+}
+
+/// Sentinel scope_kind reserved for manifest trust grants. Never appears in
+/// the manifest's declared `permissions.*` blocks; the permissions registry
+/// only writes `fs.read`/`fs.write`/`shell.execute` rows.
+pub const TRUST_SCOPE_KIND: &str = "__manifest_trust";
+
+/// Stable wire form for a sensitive-perms snapshot. The hex sha256 of this
+/// string is what we store in `scope_value`; mismatch ⇒ permissions changed.
+pub fn snapshot_json(perms: &PermsSummary) -> String {
+    // Sort each list so reordering doesn't invalidate trust.
+    let mut shell = perms.shell_execute.clone();
+    let mut fsw = perms.fs_write_outside_sandbox.clone();
+    let mut net = perms.net.clone();
+    let mut vk = perms.vault_keys.clone();
+    shell.sort();
+    fsw.sort();
+    net.sort();
+    vk.sort();
+    serde_json::to_string(&serde_json::json!({
+        "shell_execute": shell,
+        "fs_write_outside_sandbox": fsw,
+        "net": net,
+        "vault_keys": vk,
+    }))
+    .expect("snapshot json")
+}
+
+pub fn snapshot_hash(perms: &PermsSummary) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(snapshot_json(perms).as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Same as `pkg_id.starts_with("com.ikenga.")` — but explicit so the call
+/// site reads as the policy decision, not a string check.
+pub fn id_in_ikenga_namespace(pkg_id: &str) -> bool {
+    pkg_id.starts_with("com.ikenga.")
+}
+
+/// Auto-trust policy:
+///
+/// - `source.kind = "builtin"` AND id in `com.ikenga.*` namespace, OR
+/// - `source.kind = "dev"` — dev-mode mounts via `ikenga dev` bypass the
+///   modal regardless of pkg id (sensitive perms still log::warn).
+pub fn is_auto_trusted(pkg_id: &str, source: &InstallSource) -> bool {
+    if source.is_dev() {
+        return true;
+    }
+    source.is_builtin() && id_in_ikenga_namespace(pkg_id)
+}
+
+/// Outcome of a denied spawn — the caller hands this to the audit recorder.
+#[derive(Debug, Clone)]
+pub struct ShellExecuteDenied {
+    pub pkg_id: String,
+    pub command: String,
+    /// Comma-joined snapshot of the manifest's allowlist at attempt time.
+    /// Stored verbatim in the audit row so a later allowlist edit doesn't
+    /// rewrite history.
+    pub declared: String,
+}
+
+/// Returns `Ok(())` if `command` matches any glob in `shell_execute`.
+/// Returns `Err(ShellExecuteDenied)` otherwise — caller should record the
+/// denial and refuse to spawn.
+///
+/// Malformed globs are skipped (logged at warn) so a single bad pattern
+/// doesn't lock the pkg out of all its other valid entries.
+pub fn check_shell_execute(
+    pkg_id: &str,
+    shell_execute: &[String],
+    command: &str,
+) -> std::result::Result<(), ShellExecuteDenied> {
+    for raw in shell_execute {
+        match Pattern::new(raw) {
+            Ok(pat) => {
+                if pat.matches(command) {
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "[pkg.permissions_check] pkg `{pkg_id}` shell.execute entry `{raw}` \
+                     is not a valid glob: {e}"
+                );
+            }
+        }
+    }
+    Err(ShellExecuteDenied {
+        pkg_id: pkg_id.into(),
+        command: command.into(),
+        declared: shell_execute.join(","),
+    })
 }

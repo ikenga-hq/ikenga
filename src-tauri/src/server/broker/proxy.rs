@@ -257,6 +257,7 @@ fn refused(r: Refusal) -> Response {
 /// The narrowing header (§4.5.3). Set only by the broker; a client's copy is
 /// stripped with every other `x-ikenga-*` header.
 pub const CAPS_HEADER: &str = "x-ikenga-caps";
+pub const ADMIN_HEADER: &str = "x-ikenga-admin";
 
 /// The header the broker adds for the child's logs.
 pub const PRINCIPAL_HEADER: &str = "x-ikenga-principal";

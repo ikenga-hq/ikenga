@@ -377,6 +377,7 @@ mod tests {
             share_headers: false,
             caps: CapSet::of(&[crate::access::Cap::Files, crate::access::Cap::Sessions]),
             admin_strength: false,
+            is_admin: false,
             meta: RequestMeta::default(),
         };
         let e = env(&store, &reg);

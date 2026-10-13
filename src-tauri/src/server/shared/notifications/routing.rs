@@ -2551,6 +2551,7 @@ mod tests {
             share_headers: false,
             caps,
             admin_strength: tier == Tier::Full,
+            is_admin: false,
             meta: RequestMeta {
                 routing_withheld_approve: crate::access::ctx::routing_withheld_approve(
                     crate::access::caps::RoleContext::OwnWorkspace,
@@ -2593,6 +2594,7 @@ mod tests {
             share_headers: true,
             caps,
             admin_strength: false,
+            is_admin: false,
             meta: RequestMeta::default(),
         }
     }
