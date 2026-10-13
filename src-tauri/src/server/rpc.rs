@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::hook_asks;
+use super::rpc_backup;
 use super::rpc_claude;
 use super::rpc_exec;
 use super::rpc_files;
@@ -611,6 +612,10 @@ pub async fn rpc_handler(
         "data_health_db_size" => rpc_local::data_health_db_size(&state),
         "backup_list" => rpc_local::backup_list(&state),
         "backup_delete" => rpc_local::backup_delete(&state, &payload.args),
+        "backup_export" => rpc_backup::backup_export(&state, &payload.args).await,
+        "backup_import" => rpc_backup::backup_import(&state, &payload.args).await,
+        "db_export_ndjson" => rpc_backup::db_export_ndjson(&state, &payload.args).await,
+        "db_import_ndjson" => rpc_backup::db_import_ndjson(&state, &payload.args).await,
         "pkg_settings_get" => rpc_local::pkg_settings_get(&state, &payload.args).await,
 
         // --- Chi runs, agent-ops files, identity (WP-19 slice 3, WP-P10) ---

@@ -51,7 +51,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tauri::{AppHandle, Manager, State};
 
@@ -61,7 +60,10 @@ use crate::commands::secrets::{self, SecretsLock};
 // arms; re-exported so every existing `commands::backup::…` path still works.
 use crate::server::shared::backups as shared;
 use crate::server::shared::backups::{read_manifest, read_zip_bytes};
-pub use crate::server::shared::backups::{BackupManifest, BackupSummary, PathMode, PathWarning};
+pub use crate::server::shared::backups::{
+    BackupManifest, BackupSummary, ExportResult, ImportPreview, ImportResult, NdjsonExportResult,
+    NdjsonLoadResult, NdjsonTableSummary, PathMode, PathWarning, PkgEntry, SchemaAction,
+};
 
 const BACKUP_FORMAT_VERSION: u32 = 3;
 const BACKUP_SCHEMA_VERSION: i64 = 7;
@@ -122,71 +124,7 @@ const PATH_COLUMNS: &[PathColumn] = &[
     },
 ];
 
-// ─── manifest + result types ──────────────────────────────────────────────────
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PkgEntry {
-    pub id: String,
-    pub version: String,
-    pub enabled: bool,
-}
-
-// `BackupManifest` itself is defined in `server::shared::backups` (list needs
-// it on the daemon too); only the export-time constructor lives here.
-impl BackupManifest {
-    fn new(
-        path_mode: PathMode,
-        home_dir: Option<String>,
-        has_secrets: bool,
-        pkg_count: u32,
-        path_warnings: Vec<PathWarning>,
-    ) -> Self {
-        Self {
-            format_version: BACKUP_FORMAT_VERSION,
-            schema_version: BACKUP_SCHEMA_VERSION,
-            created_at: now_iso(),
-            hostname: hostname_or_unknown(),
-            username: std::env::var("USER").unwrap_or_else(|_| "unknown".into()),
-            path_mode,
-            home_dir,
-            has_secrets,
-            pkg_count,
-            path_warnings,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-pub struct ExportResult {
-    pub path: String,
-    pub size_bytes: u64,
-    pub secrets_count: u32,
-    pub pkg_count: u32,
-    pub path_warnings_count: u32,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ImportPreview {
-    pub manifest: BackupManifest,
-    pub size_bytes: u64,
-    pub schema_action: SchemaAction,
-    pub pkgs: Vec<PkgEntry>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum SchemaAction {
-    Match,
-    Forward { from: i64, to: i64 },
-    NewerThanApp { backup: i64, app: i64 },
-}
-
-#[derive(Debug, Serialize)]
-pub struct ImportResult {
-    pub staged_at: String,
-    pub requires_restart: bool,
-    pub secrets_staged: bool,
-}
+// Manifest and result types are shared with the daemon and re-exported above.
 
 // ─── public commands ──────────────────────────────────────────────────────────
 
@@ -317,6 +255,7 @@ pub async fn backup_export<R: tauri::Runtime>(
         secrets_count,
         pkg_count: pkgs.len() as u32,
         path_warnings_count: warnings_count,
+        bytes_base64: None,
     })
 }
 
@@ -868,25 +807,7 @@ fn current_home_dir() -> Option<String> {
 // `VACUUM INTO` stays as the fast binary backup (backup_export). This export
 // is the diffable / committable artifact.
 
-#[derive(Debug, Serialize)]
-pub struct NdjsonTableSummary {
-    pub table: String,
-    pub rows: u64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct NdjsonExportResult {
-    pub dir: String,
-    pub table_count: usize,
-    pub row_count: u64,
-    pub tables: Vec<NdjsonTableSummary>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct NdjsonLoadResult {
-    pub table_count: usize,
-    pub row_count: u64,
-}
+// Ndjson result structs are shared with the daemon and re-exported above.
 
 /// Per-column metadata from `PRAGMA table_info`.
 struct ColMeta {
@@ -1265,13 +1186,6 @@ fn local_backups_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PathBuf, S
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
-}
-
-fn hostname_or_unknown() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .or_else(|| std::env::var("COMPUTERNAME").ok())
-        .unwrap_or_else(|| "unknown".into())
 }
 
 fn load_pending_kvs(path: &Path) -> Result<BTreeMap<String, String>, String> {

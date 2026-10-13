@@ -574,6 +574,8 @@ pub fn route_requirement(path: &str) -> Option<Requirement> {
         "/api/shutdown" | "/api/server/update" | "/api/server/update/apply"
     ) {
         Some(Requirement::operator())
+    } else if matches!(path, "/api/backup/export" | "/api/backup/import") {
+        Some(Requirement::owner(&[Cap::Settings]))
     } else if path.starts_with("/ws/pty/") {
         Some(Requirement::owner(&[Cap::Sessions]))
     } else if path.starts_with("/ws/chat/") {
@@ -940,6 +942,11 @@ mod tests {
                 ArmClass::Operator,
                 "{p}"
             );
+        }
+        for p in ["/api/backup/export", "/api/backup/import"] {
+            let req = route_requirement(p).unwrap();
+            assert_eq!(req.class, ArmClass::Owner, "{p}");
+            assert_eq!(req.caps, CapSet::of(&[Cap::Settings]), "{p}");
         }
         assert_eq!(
             route_requirement("/ws/pty/abc").unwrap().caps,

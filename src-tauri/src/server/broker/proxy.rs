@@ -722,6 +722,77 @@ pub async fn pkgs_proxy(
     .await
 }
 
+/// `GET /api/backup/export` → the principal's child.
+pub async fn backup_export_proxy(
+    State(state): State<Arc<BrokerState>>,
+    Extension(ctx): Extension<PrincipalCtx>,
+    req: Request,
+) -> Response {
+    let (parts, _body) = req.into_parts();
+    if !matches!(parts.method, Method::GET | Method::HEAD) {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let Some(pq) = path_and_query(&parts.uri) else {
+        return bad_path();
+    };
+    let narrowing = match state.hooks.narrower.narrow(&ctx, &parts).await {
+        Ok(n) => n,
+        Err(r) => return refused(r),
+    };
+    forward(
+        &state,
+        &narrowing,
+        &ctx,
+        parts.method,
+        &pq,
+        &parts.headers,
+        Bytes::new(),
+    )
+    .await
+}
+
+/// `POST /api/backup/import` → the principal's child.
+pub async fn backup_import_proxy(
+    State(state): State<Arc<BrokerState>>,
+    Extension(ctx): Extension<PrincipalCtx>,
+    req: Request,
+) -> Response {
+    let (parts, body) = req.into_parts();
+    if parts.method != Method::POST {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let Some(pq) = path_and_query(&parts.uri) else {
+        return bad_path();
+    };
+    let narrowing = match state.hooks.narrower.narrow(&ctx, &parts).await {
+        Ok(n) => n,
+        Err(r) => return refused(r),
+    };
+    let Some(_permit) = state.uploads.try_acquire(ctx.principal.id) else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+    let bytes = match tokio::time::timeout(
+        state.uploads.read_timeout,
+        axum::body::to_bytes(body, 100 * 1024 * 1024),
+    )
+    .await
+    {
+        Ok(Ok(b)) => b,
+        Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+    };
+    forward(
+        &state,
+        &narrowing,
+        &ctx,
+        parts.method,
+        &pq,
+        &parts.headers,
+        bytes,
+    )
+    .await
+}
+
 /// The principal a viewer mount token names: its child mints
 /// `<principal uuid, 32 hex (simple form)>_<random hex>`.
 pub fn viewer_token_principal(token: &str) -> Option<crate::executor::PrincipalId> {

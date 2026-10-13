@@ -49,6 +49,7 @@ pub mod pty_ws;
 pub mod push;
 mod reserved;
 pub mod rpc;
+mod rpc_backup;
 mod rpc_claude;
 mod rpc_exec;
 mod rpc_files;
@@ -980,6 +981,14 @@ fn build_router(
         // In-app updates (WP-P9): operator only (`access::route_requirement`).
         .route("/api/server/update", get(update::t0_status))
         .route("/api/server/update/apply", post(update::t0_apply))
+        // Backup export/import (WP-B): streamed download / upload (100MB max)
+        .route("/api/backup/export", get(rpc_backup::http_backup_export))
+        .route(
+            "/api/backup/import",
+            post(rpc_backup::http_backup_import).layer(axum::extract::DefaultBodyLimit::max(
+                shared::backups::MAX_BACKUP_SIZE_BYTES as usize,
+            )),
+        )
         .route("/ws/pty/:id", get(pty_ws::pty_ws_handler))
         .route("/ws/chat/:id", get(chat_ws::chat_ws_handler))
         .route("/ws/fs", get(fs_ws::fs_ws_handler))

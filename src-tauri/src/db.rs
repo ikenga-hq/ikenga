@@ -85,6 +85,19 @@ impl PaDb {
         &self.db_path
     }
 
+    /// Close both writer and reader pools, releasing file locks so the database
+    /// file can be replaced (e.g. during backup restore).
+    pub async fn close(&self) {
+        let mut w = self.writer.lock().await;
+        if let Some(pool) = w.take() {
+            pool.close().await;
+        }
+        let mut r = self.reader.lock().await;
+        if let Some(pool) = r.take() {
+            pool.close().await;
+        }
+    }
+
     /// Shared connect options for both pools: WAL journaling, a busy_timeout so
     /// contention waits instead of erroring, `synchronous = NORMAL` (safe under
     /// WAL, much faster than FULL), and create-if-missing so a fresh install
@@ -150,6 +163,49 @@ impl PaDb {
         Ok(pool)
     }
 }
+/// The schema a full migration run produces: every user table with its column
+/// names. Cached after migrating an in-memory database once. Backup import
+/// compares a staged database against this, so a table that merely shares a
+/// name with a real one (but has other columns) is refused.
+pub async fn reference_schema(
+) -> Result<std::collections::HashMap<String, std::collections::HashSet<String>>, String> {
+    static CACHE: tokio::sync::OnceCell<
+        std::collections::HashMap<String, std::collections::HashSet<String>>,
+    > = tokio::sync::OnceCell::const_new();
+    CACHE
+        .get_or_try_init(|| async {
+            use sqlx::Row;
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .map_err(|e| format!("connect memory sqlite: {e}"))?;
+            ensure_schema(&pool).await?;
+            let tables: Vec<String> = sqlx::query_scalar(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| format!("query reference tables: {e}"))?;
+            let mut out = std::collections::HashMap::new();
+            for t in tables {
+                let rows = sqlx::query(&format!(
+                    "PRAGMA table_info(\"{}\")",
+                    t.replace('"', "\"\"")
+                ))
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| format!("table_info({t}): {e}"))?;
+                let cols = rows.iter().map(|r| r.get::<String, _>("name")).collect();
+                out.insert(t, cols);
+            }
+            pool.close().await;
+            Ok(out)
+        })
+        .await
+        .cloned()
+}
+
 /// Embedded migration set, kept in lockstep with `migrations/*.sql`.
 ///
 /// Module-level rather than function-local so tests can assert against
