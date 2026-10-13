@@ -421,7 +421,7 @@ pub(crate) async fn http_backup_import(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::db::PaDb;
+    use crate::db::PaDb;
     use crate::engines::EngineRegistry;
     use crate::executor::ExecutorTier;
     use crate::pty::PtyManager;
@@ -1213,6 +1213,7 @@ mod tests {
         assert_eq!(data_dir_leftovers(&d.data), Vec::<String>::new());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn arm_level_dangling_symlink_export_destination_is_refused() {
         let d = test_daemon();
