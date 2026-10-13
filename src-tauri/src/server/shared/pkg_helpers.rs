@@ -928,9 +928,9 @@ mod tests {
         assert!(err.contains("requires admin trust approval"), "got: {err}");
 
         // 4. Admin approves sensitive pkg in pkg-trust.json bound to version + snapshot_hash (R4-4 Blocker 2)
-        let hash = crate::pkg::trust::snapshot_hash(&crate::pkg::trust_state::summarize_sensitive(
-            &sensitive_pkg.manifest.permissions,
-        ));
+        let hash = crate::pkg::trust_state::snapshot_hash(
+            &crate::pkg::trust_state::summarize_sensitive(&sensitive_pkg.manifest.permissions),
+        );
         let trust_json = json!({
             "com.other.sensitive": {
                 "version": "1.0.0",

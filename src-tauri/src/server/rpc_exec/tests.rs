@@ -1122,8 +1122,9 @@ async fn arm_level_unapproved_sensitive_pkg_refused() {
         shell_execute: vec!["echo".into()],
         ..Default::default()
     };
-    let hash =
-        crate::pkg::trust::snapshot_hash(&crate::pkg::trust_state::summarize_sensitive(&perms));
+    let hash = crate::pkg::trust_state::snapshot_hash(
+        &crate::pkg::trust_state::summarize_sensitive(&perms),
+    );
     std::fs::write(
         root.join("pkg-trust.json"),
         json!({
