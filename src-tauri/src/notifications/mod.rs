@@ -299,7 +299,40 @@ mod routing_desktop {
         let Ok(pool) = db.ensure_pool().await else {
             return;
         };
-        let swept = core::sweep_orphaned_asks(&pool, booted_at).await;
+        // Without a store on disk (the ephemeral fallback) no audit can ever
+        // land, so don't spend a minute per ask on one at every boot.
+        let audit_possible = store_on_disk(&app);
+        sweep_orphans_with(
+            |cmd, args| {
+                let app = app.clone();
+                async move { daemon_rpc(&app, cmd, args).await }
+            },
+            &pool,
+            booted_at,
+            audit_possible,
+            Duration::from_secs(1),
+        )
+        .await;
+    }
+
+    /// [`sweep_orphans`]'s body over any daemon channel (`rpc`), so the
+    /// retry and acknowledge logic runs in tests without an `AppHandle`.
+    /// Each swept ask is audited (`access_audit_record_local`) and reported
+    /// (`permission_relay_resolve`), each retried with backoff from
+    /// `first_delay`. The row is closed (`mark_swept_audited`) only once its
+    /// audit succeeded; otherwise it stays `swept-unaudited` for the next
+    /// boot. `audit_possible == false` closes it without trying.
+    pub(super) async fn sweep_orphans_with<F, Fut>(
+        rpc: F,
+        pool: &sqlx::SqlitePool,
+        booted_at: i64,
+        audit_possible: bool,
+        first_delay: Duration,
+    ) where
+        F: Fn(&'static str, Value) -> Fut,
+        Fut: std::future::Future<Output = Result<Value, String>>,
+    {
+        let swept = core::sweep_orphaned_asks(pool, booted_at).await;
         for ask in swept {
             let target = ask.title.chars().take(120).collect::<String>();
             let detail = json!({
@@ -314,15 +347,26 @@ mod routing_desktop {
             });
 
             let args = json!({ "key": ask.dedupe_key, "outcome": "cancelled" });
-            let mut delay = Duration::from_secs(1);
-            let mut audited = false;
+            let mut delay = first_delay;
+            let mut audited = !audit_possible;
+            if !audit_possible {
+                if let Err(e) = core::mark_swept_audited(pool, ask.id).await {
+                    log::warn!(target: "ikenga::notifications", "swept ask {}: {e}", ask.id);
+                }
+            }
             let mut resolved = false;
             for attempt in 0..6 {
                 if !audited {
-                    match daemon_rpc(&app, "access_audit_record_local", audit_args.clone()).await {
+                    match rpc("access_audit_record_local", audit_args.clone()).await {
                         Ok(_) => {
                             audited = true;
-                            core::mark_swept_audited(&pool, ask.id).await;
+                            if let Err(e) = core::mark_swept_audited(pool, ask.id).await {
+                                log::warn!(
+                                    target: "ikenga::notifications",
+                                    "swept ask {}: {e}",
+                                    ask.id
+                                );
+                            }
                         }
                         Err(e) => {
                             log::debug!(
@@ -334,7 +378,7 @@ mod routing_desktop {
                     }
                 }
                 if !resolved {
-                    match daemon_rpc(&app, "permission_relay_resolve", args.clone()).await {
+                    match rpc("permission_relay_resolve", args.clone()).await {
                         Ok(_) => resolved = true,
                         Err(e) => {
                             log::debug!(
@@ -556,6 +600,142 @@ mod tests {
                 .code,
             Code::RoutingRefused
         );
+    }
+
+    /// A stale `permission` ask an earlier run left open, and the pool it is in.
+    async fn stale_hook_ask(dir: &std::path::Path) -> (sqlx::SqlitePool, i64) {
+        let db = crate::db::PaDb::new(dir.join("ikenga.db"));
+        let pool = db.ensure_pool().await.expect("pool");
+        let at = chrono::Utc::now().timestamp_millis() - 10_000;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO shell_notifications \
+             (kind, title, source, dedupe_key, created_at, updated_at, sensitive) \
+             VALUES ('permission', 'Claude wants to use Bash', 'test', \
+                     'permission:hook:stale-desktop', ?, ?, 1) RETURNING id",
+        )
+        .bind(at)
+        .bind(at)
+        .fetch_one(&pool)
+        .await
+        .expect("seed");
+        (pool, id)
+    }
+
+    async fn row_state(pool: &sqlx::SqlitePool, id: i64) -> Option<String> {
+        sqlx::query_scalar("SELECT decided_via FROM shell_notifications WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("row")
+    }
+
+    /// Run the desktop's boot sweep over a scripted daemon: the first
+    /// `audit_failures` audit calls fail. Returns the calls it made.
+    async fn run_sweep(
+        pool: &sqlx::SqlitePool,
+        audit_possible: bool,
+        audit_failures: usize,
+    ) -> Vec<(&'static str, serde_json::Value)> {
+        use std::sync::{Arc, Mutex};
+        let calls: Arc<Mutex<Vec<(&'static str, serde_json::Value)>>> = Default::default();
+        let log = calls.clone();
+        routing_desktop::sweep_orphans_with(
+            move |cmd, args| {
+                let log = log.clone();
+                async move {
+                    let mut log = log.lock().unwrap();
+                    let audits = log
+                        .iter()
+                        .filter(|(c, _)| *c == "access_audit_record_local");
+                    let failing =
+                        cmd == "access_audit_record_local" && audits.count() < audit_failures;
+                    log.push((cmd, args));
+                    if failing {
+                        Err("daemon down".to_string())
+                    } else {
+                        Ok(serde_json::json!({}))
+                    }
+                }
+            },
+            pool,
+            chrono::Utc::now().timestamp_millis(),
+            audit_possible,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        let out = calls.lock().unwrap().clone();
+        out
+    }
+
+    /// The boot sweep puts the expiry on the audit trail, then closes the row.
+    #[tokio::test]
+    async fn desktop_sweep_audits_the_expiry_then_closes_the_row() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (pool, id) = stale_hook_ask(tmp.path()).await;
+        let calls = run_sweep(&pool, true, 0).await;
+        let audits: Vec<_> = calls
+            .iter()
+            .filter(|(c, _)| *c == "access_audit_record_local")
+            .collect();
+        assert_eq!(audits.len(), 1, "{calls:?}");
+        assert_eq!(audits[0].1["kind"], "permission.refused");
+        assert_eq!(audits[0].1["target"], "Claude wants to use Bash");
+        assert_eq!(audits[0].1["detail"]["reason"], "expired:restart");
+        assert!(
+            calls.iter().any(|(c, a)| *c == "permission_relay_resolve"
+                && a["key"] == "permission:hook:stale-desktop"
+                && a["outcome"] == "cancelled"),
+            "the daemon is told too: {calls:?}"
+        );
+        assert_eq!(row_state(&pool, id).await.as_deref(), Some("swept"));
+    }
+
+    /// An audit that never lands leaves the row open for the next boot (the
+    /// report to the daemon is still made).
+    #[tokio::test]
+    async fn desktop_sweep_keeps_the_row_open_when_the_audit_never_lands() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (pool, id) = stale_hook_ask(tmp.path()).await;
+        let calls = run_sweep(&pool, true, usize::MAX).await;
+        let audits = calls
+            .iter()
+            .filter(|(c, _)| *c == "access_audit_record_local")
+            .count();
+        assert_eq!(audits, 6, "every attempt is used: {calls:?}");
+        assert!(calls.iter().any(|(c, _)| *c == "permission_relay_resolve"));
+        assert_eq!(
+            row_state(&pool, id).await.as_deref(),
+            Some("swept-unaudited")
+        );
+    }
+
+    /// A transient failure is retried, and the row closes once the audit lands.
+    #[tokio::test]
+    async fn desktop_sweep_retries_the_audit_until_it_lands() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (pool, id) = stale_hook_ask(tmp.path()).await;
+        let calls = run_sweep(&pool, true, 2).await;
+        let audits = calls
+            .iter()
+            .filter(|(c, _)| *c == "access_audit_record_local")
+            .count();
+        assert_eq!(audits, 3, "{calls:?}");
+        assert_eq!(row_state(&pool, id).await.as_deref(), Some("swept"));
+    }
+
+    /// No access store on disk: no audit can ever land, so the row is closed
+    /// without the 51 s retry (and the daemon is still told).
+    #[tokio::test]
+    async fn desktop_sweep_without_a_store_closes_the_row_without_trying() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (pool, id) = stale_hook_ask(tmp.path()).await;
+        let calls = run_sweep(&pool, false, usize::MAX).await;
+        assert!(
+            calls.iter().all(|(c, _)| *c != "access_audit_record_local"),
+            "{calls:?}"
+        );
+        assert!(calls.iter().any(|(c, _)| *c == "permission_relay_resolve"));
+        assert_eq!(row_state(&pool, id).await.as_deref(), Some("swept"));
     }
 
     #[tokio::test]

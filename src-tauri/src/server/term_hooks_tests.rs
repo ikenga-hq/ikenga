@@ -2336,52 +2336,187 @@ async fn child_on_dir(
     (a, PrincipalId::new_v7())
 }
 
+/// An ask an earlier run left open, `age_ms` old. Returns its row id.
+async fn seed_stale_ask(pool: &sqlx::SqlitePool, key: &str, age_ms: i64) -> i64 {
+    let at = chrono::Utc::now().timestamp_millis() - age_ms;
+    sqlx::query_scalar(
+        "INSERT INTO shell_notifications \
+         (kind, title, source, dedupe_key, created_at, updated_at, sensitive) \
+         VALUES ('permission', 'Claude wants to use Bash', 'test', ?, ?, ?, 1) RETURNING id",
+    )
+    .bind(format!("permission:hook:{key}"))
+    .bind(at)
+    .bind(at)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn decided_via(pool: &sqlx::SqlitePool, id: i64) -> Option<String> {
+    sqlx::query_scalar("SELECT decided_via FROM shell_notifications WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// `POST /internal/audit/events/ack` as the broker sends it, through the
+/// child's real router.
+async fn post_ack(a: &Asks, owner: PrincipalId, ids: &[i64]) -> StatusCode {
+    let req = Request::builder()
+        .method("POST")
+        .uri(audit_child::ACK_PATH)
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("x-ikenga-principal", owner.to_string())
+        .header("x-ikenga-internal-call", "1")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "ids": ids }).to_string()))
+        .unwrap();
+    a.d.router.clone().oneshot(req).await.unwrap().status()
+}
+
+/// A T1 child's boot sweep queues one note per ask an earlier run left open.
+async fn boot_child_and_take_notes(
+    data_dir: &std::path::Path,
+    want: usize,
+) -> (Asks, PrincipalId, Vec<audit_child::Note>) {
+    let outbox = Arc::new(audit_child::Outbox::new());
+    let (a, owner) = child_on_dir(data_dir.to_path_buf(), outbox.clone()).await;
+    let mut notes = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while notes.len() < want && tokio::time::Instant::now() < deadline {
+        notes.extend(outbox.take(Duration::from_millis(100)).await.notes);
+    }
+    // Anything else the sweep still has to say.
+    notes.extend(outbox.take(Duration::from_millis(150)).await.notes);
+    (a, owner, notes)
+}
+
+/// The broker acknowledges by id, through the real route: a child that died
+/// before its note was polled audits the ask again on its next boot, and one
+/// whose note was acknowledged does not. An ack closes the rows it names and
+/// no other (a note never delivered stays open).
 #[tokio::test]
-async fn t1_child_death_before_audit_poll_does_not_lose_expired_ask() {
+async fn t1_ack_closes_only_the_named_asks_and_the_rest_come_back() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().canonicalize().unwrap().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
-
     let db = Arc::new(PaDb::new(data_dir.join("ikenga.db")));
     let pool = db.ensure_pool().await.unwrap();
+    let id1 = seed_stale_ask(&pool, "stale-1", 10_000).await;
+    let id2 = seed_stale_ask(&pool, "stale-2", 10_000).await;
 
-    // Seed an ask from an earlier run (created 10s ago)
-    let booted = chrono::Utc::now().timestamp_millis();
-    let ask_time = booted - 10_000;
-    sqlx::query(
-        "INSERT INTO shell_notifications \
-         (kind, title, source, dedupe_key, created_at, updated_at, sensitive) \
-         VALUES ('permission', 'Claude wants to use Bash', 'test', 'permission:hook:stale-1', ?, ?, 1)",
-    )
-    .bind(ask_time)
-    .bind(ask_time)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // Child run 1 sweeps the ask and queues note into outbox 1.
-    let outbox1 = Arc::new(audit_child::Outbox::new());
-    let (a1, _) = child_on_dir(data_dir.clone(), outbox1.clone()).await;
-    // Simulate child 1 dying before the broker's poll: drop outbox1 and a1 without acking.
+    // Child 1 sweeps both and dies before the broker polls.
+    let (a1, _, notes1) = boot_child_and_take_notes(&data_dir, 2).await;
+    assert_eq!(notes1.len(), 2, "{notes1:?}");
     drop(a1);
-    drop(outbox1);
+    tokio::time::sleep(Duration::from_millis(10)).await;
 
-    // Child run 2 starts on the same database. Its boot sweep must derive the expiry again!
-    let outbox2 = Arc::new(audit_child::Outbox::new());
-    let (a2, _) = child_on_dir(data_dir.clone(), outbox2.clone()).await;
-    let batch2 = outbox2.take(Duration::from_millis(1500)).await;
-    assert_eq!(batch2.notes.len(), 1, "child 2 must receive the unacknowledged swept note");
-    assert_eq!(batch2.notes[0].outcome.as_deref(), Some("expired:restart"));
+    // Child 2 must derive both again, each note carrying its row's id.
+    let (a2, owner2, notes2) = boot_child_and_take_notes(&data_dir, 2).await;
+    let mut ids: Vec<i64> = notes2.iter().filter_map(|n| n.ack_id).collect();
+    ids.sort();
+    assert_eq!(ids, vec![id1, id2], "{notes2:?}");
+    assert!(notes2
+        .iter()
+        .all(|n| n.outcome.as_deref() == Some("expired:restart")));
 
-    // Now the broker acknowledges the note.
-    let pool2 = a2.db.ensure_pool().await.unwrap();
-    crate::server::shared::notifications::routing::mark_all_swept_audited(&pool2).await;
+    // The broker appended only the first and acks only that id.
+    assert_eq!(post_ack(&a2, owner2, &[id1]).await, StatusCode::OK);
+    assert_eq!(decided_via(&pool, id1).await.as_deref(), Some("swept"));
+    assert_eq!(
+        decided_via(&pool, id2).await.as_deref(),
+        Some("swept-unaudited"),
+        "an ack for another row must not close this one"
+    );
     drop(a2);
-    drop(outbox2);
+    tokio::time::sleep(Duration::from_millis(10)).await;
 
-    // Child run 3 starts: since it was acknowledged, it must not be swept again.
-    let outbox3 = Arc::new(audit_child::Outbox::new());
-    let (_a3, _) = child_on_dir(data_dir.clone(), outbox3.clone()).await;
-    let batch3 = outbox3.take(Duration::from_millis(300)).await;
-    assert_eq!(batch3.notes.len(), 0, "acknowledged ask must not be queued again");
+    // Child 3 queues exactly the one that was never acknowledged.
+    let (_a3, _, notes3) = boot_child_and_take_notes(&data_dir, 1).await;
+    let ids3: Vec<i64> = notes3.iter().filter_map(|n| n.ack_id).collect();
+    assert_eq!(ids3, vec![id2], "{notes3:?}");
+}
+
+/// T0 writes the expiry itself: once per ask however many times it restarts.
+#[tokio::test]
+async fn t0_audits_an_expired_ask_once_across_restarts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(PaDb::new(tmp.path().join("ikenga.db")));
+    let pool = db.ensure_pool().await.unwrap();
+    let id = seed_stale_ask(&pool, "t0-once", 10_000).await;
+    let store = AccessStore::memory_t0().await;
+    let asks =
+        crate::server::hook_asks::HookAsks::with_store(db, PrincipalId::new_v7(), store.clone());
+    let count = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM audit_events WHERE kind = 'permission.refused'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+
+    asks.sweep_orphans_at(now).await;
+    assert_eq!(count().await, 1, "the first boot audits the expiry");
+    assert_eq!(decided_via(&pool, id).await.as_deref(), Some("swept"));
+
+    asks.sweep_orphans_at(now + 60_000).await;
+    asks.sweep_orphans_at(now + 120_000).await;
+    assert_eq!(count().await, 1, "later boots must not audit it again");
+}
+
+/// A failed audit write must not close the ask: it is audited at the next boot.
+#[tokio::test]
+async fn t0_keeps_an_expired_ask_open_when_the_audit_write_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(PaDb::new(tmp.path().join("ikenga.db")));
+    let pool = db.ensure_pool().await.unwrap();
+    let id = seed_stale_ask(&pool, "t0-fail", 10_000).await;
+    let owner = PrincipalId::new_v7();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let broken = AccessStore::memory_t0().await;
+    broken.pool().close().await;
+    crate::server::hook_asks::HookAsks::with_store(db.clone(), owner, broken)
+        .sweep_orphans_at(now)
+        .await;
+    assert_eq!(
+        decided_via(&pool, id).await.as_deref(),
+        Some("swept-unaudited"),
+        "the write failed: the expiry is not on the chain"
+    );
+
+    // The next boot, with a working store, audits it and then closes it.
+    let healthy = AccessStore::memory_t0().await;
+    crate::server::hook_asks::HookAsks::with_store(db, owner, healthy.clone())
+        .sweep_orphans_at(now + 60_000)
+        .await;
+    let n: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE kind = 'permission.refused'")
+            .fetch_one(healthy.pool())
+            .await
+            .unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(decided_via(&pool, id).await.as_deref(), Some("swept"));
+}
+
+/// With nowhere to record, the swept row is closed at once: otherwise every
+/// boot would sweep it again for nothing.
+#[tokio::test]
+async fn an_ask_swept_with_no_audit_sink_is_closed_not_retried_forever() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(PaDb::new(tmp.path().join("ikenga.db")));
+    let pool = db.ensure_pool().await.unwrap();
+    let id = seed_stale_ask(&pool, "no-sink", 10_000).await;
+    let now = chrono::Utc::now().timestamp_millis();
+    crate::server::hook_asks::HookAsks::without_audit(db, PrincipalId::new_v7())
+        .sweep_orphans_at(now)
+        .await;
+    assert_eq!(decided_via(&pool, id).await.as_deref(), Some("swept"));
+    let again =
+        crate::server::shared::notifications::routing::sweep_orphaned_asks(&pool, now + 60_000)
+            .await;
+    assert!(again.is_empty(), "{again:?}");
 }

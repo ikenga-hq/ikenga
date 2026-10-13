@@ -257,9 +257,13 @@ pub async fn post_hook_event(
             },
         );
 
-        let allowed = match decision {
-            Ok(Ok(HookDecision { decision, .. })) => decision == "approved",
-            _ => {
+        let (allowed, _audit) = settle_gate(
+            decision,
+            Arc::new(crate::notifications::host_side(&app)),
+            payload.tool_name.clone(),
+            payload.tool_input.clone(),
+            payload.cwd.clone(),
+            || {
                 // Timeout or channel closed. Emit a synthetic timeout so the
                 // permission inbox can mark the request as closed.
                 let _ = app.emit(
@@ -269,22 +273,8 @@ pub async fn post_hook_event(
                         decision: "denied".into(),
                     },
                 );
-                let host = crate::notifications::host_side(&app);
-                let tool_name = payload.tool_name.clone();
-                let tool_input = payload.tool_input.clone();
-                let cwd = payload.cwd.clone();
-                tauri::async_runtime::spawn(async move {
-                    audit_hook_gate_timeout(
-                        &host,
-                        tool_name.as_deref(),
-                        tool_input.as_ref(),
-                        cwd.as_deref(),
-                    )
-                    .await;
-                });
-                false
-            }
-        };
+            },
+        );
 
         // Deny is expressed as a `PreToolUse` permission decision, NOT as
         // `continue: false`. `continue: false` stops the entire Claude session
@@ -517,6 +507,38 @@ async fn handle_no_row_decision(
     }
 }
 
+/// What the held gate's wait meant. An answer is the human's (`approved`
+/// allows, anything else denies). No answer — the hold ran out or the channel
+/// closed — denies, runs `on_unanswered` (the synthetic `hooks://decision`),
+/// and puts the deny on the audit trail ([`audit_hook_gate_timeout`]), spawned
+/// so the hook reply is never held on the daemon. The handle is for the tests;
+/// the caller drops it.
+fn settle_gate(
+    decision: Result<Result<HookDecision, oneshot::error::RecvError>, tokio::time::error::Elapsed>,
+    host: Arc<dyn crate::server::shared::notifications::routing::HostSide>,
+    tool_name: Option<String>,
+    tool_input: Option<serde_json::Value>,
+    cwd: Option<String>,
+    on_unanswered: impl FnOnce(),
+) -> (bool, Option<tokio::task::JoinHandle<()>>) {
+    match decision {
+        Ok(Ok(HookDecision { decision, .. })) => (decision == "approved", None),
+        _ => {
+            on_unanswered();
+            let audit = tokio::spawn(async move {
+                audit_hook_gate_timeout(
+                    host.as_ref(),
+                    tool_name.as_deref(),
+                    tool_input.as_ref(),
+                    cwd.as_deref(),
+                )
+                .await;
+            });
+            (false, Some(audit))
+        }
+    }
+}
+
 /// Audit a desktop hook gate timeout (§5.5, review WP-D).
 pub(crate) async fn audit_hook_gate_timeout(
     host: &dyn crate::server::shared::notifications::routing::HostSide,
@@ -529,12 +551,7 @@ pub(crate) async fn audit_hook_gate_timeout(
         &format!("Claude wants to use {tool}"),
         120,
     );
-    let facts = crate::notifications::producers::ask_facts(
-        tool_name,
-        tool_input,
-        cwd,
-        false,
-    );
+    let facts = crate::notifications::producers::ask_facts(tool_name, tool_input, cwd, false);
     let sensitive = crate::server::shared::notifications::hook_ask::attribution(&facts, None)
         .sensitivity
         .level();
@@ -855,6 +872,82 @@ mod tests {
             entries.is_empty(),
             "ungated decision must not audit decided"
         );
+    }
+
+    /// Run [`settle_gate`] over a fake host. Returns whether it allowed, whether
+    /// `on_unanswered` ran, and what reached the audit trail.
+    async fn settled(
+        decision: Result<
+            Result<HookDecision, oneshot::error::RecvError>,
+            tokio::time::error::Elapsed,
+        >,
+    ) -> (bool, bool, Vec<(&'static str, String, serde_json::Value)>) {
+        let audited = Arc::new(Mutex::new(Vec::new()));
+        let fake = Arc::new(AuditingFake {
+            routing: Ok(Default::default()),
+            audited: audited.clone(),
+        });
+        let emitted = std::cell::Cell::new(false);
+        let (allowed, audit) = settle_gate(
+            decision,
+            fake,
+            Some("Bash".into()),
+            Some(serde_json::json!({ "command": "cargo test" })),
+            Some("/tmp/project".into()),
+            || emitted.set(true),
+        );
+        if let Some(audit) = audit {
+            audit.await.unwrap();
+        }
+        let entries = audited.lock().unwrap().clone();
+        (allowed, emitted.get(), entries)
+    }
+
+    /// The gate's hold ran out: denied, announced, and on the audit trail.
+    /// (The audit call is in `settle_gate`, which `post_hook_event` calls.)
+    #[tokio::test]
+    async fn a_gate_that_times_out_is_denied_and_audited() {
+        let (_tx, rx) = oneshot::channel::<HookDecision>();
+        let timed_out = timeout(Duration::from_millis(10), rx).await;
+        assert!(timed_out.is_err());
+        let (allowed, emitted, entries) = settled(timed_out).await;
+        assert!(!allowed);
+        assert!(emitted, "the synthetic hooks://decision still goes out");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].0, "permission.decided");
+        assert_eq!(entries[0].1, "Claude wants to use Bash");
+        assert_eq!(entries[0].2["decision"], "deny");
+        assert_eq!(entries[0].2["outcome"], "timed_out");
+    }
+
+    #[tokio::test]
+    async fn a_gate_whose_channel_closed_is_denied_and_audited() {
+        let (tx, rx) = oneshot::channel::<HookDecision>();
+        drop(tx);
+        let closed = timeout(Duration::from_secs(5), rx).await;
+        let (allowed, _, entries) = settled(closed).await;
+        assert!(!allowed);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].2["decision"], "deny");
+    }
+
+    /// A human's answer is audited by the decide path, not here, and
+    /// `approved` is the only thing that allows.
+    #[tokio::test]
+    async fn an_answered_gate_is_not_audited_as_a_timeout() {
+        for (answer, expect_allowed) in [("approved", true), ("denied", false)] {
+            let (tx, rx) = oneshot::channel::<HookDecision>();
+            tx.send(HookDecision {
+                request_id: "perm-1".into(),
+                decision: answer.into(),
+            })
+            .unwrap();
+            let got = timeout(Duration::from_secs(5), rx).await;
+            let (allowed, emitted, entries) = settled(got).await;
+            assert_eq!(allowed, expect_allowed, "{answer}");
+            assert!(!emitted, "{answer}");
+            assert!(entries.is_empty(), "{answer}: {entries:?}");
+        }
     }
 
     #[tokio::test]

@@ -101,6 +101,11 @@ pub struct Note {
     pub requested_by: Option<String>,
     pub project_key: Option<String>,
     pub by: Option<NoteBy>,
+    /// The swept `shell_notifications` row this note audits. The broker hands
+    /// it back in the ack once the row is on the chain, so the child closes
+    /// that row and no other. Never part of the chain row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_id: Option<i64>,
 }
 
 const DECISIONS: &[&str] = &["allow_once", "allow_always_project", "deny"];
@@ -197,22 +202,11 @@ pub fn outbox() -> Option<Arc<Outbox>> {
 pub struct WaitQuery {
     #[serde(rename = "waitMs")]
     pub wait_ms: Option<u64>,
-    pub ack: Option<bool>,
 }
 
 /// `GET /internal/audit/events` (principal child only; the route's `internal`
 /// requirement was checked by `auth_middleware`).
-pub async fn events_handler(
-    axum::extract::State(state): axum::extract::State<Arc<crate::server::AppState>>,
-    Query(q): Query<WaitQuery>,
-) -> Response {
-    if q.ack == Some(true) {
-        if let Some(pa_db) = &state.pa_db {
-            if let Ok(pool) = pa_db.ensure_pool().await {
-                crate::server::shared::notifications::routing::mark_all_swept_audited(&pool).await;
-            }
-        }
-    }
+pub async fn events_handler(Query(q): Query<WaitQuery>) -> Response {
     let Some(outbox) = outbox() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -220,13 +214,32 @@ pub async fn events_handler(
     Json(outbox.take(wait).await).into_response()
 }
 
-/// `POST /internal/audit/events/ack` (principal child only).
+/// What the broker acknowledges: the [`Note::ack_id`]s it appended to the
+/// chain (and only those).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Ack {
+    pub ids: Vec<i64>,
+}
+
+/// `POST /internal/audit/events/ack` (principal child only). Closes exactly
+/// the named swept asks; a failure is an error status, so the broker knows the
+/// rows stay open and will be audited again.
 pub async fn ack_handler(
     axum::extract::State(state): axum::extract::State<Arc<crate::server::AppState>>,
+    Json(ack): Json<Ack>,
 ) -> StatusCode {
-    if let Some(pa_db) = &state.pa_db {
-        if let Ok(pool) = pa_db.ensure_pool().await {
-            crate::server::shared::notifications::routing::mark_all_swept_audited(&pool).await;
+    let Some(pa_db) = &state.pa_db else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    let Ok(pool) = pa_db.ensure_pool().await else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    for id in ack.ids {
+        if let Err(e) =
+            crate::server::shared::notifications::routing::mark_swept_audited(&pool, id).await
+        {
+            tracing::warn!("audit ack: could not close swept ask {id}: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR;
         }
     }
     StatusCode::OK
@@ -366,6 +379,45 @@ fn build_event(
     Some(ev.detail(serde_json::Value::Object(detail)))
 }
 
+/// The broker's handling of one polled batch: append each note, and
+/// acknowledge to the child (`send_ack`) exactly the swept asks whose note is
+/// now on the chain. A note that was refused or whose write failed is not
+/// acknowledged, so the child audits it again on its next boot instead of
+/// losing it. Nothing is sent when no note was appended.
+pub async fn handle_batch<F, Fut>(
+    store: &AccessStore,
+    principal: PrincipalId,
+    batch: &Batch,
+    send_ack: F,
+) where
+    F: FnOnce(Vec<i64>) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut appended = Vec::new();
+    for note in &batch.notes {
+        match accept(store, principal, note).await {
+            Some(ev) => {
+                match crate::server::shared::notifications::routing::try_append_audit(store, &ev)
+                    .await
+                {
+                    Ok(()) => appended.extend(note.ack_id),
+                    Err(e) => tracing::warn!(
+                        "audit pump: child {principal}: could not append {}: {e:#}",
+                        ev.kind
+                    ),
+                }
+            }
+            None => tracing::warn!(
+                "audit pump: child {principal} sent a note outside the closed \
+                 vocabulary; dropped"
+            ),
+        }
+    }
+    if !appended.is_empty() && !send_ack(appended).await {
+        tracing::warn!("audit pump: child {principal} did not take the ack; it will re-audit");
+    }
+}
+
 /// Start the broker's reconcile loop (once, after the access store exists):
 /// one long-poll task per running principal child. Linux-only, like the
 /// broker it serves (`server::broker` is `#[cfg(target_os = "linux")]`).
@@ -457,33 +509,28 @@ pub fn spawn(children: Arc<crate::server::broker::children::Children>, store: Ac
                             b.dropped
                         );
                     }
-                    for note in &b.notes {
-                        match accept(&store, principal, note).await {
-                            Some(ev) => {
-                                crate::server::shared::notifications::routing::append_audit(
-                                    &store, &ev,
-                                )
-                                .await
-                            }
-                            None => tracing::warn!(
-                                "audit pump: child {principal} sent a note outside the closed \
-                                 vocabulary; dropped"
-                            ),
-                        }
-                    }
-                    if !b.notes.is_empty() {
+                    handle_batch(&store, principal, &b, |ids| async {
+                        let Ok(body) = serde_json::to_vec(&Ack { ids }) else {
+                            return false;
+                        };
                         let ack_url = format!("http://{}{ACK_PATH}", endpoint.addr);
-                        let _ = client
-                            .post(&ack_url)
-                            .bearer_auth(&*endpoint.token)
-                            .header(
-                                crate::server::broker::proxy::PRINCIPAL_HEADER,
-                                principal.to_string(),
-                            )
-                            .header(crate::access::INTERNAL_CALL_HEADER, "1")
-                            .send()
-                            .await;
-                    }
+                        matches!(
+                            client
+                                .post(&ack_url)
+                                .bearer_auth(&*endpoint.token)
+                                .header(
+                                    crate::server::broker::proxy::PRINCIPAL_HEADER,
+                                    principal.to_string(),
+                                )
+                                .header(crate::access::INTERNAL_CALL_HEADER, "1")
+                                .header("content-type", "application/json")
+                                .body(body)
+                                .send()
+                                .await,
+                            Ok(r) if r.status().is_success()
+                        )
+                    })
+                    .await;
                 }
                 None => {
                     failures += 1;
@@ -670,6 +717,7 @@ mod tests {
             requested_by: None,
             project_key: None,
             by: None,
+            ack_id: None,
         };
         let ev = accept(&store, me, &expired).await.unwrap();
         assert_eq!(ev.kind, "permission.refused");
@@ -684,6 +732,62 @@ mod tests {
         let detail: serde_json::Value = serde_json::from_str(&row.3).unwrap();
         assert_eq!(detail["reason"], "expired:restart");
         assert_eq!(detail["outcome"], "expired:restart");
+    }
+
+    fn expired(ack_id: Option<i64>) -> Note {
+        Note {
+            kind: Some(NoteKind::Refused),
+            target: Some("Claude wants to use Bash".into()),
+            outcome: Some("expired:restart".into()),
+            reason: Some("expired:restart".into()),
+            sensitive: 1,
+            ack_id,
+            ..Note::default()
+        }
+    }
+
+    /// Run [`handle_batch`] and return the ids it acknowledged (`None` if it
+    /// never asked the child to).
+    async fn acked_ids(store: &AccessStore, notes: Vec<Note>) -> Option<Vec<i64>> {
+        let seen = Arc::new(Mutex::new(None));
+        let batch = Batch { notes, dropped: 0 };
+        let sink = seen.clone();
+        handle_batch(store, PrincipalId::new_v7(), &batch, |ids| async move {
+            *sink.lock().unwrap() = Some(ids);
+            true
+        })
+        .await;
+        let got = seen.lock().unwrap().take();
+        got
+    }
+
+    /// The broker acknowledges what it appended, by id: a note it refused, or
+    /// one that carries no id, closes nothing.
+    #[tokio::test]
+    async fn the_broker_acks_exactly_the_ids_it_appended() {
+        let store = AccessStore::memory_t0().await;
+        let before = rows(&store).await.len();
+        let mut refused = expired(Some(8));
+        refused.outcome = Some("made-up".into());
+        let got = acked_ids(&store, vec![expired(Some(7)), refused, expired(None)]).await;
+        assert_eq!(got, Some(vec![7]), "only the appended note's id");
+        assert_eq!(
+            rows(&store).await.len() - before,
+            2,
+            "both valid notes are chained"
+        );
+        // Nothing appended, nothing acknowledged.
+        assert_eq!(acked_ids(&store, vec![expired(None)]).await, None);
+    }
+
+    /// An audit write that failed is not acknowledged: the child keeps the
+    /// ask open and audits it again at its next boot.
+    #[tokio::test]
+    async fn a_failed_audit_write_is_not_acknowledged() {
+        let store = AccessStore::memory_t0().await;
+        store.pool().close().await;
+        let got = acked_ids(&store, vec![expired(Some(7))]).await;
+        assert_eq!(got, None, "the write failed, so there is nothing to ack");
     }
 
     #[tokio::test]

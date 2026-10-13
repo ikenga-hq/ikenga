@@ -40,8 +40,8 @@
 //!
 //! What this does not do, and says so: a hook's `PermissionRequest` (Claude
 //! showing its own prompt in the terminal) is still not recorded as an
-//! open-terminal row, and the desktop's no-row path (`/iyke/hooks/decision`)
-//! is still unaudited. Both are follow-ups.
+//! open-terminal row (a follow-up). The desktop's no-row path
+//! (`/iyke/hooks/decision`) is audited by `iyke::hooks`, not here.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -243,6 +243,36 @@ impl HookAsks {
         })
     }
 
+    /// A test seam: the same machinery over an explicit access store.
+    #[cfg(test)]
+    pub(crate) fn with_store(
+        db: Arc<crate::db::PaDb>,
+        owner: PrincipalId,
+        store: AccessStore,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            db,
+            audit: AuditSink::Store(store),
+            owner,
+        })
+    }
+
+    /// A test seam: a gate that has nowhere to record.
+    #[cfg(test)]
+    pub(crate) fn without_audit(db: Arc<crate::db::PaDb>, owner: PrincipalId) -> Arc<Self> {
+        Arc::new(Self {
+            db,
+            audit: AuditSink::Off,
+            owner,
+        })
+    }
+
+    /// A test seam: [`Self::sweep_orphans`] awaited, at an explicit boot time.
+    #[cfg(test)]
+    pub(crate) async fn sweep_orphans_at(&self, before: i64) {
+        self.sweep_orphans_before(before).await
+    }
+
     fn audit_to(&self) -> AuditTo<'_> {
         match &self.audit {
             AuditSink::Store(s) => AuditTo::Store(s),
@@ -265,23 +295,30 @@ impl HookAsks {
         };
         let me = self.clone();
         let before = chrono::Utc::now().timestamp_millis();
-        rt.spawn(async move {
-            match me.pool().await {
-                Ok(pool) => {
-                    let swept = routing::sweep_orphaned_asks(&pool, before).await;
-                    if !swept.is_empty() {
-                        debug!("hook asks: closed {} rows from an earlier run", swept.len());
-                        for ask in swept {
-                            me.audit_swept_ask(&ask).await;
-                        }
-                    }
-                }
-                Err(e) => debug!("hook asks: no pool for the boot sweep: {e}"),
-            }
-        });
+        rt.spawn(async move { me.sweep_orphans_before(before).await });
     }
 
-    async fn audit_swept_ask(&self, ask: &routing::SweptAsk) {
+    /// [`Self::sweep_orphans`]'s body, awaitable.
+    async fn sweep_orphans_before(&self, before: i64) {
+        match self.pool().await {
+            Ok(pool) => {
+                let swept = routing::sweep_orphaned_asks(&pool, before).await;
+                if !swept.is_empty() {
+                    debug!("hook asks: closed {} rows from an earlier run", swept.len());
+                    for ask in swept {
+                        self.audit_swept_ask(&pool, &ask).await;
+                    }
+                }
+            }
+            Err(e) => debug!("hook asks: no pool for the boot sweep: {e}"),
+        }
+    }
+
+    /// Put one swept ask's expiry on the audit trail, and close the row only
+    /// once it is there. The row stays `swept-unaudited` (so the next boot
+    /// audits it again) while the write failed (T0), or until the broker
+    /// acknowledges this row's id (T1, [`Note::ack_id`]).
+    async fn audit_swept_ask(&self, pool: &sqlx::SqlitePool, ask: &routing::SweptAsk) {
         let note = Note {
             kind: Some(NoteKind::Refused),
             target: Some(ask.title.clone()),
@@ -295,22 +332,43 @@ impl HookAsks {
                 .as_ref()
                 .map(|p| format!("{}/{p}", self.owner)),
             by: None,
+            ack_id: Some(ask.id),
         };
-        match &self.audit {
+        let closed = match &self.audit {
             AuditSink::Store(store) => match child::system_event(self.owner, &note) {
-                Some(ev) => {
-                    routing::append_audit(store, &ev).await;
-                    if let Ok(pool) = self.pool().await {
-                        routing::mark_swept_audited(&pool, ask.id).await;
+                Some(ev) => match routing::try_append_audit(store, &ev).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(
+                            "hook asks: {} not audited ({e:#}); retried at next boot",
+                            Outcome::ExpiredRestart.as_str()
+                        );
+                        false
                     }
+                },
+                None => {
+                    warn!("hook asks: an outcome note failed its own vocabulary");
+                    false
                 }
-                None => warn!("hook asks: an outcome note failed its own vocabulary"),
             },
-            AuditSink::Outbox(outbox) => outbox.push(note),
-            AuditSink::Off => debug!(
-                "hook asks: no audit sink; {} not recorded",
-                Outcome::ExpiredRestart.as_str()
-            ),
+            AuditSink::Outbox(outbox) => {
+                outbox.push(note);
+                false
+            }
+            // Nothing can ever record it: close the row, or every boot would
+            // sweep it again for nothing.
+            AuditSink::Off => {
+                debug!(
+                    "hook asks: no audit sink; {} not recorded",
+                    Outcome::ExpiredRestart.as_str()
+                );
+                true
+            }
+        };
+        if closed {
+            if let Err(e) = routing::mark_swept_audited(pool, ask.id).await {
+                warn!("hook asks: could not close swept ask {}: {e}", ask.id);
+            }
         }
     }
 
@@ -453,6 +511,7 @@ impl HookAsks {
             requested_by: None,
             project_key: project_id.map(|p| format!("{}/{p}", self.owner)),
             by: None,
+            ack_id: None,
         };
         match &self.audit {
             AuditSink::Store(store) => match child::system_event(self.owner, &note) {

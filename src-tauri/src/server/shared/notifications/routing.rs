@@ -1174,24 +1174,26 @@ pub fn audit_event_for(ctx: Option<&AccessCtx>, report: &DecideReport) -> Option
 
 /// Append one non-access-changing audit row (`permission.*` continue when
 /// the chain is degraded, §6.4) in its own transaction. Best effort: the
-/// decision already happened.
+/// decision already happened. A caller that must know whether the row landed
+/// (the expiry audit, which is retried until it does) uses [`try_append_audit`].
 pub async fn append_audit(store: &AccessStore, ev: &Event) {
-    let r = async {
-        let mut conn = store.pool().acquire().await?;
-        let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
-        let head = store
-            .chain()
-            .append(&mut tx, ev)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        tx.commit().await?;
-        store.chain().committed(head);
-        anyhow::Ok(())
-    }
-    .await;
-    if let Err(e) = r {
+    if let Err(e) = try_append_audit(store, ev).await {
         tracing::warn!("access audit {}: {e:#}", ev.kind);
     }
+}
+
+/// [`append_audit`], returning the failure instead of logging it.
+pub async fn try_append_audit(store: &AccessStore, ev: &Event) -> anyhow::Result<()> {
+    let mut conn = store.pool().acquire().await?;
+    let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
+    let head = store
+        .chain()
+        .append(&mut tx, ev)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    tx.commit().await?;
+    store.chain().committed(head);
+    Ok(())
 }
 
 // ─── the T0 ask relay (§5.5 (a)) ────────────────────────────────────────────
@@ -1625,26 +1627,19 @@ pub struct SweptAsk {
     pub project_id: Option<String>,
 }
 
-/// Mark a swept ask as audited in the database so subsequent restarts will not
-/// derive its expiry again.
-pub async fn mark_swept_audited(pool: &sqlx::SqlitePool, id: i64) {
-    let _ = sqlx::query(
+/// Mark one swept ask as audited, so a later restart does not derive its
+/// expiry again. Called only after the audit row was written (T0, desktop) or
+/// the broker acknowledged this very row (T1). Returns whether a row changed;
+/// an `Err` leaves the ask `swept-unaudited`, to be audited again next boot.
+pub async fn mark_swept_audited(pool: &sqlx::SqlitePool, id: i64) -> Result<bool, sqlx::Error> {
+    let done = sqlx::query(
         "UPDATE shell_notifications SET decided_via = 'swept' \
          WHERE id = ? AND decided_via = 'swept-unaudited'",
     )
     .bind(id)
     .execute(pool)
-    .await;
-}
-
-/// Mark all swept-unaudited asks as audited.
-pub async fn mark_all_swept_audited(pool: &sqlx::SqlitePool) {
-    let _ = sqlx::query(
-        "UPDATE shell_notifications SET decided_via = 'swept' \
-         WHERE decided_via = 'swept-unaudited'",
-    )
-    .execute(pool)
-    .await;
+    .await?;
+    Ok(done.rows_affected() > 0)
 }
 
 /// Review WP75-RV2: close the hook / ACP asks an earlier run left open.
@@ -1656,6 +1651,12 @@ pub async fn mark_all_swept_audited(pool: &sqlx::SqlitePool) {
 /// `permission_relay_resolve {outcome: 'cancelled'}` so the daemon retracts
 /// a `permission.decided` it wrote for a decision that never took effect.
 /// `before_ms` is this process's start: an ask raised since is live.
+///
+/// A swept row is left `decided_via = 'swept-unaudited'` until its expiry is
+/// on the audit chain ([`mark_swept_audited`]). A later boot therefore returns
+/// it again, so a crash between the sweep and the audit cannot lose the
+/// expiry; the guarantee is at-least-once (a crash between the append and the
+/// mark writes the row twice).
 pub async fn sweep_orphaned_asks(pool: &sqlx::SqlitePool, before_ms: i64) -> Vec<SweptAsk> {
     let rows: Vec<(i64, String, String, i64, Option<String>)> = match sqlx::query_as(
         "SELECT id, dedupe_key, title, sensitive, project_id FROM shell_notifications \
@@ -1964,6 +1965,7 @@ pub fn note_for(
             via: by.via.to_string(),
             device_id: by.device_id,
         }),
+        ack_id: None,
     })
 }
 
