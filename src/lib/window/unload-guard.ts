@@ -14,9 +14,12 @@
 
 import { isBrowserSession } from '@/lib/transport';
 import { useTerminalStore } from '@/terminal/session-store';
+import { isTerminalUnloadGuardSuspended } from './unload-suspend';
 
-/** The `beforeunload` handler: standard "ask before leaving" prompt. */
+/** The `beforeunload` handler: standard "ask before leaving" prompt. It stands
+ *  aside for a reload the user asked for (`withTerminalGuardSuspended`). */
 export function beforeUnloadPrompt(e: BeforeUnloadEvent): string {
+	if (isTerminalUnloadGuardSuspended()) return '';
 	e.preventDefault();
 	// Legacy browsers read `returnValue`; modern ones show their own text.
 	e.returnValue = '';

@@ -12,7 +12,9 @@ export interface InstallPromptEvent extends Event {
 }
 
 interface PwaState {
-	/** A new worker installed and waiting for this page to hand over. */
+	/** A newer worker than this page's code: installed and waiting for this
+	 *  page to hand over, or (after another tab updated) already in control
+	 *  of a page still running the old code. Either way the banner shows. */
 	waiting: ServiceWorker | null;
 	/** The deferred install prompt, when the browser offered one. */
 	installPrompt: InstallPromptEvent | null;

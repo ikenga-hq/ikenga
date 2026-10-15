@@ -15,13 +15,33 @@
 // `applyUpdate()` posts `SKIP_WAITING` and the page reloads once on the
 // resulting `controllerchange`. The first install's `clients.claim()` also
 // fires `controllerchange`, which must NOT reload — hence `reloadRequested`.
+//
+// Two ways the hand-over can find the world already moved on, both handled:
+//   - the stored worker is no longer waiting (another tab applied the update,
+//     or it activated by itself): `SKIP_WAITING` would be a no-op and no
+//     `controllerchange` would ever come, so `applyUpdate()` just reloads;
+//   - a `controllerchange` this tab did not ask for (another tab updated):
+//     this tab runs old code under a new worker. It is NOT reloaded — the
+//     user may be mid-work — but the banner is raised so they can.
+// And if `SKIP_WAITING` is posted yet no `controllerchange` follows, the
+// reload happens anyway after `HANDOVER_TIMEOUT_MS`.
+//
+// The reload itself is a deliberate one: it steps past the terminal "Leave
+// site?" prompt (see `withTerminalGuardSuspended`) but NOT past the
+// unsaved-edits one.
 
 import { isTauri } from '@/lib/transport';
+import {
+	_resetUnloadSuspendForTests,
+	withTerminalGuardSuspended,
+} from '@/lib/window/unload-suspend';
 import { SKIP_WAITING_MESSAGE } from './sw-logic';
 import { type InstallPromptEvent, usePwaStore } from './update-store';
 
 export const SW_URL = '/sw.js';
 const UPDATE_INTERVAL_MS = 60 * 60 * 1000;
+/** How long to wait for `controllerchange` after `SKIP_WAITING` before reloading anyway. */
+export const HANDOVER_TIMEOUT_MS = 3000;
 
 export type RegistrationBlocker = 'tauri' | 'dev' | 'unsupported' | 'insecure';
 
@@ -52,9 +72,24 @@ export function currentRegistrationEnv(): RegistrationEnv {
 }
 
 let reloadRequested = false;
+let handoverTimer: ReturnType<typeof setTimeout> | null = null;
+/** Did this page already run under a controller? A `controllerchange` from
+ *  none to one is the first install's claim, not an update. */
+let hadController = false;
 let reloadPage: () => void = () => window.location.reload();
 let registration: ServiceWorkerRegistration | null = null;
 let started = false;
+
+function clearHandoverTimer(): void {
+	if (handoverTimer !== null) clearTimeout(handoverTimer);
+	handoverTimer = null;
+}
+
+/** The reload for an update: the user asked for it, so the terminal prompt
+ *  stands aside; the unsaved-edits prompt still applies. */
+function reloadForUpdate(): void {
+	withTerminalGuardSuspended(() => reloadPage());
+}
 
 /** Record `worker` as waiting once it has installed — but only as an UPDATE:
  *  with no controller this is the first install, which needs no reload. */
@@ -91,10 +126,21 @@ export async function registerServiceWorker(
 	});
 	window.addEventListener('appinstalled', () => usePwaStore.getState().setInstallPrompt(null));
 
+	hadController = container.controller != null;
 	container.addEventListener('controllerchange', () => {
-		if (!reloadRequested) return;
-		reloadRequested = false;
-		reloadPage();
+		const hadBefore = hadController;
+		hadController = container.controller != null;
+		if (reloadRequested) {
+			reloadRequested = false;
+			clearHandoverTimer();
+			reloadForUpdate();
+			return;
+		}
+		// Not ours. The first install's claim (no controller before) needs
+		// nothing; anything else means a newer worker took over while this
+		// tab still runs the old code. Raise the banner, never auto-reload.
+		const { waiting, setWaiting } = usePwaStore.getState();
+		if (hadBefore && !waiting && container.controller) setWaiting(container.controller);
 	});
 
 	try {
@@ -123,16 +169,29 @@ export async function registerServiceWorker(
 
 /**
  * "Reload to update": hand control to the waiting worker, then reload once it
- * has taken over. With no waiting worker this is a plain reload.
+ * has taken over. With no waiting worker, or one that is not waiting any more
+ * (already active, or gone redundant: `SKIP_WAITING` would do nothing and no
+ * `controllerchange` would follow), this is a plain reload.
  */
 export function applyUpdate(): void {
 	const waiting = usePwaStore.getState().waiting;
-	if (!waiting || typeof navigator === 'undefined' || !navigator.serviceWorker?.controller) {
-		reloadPage();
+	const controller =
+		typeof navigator === 'undefined' ? null : (navigator.serviceWorker?.controller ?? null);
+	if (!waiting || !controller || waiting.state !== 'installed' || waiting === controller) {
+		reloadForUpdate();
 		return;
 	}
 	reloadRequested = true;
 	waiting.postMessage(SKIP_WAITING_MESSAGE);
+	// If the takeover never signals, reload anyway rather than sit on a banner
+	// that does nothing.
+	clearHandoverTimer();
+	handoverTimer = setTimeout(() => {
+		handoverTimer = null;
+		if (!reloadRequested) return;
+		reloadRequested = false;
+		reloadForUpdate();
+	}, HANDOVER_TIMEOUT_MS);
 }
 
 /** Resolves once `worker` has finished installing (or failed), or on timeout. */
@@ -195,6 +254,9 @@ export async function recoverStaleShell(): Promise<boolean> {
 export function _resetRegisterForTests(reload?: () => void): void {
 	reloadPage = reload ?? (() => window.location.reload());
 	reloadRequested = false;
+	clearHandoverTimer();
+	hadController = false;
+	_resetUnloadSuspendForTests();
 	registration = null;
 	started = false;
 }
