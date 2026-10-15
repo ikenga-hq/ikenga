@@ -228,6 +228,11 @@ impl Default for AccessOptions {
 /// `internal` arm accepts — fail closed, whatever the relay's caps.
 pub const INTERNAL_CALL_HEADER: &str = "x-ikenga-internal-call";
 
+/// Set only by the T1 broker when the principal is an admin (the broker strips
+/// every client `x-ikenga-*` header). Lives here, not in `server::broker`,
+/// because that module is Linux-only and this one builds on every platform.
+pub const ADMIN_HEADER: &str = "x-ikenga-admin";
+
 pub const DEFAULT_INVITE_TTL_DAYS: u32 = 7;
 pub const MAX_INVITE_TTL_DAYS: u32 = 30;
 
@@ -499,7 +504,7 @@ impl DaemonAccess {
             .unwrap_or(self.owner);
         let broker_call = header(INTERNAL_CALL_HEADER).as_deref() == Some("1")
             && !headers.contains_key("x-ikenga-caps");
-        let is_admin = header(crate::server::broker::proxy::ADMIN_HEADER).as_deref() == Some("1");
+        let is_admin = header(ADMIN_HEADER).as_deref() == Some("1");
         AccessCtx {
             principal_id,
             via: if broker_call {
