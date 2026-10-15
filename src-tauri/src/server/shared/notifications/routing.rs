@@ -1174,24 +1174,26 @@ pub fn audit_event_for(ctx: Option<&AccessCtx>, report: &DecideReport) -> Option
 
 /// Append one non-access-changing audit row (`permission.*` continue when
 /// the chain is degraded, §6.4) in its own transaction. Best effort: the
-/// decision already happened.
+/// decision already happened. A caller that must know whether the row landed
+/// (the expiry audit, which is retried until it does) uses [`try_append_audit`].
 pub async fn append_audit(store: &AccessStore, ev: &Event) {
-    let r = async {
-        let mut conn = store.pool().acquire().await?;
-        let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
-        let head = store
-            .chain()
-            .append(&mut tx, ev)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        tx.commit().await?;
-        store.chain().committed(head);
-        anyhow::Ok(())
-    }
-    .await;
-    if let Err(e) = r {
+    if let Err(e) = try_append_audit(store, ev).await {
         tracing::warn!("access audit {}: {e:#}", ev.kind);
     }
+}
+
+/// [`append_audit`], returning the failure instead of logging it.
+pub async fn try_append_audit(store: &AccessStore, ev: &Event) -> anyhow::Result<()> {
+    let mut conn = store.pool().acquire().await?;
+    let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
+    let head = store
+        .chain()
+        .append(&mut tx, ev)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    tx.commit().await?;
+    store.chain().committed(head);
+    Ok(())
 }
 
 // ─── the T0 ask relay (§5.5 (a)) ────────────────────────────────────────────
@@ -1615,21 +1617,55 @@ impl Relay {
     }
 }
 
-/// Desktop boot (review WP75-RV2): the hook / ACP asks an earlier desktop
-/// run left open. Their hold (the hook gate's parked response, the ACP
+/// What an orphaned ask was, for attribution in audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweptAsk {
+    pub id: i64,
+    pub dedupe_key: String,
+    pub title: String,
+    pub sensitive: i64,
+    pub project_id: Option<String>,
+}
+
+/// Mark one swept ask as audited, so a later restart does not derive its
+/// expiry again. Called only after the audit row was written (T0, desktop) or
+/// the broker acknowledged this very row (T1). Returns whether a row changed;
+/// an `Err` leaves the ask `swept-unaudited`, to be audited again next boot.
+pub async fn mark_swept_audited(pool: &sqlx::SqlitePool, id: i64) -> Result<bool, sqlx::Error> {
+    let done = sqlx::query(
+        "UPDATE shell_notifications SET decided_via = 'swept' \
+         WHERE id = ? AND decided_via = 'swept-unaudited'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Review WP75-RV2: close the hook / ACP asks an earlier run left open.
+/// Each (the in-flight request, the hook connection, or the remote
 /// round-trip) died with that process, so none can still take a decision —
 /// including a remote decision the relay delivered just before a crash and
 /// the desktop never applied. Each is resolved here (the ask is over) and
-/// its key returned, for the desktop to report to the daemon as
+/// its record returned, for callers to audit and report to the daemon as
 /// `permission_relay_resolve {outcome: 'cancelled'}` so the daemon retracts
 /// a `permission.decided` it wrote for a decision that never took effect.
 /// `before_ms` is this process's start: an ask raised since is live.
-pub async fn sweep_orphaned_asks(pool: &sqlx::SqlitePool, before_ms: i64) -> Vec<String> {
-    let rows: Vec<(i64, String)> = match sqlx::query_as(
-        "SELECT id, dedupe_key FROM shell_notifications \
-         WHERE kind = 'permission' AND resolved_at IS NULL AND created_at < ? \
+///
+/// A swept row is left `decided_via = 'swept-unaudited'` until its expiry is
+/// on the audit chain ([`mark_swept_audited`]). A later boot therefore returns
+/// it again, so a crash between the sweep and the audit cannot lose the
+/// expiry; the guarantee is at-least-once (a crash between the append and the
+/// mark writes the row twice).
+pub async fn sweep_orphaned_asks(pool: &sqlx::SqlitePool, before_ms: i64) -> Vec<SweptAsk> {
+    let rows: Vec<(i64, String, String, i64, Option<String>)> = match sqlx::query_as(
+        "SELECT id, dedupe_key, title, sensitive, project_id FROM shell_notifications \
+         WHERE kind = 'permission' \
+           AND ((resolved_at IS NULL AND created_at < ?) \
+                OR (decided_via = 'swept-unaudited' AND resolved_at < ?)) \
            AND (dedupe_key LIKE 'permission:hook:%' OR dedupe_key LIKE 'permission:acp:%')",
     )
+    .bind(before_ms)
     .bind(before_ms)
     .fetch_all(pool)
     .await
@@ -1641,11 +1677,12 @@ pub async fn sweep_orphaned_asks(pool: &sqlx::SqlitePool, before_ms: i64) -> Vec
         }
     };
     let now = now_ms();
-    let mut keys = Vec::with_capacity(rows.len());
-    for (id, key) in rows {
+    let mut swept = Vec::with_capacity(rows.len());
+    for (id, dedupe_key, title, sensitive, project_id) in rows {
         let r = sqlx::query(
-            "UPDATE shell_notifications SET resolved_at = ?, read_at = COALESCE(read_at, ?) \
-             WHERE id = ? AND resolved_at IS NULL",
+            "UPDATE shell_notifications SET resolved_at = ?, read_at = COALESCE(read_at, ?), \
+             decided_via = 'swept-unaudited' \
+             WHERE id = ? AND (resolved_at IS NULL OR decided_via = 'swept-unaudited')",
         )
         .bind(now)
         .bind(now)
@@ -1653,15 +1690,21 @@ pub async fn sweep_orphaned_asks(pool: &sqlx::SqlitePool, before_ms: i64) -> Vec
         .execute(pool)
         .await;
         match r {
-            Ok(done) if done.rows_affected() > 0 => keys.push(key),
+            Ok(done) if done.rows_affected() > 0 => swept.push(SweptAsk {
+                id,
+                dedupe_key,
+                title,
+                sensitive,
+                project_id,
+            }),
             Ok(_) => {}
-            Err(e) => log::warn!(target: "ikenga::notifications", "orphaned ask {key}: {e}"),
+            Err(e) => log::warn!(target: "ikenga::notifications", "orphaned ask {dedupe_key}: {e}"),
         }
     }
-    if !keys.is_empty() {
+    if !swept.is_empty() {
         super::publish(ChangeReason::Read, None);
     }
-    keys
+    swept
 }
 
 /// The daemon's resolver table: only the relay (§5.5).
@@ -1922,6 +1965,7 @@ pub fn note_for(
             via: by.via.to_string(),
             device_id: by.device_id,
         }),
+        ack_id: None,
     })
 }
 
@@ -3571,7 +3615,8 @@ mod tests {
             .unwrap()
             .unwrap()
             .id;
-        let mut keys = sweep_orphaned_asks(&pool, booted).await;
+        let swept = sweep_orphaned_asks(&pool, booted).await;
+        let mut keys: Vec<String> = swept.into_iter().map(|s| s.dedupe_key).collect();
         keys.sort();
         assert_eq!(keys, ["permission:acp:t1:r1", "permission:hook:crash"]);
         for (id, swept) in [

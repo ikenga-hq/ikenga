@@ -80,6 +80,9 @@ pub struct HookDecision {
 /// Pending decision for a held `PreToolUse` hook.
 struct HeldRequest {
     tx: oneshot::Sender<HookDecision>,
+    tool_name: Option<String>,
+    tool_input: Option<serde_json::Value>,
+    cwd: Option<String>,
 }
 
 static HELD_REQUESTS: OnceLock<Arc<Mutex<HashMap<String, HeldRequest>>>> = OnceLock::new();
@@ -175,7 +178,12 @@ pub async fn post_hook_event(
 
         let (tx, rx) = oneshot::channel::<HookDecision>();
         {
-            let held = HeldRequest { tx };
+            let held = HeldRequest {
+                tx,
+                tool_name: payload.tool_name.clone(),
+                tool_input: payload.tool_input.clone(),
+                cwd: payload.cwd.clone(),
+            };
             if let Ok(mut map) = get_held_requests().lock() {
                 map.insert(request_id.clone(), held);
             }
@@ -249,9 +257,13 @@ pub async fn post_hook_event(
             },
         );
 
-        let allowed = match decision {
-            Ok(Ok(HookDecision { decision, .. })) => decision == "approved",
-            _ => {
+        let (allowed, _audit) = settle_gate(
+            decision,
+            Arc::new(crate::notifications::host_side(&app)),
+            payload.tool_name.clone(),
+            payload.tool_input.clone(),
+            payload.cwd.clone(),
+            || {
                 // Timeout or channel closed. Emit a synthetic timeout so the
                 // permission inbox can mark the request as closed.
                 let _ = app.emit(
@@ -261,9 +273,8 @@ pub async fn post_hook_event(
                         decision: "denied".into(),
                     },
                 );
-                false
-            }
-        };
+            },
+        );
 
         // Deny is expressed as a `PreToolUse` permission decision, NOT as
         // `continue: false`. `continue: false` stops the entire Claude session
@@ -426,10 +437,17 @@ pub async fn post_hook_decision(
     // No row to decide through (the record is slow or failed, or routing
     // never installed — no `PaDb`): still never answer past the routing
     // preference (§5.1; reviews WP75-R10, WP75-RV1). The host's routing is
-    // read from the AppHandle either way, so this fails closed. This path
-    // writes no `decided_*` and no audit — there is no row to attribute.
+    // read from the AppHandle either way, so this fails closed.
     let host = crate::notifications::host_side(&app);
-    match answer_without_row(&host, || resolve_held(&app, &decision.request_id, approved)).await {
+    let held_facts = get_held_requests().lock().ok().and_then(|map| {
+        map.get(&decision.request_id)
+            .map(|h| (h.tool_name.clone(), h.tool_input.clone(), h.cwd.clone()))
+    });
+    match handle_no_row_decision(&host, approved, held_facts, || {
+        resolve_held(&app, &decision.request_id, approved)
+    })
+    .await
+    {
         Ok(was_gated) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -442,6 +460,108 @@ pub async fn post_hook_decision(
             Json(serde_json::json!({ "recorded": false, "error": e.to_string() })),
         ),
     }
+}
+
+async fn handle_no_row_decision(
+    host: &dyn crate::server::shared::notifications::routing::HostSide,
+    approved: bool,
+    held_facts: Option<(Option<String>, Option<serde_json::Value>, Option<String>)>,
+    answer: impl FnOnce() -> bool,
+) -> Result<bool, crate::access::AccessError> {
+    let tool_name = held_facts.as_ref().and_then(|(n, _, _)| n.as_deref());
+    let tool_input = held_facts.as_ref().and_then(|(_, i, _)| i.as_ref());
+    let cwd = held_facts.as_ref().and_then(|(_, _, c)| c.as_deref());
+    let tool = tool_name.filter(|t| !t.is_empty()).unwrap_or("a tool");
+    let target = crate::server::shared::notifications::run::truncate(
+        &format!("Claude wants to use {tool}"),
+        120,
+    );
+    let facts = crate::server::shared::notifications::hook_ask::ask_facts(
+        tool_name, tool_input, cwd, false,
+    );
+    let sensitive = crate::server::shared::notifications::hook_ask::attribution(&facts, None)
+        .sensitivity
+        .level();
+
+    match answer_without_row(host, answer).await {
+        Ok(was_gated) => {
+            if was_gated {
+                let detail = serde_json::json!({
+                    "decision": if approved { "allow_once" } else { "deny" },
+                    "sensitive": sensitive,
+                    "requested_by": null,
+                });
+                host.audit_local("permission.decided", target, detail).await;
+            }
+            Ok(was_gated)
+        }
+        Err(e) => {
+            host.audit_local(
+                "permission.refused",
+                target,
+                serde_json::json!({ "reason": "routing_refused" }),
+            )
+            .await;
+            Err(e)
+        }
+    }
+}
+
+/// What the held gate's wait meant. An answer is the human's (`approved`
+/// allows, anything else denies). No answer — the hold ran out or the channel
+/// closed — denies, runs `on_unanswered` (the synthetic `hooks://decision`),
+/// and puts the deny on the audit trail ([`audit_hook_gate_timeout`]), spawned
+/// so the hook reply is never held on the daemon. The handle is for the tests;
+/// the caller drops it.
+fn settle_gate(
+    decision: Result<Result<HookDecision, oneshot::error::RecvError>, tokio::time::error::Elapsed>,
+    host: Arc<dyn crate::server::shared::notifications::routing::HostSide>,
+    tool_name: Option<String>,
+    tool_input: Option<serde_json::Value>,
+    cwd: Option<String>,
+    on_unanswered: impl FnOnce(),
+) -> (bool, Option<tokio::task::JoinHandle<()>>) {
+    match decision {
+        Ok(Ok(HookDecision { decision, .. })) => (decision == "approved", None),
+        _ => {
+            on_unanswered();
+            let audit = tokio::spawn(async move {
+                audit_hook_gate_timeout(
+                    host.as_ref(),
+                    tool_name.as_deref(),
+                    tool_input.as_ref(),
+                    cwd.as_deref(),
+                )
+                .await;
+            });
+            (false, Some(audit))
+        }
+    }
+}
+
+/// Audit a desktop hook gate timeout (§5.5, review WP-D).
+pub(crate) async fn audit_hook_gate_timeout(
+    host: &dyn crate::server::shared::notifications::routing::HostSide,
+    tool_name: Option<&str>,
+    tool_input: Option<&serde_json::Value>,
+    cwd: Option<&str>,
+) {
+    let tool = tool_name.filter(|t| !t.is_empty()).unwrap_or("a tool");
+    let target = crate::server::shared::notifications::run::truncate(
+        &format!("Claude wants to use {tool}"),
+        120,
+    );
+    let facts = crate::notifications::producers::ask_facts(tool_name, tool_input, cwd, false);
+    let sensitive = crate::server::shared::notifications::hook_ask::attribution(&facts, None)
+        .sensitivity
+        .level();
+    let detail = serde_json::json!({
+        "decision": "deny",
+        "outcome": "timed_out",
+        "sensitive": sensitive,
+        "requested_by": null,
+    });
+    host.audit_local("permission.decided", target, detail).await;
 }
 
 /// The no-row fallback (review WP75-RV1): reads the host's routing from
@@ -634,9 +754,218 @@ mod tests {
     fn held_requests_map_isolated() {
         let map = get_held_requests();
         let (tx, _rx) = oneshot::channel::<HookDecision>();
-        map.lock()
-            .unwrap()
-            .insert("perm-123".into(), HeldRequest { tx });
+        map.lock().unwrap().insert(
+            "perm-123".into(),
+            HeldRequest {
+                tx,
+                tool_name: None,
+                tool_input: None,
+                cwd: None,
+            },
+        );
         assert!(map.lock().unwrap().contains_key("perm-123"));
+    }
+
+    struct AuditingFake {
+        routing: Result<
+            crate::server::shared::notifications::routing::HostRouting,
+            crate::access::AccessError,
+        >,
+        audited: Arc<Mutex<Vec<(&'static str, String, serde_json::Value)>>>,
+    }
+
+    impl crate::server::shared::notifications::routing::HostSide for AuditingFake {
+        fn host_routing(
+            &self,
+        ) -> futures_util::future::BoxFuture<
+            '_,
+            Result<
+                crate::server::shared::notifications::routing::HostRouting,
+                crate::access::AccessError,
+            >,
+        > {
+            let r = self.routing.clone();
+            Box::pin(async move { r })
+        }
+
+        fn audit_local(
+            &self,
+            kind: &'static str,
+            target: String,
+            detail: serde_json::Value,
+        ) -> futures_util::future::BoxFuture<'_, ()> {
+            self.audited.lock().unwrap().push((kind, target, detail));
+            Box::pin(async {})
+        }
+    }
+
+    #[tokio::test]
+    async fn no_row_decision_admitted_audits_permission_decided() {
+        use crate::server::shared::notifications::routing::HostRouting;
+
+        let audited = Arc::new(Mutex::new(Vec::new()));
+        let fake = AuditingFake {
+            routing: Ok(HostRouting {
+                routing_ok: true,
+                ..Default::default()
+            }),
+            audited: audited.clone(),
+        };
+        let facts = Some((
+            Some("Bash".to_string()),
+            Some(serde_json::json!({ "command": "cargo test" })),
+            Some("/tmp/project".to_string()),
+        ));
+        let res = handle_no_row_decision(&fake, true, facts, || true).await;
+        assert_eq!(res.unwrap(), true);
+        let entries = audited.lock().unwrap().clone();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "permission.decided");
+        assert_eq!(entries[0].1, "Claude wants to use Bash");
+        assert_eq!(entries[0].2["decision"], "allow_once");
+        assert_eq!(entries[0].2["sensitive"], 1);
+    }
+
+    #[tokio::test]
+    async fn no_row_decision_refused_audits_permission_refused() {
+        use crate::server::shared::notifications::routing::HostRouting;
+
+        let audited = Arc::new(Mutex::new(Vec::new()));
+        let fake = AuditingFake {
+            routing: Ok(HostRouting {
+                routing_ok: false,
+                ..Default::default()
+            }),
+            audited: audited.clone(),
+        };
+        let facts = Some((
+            Some("Bash".to_string()),
+            Some(serde_json::json!({ "command": "cargo test" })),
+            Some("/tmp/project".to_string()),
+        ));
+        let res = handle_no_row_decision(&fake, true, facts, || true).await;
+        assert!(res.is_err());
+        let entries = audited.lock().unwrap().clone();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "permission.refused");
+        assert_eq!(entries[0].1, "Claude wants to use Bash");
+        assert_eq!(entries[0].2["reason"], "routing_refused");
+    }
+
+    #[tokio::test]
+    async fn no_row_decision_ungated_does_not_audit_decided() {
+        use crate::server::shared::notifications::routing::HostRouting;
+
+        let audited = Arc::new(Mutex::new(Vec::new()));
+        let fake = AuditingFake {
+            routing: Ok(HostRouting {
+                routing_ok: true,
+                ..Default::default()
+            }),
+            audited: audited.clone(),
+        };
+        let facts = Some((Some("Bash".to_string()), None, None));
+        let res = handle_no_row_decision(&fake, true, facts, || false).await;
+        assert_eq!(res.unwrap(), false);
+        let entries = audited.lock().unwrap().clone();
+        assert!(
+            entries.is_empty(),
+            "ungated decision must not audit decided"
+        );
+    }
+
+    /// Run [`settle_gate`] over a fake host. Returns whether it allowed, whether
+    /// `on_unanswered` ran, and what reached the audit trail.
+    async fn settled(
+        decision: Result<
+            Result<HookDecision, oneshot::error::RecvError>,
+            tokio::time::error::Elapsed,
+        >,
+    ) -> (bool, bool, Vec<(&'static str, String, serde_json::Value)>) {
+        let audited = Arc::new(Mutex::new(Vec::new()));
+        let fake = Arc::new(AuditingFake {
+            routing: Ok(Default::default()),
+            audited: audited.clone(),
+        });
+        let emitted = std::cell::Cell::new(false);
+        let (allowed, audit) = settle_gate(
+            decision,
+            fake,
+            Some("Bash".into()),
+            Some(serde_json::json!({ "command": "cargo test" })),
+            Some("/tmp/project".into()),
+            || emitted.set(true),
+        );
+        if let Some(audit) = audit {
+            audit.await.unwrap();
+        }
+        let entries = audited.lock().unwrap().clone();
+        (allowed, emitted.get(), entries)
+    }
+
+    /// The gate's hold ran out: denied, announced, and on the audit trail.
+    /// (The audit call is in `settle_gate`, which `post_hook_event` calls.)
+    #[tokio::test]
+    async fn a_gate_that_times_out_is_denied_and_audited() {
+        let (_tx, rx) = oneshot::channel::<HookDecision>();
+        let timed_out = timeout(Duration::from_millis(10), rx).await;
+        assert!(timed_out.is_err());
+        let (allowed, emitted, entries) = settled(timed_out).await;
+        assert!(!allowed);
+        assert!(emitted, "the synthetic hooks://decision still goes out");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].0, "permission.decided");
+        assert_eq!(entries[0].1, "Claude wants to use Bash");
+        assert_eq!(entries[0].2["decision"], "deny");
+        assert_eq!(entries[0].2["outcome"], "timed_out");
+    }
+
+    #[tokio::test]
+    async fn a_gate_whose_channel_closed_is_denied_and_audited() {
+        let (tx, rx) = oneshot::channel::<HookDecision>();
+        drop(tx);
+        let closed = timeout(Duration::from_secs(5), rx).await;
+        let (allowed, _, entries) = settled(closed).await;
+        assert!(!allowed);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].2["decision"], "deny");
+    }
+
+    /// A human's answer is audited by the decide path, not here, and
+    /// `approved` is the only thing that allows.
+    #[tokio::test]
+    async fn an_answered_gate_is_not_audited_as_a_timeout() {
+        for (answer, expect_allowed) in [("approved", true), ("denied", false)] {
+            let (tx, rx) = oneshot::channel::<HookDecision>();
+            tx.send(HookDecision {
+                request_id: "perm-1".into(),
+                decision: answer.into(),
+            })
+            .unwrap();
+            let got = timeout(Duration::from_secs(5), rx).await;
+            let (allowed, emitted, entries) = settled(got).await;
+            assert_eq!(allowed, expect_allowed, "{answer}");
+            assert!(!emitted, "{answer}");
+            assert!(entries.is_empty(), "{answer}: {entries:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_gate_timeout_audits_permission_decided_with_timed_out() {
+        let audited = Arc::new(Mutex::new(Vec::new()));
+        let fake = AuditingFake {
+            routing: Ok(Default::default()),
+            audited: audited.clone(),
+        };
+        let input = serde_json::json!({ "command": "cargo test" });
+        audit_hook_gate_timeout(&fake, Some("Bash"), Some(&input), Some("/tmp/project")).await;
+
+        let entries = audited.lock().unwrap().clone();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "permission.decided");
+        assert_eq!(entries[0].1, "Claude wants to use Bash");
+        assert_eq!(entries[0].2["decision"], "deny");
+        assert_eq!(entries[0].2["outcome"], "timed_out");
+        assert_eq!(entries[0].2["sensitive"], 1);
     }
 }

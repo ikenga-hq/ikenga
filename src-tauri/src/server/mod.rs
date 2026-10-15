@@ -596,7 +596,9 @@ async fn auth_middleware(
     // poll would otherwise keep an idle principal child alive forever.
     let res = if matches!(
         req.uri().path(),
-        push::outbox::EVENTS_PATH | crate::access::audit::child::EVENTS_PATH
+        push::outbox::EVENTS_PATH
+            | crate::access::audit::child::EVENTS_PATH
+            | crate::access::audit::child::ACK_PATH
     ) {
         next.run(req).await
     } else {
@@ -1028,6 +1030,10 @@ fn build_router(
             .route(
                 crate::access::audit::child::EVENTS_PATH,
                 get(crate::access::audit::child::events_handler),
+            )
+            .route(
+                crate::access::audit::child::ACK_PATH,
+                post(crate::access::audit::child::ack_handler),
             ),
         crate::access::DaemonMode::T0 => protected_routes,
     };
