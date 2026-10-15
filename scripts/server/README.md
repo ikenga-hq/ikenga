@@ -169,7 +169,7 @@ Everything lives under `/opt/ikenga/data`. In multi-user mode that is the operat
 
 **Files.** `available.json` and `status.json` are world-readable and hold versions, times and the last run's progress lines. `last-run.log` is root-only. None of them holds a secret, and the update path never reads `.env` except for the `IKENGA_HOST` line used for the health check.
 
-**Exit codes of `upgrade`.** 0: upgraded, or already on that version. 3: the new version failed its health check and the previous one is back. 4: the rollback failed too; look at `journalctl -u ikenga-server*`.
+**Exit codes of `upgrade`.** 0: upgraded, or already on that version. 3: the new version failed its health check and the previous one is back. 4: the rollback failed too; look at `journalctl -u ikenga-server*`. 5: the new version is installed and healthy, but an [add-on script](#add-ons) failed (in the app's update status this is `failed`, with a message that says the new version is running).
 
 **Turning it off.** `sudo systemctl disable --now ikenga-update.path` stops in-app updates. `sudo systemctl disable --now ikenga-update-check.timer` stops the daily check, and the app then shows no update at all.
 
@@ -495,6 +495,27 @@ sudo ls /var/lib/ikenga-backup/private/errors/                  # raw errors, if
 ```
 
 If the sandbox blocks something (a `gcloud` that needs a path or a syscall outside the list), the journal says so; loosen that one directive in `backup_service_unit` rather than dropping the sandbox. **Not handled here:** restore drills (a periodic restore of the newest dump into a scratch database), bucket retention/lifecycle rules (objects are never deleted), a free-disk guard before a large dump, and the Rex side of the alert contract above. Schedules that start together (a `Persistent` catch-up after downtime fires them all at once) each use their own `CLOUDSDK_CONFIG` (`private/gcloud/<schedule>`), so they never contend for gcloud's sqlite files. Also note that `gcloud auth activate-service-account` needs to reach `oauth2.googleapis.com` (it refreshes a token at activation), so a run with no outbound network reports `gcs-auth` for every database and dumps nothing.
+
+## Add-ons
+
+A profile can name scripts for the provisioner to run as root after its own work, for site-specific steps this repo should not know about (extra ACLs, a local service, a metrics hook):
+
+```bash
+ADDONS=(/root/provision/addons/example.sh /root/provision/addons/other.sh)
+# or, with no spaces in the paths, one string: ADDONS="/root/a.sh /root/b.sh"
+```
+
+They run after the full `provision` run, after `sync-accounts`, and after an `upgrade` or in-app update has installed the new version and passed its health check. An `upgrade` that finds the box already on that version runs none. Each one gets `--dry-run` when the provisioner was given it, including on `upgrade --dry-run`, and must make no changes in that case. Add-ons run in the order listed; **the first one that fails stops the rest**.
+
+Because root runs them (also unattended, from `ikenga-update.service`), each script must pass the same rule as a profile, or it is refused and never run:
+
+- an **absolute** path (a relative one would be looked up on `PATH` instead of where you meant);
+- a regular file, **not a symlink**, owned by **root**, **not group- or world-writable**, and **executable** (the provisioner never changes a mode; `chmod 755` it yourself);
+- every directory above it (after following symlinks) owned by root and not group- or world-writable.
+
+A refusal or a non-zero exit is reported by name with its reason or exit code, the run still prints its summary, and the provisioner exits non-zero (for `upgrade`, 5; see "Exit codes of `upgrade`"). Only the profile can name add-ons: an `ADDONS` variable in the caller's environment is ignored. With `ADDONS` unset nothing changes.
+
+Tests: `scripts/server/test-addons-container.sh` (a non-privileged ubuntu:24.04 container, root inside; covers each rule above, `--dry-run` leaving modes alone, and the upgrade and apply-request paths with a mock server).
 
 ## T0 → T1: `accounts adopt-t0`
 

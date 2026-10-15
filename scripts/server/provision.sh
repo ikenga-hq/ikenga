@@ -212,6 +212,12 @@ SWAP_SIZE="auto"                # auto | <n>M | <n>G | off | 0
 SWAPPINESS="10"                 # vm.swappiness (0-100): use swap as an overflow, not eagerly
 SWAP_FILE="/swapfile"           # an absolute path on a local ext4/xfs/f2fs filesystem
 
+# Add-ons (README "Add-ons"): scripts root runs after provision, upgrade and
+# sync-accounts. Unset here so a stray ADDONS in the caller's environment can
+# never name a script; only the profile can. The profile writes it as
+# ADDONS=(/abs/a /abs/b) or as one space-separated string.
+unset ADDONS
+
 if [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$PROFILE_FILE"
@@ -1176,6 +1182,11 @@ do_upgrade() {
     note "[dry-run] restart service $svc"
     note "[dry-run] health check /api/health with automatic rollback to $have on failure"
     changed "ikenga-server upgraded $have -> $target"
+    if ! run_addons "upgrade"; then
+      summary
+      printf 'error: add-on step failed on the upgrade dry run; see the warnings above\n' >&2
+      exit 5
+    fi
     summary
     return 0
   fi
@@ -1253,6 +1264,13 @@ do_upgrade() {
   if [[ $healthy -eq 1 ]]; then
     log "Health check PASSED: ikenga-server $target is healthy at $url"
     changed "ikenga-server upgraded $have -> $target"
+    # The new binary is live by now: an add-on failure is reported with its own
+    # exit code (5), never as "the update did not start".
+    if ! run_addons "upgrade"; then
+      summary
+      printf 'error: ikenga-server %s is installed and healthy, but an add-on script failed; see the warnings above\n' "$target" >&2
+      exit 5
+    fi
     summary
     return 0
   fi
@@ -1281,7 +1299,8 @@ do_upgrade() {
   done
 
   # Distinct exit codes, so a caller (apply-request) can tell a clean
-  # rollback (3) from a box that needs a human (4).
+  # rollback (3) from a box that needs a human (4). 5 (add-on failed after a
+  # good upgrade) is exited above.
   if [[ $rolled_back -eq 1 ]]; then
     printf 'error: upgrade to %s failed health check; automatically rolled back to %s successfully\n' "$target" "$have" >&2
     exit 3
@@ -1593,6 +1612,7 @@ do_apply_request() {
       else state=succeeded; message="updated to $version"; fi ;;
     3) state=rolled_back; rolled_back=true; message="the update failed its health check and was rolled back to $installed" ;;
     4) state=failed; message="rollback also failed; see journalctl" ;;
+    5) state=failed; message="updated to $version, but an add-on script failed; the new version is running (see last-run.log)" ;;
     *) state=failed; message="the update did not start; nothing was changed" ;;
   esac
   write_status state="$state" from="$installed" to="$version" request_id="$request_id" \
@@ -4267,6 +4287,80 @@ sync_swap() {
   swap_sysctl
 }
 
+# ------------------------------------------------------------------ add-ons
+# Scripts a profile names in ADDONS=(/abs/path ...) (or one space-separated
+# string), run as root after provision, upgrade and sync-accounts, and given
+# --dry-run when this script is. They run in order; the first failure stops the
+# rest. Because root runs them, each must pass the profile_trusted rule: an
+# absolute path to a regular file (not a symlink), root-owned, not group- or
+# world-writable, executable, in directories that are root-owned and not
+# group- or world-writable all the way up. This code never changes a mode.
+
+# Every directory from $1 up to / (symlinks followed) is a directory, root-owned, and writable by
+# nobody else. Sets ADDON_WHY and returns 1 on the first that is not.
+addon_dirs_trusted() {
+  local d="$1" owner mode parent
+  while :; do
+    if [[ ! -d "$d" ]]; then ADDON_WHY="$d is not a directory"; return 1; fi
+    read -r owner mode < <(stat -L -c '%u %a' -- "$d") || { ADDON_WHY="cannot stat $d"; return 1; }
+    if [[ "$owner" != 0 ]]; then ADDON_WHY="directory $d is owned by uid $owner, not root"; return 1; fi
+    if (( (8#$mode & 8#022) != 0 )); then ADDON_WHY="directory $d is group- or world-writable (mode $mode)"; return 1; fi
+    parent="$(dirname -- "$d")"
+    [[ "$parent" != "$d" ]] || return 0     # reached / (or . for a relative path): stop
+    d="$parent"
+  done
+}
+
+# 0 when root may run $1; otherwise 1 with the reason in ADDON_WHY.
+addon_trusted() {
+  local p="$1" owner mode canon
+  ADDON_WHY=""
+  if [[ "$p" != /* ]]; then ADDON_WHY="not an absolute path"; return 1; fi
+  if [[ -L "$p" ]]; then ADDON_WHY="is a symlink"; return 1; fi
+  if [[ ! -e "$p" ]]; then ADDON_WHY="not found"; return 1; fi
+  if [[ ! -f "$p" ]]; then ADDON_WHY="not a regular file"; return 1; fi
+  read -r owner mode < <(stat -c '%u %a' -- "$p") || { ADDON_WHY="cannot stat it"; return 1; }
+  if [[ "$owner" != 0 ]]; then ADDON_WHY="owned by uid $owner, not root"; return 1; fi
+  if (( (8#$mode & 8#022) != 0 )); then ADDON_WHY="group- or world-writable (mode $mode)"; return 1; fi
+  if (( (8#$mode & 8#100) == 0 )); then ADDON_WHY="not executable (mode $mode); this script never changes modes, run chmod 755 yourself"; return 1; fi
+  addon_dirs_trusted "$(dirname -- "$p")" || return 1
+  canon="$(cd -P -- "$(dirname -- "$p")" && pwd -P)" || { ADDON_WHY="cannot resolve its directory"; return 1; }
+  addon_dirs_trusted "$canon"
+}
+
+# run_addons <phase>: returns 0 (also when ADDONS is empty) or 1 after a
+# soft_fail naming the add-on and, for a script that ran, its exit code.
+run_addons() {
+  local phase="$1" addons=() addon rc
+  if declare -p ADDONS 2>/dev/null | grep -q '^declare -[a-zA-Z-]*a'; then
+    addons=("${ADDONS[@]}")
+  elif [[ -n "${ADDONS:-}" ]]; then
+    read -r -a addons <<< "${ADDONS}"
+  fi
+  [[ ${#addons[@]} -gt 0 ]] || return 0
+
+  log "Running ${#addons[@]} add-on script(s) after ${phase}..."
+  for addon in "${addons[@]}"; do
+    [[ -n "$addon" ]] || continue
+    if ! addon_trusted "$addon"; then
+      soft_fail "add-on refused ($phase): $addon: $ADDON_WHY"
+      return 1
+    fi
+    log "--> Running add-on ($phase): $addon"
+    rc=0
+    if [[ $DRY_RUN -eq 1 ]]; then
+      "$addon" --dry-run || rc=$?
+    else
+      "$addon" || rc=$?
+    fi
+    if [[ $rc -ne 0 ]]; then
+      soft_fail "add-on failed ($phase): $addon: exit code $rc"
+      return 1
+    fi
+    changed "add-on executed: $addon ($phase)"
+  done
+}
+
 # ------------------------------------------------------------------ main
 
 case "$ACTION" in
@@ -4286,8 +4380,9 @@ case "$ACTION" in
     [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || die "sync-accounts needs a profile: pass --profile <file> (or provision once so $INSTALL_DIR/.profile.env exists)"
     validate_accounts_profile
     sync_accounts
+    run_addons "sync-accounts" || true
     summary
-    [[ $FAILED -eq 0 ]] || { echo "error: some account sync steps failed; see the warnings above" >&2; exit 1; }
+    [[ $FAILED -eq 0 ]] || { echo "error: some account sync steps or add-on scripts failed; see the warnings above" >&2; exit 1; }
     exit 0 ;;
   tunnels)
     [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || die "tunnels needs a profile: pass --profile <file> (or provision once so $INSTALL_DIR/.profile.env exists)"
@@ -4339,6 +4434,7 @@ verify
 sync_accounts
 sync_tunnels
 sync_backups
+run_addons "provision" || true
 sync_tunnel_lock
 summary
-[[ $FAILED -eq 0 ]] || { echo "error: some swap, account, tunnel or backup steps failed; see the warnings above" >&2; exit 1; }
+[[ $FAILED -eq 0 ]] || { echo "error: some swap, account, tunnel, backup or add-on steps failed; see the warnings above" >&2; exit 1; }
