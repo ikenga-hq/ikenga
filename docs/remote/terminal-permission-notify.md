@@ -92,8 +92,9 @@ is not free of it.
   mcp-iyke `.mcpb` plus a mod: status line, `/ikenga` commands, toasts and `prompt.compose` context
   (`01-plan.md:144-149`, `05-tracking.md:272-282`). Permission hooks are not in that scope.
 - Its load path is fixed: `claude plugin install`, or the `CLAUDE_CODE_PLUGIN_DIRS` environment variable that
-  WP-11 sets on the PTY (`01-plan.md:148`, `:95`). The PTY is started with an empty environment plus
-  the caller's, so the variable must be set explicitly (`pty/mod.rs:553-561`).
+  WP-11 sets on the PTY (`01-plan.md:149`, `:95`). The PTY clears its environment and copies back the
+  daemon's own variables minus the host-only keys, so the variable must be set explicitly
+  (`pty/mod.rs:553-561`).
 - If permission hooks later move into a plugin, they belong in that single plugin. Format, from Claude Code's
   documentation rather than this repo: the plugin manifest is `.claude-plugin/plugin.json`; hooks are declared
   in `hooks/hooks.json` (or inline in the manifest). `hooks.json` is not the manifest.
@@ -148,8 +149,8 @@ What the secret does protect:
   `authenticates`, `:407`; `unauthorized`, `:602`).
 - It is revoked when the PTY exits (`TermHooks::revoke`, `:356`).
 
-The daemon's own credentials are not in the PTY environment. The PTY starts from an empty environment, minus
-every key `is_host_only_env` names (`pty/mod.rs:553-561`; list at `:203-210`: `IKENGA_AUTH_TOKEN`,
+The daemon's own credentials are not in the PTY environment. The PTY clears its environment and copies back
+the daemon's own variables, minus every key `is_host_only_env` names (`pty/mod.rs:553-561`; list at `:203-210`: `IKENGA_AUTH_TOKEN`,
 `IKENGA_VAULT_KEY`, `IKENGA_PKG_DB_TOKEN`, the principal wrapping key, `IKENGA_SECRET_*`).
 
 **Conclusion.** The hook secret is a process-level credential for one terminal. It does not separate the
