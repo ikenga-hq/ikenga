@@ -161,6 +161,7 @@ ADMIN_USER=""
 ADMIN_SSH_KEYS_FILE=""
 PUBLIC_HOST=""
 ACME_EMAIL=""
+CADDY_DEB_FALLBACK="1"   # 1 = if Caddy's apt repo fails, install the pinned release .deb; 0 = fail instead
 TS_AUTHKEY_FILE=""
 TS_HOSTNAME=""
 SSH_PORT="22"
@@ -261,6 +262,7 @@ validate_profile() {
     # trusted operator with the bearer token as the sole gate. Refuse it.
     [[ "$TIER" == t1 ]] || die "PERIMETER=public-https requires TIER=t1 (a single shared bearer token must not be the only gate on a public host)"
     [[ -n "$PUBLIC_HOST" ]] || die "PERIMETER=public-https requires PUBLIC_HOST"
+    [[ "$CADDY_DEB_FALLBACK" == 0 || "$CADDY_DEB_FALLBACK" == 1 ]] || die "CADDY_DEB_FALLBACK must be 0 or 1 (got '$CADDY_DEB_FALLBACK')"
     SSH_ACCESS="${SSH_ACCESS:-public}"
     [[ "$SSH_ACCESS" == public || "$SSH_ACCESS" == tailnet ]] || die "SSH_ACCESS must be public or tailnet (got '$SSH_ACCESS')"
   else
@@ -491,15 +493,72 @@ perimeter_tailnet() {
   note "Operator action: add an ACL rule letting your users reach this host on tcp:4000 (default-deny tailnet)."
 }
 
+# Caddy from its Cloudsmith apt repo; each step reports its failure instead of
+# aborting (set -e is off inside an `if`), so install_caddy can fall back.
+caddy_from_repo() {
+  caddy_repo_err=""
+  local keyring=/usr/share/keyrings/caddy-stable-archive-keyring.gpg list=/etc/apt/sources.list.d/caddy-stable.list
+  # bash, not sh: dash has no pipefail, so a failed curl would feed gpg an empty key.
+  bash -c "set -o pipefail; curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o $keyring" \
+    || { caddy_repo_err="could not fetch the signing key"; return 1; }
+  curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt -o "$list" \
+    || { caddy_repo_err="could not fetch the apt source list"; return 1; }
+  DEBIAN_FRONTEND=noninteractive apt-get update -y \
+    || { caddy_repo_err="apt-get update failed"; return 1; }
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends caddy \
+    || { caddy_repo_err="apt-get install caddy failed"; return 1; }
+}
+
+# The pinned release .deb, for when the repo is down. The sha512 lives HERE, not
+# in a downloaded checksums file, so a bad mirror cannot vouch for itself.
+CADDY_DEB_VERSION="2.11.7"
+CADDY_DEB_SHA512_AMD64="47e8351c2317b427af14a103e763ca1118a3d2396a88b4c0669cdec9c4a68a957690194e2423a1633f53135741c33a41bdac2b55515b7d0f7adc8b733add50d9"
+CADDY_DEB_SHA512_ARM64="ac32f03f0eea04021f2d4e5d89bfd01b84ead115f2eba9d2a0d06447e86d4af932899e56f090993a566d0925dbd1063002929b395541a8c5f5e51d7039f7375a"
+caddy_from_deb() {
+  caddy_deb_err=""
+  local pin tmp deb rc=0
+  case "$ARCH" in
+    amd64) pin="$CADDY_DEB_SHA512_AMD64" ;;
+    arm64) pin="$CADDY_DEB_SHA512_ARM64" ;;
+    *) caddy_deb_err="no pinned Caddy .deb for architecture '$ARCH' (amd64 and arm64 only)"; return 1 ;;
+  esac
+  deb="caddy_${CADDY_DEB_VERSION}_linux_${ARCH}.deb"
+  tmp="$(mktemp -d)" || { caddy_deb_err="mktemp failed"; return 1; }
+  chmod 0755 "$tmp"   # apt downloads as _apt; a 0700 dir only earns a sandbox warning
+  local got=""
+  if ! curl -fsSL -o "$tmp/$deb" "https://github.com/caddyserver/caddy/releases/download/v$CADDY_DEB_VERSION/$deb"; then
+    caddy_deb_err="could not download $deb"; rc=1
+  elif got="$(sha512sum "$tmp/$deb" | cut -d' ' -f1)"; [[ "$got" != "$pin" ]]; then
+    caddy_deb_err="sha512 mismatch for $deb (got ${got:0:16}..., pinned ${pin:0:16}...); nothing installed"; rc=1
+  elif ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$tmp/$deb"; then
+    caddy_deb_err="apt-get install of $deb failed"; rc=1
+  fi
+  rm -rf -- "$tmp"
+  return $rc
+}
+
+install_caddy() {
+  command -v caddy >/dev/null && return 0
+  if [[ $DRY_RUN -eq 1 ]]; then
+    note "[dry-run] install caddy from the Cloudsmith apt repo"
+    [[ "$CADDY_DEB_FALLBACK" == 1 ]] && note "[dry-run] if that fails: remove its source list, install the pinned v$CADDY_DEB_VERSION release .deb (sha512 checked)"
+    changed "caddy installed"
+    return
+  fi
+  if caddy_from_repo; then changed "caddy installed from the Cloudsmith apt repo"; return; fi
+  # A half-written source list makes EVERY later apt-get update fail on this box.
+  rm -f -- /etc/apt/sources.list.d/caddy-stable.list /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  [[ "$CADDY_DEB_FALLBACK" == 1 ]] || die "caddy install failed ($caddy_repo_err) and CADDY_DEB_FALLBACK=0"
+  # The repo answered 402 Payment Required on a fresh box on 2026-10-13.
+  note "Caddy apt repo failed ($caddy_repo_err); removed its source list, trying the pinned release .deb"
+  caddy_from_deb || die "could not install caddy. apt repo: $caddy_repo_err. Pinned .deb: $caddy_deb_err"
+  changed "caddy $CADDY_DEB_VERSION installed from the pinned release .deb (apt repo failed: $caddy_repo_err)"
+}
+
 perimeter_public() {
   log "Perimeter: public-https (Caddy + Let's Encrypt)${SSH_ACCESS:+, SSH over $SSH_ACCESS}"
   [[ "$SSH_ACCESS" == tailnet ]] && tailnet_join
-  if ! command -v caddy >/dev/null; then
-    run sh -c 'curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg'
-    run sh -c "curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt -o /etc/apt/sources.list.d/caddy-stable.list"
-    run env DEBIAN_FRONTEND=noninteractive apt-get update -y
-    apt_install caddy
-  fi
+  install_caddy
   # Request body cap and security headers. The daemon has no trusted-proxy
   # setting yet (WP-P4): it sees 127.0.0.1 for every client, so per-IP rate
   # limits belong here, not in the daemon, until that lands.
@@ -632,7 +691,9 @@ install_daemon() {
   fi
   tar -xzf "$tmp/$tarball" -C "$INSTALL_DIR"
   [[ "$("$INSTALL_DIR/bin/ikenga-server" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')" == "$VERSION" ]] || die "installed binary does not report $VERSION"
-  install -d -m 0700 "$INSTALL_DIR/data"
+  # T1: principals' children run as other uids and must traverse data/ to reach
+  # data/principals/<id>/ (0711: traverse, no listing). T0 stays 0700.
+  if [[ "$TIER" == t1 ]]; then install -d -m 0711 -o root -g root "$INSTALL_DIR/data"; else install -d -m 0700 "$INSTALL_DIR/data"; fi
   BINARY_CHANGED=1
   changed "ikenga-server $VERSION installed to $INSTALL_DIR"
 }
@@ -704,6 +765,22 @@ write_env() {
   fi
 }
 
+# T1 data/ must be root:root 0711. install_daemon returns early when the version
+# already matches, so this runs on every provision, before the probe. Only the
+# directory itself: the server owns the modes of everything inside it.
+ensure_t1_data_dir() {
+  [[ "$TIER" == t1 ]] || return 0
+  local d="$INSTALL_DIR/data" have
+  have="$(stat -c '%a %U:%G' "$d" 2>/dev/null || true)"
+  if [[ -z "$have" ]]; then
+    [[ $DRY_RUN -eq 1 ]] && return 0   # install_daemon creates it on a fresh host
+    install -d -m 0711 -o root -g root "$d"; changed "data dir $d created (root:root 711)"; return
+  fi
+  [[ "$have" == "711 root:root" ]] && return 0
+  run chown root:root "$d"; run chmod 0711 "$d"
+  changed "data dir $d: $have -> 711 root:root (principal uids must traverse it)"
+}
+
 install_service() {
   log "Service ($TIER)"
   local unit="ikenga-server.service"; [[ "$TIER" == t1 ]] && unit="ikenga-server-t1.service"
@@ -714,6 +791,7 @@ install_service() {
     id ikenga >/dev/null 2>&1 || { run adduser --system --group --home /home/ikenga --shell /bin/bash ikenga; changed "service user ikenga"; }
     run chown -R ikenga:ikenga "$INSTALL_DIR/data"
   fi
+  ensure_t1_data_dir
 
   if [[ $DRY_RUN -eq 1 ]]; then note "[dry-run] install $unit, probe, enable --now $svc"; return; fi
 
