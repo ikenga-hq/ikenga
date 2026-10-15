@@ -499,7 +499,8 @@ caddy_from_repo() {
   caddy_repo_err=""
   local keyring=/usr/share/keyrings/caddy-stable-archive-keyring.gpg list=/etc/apt/sources.list.d/caddy-stable.list
   # bash, not sh: dash has no pipefail, so a failed curl would feed gpg an empty key.
-  bash -c "set -o pipefail; curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o $keyring" \
+  # --batch --yes: a keyring left by an earlier failed run must not make gpg prompt.
+  bash -c "set -o pipefail; curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --batch --yes --dearmor -o $keyring" \
     || { caddy_repo_err="could not fetch the signing key"; return 1; }
   curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt -o "$list" \
     || { caddy_repo_err="could not fetch the apt source list"; return 1; }
