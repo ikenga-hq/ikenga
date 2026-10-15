@@ -5,7 +5,8 @@
 //! with exponential backoff, and persisted lock state in `app-lock.json`.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use argon2::{self, Config, Variant, Version};
@@ -16,6 +17,8 @@ use zeroize::Zeroizing;
 
 /// Broadcast to every webview/browser session when the lock state or its config changes.
 pub const APP_LOCK_CHANGED_EVENT: &str = "app-lock://changed";
+/// What a locked account answers to anything but status, unlock and health.
+pub const LOCKED_ERROR: &str = "Account is locked. Unlock first.";
 /// Lives in `data_dir`. Mode 0600.
 pub const CONFIG_FILENAME: &str = "app-lock.json";
 
@@ -460,47 +463,41 @@ pub fn sanitize(mut config: AppLockConfig) -> AppLockConfig {
 }
 
 /// Shared lock state.
-#[derive(Debug)]
+///
+/// Cheap to share: the state lives behind an `Arc`, so a PIN check can run on
+/// its own task (see [`AppLockState::unlock`]) and finish even when the
+/// request that started it is dropped.
+#[derive(Debug, Default)]
 pub struct AppLockState {
+    core: Arc<Core>,
+}
+
+#[derive(Debug)]
+struct Core {
     inner: Mutex<Inner>,
     lock_tx: watch::Sender<bool>,
     _rx: watch::Receiver<bool>,
+    /// argon2 runs in flight right now, and the most there have ever been at
+    /// once. The busy flag allows one; the tests assert it.
+    checks_running: AtomicUsize,
+    checks_peak: AtomicUsize,
 }
 
-impl Default for AppLockState {
+impl Default for Core {
     fn default() -> Self {
         let (lock_tx, _rx) = watch::channel(false);
         Self {
             inner: Mutex::new(Inner::default()),
             lock_tx,
             _rx,
+            checks_running: AtomicUsize::new(0),
+            checks_peak: AtomicUsize::new(0),
         }
     }
 }
 
-struct VerifyingGuard<'a>(&'a AppLockState);
-
-impl<'a> Drop for VerifyingGuard<'a> {
-    fn drop(&mut self) {
-        self.0.with(|inner| {
-            if inner.verifying {
-                inner.verifying = false;
-            }
-        });
-    }
-}
-
-impl AppLockState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn configure(&self, path: PathBuf) {
-        let now = now_ms();
-        self.with(|inner| inner.load(path, now));
-    }
-
-    pub fn with<T>(&self, f: impl FnOnce(&mut Inner) -> T) -> T {
+impl Core {
+    fn with<T>(&self, f: impl FnOnce(&mut Inner) -> T) -> T {
         let mut guard = self
             .inner
             .lock()
@@ -514,12 +511,60 @@ impl AppLockState {
         res
     }
 
+    /// Run one argon2 job on the blocking pool, counted.
+    async fn argon2<T: Send + 'static>(
+        &self,
+        job: impl FnOnce() -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let now = self.checks_running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.checks_peak.fetch_max(now, Ordering::SeqCst);
+        let res = tokio::task::spawn_blocking(job)
+            .await
+            .map_err(|e| format!("join: {e}"))
+            .and_then(|r| r);
+        self.checks_running.fetch_sub(1, Ordering::SeqCst);
+        res
+    }
+}
+
+/// Run a PIN check to completion on its own task.
+///
+/// The busy flag (`Inner::verifying`) is set by `begin_*` and cleared only by
+/// this task, in `finish_*` (or on an error), so it stays set for exactly as
+/// long as the argon2 run. A dropped request (client gone, request aborted)
+/// detaches from the task rather than cancelling it: the check still
+/// finishes, still counts as an attempt, and no second check can start while
+/// the first one's 19 MiB argon2 is running. Clearing the flag on drop
+/// instead let every aborted request start another argon2 (617 MB after 30
+/// aborts) and could clear another caller's flag.
+async fn run_owned<T: Send + 'static>(
+    core: &Arc<Core>,
+    job: impl FnOnce(Arc<Core>) -> futures_util::future::BoxFuture<'static, Result<T, String>>,
+) -> Result<T, String> {
+    let task = tokio::spawn(job(Arc::clone(core)));
+    task.await.map_err(|e| format!("join: {e}"))?
+}
+
+impl AppLockState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn configure(&self, path: PathBuf) {
+        let now = now_ms();
+        self.with(|inner| inner.load(path, now));
+    }
+
+    pub fn with<T>(&self, f: impl FnOnce(&mut Inner) -> T) -> T {
+        self.core.with(f)
+    }
+
     pub fn is_locked(&self) -> bool {
         self.with(|inner| inner.locked)
     }
 
     pub fn subscribe_lock(&self) -> watch::Receiver<bool> {
-        self.lock_tx.subscribe()
+        self.core.lock_tx.subscribe()
     }
 
     pub async fn wait_unlocked(&self) {
@@ -529,6 +574,16 @@ impl AppLockState {
                 break;
             }
         }
+    }
+
+    /// The most argon2 runs this state has ever had in flight at once.
+    pub fn peak_checks(&self) -> usize {
+        self.core.checks_peak.load(Ordering::SeqCst)
+    }
+
+    /// argon2 runs in flight right now.
+    pub fn running_checks(&self) -> usize {
+        self.core.checks_running.load(Ordering::SeqCst)
     }
 
     pub fn status(&self) -> AppLockStatus {
@@ -593,18 +648,21 @@ impl AppLockState {
             UnlockGate::Check(record) => record,
         };
 
-        let _guard = VerifyingGuard(self);
-        let verified = tokio::task::spawn_blocking(move || verify_secret(secret.as_str(), &record))
-            .await
-            .map_err(|e| format!("join: {e}"))
-            .and_then(|result| result);
-        let ok = match verified {
-            Ok(ok) => ok,
-            Err(error) => {
-                return Err(error);
-            }
-        };
-        let error = self.with(|inner| inner.finish_unlock(ok, now_ms()));
+        let (ok, error) = run_owned(&self.core, move |core| {
+            Box::pin(async move {
+                let verified = core
+                    .argon2(move || verify_secret(secret.as_str(), &record))
+                    .await;
+                match verified {
+                    Ok(ok) => Ok((ok, core.with(|inner| inner.finish_unlock(ok, now_ms())))),
+                    Err(error) => {
+                        core.with(|inner| inner.verifying = false);
+                        Err(error)
+                    }
+                }
+            })
+        })
+        .await?;
         Ok((self.outcome(ok, error), ok))
     }
 
@@ -645,6 +703,9 @@ impl AppLockState {
     }
 
     /// Set or change the PIN or passphrase.
+    ///
+    /// The busy flag stays set through both argon2 runs (checking the current
+    /// PIN, hashing the new one), so one call never has two in flight.
     pub async fn set_secret(
         &self,
         current: Option<String>,
@@ -655,48 +716,46 @@ impl AppLockState {
         validate_secret(next.as_str())?;
         let now = now_ms();
         let existing = self.with(|inner| inner.begin_check(now))?;
-        let _guard = VerifyingGuard(self);
-        let check_res = if let Some(existing) = existing.as_ref() {
-            let Some(current) = current.as_ref() else {
-                return Err("Enter the current PIN to change it.".into());
-            };
-            let current_clone = current.clone();
-            let existing_clone = existing.clone();
-            tokio::task::spawn_blocking(move || {
-                verify_secret(current_clone.as_str(), &existing_clone)
-            })
-            .await
-            .map_err(|e| format!("join: {e}"))
-            .and_then(|r| r)
-        } else {
-            Ok(true)
-        };
-
-        let verified = match check_res {
-            Ok(ok) => ok,
-            Err(e) => {
-                return Err(e);
-            }
-        };
-
-        let error = self.with(|inner| inner.finish_check(verified, now_ms()));
-        if !verified {
-            return Err(error.unwrap_or_else(|| "The current PIN is wrong.".into()));
+        if existing.is_some() && current.is_none() {
+            self.with(|inner| inner.verifying = false);
+            return Err("Enter the current PIN to change it.".into());
         }
-
-        let record = tokio::task::spawn_blocking(move || hash_secret(next.as_str()))
-            .await
-            .map_err(|e| format!("join: {e}"))??;
-        let now = now_ms();
-        self.with(|inner| {
-            let previous = inner.config.clone();
-            inner.config.secret = Some(record);
-            if let Err(error) = inner.save() {
-                inner.config = previous;
-                return Err(error);
-            }
-            Ok(inner.status(now))
+        run_owned(&self.core, move |core| {
+            Box::pin(async move {
+                let verified = match existing {
+                    Some(existing) => {
+                        let current = current.unwrap_or_default();
+                        core.argon2(move || verify_secret(current.as_str(), &existing))
+                            .await
+                    }
+                    None => Ok(true),
+                };
+                let verified = match verified {
+                    Ok(ok) => ok,
+                    Err(error) => {
+                        core.with(|inner| inner.verifying = false);
+                        return Err(error);
+                    }
+                };
+                if !verified {
+                    let error = core.with(|inner| inner.finish_check(false, now_ms()));
+                    return Err(error.unwrap_or_else(|| "The current PIN is wrong.".into()));
+                }
+                let hashed = core.argon2(move || hash_secret(next.as_str())).await;
+                core.with(|inner| {
+                    inner.finish_check(true, now_ms());
+                    let record = hashed?;
+                    let previous = inner.config.clone();
+                    inner.config.secret = Some(record);
+                    if let Err(error) = inner.save() {
+                        inner.config = previous;
+                        return Err(error);
+                    }
+                    Ok(inner.status(now_ms()))
+                })
+            })
         })
+        .await
     }
 
     /// Remove the PIN. Also turns idle lock off.
@@ -704,40 +763,40 @@ impl AppLockState {
         let current = Zeroizing::new(current);
         let now = now_ms();
         let existing = self.with(|inner| inner.begin_check(now))?;
-        let _guard = VerifyingGuard(self);
         let Some(existing) = existing else {
+            self.with(|inner| inner.verifying = false);
             return Ok(self.with(|inner| inner.status(now_ms())));
         };
-        let verified =
-            tokio::task::spawn_blocking(move || verify_secret(current.as_str(), &existing))
-                .await
-                .map_err(|e| format!("join: {e}"))
-                .and_then(|r| r);
-
-        let ok = match verified {
-            Ok(ok) => ok,
-            Err(e) => {
-                return Err(e);
-            }
-        };
-
-        let error = self.with(|inner| inner.finish_check(ok, now_ms()));
-        if !ok {
-            return Err(error.unwrap_or_else(|| "The current PIN is wrong.".into()));
-        }
-
-        let now = now_ms();
-        self.with(|inner| {
-            let previous = inner.config.clone();
-            inner.config.secret = None;
-            inner.config.idle_enabled = false;
-            inner.config.method = UnlockMethod::Pin;
-            if let Err(error) = inner.save() {
-                inner.config = previous;
-                return Err(error);
-            }
-            Ok(inner.status(now))
+        run_owned(&self.core, move |core| {
+            Box::pin(async move {
+                let verified = core
+                    .argon2(move || verify_secret(current.as_str(), &existing))
+                    .await;
+                let ok = match verified {
+                    Ok(ok) => ok,
+                    Err(error) => {
+                        core.with(|inner| inner.verifying = false);
+                        return Err(error);
+                    }
+                };
+                core.with(|inner| {
+                    let error = inner.finish_check(ok, now_ms());
+                    if !ok {
+                        return Err(error.unwrap_or_else(|| "The current PIN is wrong.".into()));
+                    }
+                    let previous = inner.config.clone();
+                    inner.config.secret = None;
+                    inner.config.idle_enabled = false;
+                    inner.config.method = UnlockMethod::Pin;
+                    if let Err(error) = inner.save() {
+                        inner.config = previous;
+                        return Err(error);
+                    }
+                    Ok(inner.status(now_ms()))
+                })
+            })
         })
+        .await
     }
 
     pub fn outcome(&self, ok: bool, error: Option<String>) -> UnlockOutcome {
@@ -912,6 +971,7 @@ pub fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn inner_with_secret(dir: &Path, idle_enabled: bool) -> Inner {
         let mut inner = Inner {
@@ -1144,6 +1204,90 @@ mod tests {
         let hash = &inner.config.secret.as_ref().unwrap().hash;
         assert!(!json.contains(hash.as_str()));
         assert!(json.contains("\"secretSet\":true"));
+    }
+
+    async fn locked_state(dir: &Path) -> AppLockState {
+        let state = AppLockState::new();
+        state.configure(dir.join(CONFIG_FILENAME));
+        state.set_secret(None, "1234".into()).await.unwrap();
+        state.lock(LockReason::Manual).unwrap();
+        state
+    }
+
+    /// R4-6a / round-5 item 2: an aborted unlock must not let the next one
+    /// start a second argon2 while the first is still running. 30 aborts in a
+    /// row keep at most one check in flight, and every aborted check still
+    /// finishes and counts as an attempt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aborted_unlocks_never_run_two_checks_at_once_and_still_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(locked_state(dir.path()).await);
+        let peak_before = state.peak_checks();
+        assert_eq!(peak_before, 1, "set_secret ran one argon2 at a time");
+
+        for i in 0..30 {
+            let s = Arc::clone(&state);
+            let h = tokio::spawn(async move { s.unlock(format!("wrong{i}")).await });
+            tokio::time::sleep(Duration::from_millis(3)).await;
+            h.abort();
+            let _ = h.await;
+        }
+        // Let whatever is still running finish.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while state.running_checks() > 0 || state.with(|i| i.verifying) {
+            assert!(std::time::Instant::now() < deadline, "checks never settled");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.peak_checks(),
+            1,
+            "an aborted unlock let a second argon2 start while the first ran"
+        );
+        let status = state.status();
+        assert!(status.locked);
+        assert!(
+            status.attempts_left < MAX_ATTEMPTS || status.retry_in_ms.is_some(),
+            "aborted checks still count as attempts: {status:?}"
+        );
+    }
+
+    /// The busy flag belongs to the check that set it: while one check runs,
+    /// every other caller is told "Still checking" and none of them clears
+    /// the flag, so no extra check slips in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_busy_flag_is_never_cleared_by_another_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppLockState::new());
+        state.configure(dir.path().join(CONFIG_FILENAME));
+        state.set_secret(None, "1234".into()).await.unwrap();
+
+        // A long call: verify the current PIN, then hash the new one.
+        let s = Arc::clone(&state);
+        let long =
+            tokio::spawn(async move { s.set_secret(Some("1234".into()), "5678".into()).await });
+        while !state.with(|i| i.verifying) {
+            tokio::task::yield_now().await;
+        }
+        let mut busy = 0;
+        while !long.is_finished() {
+            let s = Arc::clone(&state);
+            let other = tokio::spawn(async move { s.clear_secret("0000".into()).await });
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            other.abort();
+            match other.await {
+                Ok(Err(e)) if e.contains("Still checking") => busy += 1,
+                Ok(Err(e)) if e.contains("Wrong PIN") => panic!("a second check ran: {e}"),
+                _ => {}
+            }
+        }
+        assert!(long.await.unwrap().is_ok());
+        assert!(busy > 0, "no caller was ever told the check was busy");
+        assert_eq!(state.peak_checks(), 1);
+        assert_eq!(
+            state.status().attempts_left,
+            MAX_ATTEMPTS,
+            "no wrong check ran"
+        );
     }
 
     #[cfg(unix)]

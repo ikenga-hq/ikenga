@@ -157,7 +157,7 @@ async fn handle_events_socket(socket: WebSocket, state: Arc<AppState>, mut guard
     let mut bus = state.events.subscribe();
     let mut subscribed: HashSet<Topic> = HashSet::new();
     let mut lock_rx = state.app_lock.subscribe_lock();
-    let mut held_events: std::collections::VecDeque<Message> = std::collections::VecDeque::new();
+    let mut held = HeldEvents::default();
 
     info!("Events WebSocket client connected");
     if ws_tx.send(ready_frame(&permitted)).await.is_err() {
@@ -165,8 +165,8 @@ async fn handle_events_socket(socket: WebSocket, state: Arc<AppState>, mut guard
     }
 
     loop {
-        while !*lock_rx.borrow() && !held_events.is_empty() {
-            if let Some(msg) = held_events.pop_front() {
+        if !*lock_rx.borrow() {
+            for msg in held.drain() {
                 if ws_tx.send(msg).await.is_err() {
                     return;
                 }
@@ -183,12 +183,12 @@ async fn handle_events_socket(socket: WebSocket, state: Arc<AppState>, mut guard
                 continue;
             }
             next = ws_rx.next() => match next {
-                Some(Ok(Message::Text(text))) => {
-                    if *lock_rx.borrow() {
-                        state.app_lock.wait_unlocked().await;
-                    }
-                    handle_control(&text, &mut subscribed)
-                }
+                // Applied at once, locked or not: a subscription only picks
+                // topics (their events are still held while locked), and a
+                // device opening this socket behind the lock screen must be
+                // able to subscribe to `app-lock://changed` to see the unlock.
+                // Nothing here waits on the lock, so revocation stays live.
+                Some(Ok(Message::Text(text))) => handle_control(&text, &mut subscribed),
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 // Binary/ping/pong carry nothing this socket understands.
                 // Axum answers pings itself.
@@ -200,7 +200,7 @@ async fn handle_events_socket(socket: WebSocket, state: Arc<AppState>, mut guard
                     if ev.topic == Topic::AppLockChanged || !*lock_rx.borrow() {
                         Some(frame)
                     } else {
-                        held_events.push_back(frame);
+                        held.push(frame);
                         None
                     }
                 }
@@ -234,6 +234,43 @@ async fn handle_events_socket(socket: WebSocket, state: Arc<AppState>, mut guard
     info!("Events WebSocket client disconnected");
 }
 
+/// Most events one socket holds while its account is locked (WP-C). Past it
+/// the oldest are dropped, so a long lock with a busy producer (a statusline
+/// ticking every second) can't grow the daemon's memory without limit.
+pub(crate) const MAX_HELD_EVENTS: usize = 256;
+
+/// Events a socket holds while its account is locked, delivered on unlock.
+#[derive(Default)]
+pub(crate) struct HeldEvents {
+    queue: std::collections::VecDeque<Message>,
+    dropped: u64,
+}
+
+impl HeldEvents {
+    pub(crate) fn push(&mut self, frame: Message) {
+        if self.queue.len() >= MAX_HELD_EVENTS {
+            self.queue.pop_front();
+            self.dropped += 1;
+            if self.dropped.is_power_of_two() {
+                warn!(
+                    "[events_ws] {} event(s) dropped while locked (cap {MAX_HELD_EVENTS})",
+                    self.dropped
+                );
+            }
+        }
+        self.queue.push_back(frame);
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub(crate) fn drain(&mut self) -> std::collections::vec_deque::Drain<'_, Message> {
+        self.dropped = 0;
+        self.queue.drain(..)
+    }
+}
+
 /// Apply one control frame; the reply to send, if any.
 fn handle_control(raw: &str, subscribed: &mut HashSet<Topic>) -> Option<Message> {
     match serde_json::from_str::<EventsControlMessage>(raw) {
@@ -262,6 +299,25 @@ fn handle_control(raw: &str, subscribed: &mut HashSet<Topic>) -> Option<Message>
 mod tests {
     use super::*;
     use crate::access::{Cap, CapSet, RequestMeta, ShareCtx, Tier, Via};
+
+    #[test]
+    fn held_events_are_capped_oldest_first() {
+        let mut held = HeldEvents::default();
+        for i in 0..(MAX_HELD_EVENTS + 50) {
+            held.push(Message::Text(i.to_string()));
+        }
+        assert_eq!(held.len(), MAX_HELD_EVENTS);
+        let kept: Vec<String> = held
+            .drain()
+            .map(|m| match m {
+                Message::Text(t) => t,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(kept.first().map(String::as_str), Some("50"));
+        assert_eq!(kept.last(), Some(&(MAX_HELD_EVENTS + 49).to_string()));
+        assert_eq!(held.len(), 0);
+    }
 
     fn ctx(caps: CapSet) -> AccessCtx {
         AccessCtx {

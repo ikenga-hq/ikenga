@@ -365,9 +365,8 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
 /// that names no arm). WP-21 served the four `secrets_*` lock verbs, which
 /// moved into the table above (X-1); `app_lock_*` served by WP-C.
 /// `app_lock_unlock_biometric` stays desktop-only.
-pub const PENDING_WP21: &[(&str, Requirement)] = &[
-    ("app_lock_unlock_biometric", req!(owner[Settings])),
-];
+pub const PENDING_WP21: &[(&str, Requirement)] =
+    &[("app_lock_unlock_biometric", req!(owner[Settings]))];
 
 /// The requirement for `cmd`; §1.6 rule 2 for an unmapped one.
 pub fn requirement(cmd: &str) -> Requirement {

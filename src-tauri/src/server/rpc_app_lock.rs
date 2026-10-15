@@ -491,11 +491,7 @@ mod tests {
         }
         let state_clone = state.clone();
         tasks.push(tokio::spawn(async move {
-            app_lock_clear_secret(
-                &state_clone,
-                &serde_json::json!({ "current": "1234" }),
-            )
-            .await
+            app_lock_clear_secret(&state_clone, &serde_json::json!({ "current": "1234" })).await
         }));
 
         let mut found = 0;
@@ -512,10 +508,16 @@ mod tests {
         }
 
         assert_eq!(found, 0, "parallel clear_secret attack must not succeed");
-        assert!(busy > 0, "busy gate must reject concurrent checks on clear_secret");
+        assert!(
+            busy > 0,
+            "busy gate must reject concurrent checks on clear_secret"
+        );
         let status: AppLockStatus =
             serde_json::from_value(app_lock_status(&state).data.unwrap()).unwrap();
-        assert!(status.secret_set, "PIN must remain set after parallel attack");
+        assert!(
+            status.secret_set,
+            "PIN must remain set after parallel attack"
+        );
     }
 
     #[tokio::test]
@@ -549,11 +551,8 @@ mod tests {
             "expected wait error, got: {err}"
         );
 
-        let res_clear = app_lock_clear_secret(
-            &state,
-            &serde_json::json!({ "current": "1234" }),
-        )
-        .await;
+        let res_clear =
+            app_lock_clear_secret(&state, &serde_json::json!({ "current": "1234" })).await;
         assert!(!res_clear.ok);
         assert!(res_clear.error.unwrap().contains("Too many wrong entries"));
 
@@ -586,12 +585,25 @@ mod tests {
         handle.abort();
         let _ = handle.await;
 
-        // Next attempt must NOT be wedged with "Still checking the last entry."
-        let res = app_lock_set_secret(
-            &state,
-            &serde_json::json!({ "current": "1234", "next": "5678" }),
-        )
-        .await;
+        // The aborted check runs to completion on its own task (round 6: so
+        // it can't be used to start a second argon2), so the next attempt may
+        // briefly hear "Still checking" — but never for good.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let res = loop {
+            let res = app_lock_set_secret(
+                &state,
+                &serde_json::json!({ "current": "1234", "next": "5678" }),
+            )
+            .await;
+            let busy = res
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("Still checking"));
+            if !busy || std::time::Instant::now() > deadline {
+                break res;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
         assert!(
             res.ok,
             "cancelled check must not leave lock wedged: error was {:?}",
@@ -618,11 +630,16 @@ mod tests {
                 share_headers: false,
                 caps: crate::access::CapSet::ALL,
                 admin_strength: true,
+                is_admin: false,
                 meta: crate::access::RequestMeta::default(),
             }
         }
 
-        async fn rpc(state: &Arc<AppState>, cmd: &str, args: serde_json::Value) -> serde_json::Value {
+        async fn rpc(
+            state: &Arc<AppState>,
+            cmd: &str,
+            args: serde_json::Value,
+        ) -> serde_json::Value {
             use axum::response::IntoResponse;
             let req = super::super::rpc::RpcRequest {
                 cmd: cmd.to_string(),
@@ -655,7 +672,10 @@ mod tests {
         let pty_res = rpc(&state, "pty_spawn", serde_json::json!({})).await;
         assert_eq!(pty_res["ok"], false);
         assert!(
-            pty_res["error"].as_str().unwrap_or("").contains("Account is locked"),
+            pty_res["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Account is locked"),
             "expected 'Account is locked', got: {:?}",
             pty_res["error"]
         );
@@ -663,7 +683,10 @@ mod tests {
         let fs_res = rpc(&state, "fs_read", serde_json::json!({ "path": "/test" })).await;
         assert_eq!(fs_res["ok"], false);
         assert!(
-            fs_res["error"].as_str().unwrap_or("").contains("Account is locked"),
+            fs_res["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Account is locked"),
             "expected 'Account is locked', got: {:?}",
             fs_res["error"]
         );
@@ -671,14 +694,20 @@ mod tests {
         let list_res = rpc(&state, "fs_list", serde_json::json!({ "path": "." })).await;
         assert_eq!(list_res["ok"], false);
         assert!(
-            list_res["error"].as_str().unwrap_or("").contains("Account is locked"),
+            list_res["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Account is locked"),
             "expected 'Account is locked', got: {:?}",
             list_res["error"]
         );
 
         // Exempt arms are permitted while locked: app_lock_status, server_health
         let status_res = rpc(&state, "app_lock_status", serde_json::json!({})).await;
-        assert_eq!(status_res["ok"], true, "app_lock_status must be exempt while locked");
+        assert_eq!(
+            status_res["ok"], true,
+            "app_lock_status must be exempt while locked"
+        );
         let status: AppLockStatus = serde_json::from_value(status_res["data"].clone()).unwrap();
         assert!(status.locked);
 
@@ -690,17 +719,30 @@ mod tests {
         );
 
         // Unlock with wrong PIN is permitted (evaluates PIN check, not blocked by lock gate)
-        let unlock_bad = rpc(&state, "app_lock_unlock", serde_json::json!({ "secret": "wrong" })).await;
+        let unlock_bad = rpc(
+            &state,
+            "app_lock_unlock",
+            serde_json::json!({ "secret": "wrong" }),
+        )
+        .await;
         assert_eq!(unlock_bad["ok"], true);
         assert_eq!(unlock_bad["data"]["ok"], false);
         assert!(
-            unlock_bad["data"]["error"].as_str().unwrap_or("").contains("Wrong PIN"),
+            unlock_bad["data"]["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Wrong PIN"),
             "expected Wrong PIN error, got: {:?}",
             unlock_bad["data"]["error"]
         );
 
         // Unlock with right PIN succeeds and unpauses
-        let unlock_ok = rpc(&state, "app_lock_unlock", serde_json::json!({ "secret": "1234" })).await;
+        let unlock_ok = rpc(
+            &state,
+            "app_lock_unlock",
+            serde_json::json!({ "secret": "1234" }),
+        )
+        .await;
         assert_eq!(unlock_ok["ok"], true);
         assert_eq!(unlock_ok["data"]["ok"], true);
         assert!(!state.app_lock.is_locked());
@@ -735,13 +777,19 @@ mod tests {
 
         // Sleep briefly: unpause_task must still be waiting
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!unpause_task.is_finished(), "socket waiter must remain paused while locked");
+        assert!(
+            !unpause_task.is_finished(),
+            "socket waiter must remain paused while locked"
+        );
 
         // Unlock: unpause_task must complete immediately
         let unlock = state.app_lock.unlock("1234".to_string()).await.unwrap();
         assert!(unlock.1, "must unlock");
 
-        let res = tokio::time::timeout(Duration::from_secs(1), unpause_task).await.unwrap().unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(1), unpause_task)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(res, "socket waiter must resume cleanly after unlock");
     }
 }

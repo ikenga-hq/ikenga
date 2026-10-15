@@ -137,14 +137,13 @@ impl RpcResponse {
     }
 }
 
+/// The RPCs a locked account still answers (WP-C, R4-6a): reading the lock
+/// state, unlocking, and the box's health. Named exactly, so a new arm is
+/// never exempt by accident.
+pub const APP_LOCK_EXEMPT_CMDS: &[&str] = &["app_lock_status", "app_lock_unlock", "server_health"];
+
 pub fn is_app_lock_exempt_cmd(cmd: &str) -> bool {
-    matches!(
-        cmd,
-        "app_lock_status"
-            | "app_lock_unlock"
-            | "server_health"
-            | "health"
-    ) || cmd.starts_with("auth")
+    APP_LOCK_EXEMPT_CMDS.contains(&cmd)
 }
 
 pub async fn rpc_handler(
@@ -159,7 +158,7 @@ pub async fn rpc_handler(
     // While an account is locked, its child refuses every RPC except app_lock_status,
     // app_lock_unlock, auth and health.
     if state.app_lock.is_locked() && !is_app_lock_exempt_cmd(&payload.cmd) {
-        return Json(RpcResponse::error("Account is locked. Unlock first."));
+        return Json(RpcResponse::error(super::shared::app_lock::LOCKED_ERROR));
     }
 
     // G-ACCESS §9.2 pre-hook: class + caps for this command (§1.6), and in

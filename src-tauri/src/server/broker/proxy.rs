@@ -659,6 +659,23 @@ pub async fn rpc_proxy(
     parts.extensions.insert(narrowing.clone());
 
     if crate::access::is_broker_arm(&cmd) {
+        // WP-C (R4-6a): the broker serves `access_*` itself, so the child's
+        // lock gate never sees them. The lock lives in the caller's child:
+        // ask it first, and refuse while locked. `server_health` stays
+        // exempt, as it is on T0 (`rpc::APP_LOCK_EXEMPT_CMDS`).
+        if cmd != "server_health" {
+            match account_locked(&state, &ctx.principal).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    return axum::Json(serde_json::json!({
+                        "ok": false,
+                        "error": crate::server::shared::app_lock::LOCKED_ERROR,
+                    }))
+                    .into_response()
+                }
+                Err(res) => return res,
+            }
+        }
         return state.hooks.access.handle(&ctx, &parts, &cmd, &args).await;
     }
     match state
@@ -691,6 +708,59 @@ pub async fn rpc_proxy(
         bytes,
     )
     .await
+}
+
+/// Whether `principal`'s account is app-locked (WP-C), asked of its child as
+/// an internal call (`app_lock_status`, the per-child bearer, no caps).
+/// Fails closed: an answer the broker can't read is an error response, never
+/// "unlocked".
+async fn account_locked(state: &BrokerState, principal: &Principal) -> Result<bool, Response> {
+    let body = serde_json::json!({ "cmd": "app_lock_status", "args": {} }).to_string();
+    let unreadable = || {
+        json_error(
+            StatusCode::BAD_GATEWAY,
+            "bad_gateway",
+            "could not check whether your workspace is locked",
+        )
+    };
+    for attempt in 0..2 {
+        let endpoint = state
+            .children
+            .endpoint(principal)
+            .await
+            .map_err(|e| child_unavailable(&e))?;
+        let sent = state
+            .http
+            .post(format!("http://{}/api/rpc", endpoint.addr))
+            .bearer_auth(&*endpoint.token)
+            .header(PRINCIPAL_HEADER, principal.id.to_string())
+            .header(crate::access::INTERNAL_CALL_HEADER, "1")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(body.clone())
+            .send()
+            .await;
+        match sent {
+            Ok(resp) => {
+                let bytes = resp.bytes().await.map_err(|_| unreadable())?;
+                let v: Value = serde_json::from_slice(&bytes).map_err(|_| unreadable())?;
+                if v.get("ok").and_then(Value::as_bool) != Some(true) {
+                    return Err(unreadable());
+                }
+                return v
+                    .pointer("/data/locked")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(unreadable);
+            }
+            Err(e) if e.is_connect() && attempt == 0 => {
+                state.children.invalidate(principal.id, &endpoint).await;
+            }
+            Err(e) => {
+                tracing::warn!("app lock check on principal child {}: {e}", principal.id);
+                return Err(unreadable());
+            }
+        }
+    }
+    Err(unreadable())
 }
 
 /// `GET /pkgs/*` → the principal's child (its read-only pkg server).
