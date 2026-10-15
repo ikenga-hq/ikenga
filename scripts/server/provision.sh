@@ -530,7 +530,7 @@ caddy_from_deb() {
   if ! curl -fsSL -o "$tmp/$deb" "https://github.com/caddyserver/caddy/releases/download/v$CADDY_DEB_VERSION/$deb"; then
     caddy_deb_err="could not download $deb"; rc=1
   elif got="$(sha512sum "$tmp/$deb" | cut -d' ' -f1)"; [[ "$got" != "$pin" ]]; then
-    caddy_deb_err="sha512 mismatch for $deb (got ${got:0:16}..., pinned ${pin:0:16}...); nothing installed"; rc=1
+    caddy_deb_err="sha512 mismatch for $deb (got $got, pinned $pin); nothing installed"; rc=1
   elif ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$tmp/$deb"; then
     caddy_deb_err="apt-get install of $deb failed"; rc=1
   fi
@@ -778,7 +778,7 @@ ensure_t1_data_dir() {
     install -d -m 0711 -o root -g root "$d"; changed "data dir $d created (root:root 711)"; return
   fi
   [[ "$have" == "711 root:root" ]] && return 0
-  run chown root:root "$d"; run chmod 0711 "$d"
+  run chown root:root "$d"; run chmod 00711 "$d"
   changed "data dir $d: $have -> 711 root:root (principal uids must traverse it)"
 }
 

@@ -158,7 +158,7 @@ inside_before="$(stat -c '%a %U:%G %n' "$D"/data/principals "$D"/data/operator "
 
 dd_scenario t1 1
 ok "dry-run t1: data untouched (700)" test "$(mode "$D/data")" = "700 root:root"
-ok "dry-run t1: says what it would do" out_has '\[dry-run\] chmod 0711'
+ok "dry-run t1: says what it would do" out_has '\[dry-run\] chmod 00711'
 ok "dry-run t1: change prefixed would:" out_has 'CHANGES: would: data dir'
 
 dd_scenario t0 0
