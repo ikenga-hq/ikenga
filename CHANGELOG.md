@@ -1,5 +1,13 @@
 # ikenga-desktop
 
+## 0.26.3
+
+### Patch Changes
+
+- dd7929e: The Ikenga daemon can now back up and restore an account's data from the browser. You can export your database as a `.ikbak` file and download it, and import one to put your data back. An import is checked against the current database layout before anything is replaced, so a broken or foreign backup is refused and your existing data is left alone. If the restore fails part-way, the daemon puts your previous database back. This works on a single-user daemon and, through the broker, on multi-user servers, where each account only ever restores into its own data.
+- e58771f: Server: pkg tool calls, MCP calls and sidecar calls now work from a browser session. Each account runs its own sidecars under its own user, capped at 8 per account, and they are stopped with their whole process group when idle or on shutdown. A pkg runs for an account only when an admin has assigned it and approved its trust for that exact version and permission set. Built-in `com.ikenga.*` pkgs count as built-in only when they sit inside the configured pkgs folder. The T1 broker again passes the request host through, and the T0 owner's own devices can use assigned third-party pkgs.
+- 72eeb20: Terminal permission asks that end with nobody deciding them now always leave an audit record. This covers a gate that times out on the desktop, a decision made when its row is gone, and an ask left open when the daemon or the desktop restarted. The restart record is written again on the next start until it really lands, so a crash or a failed write cannot lose it; the cost is that it can occasionally be written twice. On a multi-account box the broker now tells each account's process exactly which records it saved, instead of marking every waiting row done. A box or desktop with nowhere to record no longer retries these forever at every start.
+
 ## 0.26.2
 
 ### Patch Changes
