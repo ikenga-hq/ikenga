@@ -61,6 +61,7 @@ use super::rpc_shell::PathGuard;
 use super::AppState;
 use crate::access::{AccessCtx, DaemonAccess};
 use crate::fs_watch::{FileChange, FsEventSink, FsWatchManager};
+use crate::server::shared::app_lock::{AppLockState, LOCKED_ERROR};
 
 /// Cap on live watchers for one socket. Each one is an OS watch plus a
 /// debouncer thread, and nothing in the UI needs more than a handful; the cap
@@ -89,10 +90,16 @@ struct SocketSink {
     /// Drops events inside the daemon's own state. `None` only in unit tests
     /// of the frame shape.
     guard: Option<PathGuard>,
+    /// WP-C (R4-6a): while the account is locked no event goes out, from a
+    /// watch made before the lock or after. `None` only in unit tests.
+    app_lock: Option<Arc<AppLockState>>,
 }
 
 impl FsEventSink for SocketSink {
     fn emit(&self, watcher_id: &str, change: FileChange) {
+        if self.app_lock.as_ref().is_some_and(|l| l.is_locked()) {
+            return;
+        }
         // `change.path` is canonical (`fs_watch` re-checks every event path
         // through `check_allowlisted`), so the reserved compare is exact.
         if self
@@ -164,6 +171,7 @@ async fn handle_fs_socket(socket: WebSocket, state: Arc<AppState>, mut guard: So
     let sink: Arc<dyn FsEventSink> = Arc::new(SocketSink {
         tx: out_tx.clone(),
         guard: Some(state.path_guard.clone()),
+        app_lock: Some(state.app_lock.clone()),
     });
 
     let _ = out_tx.send(Message::Text(
@@ -185,6 +193,7 @@ async fn handle_fs_socket(socket: WebSocket, state: Arc<AppState>, mut guard: So
         match msg {
             Message::Close(_) => break,
             Message::Text(text) => handle_control(
+                &state.app_lock,
                 &text,
                 &state.path_guard,
                 guard.ctx.as_ref(),
@@ -207,6 +216,7 @@ async fn handle_fs_socket(socket: WebSocket, state: Arc<AppState>, mut guard: So
 }
 
 fn handle_control(
+    app_lock: &AppLockState,
     raw: &str,
     guard: &PathGuard,
     ctx: Option<&AccessCtx>,
@@ -224,6 +234,11 @@ fn handle_control(
     };
 
     match parsed {
+        // WP-C (R4-6a): no new watch while the account is locked. Refused, not
+        // deferred — it would otherwise start when someone later unlocks.
+        FsControlMessage::Watch { req_id, .. } if app_lock.is_locked() => {
+            let _ = out.send(error_frame(req_id.as_deref(), LOCKED_ERROR));
+        }
         FsControlMessage::Watch { req_id, path } => {
             if manager.len() >= MAX_WATCHERS_PER_CONNECTION {
                 let _ = out.send(error_frame(
@@ -328,7 +343,11 @@ mod tests {
     #[test]
     fn a_change_frame_carries_the_shape_the_client_reads() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = SocketSink { tx, guard: None };
+        let sink = SocketSink {
+            tx,
+            guard: None,
+            app_lock: None,
+        };
         sink.emit(
             "w-1",
             FileChange {
@@ -373,6 +392,44 @@ mod tests {
     /// the fail-closed direction, and the half of the guard worth pinning
     /// down here. `path_allow::tests` covers the symlink-escape half against
     /// a locally-built `FsRoots`.
+    /// WP-C (R4-6a): while the account is locked a watch — including one
+    /// made before the lock — puts no filename on the wire; after the unlock
+    /// events flow again.
+    #[tokio::test]
+    async fn a_locked_account_emits_no_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_lock = Arc::new(AppLockState::new());
+        app_lock.configure(dir.path().join("app-lock.json"));
+        app_lock.set_secret(None, "1234".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = SocketSink {
+            tx,
+            guard: None,
+            app_lock: Some(app_lock.clone()),
+        };
+        let change = |name: &str| FileChange {
+            kind: crate::fs_watch::ChangeKind::Create,
+            path: format!("/w/{name}"),
+        };
+        sink.emit("w", change("before.txt"));
+        assert_eq!(frames(&mut rx).len(), 1);
+
+        app_lock
+            .lock(crate::server::shared::app_lock::LockReason::Manual)
+            .unwrap();
+        sink.emit("w", change("secret-name.txt"));
+        assert!(
+            frames(&mut rx).is_empty(),
+            "a filename went out while locked"
+        );
+
+        app_lock.unlock("1234".into()).await.unwrap();
+        sink.emit("w", change("after.txt"));
+        let got = frames(&mut rx);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["path"], "/w/after.txt");
+    }
+
     #[test]
     fn with_no_allowlist_installed_no_event_reaches_the_wire() {
         if crate::fs_roots::current().is_some() {
@@ -383,7 +440,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().canonicalize().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn FsEventSink> = Arc::new(SocketSink { tx, guard: None });
+        let sink: Arc<dyn FsEventSink> = Arc::new(SocketSink {
+            tx,
+            guard: None,
+            app_lock: None,
+        });
 
         let manager = FsWatchManager::new();
         let id = manager.watch_with_sink(&dir, sink).unwrap();
@@ -441,6 +502,7 @@ mod tests {
         let sink: Arc<dyn FsEventSink> = Arc::new(SocketSink {
             tx: tx.clone(),
             guard: Some(guard.clone()),
+            app_lock: None,
         });
         let manager = FsWatchManager::new();
         for path in [
@@ -449,7 +511,15 @@ mod tests {
             root.join("data/sub"),
         ] {
             let frame = json!({ "type": "watch", "reqId": "r", "path": path }).to_string();
-            handle_control(&frame, &guard, None, &manager, &sink, &tx);
+            handle_control(
+                &AppLockState::new(),
+                &frame,
+                &guard,
+                None,
+                &manager,
+                &sink,
+                &tx,
+            );
             let got = frames(&mut rx);
             assert_eq!(got.len(), 1, "{got:?}");
             assert_eq!(got[0]["type"], "error", "{}: {got:?}", path.display());
@@ -463,7 +533,15 @@ mod tests {
 
         // The root around it is still watchable.
         let frame = json!({ "type": "watch", "reqId": "ok", "path": root }).to_string();
-        handle_control(&frame, &guard, None, &manager, &sink, &tx);
+        handle_control(
+            &AppLockState::new(),
+            &frame,
+            &guard,
+            None,
+            &manager,
+            &sink,
+            &tx,
+        );
         let got = frames(&mut rx);
         assert_eq!(got[0]["type"], "watched", "{got:?}");
         assert_eq!(manager.len(), 1);
@@ -478,6 +556,7 @@ mod tests {
         let sink = SocketSink {
             tx,
             guard: Some(guard),
+            app_lock: None,
         };
         for inside in ["data", "data/fs_roots.json", "data/backups/new.db"] {
             sink.emit(

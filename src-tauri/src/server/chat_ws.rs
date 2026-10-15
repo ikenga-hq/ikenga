@@ -27,6 +27,7 @@ use super::AppState;
 use crate::access::ws::{Frame, Route};
 use crate::access::{AccessCtx, DaemonAccess};
 use crate::engines::EngineHandle;
+use crate::server::shared::app_lock::AppLockState;
 use crate::server::shared::notifications::routing;
 
 /// Engine used when the client doesn't name one.
@@ -128,7 +129,23 @@ fn stop_reason_wire(reason: agent_client_protocol::schema::StopReason) -> String
         .unwrap_or_else(|| "end_turn".to_string())
 }
 
-async fn send(ws_tx: &WsSink, payload: String) {
+/// Turn output (WP-C, R4-6a): held while the account is locked and sent after
+/// the unlock. Only a turn's own task waits here, never the socket's loop.
+async fn send(app_lock: &AppLockState, ws_tx: &WsSink, payload: String) {
+    if app_lock.is_locked() {
+        app_lock.wait_unlocked().await;
+    }
+    let _ = ws_tx.lock().await.send(Message::Text(payload)).await;
+}
+
+/// A reply from the socket's own loop. It never waits on the lock: a loop
+/// parked until the unlock would read the frames sent behind the lock screen
+/// only after the unlock, and run them. A reply that would go out while
+/// locked is dropped instead.
+async fn reply(app_lock: &AppLockState, ws_tx: &WsSink, payload: String) {
+    if app_lock.is_locked() {
+        return;
+    }
     let _ = ws_tx.lock().await.send(Message::Text(payload)).await;
 }
 
@@ -145,15 +162,26 @@ async fn run_turn(
     model: Option<String>,
     ctx: Option<AccessCtx>,
 ) {
-    send(&ws_tx, status_event(&thread_id, "running", None)).await;
+    send(
+        &state.app_lock,
+        &ws_tx,
+        status_event(&thread_id, "running", None),
+    )
+    .await;
 
     let Some(engine_handle) = state.engine_registry.get(&engine_name).await else {
         send(
+            &state.app_lock,
             &ws_tx,
             error_event(&thread_id, format!("Unknown engine: {engine_name}")),
         )
         .await;
-        send(&ws_tx, status_event(&thread_id, "idle", Some("refusal"))).await;
+        send(
+            &state.app_lock,
+            &ws_tx,
+            status_event(&thread_id, "idle", Some("refusal")),
+        )
+        .await;
         return;
     };
 
@@ -188,12 +216,13 @@ async fn run_turn(
             let drain = {
                 let ws_tx = ws_tx.clone();
                 let thread_id = thread_id.clone();
+                let state = state.clone();
                 async move {
                     while let Some(update) = rx_chan.recv().await {
                         let update =
                             serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
                         if let Some(event) = outbound_update(ctx.as_ref(), &thread_id, update) {
-                            send(&ws_tx, event).await;
+                            send(&state.app_lock, &ws_tx, event).await;
                         }
                     }
                 }
@@ -208,12 +237,17 @@ async fn run_turn(
                     // gets; reporting a bare `end_turn` here presents a failed
                     // turn as a successful empty one.
                     tracing::warn!(thread = %thread_id, "antigravity prompt failed: {e}");
-                    send(&ws_tx, error_event(&thread_id, e)).await;
+                    send(&state.app_lock, &ws_tx, error_event(&thread_id, e)).await;
                     "refusal".to_string()
                 }
             };
 
-            send(&ws_tx, status_event(&thread_id, "idle", Some(&stop_reason))).await;
+            send(
+                &state.app_lock,
+                &ws_tx,
+                status_event(&thread_id, "idle", Some(&stop_reason)),
+            )
+            .await;
         }
         // Only reachable in the desktop build; headless `EngineHandle` has the
         // single Antigravity variant, so this arm would be an unreachable
@@ -227,6 +261,7 @@ async fn run_turn(
                 "engine has no headless daemon driver; refusing the turn"
             );
             send(
+                &state.app_lock,
                 &ws_tx,
                 error_event(
                     &thread_id,
@@ -237,7 +272,12 @@ async fn run_turn(
                 ),
             )
             .await;
-            send(&ws_tx, status_event(&thread_id, "idle", Some("refusal"))).await;
+            send(
+                &state.app_lock,
+                &ws_tx,
+                status_event(&thread_id, "idle", Some("refusal")),
+            )
+            .await;
         }
     }
 }
@@ -265,17 +305,24 @@ async fn handle_chat_socket(
     // its own id, so another socket on the thread never overwrites it.
     let prompt_socket = routing::prompt_socket();
 
-    send(&ws_tx, status_event(&thread_id, "idle", None)).await;
+    reply(
+        &state.app_lock,
+        &ws_tx,
+        status_event(&thread_id, "idle", None),
+    )
+    .await;
 
     // The engine driving the current turn, and its task handle. Tracking the
     // engine (rather than assuming the default) means cancel reaches whichever
     // adapter actually started the turn.
     let mut in_flight: Option<(tokio::task::JoinHandle<()>, String)> = None;
+    let mut dropped_while_locked: u64 = 0;
 
     loop {
         let msg = tokio::select! {
             // G-ACCESS §3.10: revoked (4401) / caps changed (4403). The turn
-            // in flight is cancelled below, as on any disconnect.
+            // in flight is cancelled below, as on any disconnect. Polled
+            // while locked too: nothing in this loop waits on the lock.
             close = &mut closed_fut => {
                 let _ = ws_tx.lock().await.send(close_message(&close)).await;
                 break;
@@ -285,12 +332,25 @@ async fn handle_chat_socket(
                 _ => break,
             },
         };
+        if let Message::Close(_) = msg {
+            break;
+        }
+        // WP-C (R4-6a): a prompt or cancel that arrives while the account is
+        // locked is dropped, never queued — it must not run when someone
+        // later unlocks.
+        if state.app_lock.is_locked() {
+            dropped_while_locked += 1;
+            if dropped_while_locked.is_power_of_two() {
+                info!("chat {thread_id}: dropped {dropped_while_locked} frame(s) while locked");
+            }
+            continue;
+        }
         match msg {
             Message::Text(text) => {
                 // G-ACCESS §1.6: `Prompt` / `Cancel` need `dispatch`; a
                 // refused frame is dropped and answered, the socket stays.
                 if let Err(refusal) = guard.check(Route::Chat, Frame::Text(&text)) {
-                    let _ = ws_tx.lock().await.send(Message::Text(refusal)).await;
+                    reply(&state.app_lock, &ws_tx, refusal).await;
                     continue;
                 }
                 let Ok(client_msg) = serde_json::from_str::<ChatClientMessage>(&text) else {
@@ -314,7 +374,12 @@ async fn handle_chat_socket(
                             None => cwd,
                             Some(Ok(cwd)) => cwd,
                             Some(Err(e)) => {
-                                send(&ws_tx, error_event(&thread_id, e.to_string())).await;
+                                reply(
+                                    &state.app_lock,
+                                    &ws_tx,
+                                    error_event(&thread_id, e.to_string()),
+                                )
+                                .await;
                                 continue;
                             }
                         };
@@ -333,7 +398,8 @@ async fn handle_chat_socket(
                             in_flight = None;
                         }
                         if in_flight.is_some() {
-                            send(
+                            reply(
+                                &state.app_lock,
                                 &ws_tx,
                                 error_event(
                                     &thread_id,
@@ -378,7 +444,7 @@ async fn handle_chat_socket(
 
                         // The ack always goes out, so the client can tell
                         // "received and acted on" from "socket is wedged".
-                        send(&ws_tx, cancel_ack_event(&thread_id)).await;
+                        reply(&state.app_lock, &ws_tx, cancel_ack_event(&thread_id)).await;
 
                         match in_flight.as_ref() {
                             // A live turn owns its own terminal status —
@@ -391,14 +457,17 @@ async fn handle_chat_socket(
                             // a terminal status for this thread.
                             None => {
                                 cancel_turn(&state, DEFAULT_ENGINE, &thread_id).await;
-                                send(&ws_tx, status_event(&thread_id, "idle", Some("cancelled")))
-                                    .await;
+                                reply(
+                                    &state.app_lock,
+                                    &ws_tx,
+                                    status_event(&thread_id, "idle", Some("cancelled")),
+                                )
+                                .await;
                             }
                         }
                     }
                 }
             }
-            Message::Close(_) => break,
             _ => {}
         }
     }

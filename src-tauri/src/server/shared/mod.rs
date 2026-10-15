@@ -14,6 +14,7 @@
 //! HTTP server — no axum, no `AppState`.
 
 pub mod acp_mode;
+pub mod app_lock;
 pub mod action_exec;
 pub mod actions;
 pub mod activity_bar;

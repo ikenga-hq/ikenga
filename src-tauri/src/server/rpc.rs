@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::hook_asks;
+use super::rpc_app_lock;
 use super::rpc_backup;
 use super::rpc_claude;
 use super::rpc_exec;
@@ -136,6 +137,15 @@ impl RpcResponse {
     }
 }
 
+/// The RPCs a locked account still answers (WP-C, R4-6a): reading the lock
+/// state, unlocking, and the box's health. Named exactly, so a new arm is
+/// never exempt by accident.
+pub const APP_LOCK_EXEMPT_CMDS: &[&str] = &["app_lock_status", "app_lock_unlock", "server_health"];
+
+pub fn is_app_lock_exempt_cmd(cmd: &str) -> bool {
+    APP_LOCK_EXEMPT_CMDS.contains(&cmd)
+}
+
 pub async fn rpc_handler(
     State(state): State<Arc<AppState>>,
     access: Option<Extension<Arc<crate::access::DaemonAccess>>>,
@@ -143,6 +153,13 @@ pub async fn rpc_handler(
     Json(payload): Json<RpcRequest>,
 ) -> impl IntoResponse {
     debug!("RPC request: cmd={}", payload.cmd);
+
+    // WP-C: Server-side app lock enforcement (DECIDED 2026-10-12, ENFORCE R4-6a)
+    // While an account is locked, its child refuses every RPC except app_lock_status,
+    // app_lock_unlock, auth and health.
+    if state.app_lock.is_locked() && !is_app_lock_exempt_cmd(&payload.cmd) {
+        return Json(RpcResponse::error(super::shared::app_lock::LOCKED_ERROR));
+    }
 
     // G-ACCESS §9.2 pre-hook: class + caps for this command (§1.6), and in
     // share mode a narrowed `AppState` (WP-76). One call, before any arm.
@@ -912,6 +929,13 @@ pub async fn rpc_handler(
         "seats_rename" => rpc_seats::seats_rename(&state, &payload.args).await,
         "seats_remove" => rpc_seats::seats_remove(&state, &payload.args).await,
         "seats_release" => rpc_seats::seats_release(&state, &payload.args).await,
+        "app_lock_status" => rpc_app_lock::app_lock_status(&state),
+        "app_lock_touch" => rpc_app_lock::app_lock_touch(&state),
+        "app_lock_lock" => rpc_app_lock::app_lock_lock(&state),
+        "app_lock_unlock" => rpc_app_lock::app_lock_unlock(&state, &payload.args).await,
+        "app_lock_configure" => rpc_app_lock::app_lock_configure(&state, &payload.args),
+        "app_lock_set_secret" => rpc_app_lock::app_lock_set_secret(&state, &payload.args).await,
+        "app_lock_clear_secret" => rpc_app_lock::app_lock_clear_secret(&state, &payload.args).await,
 
         // --- Executor-routed arms + the pkg-settings write (gap audit
         //     2026-10-06 ranks 21, 23, 20-partial) ---

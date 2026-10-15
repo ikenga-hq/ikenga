@@ -50,6 +50,9 @@ struct FakeLauncher {
     open_terminals: Arc<AtomicU64>,
     /// How long a child takes to answer `server_open_terminals`.
     open_delay_ms: Arc<AtomicU64>,
+    /// What each child answers to `app_lock_status` (WP-C): its account is
+    /// locked.
+    locked: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FakeLauncher {
@@ -99,16 +102,32 @@ impl ChildLauncher for FakeLauncher {
                 requests.clone(),
             );
             let (open, open_delay) = (self.open_terminals.clone(), self.open_delay_ms.clone());
+            let locked = self.locked.clone();
             let app = Router::new()
                 .route(
                     "/api/rpc",
                     post(move |req: Request<Body>| {
                         let (r1, open, open_delay) = (r1.clone(), open.clone(), open_delay.clone());
+                        let locked = locked.clone();
                         async move {
                             let (parts, body) = req.into_parts();
                             let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-                            let asks_open = serde_json::from_slice::<Value>(&body)
-                                .is_ok_and(|v| v["cmd"] == "server_open_terminals");
+                            let cmd = serde_json::from_slice::<Value>(&body)
+                                .map(|v| v["cmd"].clone())
+                                .unwrap_or(Value::Null);
+                            if cmd == "app_lock_status" {
+                                r1.lock().unwrap().push((
+                                    parts.uri.to_string(),
+                                    parts.headers.clone(),
+                                    String::from_utf8_lossy(&body).into_owned(),
+                                ));
+                                return Json(json!({
+                                    "ok": true,
+                                    "data": { "locked": locked.load(Ordering::SeqCst) }
+                                }))
+                                .into_response();
+                            }
+                            let asks_open = cmd == "server_open_terminals";
                             if !asks_open {
                                 return echo_http(r1, Request::from_parts(parts, Body::from(body)))
                                     .await
@@ -804,11 +823,8 @@ async fn rpc_reaches_only_the_callers_child_with_its_token_and_no_client_headers
 #[tokio::test]
 async fn access_commands_never_reach_a_child_and_bad_bodies_fail_closed() {
     let h = harness().await;
-    insert_account(&h.pool, "ada", 20_001, false).await;
+    let ada = insert_account(&h.pool, "ada", 20_001, false).await;
     let cookie = login_cookie(&h.app, "ada").await;
-    let (status, body) = rpc(&h.app, Some(&cookie), json!({"cmd":"access_list_devices"})).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body["code"], "not_found");
     for bad in [json!([1, 2]), json!({"args": {}}), json!({"cmd": 7})] {
         assert_eq!(
             rpc(&h.app, Some(&cookie), bad).await.0,
@@ -816,6 +832,86 @@ async fn access_commands_never_reach_a_child_and_bad_bodies_fail_closed() {
         );
     }
     assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 0);
+    let (status, body) = rpc(&h.app, Some(&cookie), json!({"cmd":"access_list_devices"})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "not_found");
+    // The broker served it. The child was only asked for its lock state
+    // (WP-C), never handed the `access_*` command itself.
+    let seen = h.launcher.seen_for(ada).requests.lock().unwrap().clone();
+    assert!(!seen.is_empty());
+    for (uri, _, body) in seen {
+        assert_eq!(uri, "/api/rpc");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["cmd"], "app_lock_status", "{body}");
+    }
+}
+
+/// WP-C (R4-6a) on T1: the broker serves `access_*` itself, so it asks the
+/// caller's child for the account's lock state first and refuses while it is
+/// locked — pairing, tiers, invites, policy and audit all included.
+/// `server_health` stays exempt, as on T0; the internal lock check carries
+/// the per-child bearer and the internal-call marker, never caps.
+#[tokio::test]
+async fn access_arms_are_refused_while_the_callers_account_is_locked() {
+    let h = harness().await;
+    let ada = insert_account(&h.pool, "ada", 20_001, false).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+
+    let (status, body) = rpc(&h.app, Some(&cookie), json!({"cmd":"access_list_devices"})).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "unlocked: served by the broker: {body}"
+    );
+
+    h.launcher.locked.store(true, Ordering::SeqCst);
+    for cmd in [
+        "access_status",
+        "access_devices_list",
+        "access_pair_begin",
+        "access_device_set_tier",
+        "access_invite_issue",
+        "access_policy_set_cell",
+        "access_audit_export",
+        "access_list_devices",
+    ] {
+        let (status, body) = rpc(&h.app, Some(&cookie), json!({ "cmd": cmd, "args": {} })).await;
+        assert_eq!(status, StatusCode::OK, "{cmd}: {body}");
+        assert_eq!(body["ok"], false, "{cmd}: {body}");
+        assert_eq!(
+            body["error"],
+            crate::server::shared::app_lock::LOCKED_ERROR,
+            "{cmd}: {body}"
+        );
+    }
+    let (_, body) = rpc(&h.app, Some(&cookie), json!({"cmd":"server_health"})).await;
+    assert_ne!(
+        body["error"],
+        crate::server::shared::app_lock::LOCKED_ERROR,
+        "server_health is exempt: {body}"
+    );
+
+    let seen = h.launcher.seen_for(ada);
+    let requests = seen.requests.lock().unwrap().clone();
+    let (_, headers, _) = requests
+        .iter()
+        .find(|(_, _, b)| b.contains("app_lock_status"))
+        .expect("the child was asked");
+    assert_eq!(
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+        Some(format!("Bearer {}", seen.token).as_str())
+    );
+    assert_eq!(
+        headers
+            .get(crate::access::INTERNAL_CALL_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+    assert!(headers.get("x-ikenga-caps").is_none());
+
+    h.launcher.locked.store(false, Ordering::SeqCst);
+    let (status, _) = rpc(&h.app, Some(&cookie), json!({"cmd":"access_list_devices"})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unlocked again: served");
 }
 
 struct DenyFsWrite(Arc<Mutex<Vec<(String, String, Value)>>>);

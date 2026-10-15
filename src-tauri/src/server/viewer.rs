@@ -402,6 +402,12 @@ async fn serve_mount_file(
     rel_path: &str,
     mut req: Request<Body>,
 ) -> Response {
+    // WP-C (R4-6a): a locked account serves no mounted file, including from
+    // a mount made before the lock. (The router's lock layer refuses first;
+    // this holds wherever the handler is mounted.)
+    if state.app_lock.is_locked() {
+        return super::app_lock_refusal();
+    }
     let root = &mount.root;
     if req.method() == Method::OPTIONS {
         return Response::builder()

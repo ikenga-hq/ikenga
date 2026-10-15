@@ -102,7 +102,7 @@ pub const EVENT_PATH: &str = "/term-hooks/event";
 pub const STATUSLINE_PATH: &str = "/term-hooks/statusline";
 
 /// Directory, under `--data-dir`, that holds the per-terminal files.
-const DIR_NAME: &str = "term-hooks";
+pub(crate) const DIR_NAME: &str = "term-hooks";
 
 /// Largest hook/statusline body accepted (a `PostToolUse` carries the tool's
 /// whole response). Checked only after the secret is, so an unauthenticated
@@ -129,7 +129,7 @@ pub fn terminal_file_name(terminal_id: &str) -> String {
     format!("claude-hooks-{terminal_id}.json")
 }
 
-fn header_file_name(terminal_id: &str) -> String {
+pub(crate) fn header_file_name(terminal_id: &str) -> String {
     format!("claude-hooks-{terminal_id}.hdr")
 }
 

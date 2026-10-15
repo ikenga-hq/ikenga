@@ -49,6 +49,7 @@ pub mod pty_ws;
 pub mod push;
 mod reserved;
 pub mod rpc;
+mod rpc_app_lock;
 mod rpc_backup;
 mod rpc_claude;
 mod rpc_exec;
@@ -73,6 +74,8 @@ pub mod update;
 /// Authenticated viewer file serving for browser sessions (gap audit rank 8).
 pub mod viewer;
 
+#[cfg(test)]
+mod app_lock_router_tests;
 #[cfg(test)]
 mod events_ws_tests;
 #[cfg(test)]
@@ -300,6 +303,8 @@ pub struct AppState {
     pub(crate) viewer: Arc<viewer::ViewerService>,
     /// Per-account streaming sidecar manager (R4-3).
     pub(crate) sidecars: Arc<shared::pkg_helpers::DaemonSidecarManager>,
+    /// App lock state and PIN record scoped to this daemon's `--data-dir` (WP-C).
+    pub(crate) app_lock: Arc<shared::app_lock::AppLockState>,
 }
 
 /// Compare two secrets without leaking their common prefix through timing.
@@ -402,6 +407,51 @@ fn forbidden(e: &crate::access::AccessError) -> Response {
 /// are checked against their requirement here (§1.6), `/api/rpc` per
 /// command in `rpc_handler`. A principal child takes caps only from
 /// `X-Ikenga-Caps` on per-child-token requests (§1.7).
+/// Whether `path`, a protected route, refuses while the account is app-locked
+/// (WP-C, R4-6a). Gated unless named here, so a new route is gated by
+/// default:
+/// - `/api/rpc` checks per command (`rpc::is_app_lock_exempt_cmd`);
+/// - `/ws/pty/*`, `/ws/chat/*` and `/ws/events` pause in their handlers
+///   (output held, input dropped) and must still see the unlock;
+/// - `/pkgs/*` is installed pkg code, not account data;
+/// - `/api/shutdown` and `/api/server/update*` are operator-only box
+///   operations that a provisioner or upgrade must still reach.
+///
+/// Everything else — `/__viewer/*` (mounted files), `/ws/fs` (filenames and
+/// write timing), `/api/backup/*` (the whole account) — refuses with 423.
+pub(crate) fn app_lock_gates_path(path: &str) -> bool {
+    let exempt = path == "/api/rpc"
+        || path.starts_with("/ws/pty/")
+        || path.starts_with("/ws/chat/")
+        || path == "/ws/events"
+        || path == "/pkgs"
+        || path.starts_with("/pkgs/")
+        || path == "/api/shutdown"
+        || path == "/api/server/update"
+        || path == "/api/server/update/apply";
+    !exempt
+}
+
+/// The answer a gated route gives while the account is locked.
+pub(crate) fn app_lock_refusal() -> Response {
+    (
+        StatusCode::LOCKED,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": shared::app_lock::LOCKED_ERROR,
+        })),
+    )
+        .into_response()
+}
+
+/// [`app_lock_gates_path`] as a layer, inside `auth_middleware`.
+async fn app_lock_gate(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    if state.app_lock.is_locked() && app_lock_gates_path(req.uri().path()) {
+        return app_lock_refusal();
+    }
+    next.run(req).await
+}
+
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     mut req: Request,
@@ -938,6 +988,24 @@ fn build_router(
         asks.sweep_orphans();
         term_hooks.attach_asks(asks);
     }
+    let app_lock = Arc::new(shared::app_lock::AppLockState::new());
+    if let Some(ref data_dir) = config.data_dir {
+        app_lock.configure(data_dir.join(shared::app_lock::CONFIG_FILENAME));
+        let ticker_lock = Arc::clone(&app_lock);
+        let ticker_events = events.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(shared::app_lock::IDLE_TICK);
+            loop {
+                tick.tick().await;
+                let (locked_now, _) = ticker_lock.check_idle();
+                if locked_now {
+                    tracing::info!("[app-lock] locked after idle");
+                    ticker_events.publish(events::Topic::AppLockChanged, &serde_json::json!({}));
+                }
+            }
+        });
+    }
+
     let state = Arc::new(AppState {
         config,
         spa_service: spa_service.clone(),
@@ -959,6 +1027,7 @@ fn build_router(
         shutdown_tx,
         viewer: Arc::new(viewer::ViewerService::new()),
         sidecars: Arc::new(shared::pkg_helpers::DaemonSidecarManager::new()),
+        app_lock,
     });
 
     // Same-origin needs no CORS headers at all; anything else has to be named
@@ -1018,7 +1087,10 @@ fn build_router(
         .route(
             "/__viewer/:token/*path",
             axum::routing::any(viewer::serve_viewer_handler),
-        );
+        )
+        // WP-C (R4-6a). Only the routes above: the broker-internal drains
+        // added below for a principal child must keep working while locked.
+        .layer(middleware::from_fn_with_state(state.clone(), app_lock_gate));
     // plans/pwa S2 §10: a principal child's push outbox, drained by the T1
     // broker only (`internal` class: the per-child token plus the broker's
     // internal-call header; the broker never proxies `/internal/*`).
