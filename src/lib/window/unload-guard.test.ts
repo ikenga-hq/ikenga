@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { beforeUnloadPrompt, installUnloadGuard } from './unload-guard';
+import { _resetUnloadSuspendForTests, withTerminalGuardSuspended } from './unload-suspend';
 
 function harness(opts: { browser: boolean; count: number }) {
 	let count = opts.count;
@@ -59,5 +60,47 @@ describe('installUnloadGuard', () => {
 		const e = new Event('beforeunload', { cancelable: true }) as BeforeUnloadEvent;
 		beforeUnloadPrompt(e);
 		expect(e.defaultPrevented).toBe(true);
+	});
+});
+
+describe('withTerminalGuardSuspended', () => {
+	const fire = () => {
+		const e = new Event('beforeunload', { cancelable: true }) as BeforeUnloadEvent;
+		beforeUnloadPrompt(e);
+		return e.defaultPrevented;
+	};
+
+	beforeEach(() => {
+		vi.useFakeTimers();
+		_resetUnloadSuspendForTests();
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+		_resetUnloadSuspendForTests();
+	});
+
+	it('stands the terminal prompt aside while the callback runs', () => {
+		let during: boolean | null = null;
+		withTerminalGuardSuspended(() => {
+			during = fire();
+		});
+		expect(during).toBe(false);
+	});
+
+	it('re-arms shortly after, so a cancelled reload does not leave the tab unguarded', () => {
+		withTerminalGuardSuspended(() => {});
+		expect(fire()).toBe(false);
+		vi.advanceTimersByTime(1000);
+		expect(fire()).toBe(true);
+	});
+
+	it('re-arms even when the callback throws', () => {
+		expect(() =>
+			withTerminalGuardSuspended(() => {
+				throw new Error('boom');
+			})
+		).toThrow('boom');
+		vi.advanceTimersByTime(1000);
+		expect(fire()).toBe(true);
 	});
 });
