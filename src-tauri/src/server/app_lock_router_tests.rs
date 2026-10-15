@@ -4,9 +4,11 @@
 //! - pty: input sent while locked is dropped (never run after the unlock), a
 //!   `?spawn=true` is refused, an attach gets no scrollback until the unlock,
 //!   and an open socket pauses and is re-sent a snapshot on unlock;
-//! - chat: a prompt sent while locked never runs;
+//! - chat: a prompt sent while locked never runs, and the output of a turn
+//!   started before the lock is held until the unlock;
 //! - events: control frames are answered while locked (nothing parks the
-//!   loop) and a socket opened behind the lock screen sees the unlock;
+//!   loop), a socket opened behind the lock screen sees the unlock, and an
+//!   event published during the lock is held until the unlock;
 //! - fs: no events and no new watches while locked, and a new socket is
 //!   refused;
 //! - viewer and backup: refused while locked, including a mount made before.
@@ -38,11 +40,17 @@ type Client =
 struct Daemon {
     _tmp: tempfile::TempDir,
     root: PathBuf,
+    data: PathBuf,
     router: Router,
     addr: SocketAddr,
 }
 
 async fn daemon() -> Daemon {
+    daemon_with(Arc::new(crate::engines::EngineRegistry::new()), 0).await
+}
+
+/// `port` is only what the hook settings files name (nothing here binds it).
+async fn daemon_with(engines: Arc<crate::engines::EngineRegistry>, port: u16) -> Daemon {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let work = root.join("work");
@@ -57,7 +65,7 @@ async fn daemon() -> Daemon {
     let roots = Arc::new(crate::fs_roots::FsRoots::load(roots_file).unwrap());
     let config = crate::server::ServerConfig {
         host: "127.0.0.1".into(),
-        port: 0,
+        port,
         static_dir: root.join("no-spa-here"),
         pkgs_dir: None,
         data_dir: Some(root.join("data")),
@@ -69,7 +77,7 @@ async fn daemon() -> Daemon {
     let router = crate::server::build_router(
         config,
         Arc::new(crate::pty::PtyManager::new()),
-        Arc::new(crate::engines::EngineRegistry::new()),
+        engines,
         None,
         None,
         None,
@@ -92,6 +100,7 @@ async fn daemon() -> Daemon {
     Daemon {
         _tmp: tmp,
         root: work,
+        data: root.join("data"),
         router,
         addr,
     }
@@ -509,6 +518,105 @@ async fn chat_prompt_sent_while_locked_never_runs_after_unlock() {
     .await;
 }
 
+/// A fake `agy` that holds its answer until the test creates `gate` in its
+/// cwd: it marks `started`, reads its stdin to EOF, waits for the gate, then
+/// speaks stream-json. That makes "a turn started before the lock, answering
+/// during it" deterministic.
+///
+/// Written once per test process: writing an executable while other test
+/// threads fork can make a concurrent exec of it fail with ETXTBSY.
+#[cfg(unix)]
+fn gated_agy() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    static STUB: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    STUB.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("ikenga-lock-stub-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agy");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+cat > /dev/null
+: > started
+while [ ! -e gate ]; do sleep 0.05; done
+printf '%s\n' '{"event":"init","conversation_id":"conv-lock"}'
+printf '%s\n' '{"event":"step_update","step_update":{"step_type":"response","text_delta":"PONG_FROM_LOCKED_TURN"}}'
+printf '%s\n' '{"event":"result","result":{"status":"SUCCESS"}}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    })
+    .clone()
+}
+
+/// WP-C round 6 (mutation CS): a turn started BEFORE the lock keeps running
+/// and answers during it. Its output (a delta and the closing `idle`) is held
+/// on the socket while locked and delivered after the unlock. Goes through
+/// the real `/ws/chat` socket and the real `app_lock_*` RPCs.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chat_output_of_a_turn_started_before_the_lock_is_held_until_unlock() {
+    use crate::engines::antigravity_acp::AntigravityEngine;
+    use crate::engines::{EngineHandle, EngineRegistry};
+
+    let engines = Arc::new(EngineRegistry::new());
+    engines
+        .insert(
+            "antigravity-cli",
+            EngineHandle::Antigravity(Arc::new(AntigravityEngine::with_binary(gated_agy()))),
+        )
+        .await;
+    let d = daemon_with(engines, 0).await;
+    d.set_pin().await;
+
+    let status = |f: &Frame, s: &str| {
+        matches!(f, Frame::Text(v) if v["params"]["update"]["type"] == "status"
+            && v["params"]["update"]["status"] == s)
+    };
+    let answer =
+        |f: &Frame| matches!(f, Frame::Text(v) if v.to_string().contains("PONG_FROM_LOCKED_TURN"));
+
+    let mut ws = d.ws("/ws/chat/lock-turn").await;
+    until(&mut ws, Duration::from_secs(5), "idle", |f| {
+        status(f, "idle")
+    })
+    .await;
+    ws.send(tungstenite::Message::Text(
+        json!({ "type": "prompt", "prompt": "before the lock", "cwd": d.root.to_string_lossy() })
+            .to_string(),
+    ))
+    .await
+    .unwrap();
+    until(&mut ws, Duration::from_secs(5), "running", |f| {
+        status(f, "running")
+    })
+    .await;
+    assert!(
+        wait_for_file(&d.root.join("started"), Duration::from_secs(10)).await,
+        "the engine never started: the turn is not in flight"
+    );
+
+    // The turn is in flight. Lock, and only then let the engine answer.
+    d.lock().await;
+    std::fs::write(d.root.join("gate"), "go").unwrap();
+
+    let held = frames(&mut ws, Duration::from_millis(1500)).await;
+    assert!(
+        !held.iter().any(|f| answer(f) || status(f, "idle")),
+        "chat output of an in-flight turn was delivered while locked: {held:?}"
+    );
+
+    d.unlock().await;
+    until(&mut ws, Duration::from_secs(10), "the held answer", answer).await;
+    // The terminal status of the same turn follows the answer.
+    until(&mut ws, Duration::from_secs(5), "idle after unlock", |f| {
+        status(f, "idle")
+    })
+    .await;
+}
+
 /// The events socket never parks on the lock: a ping is answered while
 /// locked, and a socket opened behind the lock screen can subscribe and sees
 /// the unlock.
@@ -577,6 +685,124 @@ async fn events_socket_answers_while_locked_and_sees_the_unlock() {
         Duration::from_secs(5),
         "the unlock event",
         is_change,
+    )
+    .await;
+}
+
+/// WP-C round 6 (mutation EV): an event that is not `app-lock://changed`,
+/// published while locked, is held on the socket and delivered after the
+/// unlock. The producer is a daemon terminal's statusline POST (it needs no
+/// RPC, so it keeps publishing behind the lock screen); the wiring
+/// (`pty_spawn`) happens before the lock, as RPCs are refused while locked.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_event_published_while_locked_is_held_until_unlock() {
+    use crate::server::term_hooks::{
+        header_file_name, terminal_file_name, DIR_NAME, STATUSLINE_PATH,
+    };
+
+    let d = daemon_with(Arc::new(crate::engines::EngineRegistry::new()), 45873).await;
+    d.set_pin().await;
+    let term = "lock-hud";
+    let hooks_dir = d.data.join(DIR_NAME);
+    let spawned = d
+        .rpc(
+            "pty_spawn",
+            json!({
+                "terminalId": term,
+                "cwd": d.root.to_string_lossy(),
+                "cmd": ["/bin/sh", "-c", "sleep 60"],
+                "rows": 24,
+                "cols": 80,
+                "settingsPath": hooks_dir.join(terminal_file_name(term)).to_string_lossy(),
+            }),
+        )
+        .await;
+    assert_eq!(spawned["ok"], true, "{spawned}");
+    let secret = std::fs::read_to_string(hooks_dir.join(header_file_name(term)))
+        .unwrap()
+        .trim()
+        .strip_prefix("Authorization: Bearer ")
+        .unwrap()
+        .to_string();
+
+    // A statusline POST: the producer of `statusline://snapshot`.
+    let post = |session: &'static str| {
+        let router = d.router.clone();
+        let secret = secret.clone();
+        async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("{STATUSLINE_PATH}?terminal={term}"))
+                        .header("authorization", format!("Bearer {secret}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({ "session_id": session }).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    let snapshot = |session: &'static str| {
+        move |f: &Frame| {
+            matches!(f, Frame::Text(v) if v["event"] == "statusline://snapshot"
+                && v["payload"]["session_id"] == session)
+        }
+    };
+
+    let mut ws = d.ws("/ws/events").await;
+    until(&mut ws, Duration::from_secs(5), "ready", |f| {
+        is_type(f, "ready")
+    })
+    .await;
+    ws.send(tungstenite::Message::Text(
+        json!({ "type": "subscribe", "events": ["statusline://snapshot", "app-lock://changed"] })
+            .to_string(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Unlocked, the event arrives: the test can see this producer's events.
+    assert_eq!(post("before-lock").await, StatusCode::OK);
+    until(
+        &mut ws,
+        Duration::from_secs(5),
+        "the unlocked event",
+        snapshot("before-lock"),
+    )
+    .await;
+
+    d.lock().await;
+    until(
+        &mut ws,
+        Duration::from_secs(5),
+        "the lock event",
+        |f| matches!(f, Frame::Text(v) if v["event"] == "app-lock://changed"),
+    )
+    .await;
+    assert_eq!(
+        post("during-lock").await,
+        StatusCode::OK,
+        "the producer must really publish while locked"
+    );
+    let held = frames(&mut ws, Duration::from_millis(1000)).await;
+    assert!(
+        !held
+            .iter()
+            .any(|f| matches!(f, Frame::Text(v) if v["event"] == "statusline://snapshot")),
+        "an event published while locked was delivered while locked: {held:?}"
+    );
+
+    d.unlock().await;
+    until(
+        &mut ws,
+        Duration::from_secs(5),
+        "the held event after unlock",
+        snapshot("during-lock"),
     )
     .await;
 }

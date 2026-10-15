@@ -1288,6 +1288,43 @@ mod tests {
             MAX_ATTEMPTS,
             "no wrong check ran"
         );
+
+        // Phase 2, the owner goes away: a request dropped mid-check (client
+        // gone) must not clear the flag its still-running argon2 holds. The
+        // check detaches and finishes; callers meanwhile are told it is busy
+        // and none starts a second argon2. (Phase 1 only ever aborted callers
+        // that were refused, which owned nothing, so an inline run with a
+        // clear-on-drop guard passed it.)
+        let s = Arc::clone(&state);
+        let owner =
+            tokio::spawn(async move { s.set_secret(Some("5678".into()), "9999".into()).await });
+        while !state.with(|i| i.verifying) {
+            tokio::task::yield_now().await;
+        }
+        owner.abort();
+        let _ = owner.await;
+        assert!(
+            state.with(|i| i.verifying),
+            "dropping the request cleared the busy flag of a check still running"
+        );
+        let mut busy_after_abort = 0;
+        while state.running_checks() > 0 || state.with(|i| i.verifying) {
+            if let Err(e) = state.clear_secret("0000".into()).await {
+                if e.contains("Still checking") {
+                    busy_after_abort += 1;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            busy_after_abort > 0,
+            "no caller was told the aborted owner's check was still running"
+        );
+        assert_eq!(
+            state.peak_checks(),
+            1,
+            "a second argon2 started while the aborted owner's was running"
+        );
     }
 
     #[cfg(unix)]

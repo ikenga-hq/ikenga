@@ -187,7 +187,7 @@ impl AntigravityEngine {
 
     /// An engine that runs `binary` instead of `agy` (a test stub).
     #[cfg(test)]
-    fn with_binary(binary: PathBuf) -> Self {
+    pub(crate) fn with_binary(binary: PathBuf) -> Self {
         Self {
             binary_override: Some(binary),
             ..Self::new()
