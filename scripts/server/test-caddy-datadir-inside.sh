@@ -158,7 +158,7 @@ inside_before="$(stat -c '%a %U:%G %n' "$D"/data/principals "$D"/data/operator "
 
 dd_scenario t1 1
 ok "dry-run t1: data untouched (700)" test "$(mode "$D/data")" = "700 root:root"
-ok "dry-run t1: says what it would do" out_has '\[dry-run\] chmod 00711'
+ok "dry-run t1: says what it would do" out_has '\[dry-run\] chmod 00755'
 ok "dry-run t1: change prefixed would:" out_has 'CHANGES: would: data dir'
 
 dd_scenario t0 0
@@ -166,26 +166,26 @@ ok "t0: stays 700" test "$(mode "$D/data")" = "700 root:root"
 ok "t0: no change reported" out_has '^CHANGES: $'
 
 dd_scenario t1 0
-ok "t1: pre-existing 0700 converges to 0711 root:root" test "$(mode "$D/data")" = "711 root:root"
-ok "t1: change reported" out_has 'CHANGES: data dir .*: 700 root:root -> 711 root:root'
+ok "t1: pre-existing 0700 converges to 0755 root:root" test "$(mode "$D/data")" = "755 root:root"
+ok "t1: change reported" out_has 'CHANGES: data dir .*: 700 root:root -> 755 root:root'
 ok "t1: nothing inside data/ touched" test "$(stat -c '%a %U:%G %n' "$D"/data/principals "$D"/data/operator "$D"/data/operator/key)" = "$inside_before"
 
 dd_scenario t1 0
 ok "t1: second run is a no-op" out_has '^CHANGES: $'
 
-chown 1000:1000 "$D/data"; chmod 0755 "$D/data"
+chown 1000:1000 "$D/data"; chmod 0711 "$D/data"
 dd_scenario t1 0
-ok "t1: wrong owner/mode (1000:1000 755) converges" test "$(mode "$D/data")" = "711 root:root"
+ok "t1: wrong owner/mode (1000:1000 0711) converges" test "$(mode "$D/data")" = "755 root:root"
 
 rm -rf "$D/data"
 dd_scenario t1 1
 no "dry-run t1, dir missing: not created" test -e "$D/data"
 dd_scenario t1 0
-ok "t1, dir missing: created 0711 root:root" test "$(mode "$D/data")" = "711 root:root"
+ok "t1, dir missing: created 0755 root:root" test "$(mode "$D/data")" = "755 root:root"
 
 # install_daemon's own mkdir: the t1/t0 split is a one-liner we can only grep for.
 CHECKS=$((CHECKS + 1))
-grep -qE 'if \[\[ "\$TIER" == t1 \]\]; then install -d -m 0711 -o root -g root "\$INSTALL_DIR/data"; else install -d -m 0700 "\$INSTALL_DIR/data"; fi' "$PROVISION" \
+grep -qE 'if \[\[ "\$TIER" == t1 \]\]; then install -d -m 0755 -o root -g root "\$INSTALL_DIR/data"; else install -d -m 0700 "\$INSTALL_DIR/data"; fi' "$PROVISION" \
   || fail "install_daemon data-dir line not as expected"
 
 echo "==> [Container] $CHECKS checks PASSED"
