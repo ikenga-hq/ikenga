@@ -203,10 +203,25 @@ One download per project, everyone on their own branch, and nobody able to affec
 | `PROJECTS_READ` | `members` | `members`: the managed accounts get a **read-only** ACL entry on each mirror and nobody else can read it (right for private repos). `world`: any user on the box can read the mirrors. |
 | `PROJECTS_MEMBERS` | all managed accounts | Who gets a clone and (with `PROJECTS_READ=members`) read access. Narrowing it removes the ACL entry; the account's clone is left where it is. |
 | `PROJECTS_TOKEN_SECRET` | none | Name of a secret in `SECRETS_FILE` (scope it `root`): an https deploy token for private repos. |
+| `PROJECTS_TOKEN_SECRETS` | none | `("project=SECRET_NAME" ...)`: a project's **own** deploy token, for repos the default token cannot read. A listed project uses that secret; every other project uses `PROJECTS_TOKEN_SECRET` (or no token if that is unset too). Each project name must be in `PROJECTS` (once), each secret must be in `SECRETS_FILE` exactly once, and should be scoped `root`. A GitHub fine-grained token belongs to one owner, so an org's repos and a personal repo need one token each. |
 | `PROJECTS_FASTFORWARD` | none | Accounts whose existing clones `refresh-projects` keeps current (agents, never people). Must be managed accounts. |
 | `PROJECTS_REFRESH_SCHEDULE` | `daily` | `OnCalendar` of `ikenga-projects-refresh.timer` (e.g. `*-*-* 02,14:00:00`). `off` = no timer, and an installed one is removed. |
 
-**How the provisioner updates the mirror without trusting anything.** Root's `git fetch` runs with an empty environment (`env -i`), `HOME` in a root-only scratch directory, system and global config disabled, its working directory in that scratch directory, `core.hooksPath=/dev/null`, `core.fsmonitor=false`, no credential helper, no redirects, gc and maintenance off, and `GIT_ALLOW_PROTOCOL` narrowed to the one transport the profile URL uses. It fetches the profile's URL explicitly, so no `remote.*` or `url.*.insteadOf` in the repo is ever consulted, and it rewrites the mirror's `config` to a fixed canonical one on every run, empties `hooks/`, and removes symlinks and `alternates` files. The deploy token reaches `git` through `GIT_ASKPASS` (a script reading a `0600` file in the scratch directory) for http(s) URLs only: never argv, the URL or a repo config. Errors are captured in a variable, not written to a file. Root writes nothing into an account's home or any other directory an account can write. `sync-accounts` converges an older group-writable layout back to this one.
+**Example: one token per resource owner.** The org's repos use one token, a personal repo another (both `[root]` secrets, so no account ever sees them):
+
+```bash
+PROJECTS=("app=https://github.com/example-org/app.git#main"
+          "site=https://github.com/example-org/site.git#main"
+          "monorepo=https://github.com/example-user/monorepo.git#main")
+PROJECTS_TOKEN_SECRET=ORG_GH_TOKEN                       # default: app, site
+PROJECTS_TOKEN_SECRETS=("monorepo=PERSONAL_GH_TOKEN")    # monorepo only
+SECRETS_FILE=/root/provision/secrets.scoped
+# secrets.scoped:
+#   [root] ORG_GH_TOKEN=github_pat_...
+#   [root] PERSONAL_GH_TOKEN=github_pat_...
+```
+
+**How the provisioner updates the mirror without trusting anything.** Root's `git fetch` runs with an empty environment (`env -i`), `HOME` in a root-only scratch directory, system and global config disabled, its working directory in that scratch directory, `core.hooksPath=/dev/null`, `core.fsmonitor=false`, no credential helper, no redirects, gc and maintenance off, and `GIT_ALLOW_PROTOCOL` narrowed to the one transport the profile URL uses. It fetches the profile's URL explicitly, so no `remote.*` or `url.*.insteadOf` in the repo is ever consulted, and it rewrites the mirror's `config` to a fixed canonical one on every run, empties `hooks/`, and removes symlinks and `alternates` files. The deploy token reaches `git` through `GIT_ASKPASS` (a script reading a `0600` file in the scratch directory) for http(s) URLs only: never argv, the URL or a repo config. With `PROJECTS_TOKEN_SECRETS` each secret has its own file there and each project is fetched with the file of the secret it resolves to; a project with no token (none of its own, no default) is fetched with no askpass at all, so it can never be handed another project's token. Errors are captured in a variable, not written to a file. Root writes nothing into an account's home or any other directory an account can write. `sync-accounts` converges an older group-writable layout back to this one.
 
 **Why `PROJECTS_READ=members` uses ACLs, not a group.** The daemon starts every account's sessions with **no supplementary groups** (`src-tauri/src/executor/t1.rs`, `verify_dropped()` refuses a spawn that has any), so group membership would help an SSH login but not a terminal or Chi run. A named-user ACL entry is matched on the uid and survives the drop. The entries are read-only (`r-x` on directories, `r--` on files); nothing grants write. The filesystem must support ACLs (ext4 and xfs do by default); if `setfacl` fails the run warns and exits non-zero.
 
