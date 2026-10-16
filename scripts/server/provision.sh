@@ -185,6 +185,7 @@ PROJECTS_MEMBERS=()    # empty = every managed account
 PROJECTS=()            # name=git-url[#branch]
 PROJECTS_BRANCH_PREFIX=""   # each account's branch = <prefix><account>/main
 PROJECTS_TOKEN_SECRET=""    # NAME of a SECRETS_FILE entry: https deploy token for private repos
+PROJECTS_TOKEN_SECRETS=()   # "<project>=<SECRET NAME>": a project's own deploy token (default: PROJECTS_TOKEN_SECRET)
 PROJECTS_FASTFORWARD=()     # accounts whose existing clones refresh-projects fast-forwards (agents; never people)
 PROJECTS_REFRESH_SCHEDULE="daily"   # OnCalendar of ikenga-projects-refresh.timer; "off" = no timer
 SECRETS_FILE=""             # root-only scoped secrets (format in README)
@@ -1957,6 +1958,11 @@ GITCONFIG_SYSTEM="/etc/gitconfig"
 BASH_BASHRC="/etc/bash.bashrc"
 FAILED=0
 GIT_HOME=""; ASKPASS_FILE=""; MIRROR_UMASK=077     # git_root's scratch dir, askpass, umask (see sync_projects)
+# Deploy tokens, per project (see refresh_mirrors). TOKEN_FILE_OF maps a secret
+# NAME to its 0600 file in GIT_HOME; PROJ_TOKEN_CUR is the file for the project
+# being fetched right now, and is empty whenever that project has no token.
+declare -A TOKEN_FILE_OF=()
+PROJ_TOKEN_CUR=""
 soft_fail() { printf 'warning: %s\n' "$*" >&2; FAILED=1; }
 
 declare -A ACCT_UID=() ACCT_GID=() ACCT_HOME=()
@@ -1971,6 +1977,17 @@ secret_name_ok() {
     IKENGA_*|LD_*|DYLD_*|BASH_*|PATH|HOME|USER|LOGNAME|SHELL|IFS|ENV|PS1|PS2|PS4|PROMPT_COMMAND|CDPATH|GLOBIGNORE|SHELLOPTS|TMPDIR|TERM|PWD|OLDPWD) return 1 ;;
     GIT_ASKPASS|GIT_SSH|GIT_SSH_COMMAND|GIT_PROXY_COMMAND|GIT_EXEC_PATH|GIT_DIR|GIT_WORK_TREE|GIT_CONFIG*) return 1 ;;
   esac
+}
+
+# project_token_secret <project>: the NAME of the secret that holds the project's
+# deploy token. The project's own PROJECTS_TOKEN_SECRETS entry wins, else
+# PROJECTS_TOKEN_SECRET, else nothing (the project is fetched with no token).
+project_token_secret() {
+  local e
+  for e in "${PROJECTS_TOKEN_SECRETS[@]}"; do
+    if [[ "${e%%=*}" == "$1" ]]; then printf '%s' "${e#*=}"; return 0; fi
+  done
+  printf '%s' "$PROJECTS_TOKEN_SECRET"
 }
 
 is_reserved_scope() { [[ "$1" == everyone || "$1" == agents || "$1" == root || "$1" == backup ]]; }
@@ -2001,7 +2018,7 @@ validate_accounts_profile() {
       [[ "${rest#*#}" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die "PROJECTS '$name': the #branch '${rest#*#}' is not a plain branch name"
     fi
     if [[ "${rest%%#*}" =~ ^https?://[^/]*@ ]]; then
-      die "PROJECTS '$name': the URL carries credentials; remove them and set PROJECTS_TOKEN_SECRET (a secret in SECRETS_FILE)"
+      die "PROJECTS '$name': the URL carries credentials; remove them and set PROJECTS_TOKEN_SECRET or PROJECTS_TOKEN_SECRETS (a secret in SECRETS_FILE)"
     fi
   done
   for a in "${PROJECTS_FASTFORWARD[@]}"; do
@@ -2017,6 +2034,20 @@ validate_accounts_profile() {
   fi
   [[ -z "$PROJECTS_TOKEN_SECRET" || -n "$SECRETS_FILE" ]] || die "PROJECTS_TOKEN_SECRET needs SECRETS_FILE"
   [[ -z "$PROJECTS_TOKEN_SECRET" ]] || secret_name_ok "$PROJECTS_TOKEN_SECRET" || die "PROJECTS_TOKEN_SECRET '$PROJECTS_TOKEN_SECRET' is not a usable secret name"
+  # Per-project deploy tokens: every entry names a project that exists, once.
+  # (That each secret appears exactly once in SECRETS_FILE is checked in
+  # refresh_mirrors, once the secrets are loaded.)
+  [[ ${#PROJECTS_TOKEN_SECRETS[@]} -eq 0 || -n "$SECRETS_FILE" ]] || die "PROJECTS_TOKEN_SECRETS needs SECRETS_FILE"
+  local tseen=" " tname tsecret
+  for e in "${PROJECTS_TOKEN_SECRETS[@]}"; do
+    tname="${e%%=*}"; tsecret="${e#*=}"
+    [[ "$e" == *=* && -n "$tname" && -n "$tsecret" ]] || die "PROJECTS_TOKEN_SECRETS entry '$e' must look like project=SECRET_NAME"
+    # The name check first: 'seen' is space-separated, so "a b" would match it.
+    [[ "$tname" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && "$seen" == *" $tname "* ]] || die "PROJECTS_TOKEN_SECRETS names '$tname', which is not in PROJECTS (typo?)"
+    [[ "$tseen" != *" $tname "* ]] || die "PROJECTS_TOKEN_SECRETS names '$tname' twice"
+    tseen+="$tname "
+    secret_name_ok "$tsecret" || die "PROJECTS_TOKEN_SECRETS '$tname=$tsecret': '$tsecret' is not a usable secret name"
+  done
   [[ -z "$SECRETS_FILE" || -f "$SECRETS_FILE" ]] || die "SECRETS_FILE '$SECRETS_FILE' does not exist"
 }
 
@@ -2133,7 +2164,8 @@ managed_block() {
 #  - only the protocol the profile's URL uses is allowed;
 #  - the deploy token, for an http(s) URL only, reaches git through GIT_ASKPASS
 #    (an askpass script reading a 0600 file in the scratch dir): never argv,
-#    never a repo config.
+#    never a repo config. Which token is per project: PROJ_TOKEN_CUR names the
+#    file for the project being fetched, and is empty for one with no token.
 git_root() {
   local url="$1"; shift
   local proto=none
@@ -2146,8 +2178,8 @@ git_root() {
   local -a e=(PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 HOME="$GIT_HOME"
     GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
     GIT_ALLOW_PROTOCOL="$proto" GIT_SSH_COMMAND="ssh -o BatchMode=yes")
-  if [[ -n "$ASKPASS_FILE" && ( "$proto" == https || "$proto" == http ) ]]; then
-    e+=(GIT_ASKPASS="$ASKPASS_FILE" IKENGA_TOKEN_FILE="$GIT_HOME/token")
+  if [[ -n "$ASKPASS_FILE" && -n "$PROJ_TOKEN_CUR" && ( "$proto" == https || "$proto" == http ) ]]; then
+    e+=(GIT_ASKPASS="$ASKPASS_FILE" IKENGA_TOKEN_FILE="$PROJ_TOKEN_CUR")
   fi
   ( umask "$MIRROR_UMASK"; cd "$GIT_HOME" && exec env -i "${e[@]}" git \
       -c core.hooksPath=/dev/null -c core.fsmonitor=false -c credential.helper= \
@@ -2308,33 +2340,57 @@ refresh_mirrors() {
     changed "safe.directory for the shared mirrors in $GITCONFIG_SYSTEM"
   fi
 
-  # Root-only scratch dir: git's HOME and cwd, and the deploy token's askpass.
-  ASKPASS_FILE=""
+  # Root-only scratch dir: git's HOME and cwd, and the deploy tokens' askpass.
+  # One 0600 file per deploy-token SECRET (not per project), so a project can
+  # only ever be handed the file of the secret it resolves to.
+  ASKPASS_FILE=""; TOKEN_FILE_OF=(); PROJ_TOKEN_CUR=""
   GIT_HOME="$(mktemp -d)"; chmod 0700 "$GIT_HOME"
   trap 'rm -rf -- "${GIT_HOME:-/nonexistent}"' EXIT
-  local PROJ_TOKEN=""
-  if [[ -n "$PROJECTS_TOKEN_SECRET" ]]; then
-    [[ "${ROOT_COUNT[$PROJECTS_TOKEN_SECRET]:-0}" -eq 1 ]] \
-      || { [[ $SECRETS_UNREADABLE -eq 1 ]] || die "PROJECTS_TOKEN_SECRET '$PROJECTS_TOKEN_SECRET' must appear exactly once in SECRETS_FILE (found ${ROOT_COUNT[$PROJECTS_TOKEN_SECRET]:-0})"; }
-    PROJ_TOKEN="${ROOT_VALUE[$PROJECTS_TOKEN_SECRET]:-}"
-    if [[ -n "${ROOT_SCOPE[$PROJECTS_TOKEN_SECRET]:-}" && "${ROOT_SCOPE[$PROJECTS_TOKEN_SECRET]}" != root ]]; then
-      note "WARNING: $PROJECTS_TOKEN_SECRET is the deploy token and is scoped '${ROOT_SCOPE[$PROJECTS_TOKEN_SECRET]}', so those accounts get it too. Scope it 'root' to keep it provisioner-only."
-    fi
-    if [[ -n "$PROJ_TOKEN" && $DRY_RUN -eq 0 ]]; then
-      ( umask 077
-        printf '%s\n' "$PROJ_TOKEN" > "$GIT_HOME/token"
-        printf '%s\n' '#!/bin/sh' 'case "$1" in *sername*) echo x-access-token ;; *) cat "$IKENGA_TOKEN_FILE" ;; esac' > "$GIT_HOME/askpass"
-        chmod 0700 "$GIT_HOME/askpass" )
-      ASKPASS_FILE="$GIT_HOME/askpass"
-    fi
-  fi
-  PROJ_TOKEN=""
+  local ent tsecret
+  [[ -z "$PROJECTS_TOKEN_SECRET" ]] || prepare_deploy_token PROJECTS_TOKEN_SECRET "$PROJECTS_TOKEN_SECRET"
+  for ent in "${PROJECTS_TOKEN_SECRETS[@]}"; do
+    prepare_deploy_token "PROJECTS_TOKEN_SECRETS (${ent%%=*})" "${ent#*=}"
+  done
 
-  for e in "${PROJECTS[@]}"; do ensure_mirror "${e%%=*}" "${e#*=}"; done
+  for e in "${PROJECTS[@]}"; do
+    name="${e%%=*}"
+    # A project with no token gets an empty PROJ_TOKEN_CUR, so git_root hands it
+    # no askpass at all; a token never carries over from the previous project.
+    tsecret="$(project_token_secret "$name")"
+    PROJ_TOKEN_CUR=""
+    [[ -z "$tsecret" ]] || PROJ_TOKEN_CUR="${TOKEN_FILE_OF[$tsecret]:-}"
+    ensure_mirror "$name" "${e#*=}" "$tsecret"
+  done
+  PROJ_TOKEN_CUR=""
+}
+
+# prepare_deploy_token <label> <secret name>: check the secret is in SECRETS_FILE
+# exactly once (a warning only when the file is unreadable in a dry run), warn
+# when its scope hands it to accounts, and write its value to
+# $GIT_HOME/tokens/<secret> (0600) with the shared askpass script. Once per secret.
+prepare_deploy_token() {
+  local label="$1" secret="$2" value
+  [[ -z "${TOKEN_FILE_OF[$secret]+x}" ]] || return 0
+  TOKEN_FILE_OF[$secret]=""
+  [[ "${ROOT_COUNT[$secret]:-0}" -eq 1 ]] \
+    || { [[ $SECRETS_UNREADABLE -eq 1 ]] || die "$label '$secret' must appear exactly once in SECRETS_FILE (found ${ROOT_COUNT[$secret]:-0})"; }
+  value="${ROOT_VALUE[$secret]:-}"
+  if [[ -n "${ROOT_SCOPE[$secret]:-}" && "${ROOT_SCOPE[$secret]}" != root ]]; then
+    note "WARNING: $secret is the deploy token and is scoped '${ROOT_SCOPE[$secret]}', so those accounts get it too. Scope it 'root' to keep it provisioner-only."
+  fi
+  if [[ -n "$value" && $DRY_RUN -eq 0 ]]; then
+    ( umask 077
+      install -d -m 0700 "$GIT_HOME/tokens"
+      printf '%s\n' "$value" > "$GIT_HOME/tokens/$secret"
+      printf '%s\n' '#!/bin/sh' 'case "$1" in *sername*) echo x-access-token ;; *) cat "$IKENGA_TOKEN_FILE" ;; esac' > "$GIT_HOME/askpass"
+      chmod 0700 "$GIT_HOME/askpass" )
+    ASKPASS_FILE="$GIT_HOME/askpass"
+    TOKEN_FILE_OF[$secret]="$GIT_HOME/tokens/$secret"
+  fi
 }
 
 ensure_mirror() {
-  local name="$1" spec="$2" url branch repo work before after def cur first out rc=0 new=0
+  local name="$1" spec="$2" tsecret="${3:-}" url branch repo work before after def cur first out rc=0 new=0
   url="${spec%%#*}"; branch=""; [[ "$spec" == *"#"* ]] && branch="${spec#*#}"
   repo="$PROJECTS_DIR/$name.git"
   if [[ -L "$repo" ]] || { [[ -e "$repo" ]] && [[ "$(stat -c '%u' -- "$repo")" != 0 ]]; }; then
@@ -2351,7 +2407,13 @@ ensure_mirror() {
     if [[ $DRY_RUN -eq 1 ]]; then
       lock_mirror "$repo"
       write_mirror_config "$work" && changed "mirror $name: config reset to the canonical one"
-      note "[dry-run] fetch $name from $url"; return
+      # Which secret is shown only with PROJECTS_TOKEN_SECRETS, so a profile
+      # without it prints exactly what it did before.
+      case "$url" in
+        https://*|http://*) [[ ${#PROJECTS_TOKEN_SECRETS[@]} -gt 0 ]] || tsecret="" ;;
+        *) tsecret="" ;;
+      esac
+      note "[dry-run] fetch $name from $url${tsecret:+ (deploy token: $tsecret)}"; return
     fi
     # Lock FIRST: on a mirror left group-writable by an older layout, a member
     # could swap in a config between our write and the lock.
