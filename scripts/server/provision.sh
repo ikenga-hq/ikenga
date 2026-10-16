@@ -84,9 +84,9 @@ while [[ $# -gt 0 ]]; do
         printf '  - reads release manifest for profile channel (stable)\n'
         printf '  - refuses if installed version is below min-upgrade-from\n'
         printf '  - verifies checksum and attestation\n'
-        printf '  - keeps bin/ikenga-server.prev-<ver> for rollback\n'
-        printf '  - swaps binary, restarts service, and health-checks /api/health\n'
-        printf '  - automatically rolls back to previous binary if health-check fails\n'
+        printf '  - keeps bin/ikenga-server.prev-<ver> (and bin/chi-runner.prev-<ver>) for rollback\n'
+        printf '  - swaps binary (and chi-runner, when the tarball ships it), restarts service, and health-checks /api/health\n'
+        printf '  - automatically rolls back to previous binaries if health-check fails\n'
         printf '  - refuses if open terminals are detected unless --force\n'
         printf '  - exit codes: 0 upgraded or already current, 3 rolled back, 4 rollback failed\n'
         exit 0
@@ -693,8 +693,15 @@ install_daemon() {
   if [[ -x "$INSTALL_DIR/bin/ikenga-server" && -n "$have" ]]; then
     cp -a "$INSTALL_DIR/bin/ikenga-server" "$INSTALL_DIR/bin/ikenga-server.prev-$have"
     note "previous binary kept as ikenga-server.prev-$have (rollback)"
+    if [[ -f "$INSTALL_DIR/bin/chi-runner" ]]; then
+      cp -a "$INSTALL_DIR/bin/chi-runner" "$INSTALL_DIR/bin/chi-runner.prev-$have"
+      note "previous chi-runner kept as chi-runner.prev-$have (rollback)"
+    fi
   fi
   tar -xzf "$tmp/$tarball" -C "$INSTALL_DIR"
+  # Releases from the one that adds chi-runner ship bin/chi-runner; older tarballs do not,
+  # and then persistent Chi runs fall back to in-process runs (the server logs it).
+  [[ -x "$INSTALL_DIR/bin/chi-runner" ]] || note "WARNING: $tarball carries no bin/chi-runner; persistent Chi runs will not survive a restart"
   [[ "$("$INSTALL_DIR/bin/ikenga-server" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')" == "$VERSION" ]] || die "installed binary does not report $VERSION"
   # T1: principals' children run as other uids and must traverse data/ to reach
   # data/principals/<id>/. 0755 is the server's own layout for the data root
@@ -1266,8 +1273,8 @@ do_upgrade() {
   if [[ $DRY_RUN -eq 1 ]]; then
     note "[dry-run] download $ARTIFACT_NAME"
     note "[dry-run] verify sha256 checksum ($ARTIFACT_SHA)"
-    note "[dry-run] keep previous binary as bin/ikenga-server.prev-$have"
-    note "[dry-run] swap binary to $target in $INSTALL_DIR/bin/"
+    note "[dry-run] keep previous binary as bin/ikenga-server.prev-$have (and bin/chi-runner.prev-$have if installed)"
+    note "[dry-run] swap binary to $target in $INSTALL_DIR/bin/ (plus bin/chi-runner when the tarball ships it)"
     note "[dry-run] restart service $svc"
     note "[dry-run] health check /api/health with automatic rollback to $have on failure"
     changed "ikenga-server upgraded $have -> $target"
@@ -1308,7 +1315,31 @@ do_upgrade() {
   tar -xzf "$tarball_path" -C "$tmp/stage"
   [[ -x "$tmp/stage/bin/ikenga-server" ]] || die "tarball $ARTIFACT_NAME missing bin/ikenga-server"
 
+  # chi-runner rides along with the server: persistent Chi runs are a detached
+  # chi-runner the server spawns, and without the binary they fall back to
+  # in-process runs that die with the server. Saved like ikenga-server so a
+  # rollback puts the previous one back. chi_state: "none" = not touched,
+  # "saved" = an earlier chi-runner was saved and replaced, "added" = there was
+  # none before (rollback removes the new one). A tarball without chi-runner
+  # (an older release) is allowed: the installed one, if any, stays.
+  local chi_state=none
+  rm -f "$INSTALL_DIR/bin/chi-runner.prev-$have"
+  if [[ -f "$tmp/stage/bin/chi-runner" ]]; then
+    if [[ -f "$INSTALL_DIR/bin/chi-runner" ]]; then
+      cp -a "$INSTALL_DIR/bin/chi-runner" "$INSTALL_DIR/bin/chi-runner.prev-$have"
+      note "previous chi-runner saved as bin/chi-runner.prev-$have (rollback guard)"
+      chi_state=saved
+    else
+      chi_state=added
+    fi
+  else
+    note "tarball $ARTIFACT_NAME carries no bin/chi-runner (older release); leaving the installed one in place"
+  fi
+
   install -m 0755 "$tmp/stage/bin/ikenga-server" "$INSTALL_DIR/bin/ikenga-server"
+  # `install` unlinks the destination first, so a chi-runner that is running
+  # right now (detached runs outlive the server) does not block the swap.
+  [[ "$chi_state" == none ]] || install -m 0755 "$tmp/stage/bin/chi-runner" "$INSTALL_DIR/bin/chi-runner"
 
   if [[ -d "$tmp/stage/dist" ]]; then
     rm -rf "$INSTALL_DIR/dist.prev-$have"
@@ -1366,6 +1397,16 @@ do_upgrade() {
 
   log "WARNING: /api/health failed after upgrade to $target! Initiating automatic rollback to $have..."
   cp -a "$INSTALL_DIR/bin/ikenga-server.prev-$have" "$INSTALL_DIR/bin/ikenga-server"
+  # chi-runner goes back with it. Rename a copy into place rather than cp over
+  # it: a runner started by the new binary may be executing the file right now
+  # (cp onto it fails with "Text file busy"; a rename does not).
+  if [[ "$chi_state" == saved && -f "$INSTALL_DIR/bin/chi-runner.prev-$have" ]]; then
+    cp -a "$INSTALL_DIR/bin/chi-runner.prev-$have" "$INSTALL_DIR/bin/chi-runner.rollback.$$" \
+      && mv -f "$INSTALL_DIR/bin/chi-runner.rollback.$$" "$INSTALL_DIR/bin/chi-runner" \
+      || log "WARNING: could not restore the previous chi-runner from bin/chi-runner.prev-$have"
+  elif [[ "$chi_state" == added ]]; then
+    rm -f "$INSTALL_DIR/bin/chi-runner"
+  fi
   if [[ -d "$INSTALL_DIR/dist.prev-$have" ]]; then
     rm -rf "$INSTALL_DIR/dist"
     mv "$INSTALL_DIR/dist.prev-$have" "$INSTALL_DIR/dist"

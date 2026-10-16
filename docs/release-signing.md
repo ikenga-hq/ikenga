@@ -97,9 +97,10 @@ All of them are also covered by `SHA256SUMS.txt`, and each tarball and the
 manifest carries a GitHub build-provenance attestation. If either server build
 fails, the release stays a draft.
 
-A tarball extracts straight into the install root (`/opt/ikenga`): `bin/`,
-`dist/`, the two systemd unit files, `README.md`, `LICENSE`, `NOTICE` and a small
-`release.json` naming the version, commit and architecture it was built from.
+A tarball extracts straight into the install root (`/opt/ikenga`): `bin/`
+(`ikenga-server` and `chi-runner`), `dist/`, the two systemd unit files,
+`README.md`, `LICENSE`, `NOTICE` and a small `release.json` naming the version,
+commit, architecture and the iyke-cli commit `chi-runner` was built from.
 
 ### glibc floor: 2.31
 
@@ -112,8 +113,12 @@ Alma 9 (glibc 2.34). The value lives in one place, `GLIBC_FLOOR` in
 and the release notes read it from there. To move the floor, change that one
 default.
 
-The build fails if the binary references a glibc symbol version above the
-floor. To check an extracted binary yourself:
+The build fails if either binary (`ikenga-server` or `chi-runner`) references a
+glibc symbol version above the floor. `chi-runner` is built by the same step from
+the public ikenga-hq/iyke-cli repo at the full commit SHA in `CHI_RUNNER_REF`
+(`scripts/server/package-server.sh`), with `--locked` against that commit's
+`Cargo.lock`, and the packer refuses to produce a tarball without it. To check an
+extracted binary yourself:
 
 ```bash
 objdump -T bin/ikenga-server | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sort -V | tail -1

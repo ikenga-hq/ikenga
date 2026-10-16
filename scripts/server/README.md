@@ -36,7 +36,7 @@ sudo tar -xzf ikenga-server_${V}_linux_$A.tar.gz -C /opt/ikenga
 /opt/ikenga/bin/ikenga-server --version          # prints X.Y.Z
 ```
 
-The tarball unpacks to `/opt/ikenga/{bin,dist}` plus both unit files. A matching checksum shows the download is intact. To check it was built by this repository's release workflow, verify the build attestation, or the signature:
+The tarball unpacks to `/opt/ikenga/{bin,dist}` plus both unit files. `bin/` holds `ikenga-server` and `chi-runner`, the helper that keeps a persistent Chi run alive across a restart (see [Detached chi-runners survive a restart](#detached-chi-runners-survive-a-restart)). A matching checksum shows the download is intact. To check it was built by this repository's release workflow, verify the build attestation, or the signature:
 
 ```bash
 gh attestation verify ikenga-server_${V}_linux_$A.tar.gz -R ikenga-hq/ikenga
@@ -109,6 +109,8 @@ The unit differs from the T0 one in five ways (§8 "Deploy consequence", plus th
 - **`ProtectProc=invisible`.** `/proc` is mounted `hidepid=invisible` inside the unit, so a person's processes can't see anyone else's there. This is defense in depth, not a guarantee: someone signed in over SSH uses the host `/proc`, where it doesn't apply. Nothing depends on it. Every Chi engine (`claude-code`, `codex`, `antigravity-cli`, `opencode`, `pi`) reads its prompt from stdin, never from a command-line argument that `/proc/<pid>/cmdline` would show to other users (I-7). The same holds for the chat socket (`/ws/chat/:id`, default engine `antigravity-cli`), which sends each turn to `agy` on stdin as well. So all of them run under T1 with or without this line, including in the Docker deploy.
 
 ### Detached chi-runners survive a restart
+
+The server finds `chi-runner` next to its own executable (`/opt/ikenga/bin/chi-runner`), then on `PATH`. The release tarball ships it, built from a pinned commit of the public [iyke-cli](https://github.com/ikenga-hq/iyke-cli) repo (`CHI_RUNNER_REF` in `package-server.sh`). `provision.sh upgrade` installs the new one with the server, keeps the old one as `bin/chi-runner.prev-<version>`, and restores it if the upgrade rolls back. A server installed from a release that predates this has no `chi-runner`, and its persistent Chi runs fall back to in-process runs that end with the server (the run's warning says so); upgrading fixes that. A source build from `deploy.sh` does not build it either: `cargo install --git https://github.com/ikenga-hq/iyke-cli --bin chi-runner` and copy it to `/opt/ikenga/bin/`.
 
 A persistent Chi run is a `chi-runner` that the principal's child spawns detached, in its own process group. A process group stays inside the unit's cgroup, so the default `KillMode=control-group` would SIGKILL every runner on `systemctl restart`. With `KillMode=process`, systemd signals only the broker:
 

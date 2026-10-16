@@ -468,7 +468,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ci-server-bin-${{ matrix.arch }}
-          path: server-bin/ikenga-server-linux-${{ matrix.arch }}
+          path: |
+            server-bin/ikenga-server-linux-${{ matrix.arch }}
+            server-bin/chi-runner-linux-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 3
 

@@ -66,11 +66,14 @@ pub(crate) struct RunnerConf<'a> {
 /// (which includes `~/.cargo/bin`). `None` when neither has it — the caller
 /// falls back to an in-process run.
 ///
-/// NB the app bundle does NOT ship chi-runner today (no `externalBin`, no
-/// release step builds it — it lives in the iyke-cli repo and reaches users
-/// only via `cargo install`), so on a stock install this is `None` unless the
-/// user installed it themselves. The sibling-of-exe probe is where a Tauri
-/// `externalBin` sidecar would land once the release ships one.
+/// NB only the headless server release ships chi-runner: the server tarball
+/// carries `bin/chi-runner` beside `bin/ikenga-server` (built from the pinned
+/// iyke-cli commit `CHI_RUNNER_REF` in `scripts/server/package-server.sh`), which
+/// the sibling-of-exe probe finds. The desktop app bundle does NOT ship it (no
+/// `externalBin`; chi-runner lives in the iyke-cli repo and reaches desktop users
+/// only via `cargo install`), so on a desktop install this is `None` unless the
+/// user installed it themselves. A server installed from a release older than the
+/// one that added it also has none.
 pub(crate) fn resolve_runner_path() -> Option<PathBuf> {
     let file_name = format!("{RUNNER_BINARY}{}", std::env::consts::EXE_SUFFIX);
     if let Ok(exe) = std::env::current_exe() {

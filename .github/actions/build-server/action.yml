@@ -2,16 +2,18 @@ name: Build ikenga-server for one architecture
 description: >-
   Cross-link the headless server with cargo-zigbuild against the pinned glibc
   floor (see scripts/server/package-server.sh), run its gates, and stage the
-  binary as ikenga-server-linux-<arch> in out-dir. Run it on a runner of the
-  matching architecture so the link and --version gates can execute the
-  binary. Expects the repository checked out at the workspace root.
+  binary as ikenga-server-linux-<arch> in out-dir. Also builds chi-runner from
+  the pinned ikenga-hq/iyke-cli commit (CHI_RUNNER_REF in package-server.sh)
+  and stages it as chi-runner-linux-<arch> beside it. Run it on a runner of
+  the matching architecture so the link, --version and smoke gates can execute
+  the binaries. Expects the repository checked out at the workspace root.
 
 inputs:
   arch:
     description: amd64 or arm64.
     required: true
   out-dir:
-    description: Directory the staged binary is written to.
+    description: Directory the staged binaries (ikenga-server and chi-runner) are written to.
     required: false
     default: server-bin
   expect-version:
@@ -55,7 +57,7 @@ runs:
       with:
         tool: cargo-zigbuild@0.23.4
 
-    - name: Build, gate and stage ikenga-server (${{ inputs.arch }})
+    - name: Build, gate and stage ikenga-server and chi-runner (${{ inputs.arch }})
       shell: bash
       env:
         ARCH: ${{ inputs.arch }}
