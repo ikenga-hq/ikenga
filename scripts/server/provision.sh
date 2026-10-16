@@ -60,7 +60,7 @@ UPDATE_RETRY_COOLDOWN="${UPDATE_RETRY_COOLDOWN:-3600}"
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
 
 case "${1:-}" in
-  upgrade|check-update|apply-request|install-update-units|install-agent-cli-updates|sync-accounts|backups|tunnels|swap) ACTION="$1"; shift ;;
+  upgrade|check-update|apply-request|install-update-units|install-agent-cli-updates|sync-accounts|refresh-projects|backups|tunnels|swap) ACTION="$1"; shift ;;
 esac
 
 while [[ $# -gt 0 ]]; do
@@ -92,13 +92,15 @@ while [[ $# -gt 0 ]]; do
         exit 0
       fi
       if [[ "$ACTION" != "provision" ]]; then
-        printf 'Usage: %s check-update | apply-request | install-update-units | install-agent-cli-updates | sync-accounts | backups | tunnels | swap [--profile <file>] [--dry-run]\n\n' "${BASH_SOURCE[0]}"
+        printf 'Usage: %s check-update | apply-request | install-update-units | install-agent-cli-updates | sync-accounts | refresh-projects | backups | tunnels | swap [--profile <file>] [--dry-run]\n\n' "${BASH_SOURCE[0]}"
         printf '  check-update          read the release manifest and write %s/available.json (installs nothing)\n' "$STATE_DIR"
         printf '  apply-request         claim and apply an admin update request (run by ikenga-update.service)\n'
         printf '  install-update-units  install %s and the update timer, path and service units\n' "$STABLE_COPY"
         printf '  install-agent-cli-updates  install the daily npm update timer for the profile'"'"'s AGENT_CLIS\n'
         printf '  sync-accounts         converge shared project mirrors, per-account clones and scoped secrets\n'
         printf '                        (run it after creating or removing accounts; the full provision run does it too)\n'
+        printf '  refresh-projects      fetch the shared project mirrors and fast-forward the clones of PROJECTS_FASTFORWARD accounts\n'
+        printf '                        (clean, on a branch, strictly behind only; run daily by ikenga-projects-refresh.timer)\n'
         printf '  backups               converge the Postgres backup jobs (BACKUPS_ENABLED): backup user, pg_dump, gcloud, scoped\n'
         printf '                        secrets, systemd service and timers, status file (the full provision run does it too)\n'
         printf '  tunnels               converge the SSH tunnels (TUNNELS): tunnel user, one key, pinned known_hosts, one systemd unit\n'
@@ -183,6 +185,8 @@ PROJECTS_MEMBERS=()    # empty = every managed account
 PROJECTS=()            # name=git-url[#branch]
 PROJECTS_BRANCH_PREFIX=""   # each account's branch = <prefix><account>/main
 PROJECTS_TOKEN_SECRET=""    # NAME of a SECRETS_FILE entry: https deploy token for private repos
+PROJECTS_FASTFORWARD=()     # accounts whose existing clones refresh-projects fast-forwards (agents; never people)
+PROJECTS_REFRESH_SCHEDULE="daily"   # OnCalendar of ikenga-projects-refresh.timer; "off" = no timer
 SECRETS_FILE=""             # root-only scoped secrets (format in README)
 # Postgres backups to GCS as system jobs (D-B10). See README "Database backups".
 BACKUPS_ENABLED=0
@@ -855,6 +859,10 @@ summary() {
   log "Summary"
   if [[ ${#CHANGES[@]} -eq 0 ]]; then note "no changes: the host already matches this profile"; return; fi
   printf '    - %s\n' "${CHANGES[@]}"
+  if [[ "$ACTION" == refresh-projects ]]; then
+    note "Mirrors fetched; only clean, on-a-branch, strictly-behind clones of PROJECTS_FASTFORWARD accounts were fast-forwarded."
+    return
+  fi
   if [[ "$ACTION" == sync-accounts ]]; then
     note "Secrets are listed by name only (+ added, ~ value changed, - removed). Per-account files: $SECRETS_DIR (root-owned, 0640)."
     return
@@ -1719,18 +1727,23 @@ write_unit() {
   return 0
 }
 
-# The stable copy of this script and the four update units. Idempotent.
-install_update_units() {
-  log "Update units (check timer, request path, stable provisioner copy)"
-  [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo); dry runs may be unprivileged"
-  local self req
+# The stable copy of this script, which every timer unit runs. Idempotent.
+ensure_stable_copy() {
+  local self
   self="$(readlink -f "${BASH_SOURCE[0]}")"
-  req="$(update_request_path)"
-
   if [[ "$self" != "$(readlink -f "$STABLE_COPY" 2>/dev/null || true)" ]] && ! cmp -s "$self" "$STABLE_COPY"; then
     run install -D -m 0755 -o root -g root "$self" "$STABLE_COPY"
     changed "stable provisioner copy at $STABLE_COPY"
   fi
+}
+
+# The stable copy of this script and the four update units. Idempotent.
+install_update_units() {
+  log "Update units (check timer, request path, stable provisioner copy)"
+  [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo); dry runs may be unprivileged"
+  local req
+  req="$(update_request_path)"
+  ensure_stable_copy
 
   local any=0
   write_unit ikenga-update-check.service "[Unit]
@@ -1948,6 +1961,17 @@ validate_accounts_profile() {
       die "PROJECTS '$name': the URL carries credentials; remove them and set PROJECTS_TOKEN_SECRET (a secret in SECRETS_FILE)"
     fi
   done
+  for a in "${PROJECTS_FASTFORWARD[@]}"; do
+    [[ "$a" =~ ^[a-z][a-z0-9_-]{0,30}$ ]] || die "PROJECTS_FASTFORWARD entry '$a' is not a valid login name (lowercase letters, digits, - and _)"
+    is_reserved_scope "$a" && die "PROJECTS_FASTFORWARD entry '$a' is reserved (everyone, agents, root and backup are secret scopes, not accounts)"
+  done
+  # The value lands in a unit file: only what a calendar expression needs.
+  [[ "$PROJECTS_REFRESH_SCHEDULE" =~ ^[A-Za-z0-9*/:,.~\ -]+$ ]] \
+    || die "PROJECTS_REFRESH_SCHEDULE must be a systemd OnCalendar expression (or 'off'); it has characters a calendar expression does not need"
+  if [[ "$PROJECTS_REFRESH_SCHEDULE" != off ]] && command -v systemd-analyze >/dev/null 2>&1; then
+    systemd-analyze calendar "$PROJECTS_REFRESH_SCHEDULE" >/dev/null 2>&1 \
+      || die "PROJECTS_REFRESH_SCHEDULE: systemd cannot parse the calendar expression '$PROJECTS_REFRESH_SCHEDULE' (try: systemd-analyze calendar '$PROJECTS_REFRESH_SCHEDULE')"
+  fi
   [[ -z "$PROJECTS_TOKEN_SECRET" || -n "$SECRETS_FILE" ]] || die "PROJECTS_TOKEN_SECRET needs SECRETS_FILE"
   [[ -z "$PROJECTS_TOKEN_SECRET" ]] || secret_name_ok "$PROJECTS_TOKEN_SECRET" || die "PROJECTS_TOKEN_SECRET '$PROJECTS_TOKEN_SECRET' is not a usable secret name"
   [[ -z "$SECRETS_FILE" || -f "$SECRETS_FILE" ]] || die "SECRETS_FILE '$SECRETS_FILE' does not exist"
@@ -1989,6 +2013,9 @@ resolve_accounts() {
       MEMBERS+=("$a")
     done
   fi
+  for a in "${PROJECTS_FASTFORWARD[@]}"; do
+    [[ "$seen" == *" $a "* ]] || die "PROJECTS_FASTFORWARD names '$a', which is not a managed account (add it to ACCOUNTS)"
+  done
   note "managed accounts: ${ACCT_LOGINS[*]:-none}"
 }
 
@@ -1998,7 +2025,12 @@ has_account() { [[ -n "${ACCT_UID[$1]:-}" ]]; }
 # private gid, no supplementary groups, a minimal environment.
 as_account() {
   local a="$1"; shift
-  ( cd / && umask 0002 && exec setpriv --reuid="${ACCT_UID[$a]}" --regid="${ACCT_GID[$a]}" --clear-groups \
+  # AS_ACCOUNT_TIMEOUT=<seconds> puts a ROOT-owned timeout(1) around the command:
+  # the account can kill its own processes, but not the supervisor above them.
+  local -a sup=()
+  [[ -z "${AS_ACCOUNT_TIMEOUT:-}" ]] || sup=(timeout --kill-after=10 "$AS_ACCOUNT_TIMEOUT")
+  ( cd / && umask 0002 && { [[ -z "$PROJECTS_LOCK_FD" ]] || exec {PROJECTS_LOCK_FD}>&-; } \
+      && exec ${sup[@]+"${sup[@]}"} setpriv --reuid="${ACCT_UID[$a]}" --regid="${ACCT_GID[$a]}" --clear-groups \
       env -i HOME="${ACCT_HOME[$a]}" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 GIT_TERMINAL_PROMPT=0 "$@" )
 }
 
@@ -2143,9 +2175,40 @@ write_mirror_config() {
   return 1
 }
 
+# Serialise everything that writes the mirrors (sync-accounts, a full provision
+# run, and the refresh timer): two roots chmod/chown-ing the same mirror while a
+# fetch lands would corrupt the lock-down. Held until the process exits.
+PROJECTS_LOCK_FILE="${IKENGA_PROJECTS_LOCK:-/run/ikenga-projects.lock}"
+PROJECTS_LOCK_HELD=0
+PROJECTS_LOCK_FD=""     # as_account closes it, so no account process ever holds root's lock
+take_projects_lock() {
+  [[ $DRY_RUN -eq 0 && $PROJECTS_LOCK_HELD -eq 0 ]] || return 0
+  local fd
+  [[ ! -L "$PROJECTS_LOCK_FILE" ]] || die "$PROJECTS_LOCK_FILE is a symlink; refusing"
+  exec {fd}>>"$PROJECTS_LOCK_FILE" || die "cannot open the project lock $PROJECTS_LOCK_FILE"
+  chmod 0600 -- "$PROJECTS_LOCK_FILE" 2>/dev/null || true
+  flock -w 1800 "$fd" || die "another run is changing the project mirrors (lock $PROJECTS_LOCK_FILE); gave up after 30 minutes"
+  PROJECTS_LOCK_FD="$fd"; PROJECTS_LOCK_HELD=1
+}
+
 sync_projects() {
   log "Shared project mirrors ($PROJECTS_DIR, read: $PROJECTS_READ)"
   apt_install git acl
+  refresh_mirrors
+  local a e
+  for a in "${MEMBERS[@]}"; do
+    has_account "$a" || continue
+    for e in "${PROJECTS[@]}"; do ensure_account_clone "$a" "${e%%=*}" "${e#*=}"; done
+  done
+  rm -rf -- "$GIT_HOME"; GIT_HOME=""; ASKPASS_FILE=""
+}
+
+# Everything sync_projects does to the mirrors, and nothing to the accounts:
+# vet and prepare PROJECTS_DIR, converge safe.directory, set up git_root's
+# scratch dir and the deploy token, then fetch every mirror. Leaves GIT_HOME
+# set (git_root needs it); the caller removes it. refresh-projects reuses this.
+refresh_mirrors() {
+  take_projects_lock
   case "$PROJECTS_READ" in world) MIRROR_UMASK=022 ;; *) MIRROR_UMASK=077 ;; esac
 
   # Root writes under PROJECTS_DIR, so no other user may be able to create or
@@ -2225,12 +2288,6 @@ sync_projects() {
   PROJ_TOKEN=""
 
   for e in "${PROJECTS[@]}"; do ensure_mirror "${e%%=*}" "${e#*=}"; done
-  local a
-  for a in "${MEMBERS[@]}"; do
-    has_account "$a" || continue
-    for e in "${PROJECTS[@]}"; do ensure_account_clone "$a" "${e%%=*}" "${e#*=}"; done
-  done
-  rm -rf -- "$GIT_HOME"; GIT_HOME=""; ASKPASS_FILE=""
 }
 
 ensure_mirror() {
@@ -2368,6 +2425,223 @@ ensure_account_clone() {
       || soft_fail "ik-$a:$name: cannot set the push URL"
   fi
   changed "clone ik-$a:$name on $branch${push:+ (push: $push)}"
+}
+
+# ---- keeping agent clones current (refresh-projects)
+#
+# Mirrors go stale unless something fetches them, and an agent's clone goes
+# stale behind its mirror. `refresh-projects` (run daily by
+# ikenga-projects-refresh.timer, or by hand) fetches every mirror with the same
+# code sync-accounts uses, then fast-forwards the existing clones of the
+# accounts in PROJECTS_FASTFORWARD, and only those. It never creates a clone
+# (sync-accounts does), and it never resets, checks out another branch, stashes
+# or merges: a clone is moved only when it is clean, on a branch, and strictly
+# behind its upstream. A person's clone is never named here, so it is never read.
+#
+# This runs as ROOT, against directories an account owns, so the rules are:
+#  - root never runs git inside a clone: every call goes through as_account;
+#  - the clone's own config and hooks cannot steer it: hooks, fsmonitor, askpass
+#    and credential helpers are off on the command line, the account's global
+#    config is not read, only the file protocol is allowed, and the fetch URL is
+#    the mirror path from the profile, never the clone's remote config;
+#  - nothing can hang or prompt: stdin is /dev/null, no terminal prompts, and
+#    every git call is bounded by timeout(1);
+#  - the clone path must be a real directory the account owns, under a real
+#    ~/projects the account owns, or it is refused.
+REFRESH_GIT_TIMEOUT="${IKENGA_REFRESH_GIT_TIMEOUT:-120}"
+
+# acct_git <account> <clone> <git args...> : the exit status is git's (124 =
+# timed out). Its stdout and stderr land in ACCT_OUT and ACCT_ERR (capped), read
+# from root-only files rather than through a pipe: a process the account leaves
+# running in the background cannot hold a pipe open and stall this script.
+ACCT_OUT=""; ACCT_ERR=""
+acct_git() {
+  local a="$1" wt="$2" rc=0; shift 2
+  # Fresh files (new inodes) for every call: a process an account left running
+  # still holds the OLD files open and can write into them at any offset, so
+  # reusing them would let it forge what root reads for the next call, which
+  # may be another account's clone.
+  rm -f -- "$GIT_HOME/acct.out" "$GIT_HOME/acct.err"
+  AS_ACCOUNT_TIMEOUT="$REFRESH_GIT_TIMEOUT" as_account "$a" \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_ALLOW_PROTOCOL=file GIT_OPTIONAL_LOCKS=0 GIT_MERGE_AUTOEDIT=no \
+    git --no-pager -C "$wt" \
+      -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.askPass= -c credential.helper= \
+      -c core.sshCommand=/bin/false -c gc.auto=0 -c maintenance.auto=false \
+      -c fetch.recurseSubmodules=false -c submodule.recurse=false -c fetch.prune=false -c fetch.pruneTags=false \
+      -c merge.autoStash=false -c merge.verifySignatures=false -c commit.gpgSign=false "$@" \
+    </dev/null >"$GIT_HOME/acct.out" 2>"$GIT_HOME/acct.err" || rc=$?
+  ACCT_OUT="$(head -c 65536 "$GIT_HOME/acct.out" 2>/dev/null || true)"
+  ACCT_ERR="$(head -c 4096 "$GIT_HOME/acct.err" 2>/dev/null || true)"
+  return "$rc"
+}
+
+# A clone path root may hand to the account's git: refuses (returns 1, says why)
+# a symlink, anything the account does not own, or a clone that is not an
+# ordinary repository with a real .git directory.
+clone_path_ok() {
+  local a="$1" name="$2" wt="$3" home uid rhome p
+  home="${ACCT_HOME[$a]}"; uid="${ACCT_UID[$a]}"
+  rhome="$(readlink -f -- "$home" 2>/dev/null || true)"
+  [[ -n "$rhome" && "$(stat -c %u -- "$home" 2>/dev/null)" == "$uid" ]] \
+    || { soft_fail "ik-$a:$name: home $home is not owned by the account; refusing"; return 1; }
+  for p in "$home/projects" "$wt" "$wt/.git"; do
+    if [[ -L "$p" ]]; then soft_fail "ik-$a:$name: $p is a symlink; refusing"; return 1; fi
+    [[ -d "$p" && "$(stat -c %u -- "$p" 2>/dev/null)" == "$uid" ]] \
+      || { soft_fail "ik-$a:$name: $p is not a directory owned by the account; refusing"; return 1; }
+  done
+  [[ "$(readlink -f -- "$wt" 2>/dev/null)" == "$rhome/projects/$name" ]] \
+    || { soft_fail "ik-$a:$name: $wt does not resolve to $rhome/projects/$name; refusing"; return 1; }
+}
+
+# fastforward_clone <account> <project> : never fails the caller.
+fastforward_clone() {
+  local a="$1" name="$2" repo wt tag rc origin def target="" tsha head hsha branch
+  repo="$PROJECTS_DIR/$name.git"; wt="${ACCT_HOME[$a]}/projects/$name"; tag="ik-$a:$name"
+  if [[ ! -e "$wt" && ! -L "$wt" ]]; then note "$tag: no clone yet; sync-accounts creates it"; return 0; fi
+  clone_path_ok "$a" "$name" "$wt" || return 0
+  if [[ $DRY_RUN -eq 1 ]]; then
+    note "[dry-run] $tag: would fetch $repo and fast-forward $wt if clean, on a branch and strictly behind"
+    return 0
+  fi
+  if [[ -L "$repo" || ! -d "$repo" || "$(stat -c %u -- "$repo")" != 0 ]]; then
+    note "$tag: no usable mirror at $repo; left as it is"; return 0
+  fi
+  origin=""; acct_git "$a" "$wt" config --get remote.origin.url && origin="$ACCT_OUT" || true
+  if [[ "$origin" != "$repo" ]]; then
+    note "$tag: origin is '${origin:-unset}', not the mirror $repo; left as it is"; return 0
+  fi
+
+  # Fetch the mirror (by path, not by the clone's remote config) into the
+  # remote-tracking refs. This moves no branch and touches no file.
+  rc=0
+  acct_git "$a" "$wt" fetch --quiet --no-write-fetch-head --no-tags -- "$repo" '+refs/heads/*:refs/remotes/origin/*' || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    soft_fail "$tag: fetch failed (rc $rc): $(tr '\n' ' ' <<<"$ACCT_ERR" | cut -c1-200)"; return 0
+  fi
+
+  # What the clone follows: origin/HEAD, else the mirror's default branch.
+  if acct_git "$a" "$wt" rev-parse --verify -q "refs/remotes/origin/HEAD^{commit}"; then
+    target="refs/remotes/origin/HEAD"
+  else
+    def="$(git_root none --git-dir "$repo" symbolic-ref -q --short HEAD || true)"
+    if [[ -n "$def" ]] && git_root none check-ref-format --branch "$def" >/dev/null 2>&1; then target="refs/remotes/origin/$def"; fi
+  fi
+  tsha=""
+  if [[ -n "$target" ]] && acct_git "$a" "$wt" rev-parse --verify -q "$target^{commit}"; then tsha="$ACCT_OUT"; fi
+  if [[ ! "$tsha" =~ ^[0-9a-f]{40,64}$ ]]; then note "$tag: no upstream branch to follow yet; left as it is"; return 0; fi
+
+  branch=""; acct_git "$a" "$wt" symbolic-ref -q HEAD && branch="$ACCT_OUT" || true
+  if [[ "$branch" != refs/heads/* ]]; then note "$tag: HEAD is detached; left as it is"; return 0; fi
+  hsha=""; acct_git "$a" "$wt" rev-parse --verify -q "HEAD^{commit}" && hsha="$ACCT_OUT" || true
+  if [[ ! "$hsha" =~ ^[0-9a-f]{40,64}$ ]]; then note "$tag: ${branch#refs/heads/} has no commits; left as it is"; return 0; fi
+  if [[ "$hsha" == "$tsha" ]]; then note "$tag: ${branch#refs/heads/} is up to date"; return 0; fi
+
+  rc=0
+  acct_git "$a" "$wt" merge-base --is-ancestor "$hsha" "$tsha" || rc=$?
+  if [[ $rc -eq 1 ]]; then note "$tag: ${branch#refs/heads/} has commits upstream does not (ahead or diverged); left as it is"; return 0; fi
+  if [[ $rc -ne 0 ]]; then soft_fail "$tag: cannot compare HEAD with upstream (rc $rc)"; return 0; fi
+
+  rc=0
+  acct_git "$a" "$wt" status --porcelain --untracked-files=all || rc=$?
+  if [[ $rc -ne 0 ]]; then soft_fail "$tag: cannot read the work tree status (rc $rc)"; return 0; fi
+  if [[ -n "$ACCT_OUT" || -n "$ACCT_ERR" ]]; then note "$tag: has uncommitted or untracked changes; left as it is"; return 0; fi
+
+  rc=0
+  acct_git "$a" "$wt" merge --ff-only --quiet --no-edit "$tsha" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    soft_fail "$tag: fast-forward failed (rc $rc$([[ $rc -ne 124 ]] || echo ', timed out')): $(tr '\n' ' ' <<<"$ACCT_ERR" | cut -c1-200)"; return 0
+  fi
+  head=""; acct_git "$a" "$wt" rev-parse --verify -q "HEAD^{commit}" && head="$ACCT_OUT" || true
+  [[ "$head" == "$tsha" ]] || { soft_fail "$tag: HEAD is $head after the fast-forward, expected $tsha"; return 0; }
+  changed "clone $tag ${branch#refs/heads/} fast-forwarded ${hsha:0:9}..${tsha:0:9}"
+}
+
+refresh_projects() {
+  if [[ ${#PROJECTS[@]} -eq 0 ]]; then
+    note "nothing to do: the profile sets no PROJECTS"
+    return 0
+  fi
+  log "Refresh project mirrors; fast-forward clones of: ${PROJECTS_FASTFORWARD[*]:-none}"
+  [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo)"
+  command -v git >/dev/null 2>&1 || die "git is not installed (run sync-accounts first)"
+  resolve_accounts
+  load_secrets
+  refresh_mirrors
+  local a e
+  for a in "${PROJECTS_FASTFORWARD[@]}"; do
+    if ! has_account "$a"; then note "ik-$a: not created yet; skipped"; continue; fi
+    for e in "${PROJECTS[@]}"; do fastforward_clone "$a" "${e%%=*}"; done
+  done
+  rm -rf -- "$GIT_HOME"; GIT_HOME=""; ASKPASS_FILE=""
+}
+
+# The daily timer that runs refresh-projects. It runs the stable provisioner
+# copy, which finds the trusted profile (a root-owned, root-only-writable
+# $INSTALL_DIR/.profile.env, see profile_trusted) itself, like the update units.
+# Installed while PROJECTS is non-empty and the schedule is not "off"; removed
+# otherwise. Idempotent.
+PROJECTS_REFRESH_UNIT="ikenga-projects-refresh"
+sync_projects_refresh_units() {
+  local svc="$PROJECTS_REFRESH_UNIT.service" tmr="$PROJECTS_REFRESH_UNIT.timer" f any=0 tchanged=0 why
+  if [[ ${#PROJECTS[@]} -eq 0 || "$PROJECTS_REFRESH_SCHEDULE" == off ]]; then
+    why="PROJECTS_REFRESH_SCHEDULE=off"; [[ ${#PROJECTS[@]} -gt 0 ]] || why="the profile sets no PROJECTS"
+    for f in "$tmr" "$svc"; do
+      [[ -e "$SYSTEMD_DIR/$f" ]] || continue
+      if [[ $DRY_RUN -eq 0 ]]; then
+        [[ "$f" != "$tmr" ]] || sc disable --now "$tmr" >/dev/null 2>&1 || true
+        rm -f -- "$SYSTEMD_DIR/$f"
+      fi
+      changed "unit $f removed ($why)"
+      any=1
+    done
+    [[ $any -eq 0 || $DRY_RUN -eq 1 ]] || sc daemon-reload
+    return 0
+  fi
+  [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo); dry runs may be unprivileged"
+  [[ $DRY_RUN -eq 1 || -d "$SYSTEMD_DIR" ]] || install -d -m 0755 -o root -g root "$SYSTEMD_DIR"
+  ensure_stable_copy
+  write_unit "$svc" "[Unit]
+Description=Ikenga: refresh the shared project mirrors and fast-forward agent clones
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=INSTALL_DIR=$INSTALL_DIR
+ExecStart=$STABLE_COPY refresh-projects
+TimeoutStartSec=30min
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+" && any=1
+  write_unit "$tmr" "[Unit]
+Description=Ikenga: refresh the shared project mirrors
+
+[Timer]
+OnCalendar=$PROJECTS_REFRESH_SCHEDULE
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+" && { any=1; tchanged=1; }
+  if [[ $DRY_RUN -eq 1 ]]; then
+    note "[dry-run] systemctl daemon-reload; enable --now $tmr"
+    return 0
+  fi
+  if [[ ! -f "$INSTALL_DIR/.profile.env" ]]; then
+    note "WARNING: $INSTALL_DIR/.profile.env does not exist; $svc needs the stored profile a full provision run writes"
+  elif ! profile_trusted "$INSTALL_DIR/.profile.env"; then
+    note "WARNING: $INSTALL_DIR/.profile.env is not a root-owned file only root can write; $svc will not use it"
+  fi
+  [[ $any -eq 0 ]] || sc daemon-reload
+  if ! sc is-enabled --quiet "$tmr" 2>/dev/null || ! sc is-active --quiet "$tmr" 2>/dev/null; then
+    sc enable --now "$tmr" >/dev/null 2>&1 || soft_fail "could not enable $tmr (see: systemctl status $tmr)"
+    changed "timer $tmr enabled ($PROJECTS_REFRESH_SCHEDULE)"
+  elif [[ $tchanged -eq 1 ]]; then
+    sc restart "$tmr" >/dev/null 2>&1 || soft_fail "could not restart $tmr"
+    changed "timer $tmr restarted with the new schedule"
+  fi
 }
 
 # ---- scoped secrets (D-B3)
@@ -2571,6 +2845,7 @@ sync_secrets() {
 sync_accounts() {
   if [[ ${#PROJECTS[@]} -eq 0 && -z "$SECRETS_FILE" ]]; then
     [[ "$ACTION" != sync-accounts ]] || note "nothing to do: the profile sets no PROJECTS and no SECRETS_FILE"
+    sync_projects_refresh_units         # removes the refresh timer if an earlier profile installed it
     return 0
   fi
   log "Accounts: shared projects and scoped secrets"
@@ -2579,6 +2854,7 @@ sync_accounts() {
   load_secrets
   [[ ${#PROJECTS[@]} -eq 0 ]] || sync_projects
   [[ -z "$SECRETS_FILE" ]] || sync_secrets
+  sync_projects_refresh_units
 }
 
 # ------------------------------------------------- database backups (D-B10)
@@ -4462,6 +4738,13 @@ case "$ACTION" in
     run_addons "sync-accounts" || true
     summary
     [[ $FAILED -eq 0 ]] || { echo "error: some account sync steps or add-on scripts failed; see the warnings above" >&2; exit 1; }
+    exit 0 ;;
+  refresh-projects)
+    [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || die "refresh-projects needs a profile: pass --profile <file> (or provision once so $INSTALL_DIR/.profile.env exists)"
+    validate_accounts_profile
+    refresh_projects
+    summary
+    [[ $FAILED -eq 0 ]] || { echo "error: some project refresh steps failed; see the warnings above" >&2; exit 1; }
     exit 0 ;;
   tunnels)
     [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || die "tunnels needs a profile: pass --profile <file> (or provision once so $INSTALL_DIR/.profile.env exists)"
