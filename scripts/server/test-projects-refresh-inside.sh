@@ -403,4 +403,34 @@ RC=0; env -u IKENGA_REFRESH_GIT_TIMEOUT $cmd >"$OUT" 2>&1 || RC=$?
 [[ $RC -ne 0 ]] || fail "the stable copy used a group/world-writable stored profile"
 pass "the unit refuses an untrusted stored profile"
 
+# ------------------- 11. a process one account leaves behind cannot steer another's
+
+# rex's filter leaves a detached process holding git's stderr (root's capture
+# file) and rewriting it from offset 0 for the rest of the run. If root reused
+# that file for later calls, ruby's clean clone would read as dirty (or worse,
+# with forged output) and be skipped. rex is processed first.
+chmod 600 "$INSTALL/.profile.env"
+profile_set PROJECTS_FASTFORWARD 'PROJECTS_FASTFORWARD=(rex ruby)'
+cat > /var/tmp/forge.py <<'EOP'
+import os, stat, time
+end = time.time() + 40
+while time.time() < end:
+    try:
+        if stat.S_ISREG(os.fstat(2).st_mode): os.pwrite(2, b"FORGED by rex\n", 0)
+    except Exception: pass
+    time.sleep(0.01)
+EOP
+chmod 644 /var/tmp/forge.py
+cfg rex clean config filter.slow.smudge 'setsid python3 /var/tmp/forge.py </dev/null >/dev/null & cat'
+advance 4
+refr
+pkill -u ik-rex -f forge.py || true
+[[ $RC -eq 0 ]] || fail "the forge run exited $RC"
+[[ "$(cfg rex clean rev-parse HEAD)" == "$(git -C $W rev-parse HEAD)" ]] || fail "setup: rex's clean clone did not fast-forward (the forger never started)"
+[[ "$(cfg ruby clean rev-parse HEAD)" == "$(git -C $W rev-parse HEAD)" ]] \
+  || fail "ruby's clean clone was skipped: a process rex left running wrote into what root read for ruby ($(grep 'ik-ruby:clean' "$OUT"))"
+! grep -q FORGED "$OUT" || fail "text an account process wrote reached the provisioner's output"
+cfg rex clean config --unset filter.slow.smudge
+pass "a detached process left by one account cannot write into what root reads for another account's clone"
+
 echo "==> [Container] ALL PROJECTS-REFRESH TESTS PASSED"

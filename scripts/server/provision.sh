@@ -2457,6 +2457,11 @@ REFRESH_GIT_TIMEOUT="${IKENGA_REFRESH_GIT_TIMEOUT:-120}"
 ACCT_OUT=""; ACCT_ERR=""
 acct_git() {
   local a="$1" wt="$2" rc=0; shift 2
+  # Fresh files (new inodes) for every call: a process an account left running
+  # still holds the OLD files open and can write into them at any offset, so
+  # reusing them would let it forge what root reads for the next call, which
+  # may be another account's clone.
+  rm -f -- "$GIT_HOME/acct.out" "$GIT_HOME/acct.err"
   AS_ACCOUNT_TIMEOUT="$REFRESH_GIT_TIMEOUT" as_account "$a" \
     GIT_CONFIG_GLOBAL=/dev/null GIT_ALLOW_PROTOCOL=file GIT_OPTIONAL_LOCKS=0 GIT_MERGE_AUTOEDIT=no \
     git --no-pager -C "$wt" \
