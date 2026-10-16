@@ -697,8 +697,10 @@ install_daemon() {
   tar -xzf "$tmp/$tarball" -C "$INSTALL_DIR"
   [[ "$("$INSTALL_DIR/bin/ikenga-server" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')" == "$VERSION" ]] || die "installed binary does not report $VERSION"
   # T1: principals' children run as other uids and must traverse data/ to reach
-  # data/principals/<id>/ (0711: traverse, no listing). T0 stays 0700.
-  if [[ "$TIER" == t1 ]]; then install -d -m 0711 -o root -g root "$INSTALL_DIR/data"; else install -d -m 0700 "$INSTALL_DIR/data"; fi
+  # data/principals/<id>/. 0755 is the server's own layout for the data root
+  # (operator/mod.rs operator_dirs); it re-applies that mode at runtime, so any
+  # other mode here would flip back and forth. T0 stays 0700.
+  if [[ "$TIER" == t1 ]]; then install -d -m 0755 -o root -g root "$INSTALL_DIR/data"; else install -d -m 0700 "$INSTALL_DIR/data"; fi
   BINARY_CHANGED=1
   changed "ikenga-server $VERSION installed to $INSTALL_DIR"
 }
@@ -770,7 +772,7 @@ write_env() {
   fi
 }
 
-# T1 data/ must be root:root 0711. install_daemon returns early when the version
+# T1 data/ must be root:root 0755 (the server's layout, see install_daemon). install_daemon returns early when the version
 # already matches, so this runs on every provision, before the probe. Only the
 # directory itself: the server owns the modes of everything inside it.
 ensure_t1_data_dir() {
@@ -779,11 +781,11 @@ ensure_t1_data_dir() {
   have="$(stat -c '%a %U:%G' "$d" 2>/dev/null || true)"
   if [[ -z "$have" ]]; then
     [[ $DRY_RUN -eq 1 ]] && return 0   # install_daemon creates it on a fresh host
-    install -d -m 0711 -o root -g root "$d"; changed "data dir $d created (root:root 711)"; return
+    install -d -m 0755 -o root -g root "$d"; changed "data dir $d created (root:root 755)"; return
   fi
-  [[ "$have" == "711 root:root" ]] && return 0
-  run chown root:root "$d"; run chmod 00711 "$d"
-  changed "data dir $d: $have -> 711 root:root (principal uids must traverse it)"
+  [[ "$have" == "755 root:root" ]] && return 0
+  run chown root:root "$d"; run chmod 00755 "$d"
+  changed "data dir $d: $have -> 755 root:root (principal uids must traverse it)"
 }
 
 install_service() {
