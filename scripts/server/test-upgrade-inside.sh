@@ -70,15 +70,21 @@ BIN
   chmod +x "$bin"
 }
 
-# make_release <version> <health version|broken> [min_upgrade_from] [with-unit]
+# A stand-in chi-runner that names the release it came from.
+make_chi() { printf '#!/bin/sh\necho chi-%s\n' "$2" > "$1"; chmod +x "$1"; }
+chi_id() { "$INSTALL_DIR/bin/chi-runner"; }
+
+# make_release <version> <health version|broken> [min_upgrade_from] [with-unit] [with-chi]
+# Releases without with-chi model the tarballs that predate chi-runner.
 make_release() {
-  local ver="$1" health="$2" min="${3:-}" unit="${4:-}"
+  local ver="$1" health="$2" min="${3:-}" unit="${4:-}" chi="${5:-}"
   local stage="$TEST_DIR/stage-$ver" members=(bin)
   if [[ "$health" == broken ]]; then
     make_mock "$stage/bin/ikenga-server" "$ver-broken" "" broken
   else
     make_mock "$stage/bin/ikenga-server" "$ver" "$health"
   fi
+  [[ -z "$chi" ]] || make_chi "$stage/bin/chi-runner" "$ver"
   if [[ -n "$unit" ]]; then
     echo "# unit version $ver" > "$stage/ikenga-server-t1.service"
     members+=(ikenga-server-t1.service)
@@ -111,6 +117,7 @@ tarball() { echo "$REL/ikenga-server_$1_linux_amd64.tar.gz"; }
 
 # Initial install: 0.18.2.
 make_mock "$INSTALL_DIR/bin/ikenga-server" 0.18.2 0.18.2
+make_chi "$INSTALL_DIR/bin/chi-runner" 0.18.2
 
 # Mock systemctl. Only ikenga-server* units start the mock server; fds 8/9
 # (provision.sh's locks) are closed so the server never holds them.
@@ -152,8 +159,8 @@ print(json.dumps(v) if not isinstance(v,str) else v)' "$1" "$2"; }
 no_secret() { if grep -rq "$FAKE_SECRET" "$@"; then fail "secret leaked into $*"; fi; }
 
 make_release 0.18.3 0.18.3 0.18.0
-make_release 0.18.4 broken 0.18.0 with-unit
-make_release 0.18.5 0.18.5
+make_release 0.18.4 broken 0.18.0 with-unit with-chi
+make_release 0.18.5 0.18.5 '' '' with-chi
 # 0.18.7's binary says 0.18.7 but /api/health still reports 0.18.6.
 make_release 0.18.7 0.18.6
 
@@ -223,6 +230,9 @@ if grep -q "unit version 0.18.4" "$SYSTEMD_DIR/ikenga-server-t1.service"; then
   fail "the broken unit is still installed after rollback"
 fi
 [[ "$(health_version)" == "0.18.2" ]]
+# chi-runner rolls back with the server.
+[[ "$(chi_id)" == "chi-0.18.2" ]] || fail "rollback left chi-runner at $(chi_id)"
+[[ "$("$INSTALL_DIR/bin/chi-runner.prev-0.18.2")" == "chi-0.18.2" ]]
 pass "TEST 4 (automatic rollback, exit 3)"
 
 # From here the box is T1 (the t1 unit exists, no profile): requests live in
@@ -351,6 +361,9 @@ python3 -c 'import json,sys; t=json.load(open(sys.argv[1]))["log_tail"]; assert 
 [[ "$(stat -c '%u %a' "$STATE/last-run.log")" == "0 600" ]] || fail "last-run.log must be root 0600"
 no_secret "$ST" "$STATE/last-run.log" "$AV"
 [[ "$(installed)" == "0.18.3" && "$(health_version)" == "0.18.3" ]]
+# 0.18.3 predates chi-runner: its tarball has none, the upgrade still works,
+# and the installed chi-runner is left alone.
+[[ "$(chi_id)" == "chi-0.18.2" ]] || fail "a tarball without chi-runner must not touch the installed one"
 [[ "$(jget "$AV" installed)" == "0.18.3" ]] || fail "available.json not refreshed after the apply"
 PID_BEFORE="$(cat /tmp/mock-ikenga.pid)"
 write_request "$REQ_T0" 0.18.3 ikenga
@@ -383,6 +396,9 @@ OUT="$(MOCK_HOST=127.0.0.2 HEALTH_TIMEOUT=8 RELEASE_MANIFEST_URL="$(manifest 0.1
   "$PROVISION" upgrade --to 0.18.5 2>&1)" || { echo "$OUT"; fail "tailnet upgrade did not succeed"; }
 echo "$OUT" | grep -q "healthy at http://127.0.0.2:4000" || fail "health was not checked on IKENGA_HOST: $OUT"
 [[ "$(installed)" == "0.18.5" && "$(health_version 127.0.0.2)" == "0.18.5" ]]
+# 0.18.5 ships chi-runner: it is installed, and the old one is kept for rollback.
+[[ "$(chi_id)" == "chi-0.18.5" ]] || fail "upgrade did not install the tarball's chi-runner"
+[[ "$("$INSTALL_DIR/bin/chi-runner.prev-0.18.3")" == "chi-0.18.2" ]] || fail "previous chi-runner not kept"
 no_secret <(printf '%s' "$OUT")
 sed -i 's/^IKENGA_HOST=.*/IKENGA_HOST=127.0.0.1/' "$INSTALL_DIR/.env"
 rm -f "$INSTALL_DIR/.profile.env"

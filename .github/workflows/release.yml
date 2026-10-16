@@ -501,9 +501,11 @@ jobs:
 
   # ── Server artifacts ───────────────────────────────────────────────────────
   # Cross-links `ikenga-server` for amd64 and arm64 against a pinned glibc
-  # floor, then signs and attests the tarballs and a release manifest. Both
-  # architectures build on a native runner, so the link and `--version` gates
-  # actually execute the binary they ship.
+  # floor, together with `chi-runner` (built from ikenga-hq/iyke-cli at the
+  # CHI_RUNNER_REF pinned in scripts/server/package-server.sh, so persistent Chi
+  # runs survive a restart), then signs and attests the tarballs and a release
+  # manifest. Both architectures build on a native runner, so the link,
+  # `--version` and smoke gates actually execute the binaries they ship.
   #
   # The release is published by `notes`, which needs `server`: a tag whose
   # server artifacts failed stays a draft rather than going out without them.
@@ -534,7 +536,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: server-bin-${{ matrix.arch }}
-          path: server-bin/ikenga-server-linux-${{ matrix.arch }}
+          path: |
+            server-bin/ikenga-server-linux-${{ matrix.arch }}
+            server-bin/chi-runner-linux-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
 
@@ -762,8 +766,8 @@ jobs:
             echo "## Server"
             echo ""
             echo "The multi-user server for Linux (amd64 and arm64, glibc ${FLOOR} or newer) is attached as"
-            echo "\`ikenga-server_${SERVER_VERSION}_linux_<arch>.tar.gz\`. Each tarball holds the binary, the web app"
-            echo "and the systemd units. \`ikenga-server_${SERVER_VERSION}_manifest.json\` lists them with their digests."
+            echo "\`ikenga-server_${SERVER_VERSION}_linux_<arch>.tar.gz\`. Each tarball holds the server binary, its"
+            echo "\`chi-runner\` helper, the web app and the systemd units. \`ikenga-server_${SERVER_VERSION}_manifest.json\` lists them with their digests."
             echo ""
             echo "Verify a download against the signature this release workflow made:"
             echo ""
