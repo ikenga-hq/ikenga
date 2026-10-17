@@ -186,6 +186,9 @@ PROJECTS=()            # name=git-url[#branch]
 PROJECTS_BRANCH_PREFIX=""   # each account's branch = <prefix><account>/main
 PROJECTS_TOKEN_SECRET=""    # NAME of a SECRETS_FILE entry: https deploy token for private repos
 PROJECTS_TOKEN_SECRETS=()   # "<project>=<SECRET NAME>": a project's own deploy token (default: PROJECTS_TOKEN_SECRET)
+PROJECTS_ACCESS=()          # "<project>=<account> [<account>...]": only these accounts reach the project (mirror ACLs + clones)
+PROJECTS_PUSH_TOKEN_SECRETS=()   # "<project>=<SECRET NAME>": accounts push to the upstream with this secret (an env var in their sessions)
+PROJECTS_SHARED_MAIN=()     # project names: a team repo everyone pushes straight to main (clones track origin/<branch> at the upstream)
 PROJECTS_FASTFORWARD=()     # accounts whose existing clones refresh-projects fast-forwards (agents; never people)
 PROJECTS_REFRESH_SCHEDULE="daily"   # OnCalendar of ikenga-projects-refresh.timer; "off" = no timer
 SECRETS_FILE=""             # root-only scoped secrets (format in README)
@@ -1963,6 +1966,14 @@ GIT_HOME=""; ASKPASS_FILE=""; MIRROR_UMASK=077     # git_root's scratch dir, ask
 # being fetched right now, and is empty whenever that project has no token.
 declare -A TOKEN_FILE_OF=()
 PROJ_TOKEN_CUR=""
+# Restricted projects (PROJECTS_ACCESS): project name -> " rex ruby " (space-
+# padded, so a membership test is a glob). Filled by validate_accounts_profile.
+# A project absent from it is unrestricted: PROJECTS_READ and PROJECTS_MEMBERS apply.
+declare -A PROJ_ACCESS=()
+# Push tokens (PROJECTS_PUSH_TOKEN_SECRETS): project name -> secret NAME. And the
+# PROJECTS_SHARED_MAIN names, space-padded like PROJ_ACCESS values.
+declare -A PROJ_PUSH_SECRET=()
+PROJ_SHARED_MAIN=" "
 soft_fail() { printf 'warning: %s\n' "$*" >&2; FAILED=1; }
 
 declare -A ACCT_UID=() ACCT_GID=() ACCT_HOME=()
@@ -1991,6 +2002,31 @@ project_token_secret() {
 }
 
 is_reserved_scope() { [[ "$1" == everyone || "$1" == agents || "$1" == root || "$1" == backup ]]; }
+
+# A restricted project's effective member set is exactly its PROJECTS_ACCESS
+# list: it narrows PROJECTS_MEMBERS, never widens it, and it is the one thing
+# PROJECTS_READ=world cannot override. project_allows is true for every account
+# of an unrestricted project (who may have a clone there is MEMBERS' business).
+project_restricted() { [[ -n "${PROJ_ACCESS[$1]:-}" ]]; }
+project_allows() { project_restricted "$1" || return 0; [[ "${PROJ_ACCESS[$1]}" == *" $2 "* ]]; }
+project_access_str() { local v="${PROJ_ACCESS[$1]# }"; printf '%s' "${v% }"; }   # "rex ruby"
+# project_readers <project>: the accounts that get a read ACL on its mirror.
+project_readers() { if project_restricted "$1"; then printf '%s' "${PROJ_ACCESS[$1]}"; else printf ' %s' "${MEMBERS[@]}"; fi; }
+# project_accounts <project>: the effective set, as a list: the managed accounts
+# that are in PROJECTS_MEMBERS and (when restricted) in PROJECTS_ACCESS. Accounts
+# not created yet are in it: their secret scopes already count.
+project_accounts() {
+  local a
+  for a in "${ACCT_LOGINS[@]}"; do
+    [[ " ${MEMBERS[*]} " == *" $a "* ]] && project_allows "$1" "$a" && printf '%s ' "$a"
+  done
+  return 0
+}
+project_shared_main() { [[ "$PROJ_SHARED_MAIN" == *" $1 "* ]]; }
+# project_spec <project>: the url[#branch] of its PROJECTS entry; project_url / project_branch split it.
+project_spec() { local e; for e in "${PROJECTS[@]}"; do [[ "${e%%=*}" == "$1" ]] && { printf '%s' "${e#*=}"; return 0; }; done; return 1; }
+project_url() { local s; s="$(project_spec "$1")" || return 1; printf '%s' "${s%%#*}"; }
+project_branch() { local s; s="$(project_spec "$1")" || return 1; [[ "$s" == *"#"* ]] && printf '%s' "${s#*#}"; return 0; }
 
 validate_accounts_profile() {
   local a e name rest
@@ -2048,6 +2084,64 @@ validate_accounts_profile() {
     tseen+="$tname "
     secret_name_ok "$tsecret" || die "PROJECTS_TOKEN_SECRETS '$tname=$tsecret': '$tsecret' is not a usable secret name"
   done
+  # Per-project access: "project=acct [acct...]". Every entry names a project
+  # that exists, once, and at least one managed account (each a plain login,
+  # once). With ACCOUNTS empty the managed set is only known after
+  # resolve_accounts, which repeats the managed check.
+  local aseen=" " aname arest alist
+  local -a aaccts
+  PROJ_ACCESS=()
+  for e in "${PROJECTS_ACCESS[@]}"; do
+    aname="${e%%=*}"; arest="${e#*=}"
+    [[ "$e" == *=* && -n "$aname" ]] || die "PROJECTS_ACCESS entry '$e' must look like project=account [account...]"
+    # The name check first: 'seen' is space-separated, so "a b" would match it.
+    [[ "$aname" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && "$seen" == *" $aname "* ]] || die "PROJECTS_ACCESS names '$aname', which is not in PROJECTS (typo?)"
+    [[ "$aseen" != *" $aname "* ]] || die "PROJECTS_ACCESS names '$aname' twice"
+    aseen+="$aname "
+    aaccts=(); IFS=$' \t\n' read -r -d '' -a aaccts <<<"$arest" || true
+    [[ ${#aaccts[@]} -gt 0 ]] || die "PROJECTS_ACCESS '$aname' lists no accounts (an empty list would lock everyone out; drop the entry to leave the project open)"
+    alist=" "
+    for a in "${aaccts[@]}"; do
+      [[ "$a" =~ ^[a-z][a-z0-9_-]{0,30}$ ]] || die "PROJECTS_ACCESS '$aname': '$a' is not a valid login name (lowercase letters, digits, - and _)"
+      is_reserved_scope "$a" && die "PROJECTS_ACCESS '$aname': '$a' is reserved (everyone, agents, root and backup are secret scopes, not accounts)"
+      [[ "$alist" != *" $a "* ]] || die "PROJECTS_ACCESS '$aname' names '$a' twice"
+      if [[ ${#ACCOUNTS[@]} -gt 0 && " ${ACCOUNTS[*]} ${AGENT_ACCOUNTS[*]} " != *" $a "* ]]; then
+        die "PROJECTS_ACCESS '$aname' names '$a', which is not a managed account (add it to ACCOUNTS)"
+      fi
+      alist+="$a "
+    done
+    PROJ_ACCESS[$aname]="$alist"
+  done
+  # Push tokens: "project=SECRET". The secret reaches an account as an
+  # environment variable of its sessions (a SECRETS_FILE scope), so whether it
+  # reaches EVERY account of the project is checked once the secrets are loaded
+  # (validate_project_secrets). Only an http(s) upstream can use one.
+  [[ ${#PROJECTS_PUSH_TOKEN_SECRETS[@]} -eq 0 || -n "$SECRETS_FILE" ]] || die "PROJECTS_PUSH_TOKEN_SECRETS needs SECRETS_FILE"
+  local pseen=" " pname psecret
+  PROJ_PUSH_SECRET=()
+  for e in "${PROJECTS_PUSH_TOKEN_SECRETS[@]}"; do
+    pname="${e%%=*}"; psecret="${e#*=}"
+    [[ "$e" == *=* && -n "$pname" && -n "$psecret" ]] || die "PROJECTS_PUSH_TOKEN_SECRETS entry '$e' must look like project=SECRET_NAME"
+    [[ "$pname" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && "$seen" == *" $pname "* ]] || die "PROJECTS_PUSH_TOKEN_SECRETS names '$pname', which is not in PROJECTS (typo?)"
+    [[ "$pseen" != *" $pname "* ]] || die "PROJECTS_PUSH_TOKEN_SECRETS names '$pname' twice"
+    pseen+="$pname "
+    secret_name_ok "$psecret" || die "PROJECTS_PUSH_TOKEN_SECRETS '$pname=$psecret': '$psecret' is not a usable secret name"
+    case "$(project_url "$pname")" in
+      https://*|http://*) ;;
+      *) die "PROJECTS_PUSH_TOKEN_SECRETS '$pname': a push token only works for an https:// or http:// upstream (got '$(project_url "$pname")')" ;;
+    esac
+    PROJ_PUSH_SECRET[$pname]="$psecret"
+  done
+  # Shared-main projects: everyone pushes straight to the upstream's branch, so
+  # origin must be the upstream itself and every push needs a token.
+  PROJ_SHARED_MAIN=" "
+  for e in "${PROJECTS_SHARED_MAIN[@]}"; do
+    [[ "$e" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && "$seen" == *" $e "* ]] || die "PROJECTS_SHARED_MAIN names '$e', which is not in PROJECTS (typo?)"
+    [[ "$PROJ_SHARED_MAIN" != *" $e "* ]] || die "PROJECTS_SHARED_MAIN names '$e' twice"
+    [[ -n "${PROJ_PUSH_SECRET[$e]:-}" ]] \
+      || die "PROJECTS_SHARED_MAIN '$e' needs a PROJECTS_PUSH_TOKEN_SECRETS entry (its clones fetch from and push to the upstream, and push as the account that has no GitHub login of its own)"
+    PROJ_SHARED_MAIN+="$e "
+  done
   [[ -z "$SECRETS_FILE" || -f "$SECRETS_FILE" ]] || die "SECRETS_FILE '$SECRETS_FILE' does not exist"
 }
 
@@ -2090,7 +2184,54 @@ resolve_accounts() {
   for a in "${PROJECTS_FASTFORWARD[@]}"; do
     [[ "$seen" == *" $a "* ]] || die "PROJECTS_FASTFORWARD names '$a', which is not a managed account (add it to ACCOUNTS)"
   done
+  # PROJECTS_ACCESS narrows PROJECTS_MEMBERS. An account it names that
+  # PROJECTS_MEMBERS leaves out would be a widening, so that is an error.
+  local e pn
+  for e in "${PROJECTS[@]}"; do
+    pn="${e%%=*}"
+    project_restricted "$pn" || continue
+    for a in ${PROJ_ACCESS[$pn]}; do
+      [[ "$seen" == *" $a "* ]] || die "PROJECTS_ACCESS '$pn' names '$a', which is not a managed account (add it to ACCOUNTS)"
+      if [[ ${#PROJECTS_MEMBERS[@]} -gt 0 && " ${MEMBERS[*]} " != *" $a "* ]]; then
+        die "PROJECTS_ACCESS '$pn' names '$a', who is not in PROJECTS_MEMBERS; PROJECTS_ACCESS only narrows PROJECTS_MEMBERS (add '$a' there, or drop it here)"
+      fi
+    done
+  done
   note "managed accounts: ${ACCT_LOGINS[*]:-none}"
+}
+
+# What needs the secrets to be loaded as well (run after load_secrets):
+#  - a push token must reach EVERY account of its project, or that account's
+#    pushes would fail with no hint why;
+#  - a restricted project's deploy token AND push token must reach nobody
+#    outside its access list: either reads the whole repo from GitHub, so
+#    handing it to another account would undo the restriction.
+validate_project_secrets() {
+  local e name sec a
+  [[ $SECRETS_UNREADABLE -eq 0 ]] || return 0
+  for e in "${PROJECTS[@]}"; do
+    name="${e%%=*}"
+    sec="${PROJ_PUSH_SECRET[$name]:-}"
+    if [[ -n "$sec" ]]; then
+      [[ "${ROOT_COUNT[$sec]:-0}" -ge 1 ]] || die "PROJECTS_PUSH_TOKEN_SECRETS '$name': '$sec' is not in SECRETS_FILE"
+      for a in $(project_accounts "$name"); do
+        [[ -n "${SEC_SEEN[$a|$sec]:-}" ]] \
+          || die "PROJECTS_PUSH_TOKEN_SECRETS '$name': $sec is not delivered to ik-$a, so it could not push (give $sec a SECRETS_FILE scope that reaches $a: [everyone], [agents] or [$a])"
+      done
+    fi
+    project_restricted "$name" || continue
+    # Both the deploy token and the push token read the whole repo from GitHub.
+    local kind
+    for kind in deploy push; do
+      if [[ $kind == deploy ]]; then sec="$(project_token_secret "$name")"; else sec="${PROJ_PUSH_SECRET[$name]:-}"; fi
+      [[ -n "$sec" ]] || continue
+      for a in "${ACCT_LOGINS[@]}"; do
+        project_allows "$name" "$a" && continue
+        [[ -z "${SEC_SEEN[$a|$sec]:-}" ]] \
+          || die "PROJECTS_ACCESS '$name' is restricted, but its $kind token $sec is delivered to ik-$a, who is not on its access list (scope $sec [root], or [<acct>] for each account on the list)"
+      done
+    done
+  done
 }
 
 has_account() { [[ -n "${ACCT_UID[$1]:-}" ]]; }
@@ -2186,18 +2327,30 @@ git_root() {
       -c http.followRedirects=false -c gc.auto=0 -c maintenance.auto=false "$@" )
 }
 
-# Named-user ACL entries (on the directory itself) as "ik-ada ik-grace".
-acl_users() { getfacl -cp -- "$1" 2>/dev/null | sed -n 's/^user:\(ik-[^:]*\):.*/\1/p'; }
+# Named-user ACL entries (on the directory itself, access AND default) as
+# "ik-ada ik-grace". acl_has_r / acl_has_default_r: that user's r-x entry exists.
+acl_users() { getfacl -cp -- "$1" 2>/dev/null | sed -n 's/^\(default:\)\{0,1\}user:\(ik-[^:]*\):.*/\2/p' | sort -u; }
 acl_has_r() { getfacl -cp -- "$1" 2>/dev/null | grep -q "^user:$2:r-x"; }
+acl_has_default_r() { getfacl -cp -- "$1" 2>/dev/null | grep -q "^default:user:$2:r-x"; }
+acl_has_default() { getfacl -cp -- "$1" 2>/dev/null | grep -q '^default:'; }
 
 # Make a mirror (or PROJECTS_DIR) exactly: root-owned, nobody can write,
 # nothing setuid/setgid, no symlinks, no hooks, no foreign alternates. Read
 # access: world (PROJECTS_READ=world) or per-member READ-ONLY ACL entries
 # (PROJECTS_READ=members; matched on the uid, so they hold for daemon sessions
-# that run with no supplementary groups). Reports a change only when it
-# actually had to repair something (and not at all with a second argument).
+# that run with no supplementary groups). A project in PROJECTS_ACCESS is never
+# world-readable, whatever PROJECTS_READ says: it gets ACL entries for exactly
+# its accounts, and a re-run drops the entries (and the world bits) of anyone
+# it no longer names. A restricted mirror also carries DEFAULT ACLs (the same
+# readers, nothing for others), so a file or directory a later fetch creates
+# starts out closed too, whatever the umask or a chmod does (belt and braces:
+# the 0750 top directory already keeps every non-member out of the whole tree).
+# Reports a change only when it actually had to repair something (and not at
+# all with a third argument).
 lock_mirror() {
-  local repo="$1" quiet="${2:-}" a u want="" fixed=0 bad
+  local repo="$1" name="$2" quiet="${3:-}" a u want="" fixed=0 bad world=0 restricted=0
+  project_restricted "$name" && restricted=1
+  [[ "$PROJECTS_READ" == world && $restricted -eq 0 ]] && world=1
   # Debris an older (group-writable) layout, or a member, could have left.
   if [[ -e "$repo/hooks" || -e "$repo/worktrees" || -e "$repo/.fetch.err" \
         || -e "$repo/objects/info/alternates" || -e "$repo/objects/info/http-alternates" ]]; then
@@ -2205,7 +2358,7 @@ lock_mirror() {
     [[ $DRY_RUN -eq 1 ]] || rm -rf -- "$repo/hooks" "$repo/worktrees" "$repo/.fetch.err" \
       "$repo/objects/info/alternates" "$repo/objects/info/http-alternates"
   fi
-  if [[ "$PROJECTS_READ" == world ]]; then
+  if [[ $world -eq 1 ]]; then
     bad="$(find "$repo" \( ! -user root -o ! -group root -o -type l -o -perm /6022 -o ! -perm -004 -o \( -type d ! -perm -005 \) \) -print -quit 2>/dev/null)"
   else
     bad="$(find "$repo" \( ! -user root -o ! -group root -o -type l -o -perm /6027 -o \( -type d ! -perm -050 \) \) -print -quit 2>/dev/null)"
@@ -2214,24 +2367,36 @@ lock_mirror() {
   if [[ $DRY_RUN -eq 0 ]]; then
     find "$repo" -type l -delete
     chown -R root:root -- "$repo"
-    if [[ "$PROJECTS_READ" == world ]]; then chmod -R u=rwX,go=rX,u-s,g-s -- "$repo"
+    if [[ $world -eq 1 ]]; then chmod -R u=rwX,go=rX,u-s,g-s -- "$repo"
     else chmod -R u=rwX,g=rX,o=,u-s,g-s -- "$repo"; fi
   fi
-  if [[ "$PROJECTS_READ" == world ]]; then
-    if [[ -n "$(acl_users "$repo")" ]]; then
+  if [[ $world -eq 1 ]]; then
+    if [[ -n "$(acl_users "$repo")" ]] || acl_has_default "$repo"; then
       fixed=1; [[ $DRY_RUN -eq 1 ]] || setfacl -R -b -- "$repo"
     fi
   else
-    for a in "${MEMBERS[@]}"; do has_account "$a" && want+=" ik-$a"; done
+    for a in $(project_readers "$name"); do has_account "$a" && want+=" ik-$a"; done
     for u in $want; do
       acl_has_r "$repo" "$u" || fixed=1
       [[ $DRY_RUN -eq 1 ]] || setfacl -R -m "u:$u:rX" -- "$repo" \
         || soft_fail "setfacl failed on $repo: this filesystem may not support ACLs, so daemon sessions (no supplementary groups) cannot read the mirror"
+      if [[ $restricted -eq 1 ]]; then
+        acl_has_default_r "$repo" "$u" || fixed=1
+        [[ $DRY_RUN -eq 1 ]] || setfacl -R -d -m "u:$u:rX" -- "$repo" \
+          || soft_fail "setfacl (default) failed on $repo"
+      fi
     done
+    # Revoke: any named user not wanted loses the access AND the default entry.
     for u in $(acl_users "$repo"); do
       [[ " $want " == *" $u "* ]] && continue
-      fixed=1; [[ $DRY_RUN -eq 1 ]] || setfacl -R -x "u:$u" -- "$repo"
+      fixed=1; [[ $DRY_RUN -eq 1 ]] || { setfacl -R -x "u:$u" -- "$repo"; setfacl -R -d -x "u:$u" -- "$repo"; }
     done
+    if [[ $restricted -eq 1 ]]; then
+      [[ $DRY_RUN -eq 1 ]] || setfacl -R -d -m 'o::-' -- "$repo"
+    elif acl_has_default "$repo"; then
+      # No longer restricted: the defaults go (the readers' access entries stay).
+      fixed=1; [[ $DRY_RUN -eq 1 ]] || setfacl -R -k -- "$repo"
+    fi
   fi
   [[ $fixed -eq 0 || -n "$quiet" ]] || changed "mirror $repo locked down (root-owned, read-only for everyone else)"
 }
@@ -2270,12 +2435,44 @@ sync_projects() {
   log "Shared project mirrors ($PROJECTS_DIR, read: $PROJECTS_READ)"
   apt_install git acl
   refresh_mirrors
-  local a e
-  for a in "${MEMBERS[@]}"; do
+  local a e name
+  note_project_access
+  # Everyone managed is walked, not just MEMBERS: a restricted project's clone
+  # that an excluded account already has is reported (and left alone) too.
+  for a in "${ACCT_LOGINS[@]}"; do
     has_account "$a" || continue
-    for e in "${PROJECTS[@]}"; do ensure_account_clone "$a" "${e%%=*}" "${e#*=}"; done
+    for e in "${PROJECTS[@]}"; do
+      name="${e%%=*}"
+      if ! project_allows "$name" "$a"; then
+        [[ ! -e "${ACCT_HOME[$a]}/projects/$name" && ! -L "${ACCT_HOME[$a]}/projects/$name" ]] \
+          || note "ik-$a:$name: not in PROJECTS_ACCESS, but already has a clone; left as it is (remove ${ACCT_HOME[$a]}/projects/$name by hand if it should go)"
+        continue
+      fi
+      [[ " ${MEMBERS[*]} " == *" $a "* ]] || continue
+      ensure_account_clone "$a" "$name" "${e#*=}"
+    done
   done
   rm -rf -- "$GIT_HOME"; GIT_HOME=""; ASKPASS_FILE=""
+}
+
+# One line per restricted project, so a dry run (and the log) shows who can
+# reach it. The mirror is never world-readable and only these accounts get a clone.
+# Then a line per project with a push token and per shared-main project.
+note_project_access() {
+  local e pn b
+  for e in "${PROJECTS[@]}"; do
+    pn="${e%%=*}"
+    if project_restricted "$pn"; then
+      note "project $pn: access: $(project_access_str "$pn") (mirror never world-readable; clones only for these)"
+    fi
+    if [[ -n "${PROJ_PUSH_SECRET[$pn]:-}" ]]; then
+      note "project $pn: pushes use \$${PROJ_PUSH_SECRET[$pn]} from the account's environment (credential helper in each clone, scoped to $(project_url "$pn"))"
+    fi
+    if project_shared_main "$pn"; then
+      b="$(project_branch "$pn")"
+      note "project $pn: shared main: clones track origin/${b:-<default branch>} at the upstream, not <account>/main"
+    fi
+  done
 }
 
 # Everything sync_projects does to the mirrors, and nothing to the accounts:
@@ -2362,6 +2559,7 @@ refresh_mirrors() {
     ensure_mirror "$name" "${e#*=}" "$tsecret"
   done
   PROJ_TOKEN_CUR=""
+  case "$PROJECTS_READ" in world) MIRROR_UMASK=022 ;; *) MIRROR_UMASK=077 ;; esac   # ensure_mirror set it per project
 }
 
 # prepare_deploy_token <label> <secret name>: check the secret is in SECRETS_FILE
@@ -2375,7 +2573,8 @@ prepare_deploy_token() {
   [[ "${ROOT_COUNT[$secret]:-0}" -eq 1 ]] \
     || { [[ $SECRETS_UNREADABLE -eq 1 ]] || die "$label '$secret' must appear exactly once in SECRETS_FILE (found ${ROOT_COUNT[$secret]:-0})"; }
   value="${ROOT_VALUE[$secret]:-}"
-  if [[ -n "${ROOT_SCOPE[$secret]:-}" && "${ROOT_SCOPE[$secret]}" != root ]]; then
+  # A secret that is also a push token is meant to reach accounts: no warning.
+  if [[ -n "${ROOT_SCOPE[$secret]:-}" && "${ROOT_SCOPE[$secret]}" != root && " ${PROJ_PUSH_SECRET[*]} " != *" $secret "* ]]; then
     note "WARNING: $secret is the deploy token and is scoped '${ROOT_SCOPE[$secret]}', so those accounts get it too. Scope it 'root' to keep it provisioner-only."
   fi
   if [[ -n "$value" && $DRY_RUN -eq 0 ]]; then
@@ -2391,13 +2590,16 @@ prepare_deploy_token() {
 
 ensure_mirror() {
   local name="$1" spec="$2" tsecret="${3:-}" url branch repo work before after def cur first out rc=0 new=0
+  # What this project's fetch writes: 0077 unless it is world-readable, which a
+  # restricted project never is (lock_mirror enforces the same on what exists).
+  if [[ "$PROJECTS_READ" == world ]] && ! project_restricted "$name"; then MIRROR_UMASK=022; else MIRROR_UMASK=077; fi
   url="${spec%%#*}"; branch=""; [[ "$spec" == *"#"* ]] && branch="${spec#*#}"
   repo="$PROJECTS_DIR/$name.git"
   if [[ -L "$repo" ]] || { [[ -e "$repo" ]] && [[ "$(stat -c '%u' -- "$repo")" != 0 ]]; }; then
     soft_fail "project $name: $repo is a symlink or not owned by root; refusing to use it"; return
   fi
   if [[ ! -d "$repo" ]]; then
-    if [[ $DRY_RUN -eq 1 ]]; then changed "project $name mirrored from $url"; return; fi
+    if [[ $DRY_RUN -eq 1 ]]; then changed "project $name mirrored from $url${PROJ_ACCESS[$name]:+ (access: $(project_access_str "$name"))}"; return; fi
     new=1
     work="$(mktemp -d "$PROJECTS_DIR/.new-$name.XXXXXX")"
     git_root none init --bare -q --template= -- "$work" || { soft_fail "project $name: git init failed"; rm -rf -- "$work"; return; }
@@ -2405,7 +2607,7 @@ ensure_mirror() {
   else
     work="$repo"
     if [[ $DRY_RUN -eq 1 ]]; then
-      lock_mirror "$repo"
+      lock_mirror "$repo" "$name"
       write_mirror_config "$work" && changed "mirror $name: config reset to the canonical one"
       # Which secret is shown only with PROJECTS_TOKEN_SECRETS, so a profile
       # without it prints exactly what it did before.
@@ -2417,7 +2619,7 @@ ensure_mirror() {
     fi
     # Lock FIRST: on a mirror left group-writable by an older layout, a member
     # could swap in a config between our write and the lock.
-    lock_mirror "$repo"
+    lock_mirror "$repo" "$name"
     write_mirror_config "$work" && changed "mirror $name: config reset to the canonical one"
   fi
 
@@ -2459,11 +2661,11 @@ ensure_mirror() {
 
   if [[ $new -eq 1 ]]; then
     mv -T -- "$work" "$repo" || { soft_fail "project $name: cannot move the new mirror into place"; rm -rf -- "$work"; return; }
-    lock_mirror "$repo" quiet
+    lock_mirror "$repo" "$name" quiet
     changed "project $name mirrored from $url (default branch ${def:-none yet})"
     return
   fi
-  lock_mirror "$repo" quiet            # what the fetch just wrote gets the same modes
+  lock_mirror "$repo" "$name" quiet     # what the fetch just wrote gets the same modes
   [[ "$before" == "$after" ]] || changed "project $name fetched new commits"
 }
 
@@ -2493,27 +2695,105 @@ converge_clone_push_url() {
     || soft_fail "ik-$a:$name: cannot set the push URL"
 }
 
+# The credential helper a clone gets for PROJECTS_PUSH_TOKEN_SECRETS: a shell
+# function (git runs a "!" helper with "get" appended) that prints the token
+# from the ENVIRONMENT variable named <SECRET> when git asks, and nothing at all
+# when the variable is unset. The text names the variable, never its value, so
+# no token is ever written to a git config, a file or a log.
+push_helper_text() {
+  printf '%s' "!f() { [ \"\$1\" = get ] || exit 0; [ -n \"\${$1:-}\" ] || exit 0; printf '%s\\n' username=x-access-token \"password=\$$1\"; }; f"
+}
+# git config keys of the clone: the helper is scoped to the upstream URL (and so
+# is never offered to any other host or repo); the marker records which secret
+# we set it for, which is how a later run tells "ours" from "the account's".
+push_helper_key() { printf 'credential.%s.helper' "$(project_url "$1")"; }
+PUSH_MARKER_KEY="ikenga.pushTokenSecret"
+
+# converge_push_helper <account> <project> <clone>: give an existing or new
+# clone the push helper of its project (PROJECTS_PUSH_TOKEN_SECRETS), in the
+# clone's OWN config (repo-local), as the account. The same "never touch what
+# the account set itself" rule as the push URL:
+#   - no helper and no marker             -> add the helper and the marker
+#   - helper == ours                      -> nothing
+#   - no helper but a marker              -> the account removed it: left removed
+#   - helper == what we set for the secret the marker names, and the profile now
+#     names another secret              -> ours, so it is updated
+#   - any other helper for that URL       -> the account's own: left as it is
+converge_push_helper() {
+  local a="$1" name="$2" wt="$3" secret key want cur marker
+  secret="${PROJ_PUSH_SECRET[$name]:-}"
+  [[ -n "$secret" && -d "$wt/.git" && ! -L "$wt" ]] || return 0
+  key="$(push_helper_key "$name")"; want="$(push_helper_text "$secret")"
+  cur="$(as_account "$a" git -C "$wt" config --local --get-all "$key" 2>/dev/null || true)"
+  marker="$(as_account "$a" git -C "$wt" config --local --get "$PUSH_MARKER_KEY" 2>/dev/null || true)"
+  if [[ "$cur" == "$want" ]]; then
+    [[ "$marker" == "$secret" || $DRY_RUN -eq 1 ]] || as_account "$a" git -C "$wt" config --local "$PUSH_MARKER_KEY" "$secret" || true
+    return 0
+  fi
+  if [[ -z "$cur" && -n "$marker" ]]; then
+    note "ik-$a:$name: the push credential helper was removed from the clone; left removed (delete $PUSH_MARKER_KEY from its .git/config to have it set again)"
+    return 0
+  fi
+  if [[ -n "$cur" ]] && ! [[ -n "$marker" && "$marker" != "$secret" && "$cur" == "$(push_helper_text "$marker")" ]]; then
+    note "ik-$a:$name: the clone has its own credential helper for $(project_url "$name"); left as it is"
+    return 0
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then changed "clone ik-$a:$name: push credential helper (env $secret)"; return 0; fi
+  as_account "$a" git -C "$wt" config --local --replace-all "$key" "$want" \
+    && as_account "$a" git -C "$wt" config --local "$PUSH_MARKER_KEY" "$secret" \
+    && changed "clone ik-$a:$name: push credential helper (env $secret)" \
+    || soft_fail "ik-$a:$name: cannot set the push credential helper"
+}
+
 # An account's own clone: created once, as the account, and then never touched
-# (beyond pointing an untouched push URL at the upstream, above).
+# (beyond pointing an untouched push URL at the upstream, and adding the push
+# credential helper, above).
+#
+# A PROJECTS_SHARED_MAIN project is cloned differently: the account's branch is
+# the upstream's own (<branch>, tracking origin/<branch>), not <prefix><account>/main,
+# and origin is the UPSTREAM url for fetch and push alike (the mirror can be a
+# day behind, and a push from behind it would be refused). The first clone still
+# reads the local mirror (--reference), so nothing is downloaded twice. Clones
+# made before the project was shared-main are noted, never rewritten.
 ensure_account_clone() {
-  local a="$1" name="$2" spec="${3:-}" repo wt branch def home out push
+  local a="$1" name="$2" spec="${3:-}" repo wt branch def home out push shared=0 sbranch cur up xtra=""
   repo="$PROJECTS_DIR/$name.git"; home="${ACCT_HOME[$a]}"; wt="$home/projects/$name"
   branch="${PROJECTS_BRANCH_PREFIX}${a}/main"
   push="$(clone_push_url "$spec")"
+  up="$(project_url "$name")"; sbranch="$(project_branch "$name")"
+  if project_shared_main "$name"; then
+    shared=1; branch="${sbranch:-the default branch}"; push=""
+    xtra=" (shared main: origin is $up)"
+  fi
+  [[ -z "${PROJ_PUSH_SECRET[$name]:-}" ]] || xtra+=" (push token env: ${PROJ_PUSH_SECRET[$name]})"
+  # Only the project's effective member set gets a clone. An excluded account's
+  # existing clone is its own business: reported, never touched.
+  if ! project_allows "$name" "$a"; then
+    [[ ! -e "$wt" && ! -L "$wt" ]] || note "ik-$a:$name: not in PROJECTS_ACCESS, but already has a clone; left as it is"
+    return 0
+  fi
   if [[ -e "$wt" || -L "$wt" ]]; then
     converge_clone_push_url "$a" "$name" "$wt" "$repo" "$push"
+    if [[ $shared -eq 1 && -d "$wt/.git" && ! -L "$wt" ]]; then
+      cur="$(as_account "$a" git -C "$wt" config --get remote.origin.url 2>/dev/null || true)"
+      [[ "$cur" != "$repo" ]] || note "ik-$a:$name: made before PROJECTS_SHARED_MAIN (origin is the mirror, on its own branch); left as it is. To switch: git remote set-url origin $up && git fetch origin && git checkout -b <branch> --track origin/<branch>"
+    fi
+    converge_push_helper "$a" "$name" "$wt"
+    converge_clone_private "$a" "$name" "$wt"
     return 0
   fi
   if [[ $DRY_RUN -eq 1 ]]; then
-    [[ -d "$repo" ]] && changed "clone ik-$a:$name on $branch" || changed "clone ik-$a:$name on $branch (after the mirror)"
+    changed "clone ik-$a:$name on $branch${xtra}$([[ -d "$repo" ]] || echo ' (after the mirror)')"
     return
   fi
   [[ -d "$repo" ]] || return 0
   def="$(git_root none --git-dir "$repo" symbolic-ref -q --short HEAD || true)"
+  [[ $shared -eq 0 || -z "$sbranch" ]] || def="$sbranch"
   if [[ -z "$def" ]] || ! git_root none --git-dir "$repo" show-ref --verify --quiet "refs/heads/$def"; then
     note "ik-$a:$name: the mirror has no commits on '${def:-?}' yet; no clone"
     return
   fi
+  [[ $shared -eq 0 ]] || branch="$def"
   [[ "$(stat -c %u -- "$home" 2>/dev/null)" == "${ACCT_UID[$a]}" ]] || { soft_fail "ik-$a: home $home is not owned by the account; no clone"; return; }
   as_account "$a" mkdir -p -- "$home/projects" || { soft_fail "ik-$a: cannot create $home/projects"; return; }
   # --no-local: transfer through upload-pack, never hard-link or copy from the
@@ -2522,14 +2802,44 @@ ensure_account_clone() {
   if ! out="$(as_account "$a" git clone --quiet --no-local --no-checkout --reference "$repo" -- "$repo" "$wt" 2>&1)"; then
     soft_fail "ik-$a:$name: git clone failed: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"; return
   fi
-  if ! out="$(as_account "$a" git -C "$wt" checkout --quiet --no-track -b "$branch" "refs/remotes/origin/$def" 2>&1)"; then
-    soft_fail "ik-$a:$name: cannot create $branch: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"; return
+  if [[ $shared -eq 1 ]]; then
+    if ! out="$(as_account "$a" git -C "$wt" checkout --quiet --track -B "$branch" "refs/remotes/origin/$def" 2>&1)"; then
+      soft_fail "ik-$a:$name: cannot create $branch: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"; return
+    fi
+    as_account "$a" git -C "$wt" remote set-url origin "$up" \
+      || soft_fail "ik-$a:$name: cannot point origin at the upstream"
+  else
+    if ! out="$(as_account "$a" git -C "$wt" checkout --quiet --no-track -b "$branch" "refs/remotes/origin/$def" 2>&1)"; then
+      soft_fail "ik-$a:$name: cannot create $branch: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"; return
+    fi
   fi
   if [[ -n "$push" ]]; then
     as_account "$a" git -C "$wt" remote set-url --push origin "$push" \
       || soft_fail "ik-$a:$name: cannot set the push URL"
   fi
-  changed "clone ik-$a:$name on $branch${push:+ (push: $push)}"
+  changed "clone ik-$a:$name on $branch${push:+ (push: $push)}${xtra}"
+  converge_push_helper "$a" "$name" "$wt"
+  converge_clone_private "$a" "$name" "$wt"
+}
+
+# A restricted project's clone is closed to group and other at its top
+# directory. Accounts get their clones under umask 0002, so without this the
+# working tree is only as private as the member's home, and an adopted account
+# can keep a home that other users can enter.
+converge_clone_private() {
+  local a="$1" name="$2" wt="$3" mode
+  project_restricted "$name" || return 0
+  [[ -d "$wt" && ! -L "$wt" ]] || return 0
+  [[ "$(stat -c %u -- "$wt" 2>/dev/null)" == "${ACCT_UID[$a]}" ]] || return 0
+  mode="$(stat -c %a -- "$wt" 2>/dev/null)" || return 0
+  (( (8#$mode & 8#077) != 0 )) || return 0
+  if [[ $DRY_RUN -eq 1 ]]; then
+    changed "close ik-$a:$name clone to other users (mode $mode)"
+    return 0
+  fi
+  as_account "$a" chmod go= -- "$wt" \
+    && changed "close ik-$a:$name clone to other users (was mode $mode)" \
+    || soft_fail "ik-$a:$name: cannot close the clone to other users"
 }
 
 # ---- keeping agent clones current (refresh-projects)
@@ -2560,6 +2870,7 @@ REFRESH_GIT_TIMEOUT="${IKENGA_REFRESH_GIT_TIMEOUT:-120}"
 # from root-only files rather than through a pipe: a process the account leaves
 # running in the background cannot hold a pipe open and stall this script.
 ACCT_OUT=""; ACCT_ERR=""
+ACCT_GIT_PROTO=file     # the one transport allowed; only a shared-main fetch of an http(s) upstream sets another
 acct_git() {
   local a="$1" wt="$2" rc=0; shift 2
   # Fresh files (new inodes) for every call: a process an account left running
@@ -2568,7 +2879,7 @@ acct_git() {
   # may be another account's clone.
   rm -f -- "$GIT_HOME/acct.out" "$GIT_HOME/acct.err"
   AS_ACCOUNT_TIMEOUT="$REFRESH_GIT_TIMEOUT" as_account "$a" \
-    GIT_CONFIG_GLOBAL=/dev/null GIT_ALLOW_PROTOCOL=file GIT_OPTIONAL_LOCKS=0 GIT_MERGE_AUTOEDIT=no \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_ALLOW_PROTOCOL="$ACCT_GIT_PROTO" GIT_OPTIONAL_LOCKS=0 GIT_MERGE_AUTOEDIT=no \
     git --no-pager -C "$wt" \
       -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.askPass= -c credential.helper= \
       -c core.sshCommand=/bin/false -c gc.auto=0 -c maintenance.auto=false \
@@ -2598,38 +2909,86 @@ clone_path_ok() {
     || { soft_fail "ik-$a:$name: $wt does not resolve to $rhome/projects/$name; refusing"; return 1; }
 }
 
+# account_secret_value <account> <secret>: the value that account's own
+# SECRETS_FILE scopes give it (empty if none). Read from root's parsed copy.
+account_secret_value() {
+  local l
+  while IFS= read -r l; do
+    [[ "${l%%=*}" == "$2" ]] && { printf '%s' "${l#*=}"; return 0; }
+  done <<<"${SEC_BODY[$1]:-}"
+  return 0
+}
+
 # fastforward_clone <account> <project> : never fails the caller.
 fastforward_clone() {
   local a="$1" name="$2" repo wt tag rc origin def target="" tsha head hsha branch
+  local up shared=0 sb="" sec val tokf
   repo="$PROJECTS_DIR/$name.git"; wt="${ACCT_HOME[$a]}/projects/$name"; tag="ik-$a:$name"
+  # PROJECTS_FASTFORWARD ∩ the project's effective set: root never runs git in
+  # a clone of an account the project does not admit.
+  if ! project_allows "$name" "$a"; then note "$tag: not in PROJECTS_ACCESS; skipped"; return 0; fi
   if [[ ! -e "$wt" && ! -L "$wt" ]]; then note "$tag: no clone yet; sync-accounts creates it"; return 0; fi
   clone_path_ok "$a" "$name" "$wt" || return 0
+  up="$(project_url "$name")"
   if [[ $DRY_RUN -eq 1 ]]; then
-    note "[dry-run] $tag: would fetch $repo and fast-forward $wt if clean, on a branch and strictly behind"
+    if project_shared_main "$name"; then
+      note "[dry-run] $tag: would fetch the upstream $up as the account (its own ${PROJ_PUSH_SECRET[$name]}) and fast-forward $wt if clean, on the project's branch and strictly behind"
+    else
+      note "[dry-run] $tag: would fetch $repo and fast-forward $wt if clean, on a branch and strictly behind"
+    fi
     return 0
   fi
   if [[ -L "$repo" || ! -d "$repo" || "$(stat -c %u -- "$repo")" != 0 ]]; then
     note "$tag: no usable mirror at $repo; left as it is"; return 0
   fi
   origin=""; acct_git "$a" "$wt" config --get remote.origin.url && origin="$ACCT_OUT" || true
-  if [[ "$origin" != "$repo" ]]; then
+  # A shared-main clone follows the UPSTREAM; one made before the project was
+  # shared-main (origin is still the mirror) keeps following the mirror.
+  if project_shared_main "$name" && [[ "$origin" == "$up" ]]; then shared=1
+  elif [[ "$origin" != "$repo" ]]; then
     note "$tag: origin is '${origin:-unset}', not the mirror $repo; left as it is"; return 0
   fi
 
-  # Fetch the mirror (by path, not by the clone's remote config) into the
-  # remote-tracking refs. This moves no branch and touches no file.
   rc=0
-  acct_git "$a" "$wt" fetch --quiet --no-write-fetch-head --no-tags -- "$repo" '+refs/heads/*:refs/remotes/origin/*' || rc=$?
-  if [[ $rc -ne 0 ]]; then
-    soft_fail "$tag: fetch failed (rc $rc): $(tr '\n' ' ' <<<"$ACCT_ERR" | cut -c1-200)"; return 0
-  fi
-
-  # What the clone follows: origin/HEAD, else the mirror's default branch.
-  if acct_git "$a" "$wt" rev-parse --verify -q "refs/remotes/origin/HEAD^{commit}"; then
-    target="refs/remotes/origin/HEAD"
+  if [[ $shared -eq 1 ]]; then
+    # Fetch the upstream, as the account, with the account's OWN value of the
+    # project's push secret. Root has that value (it renders the account's env
+    # file); the account's git reads it from an inherited descriptor through a
+    # one-shot credential helper: never argv, never a file the account owns,
+    # never a config. Only the branch is fetched, into its remote-tracking ref.
+    sb="$(project_branch "$name")"
+    [[ -n "$sb" ]] || sb="$(git_root none --git-dir "$repo" symbolic-ref -q --short HEAD || true)"
+    git_root none check-ref-format --branch "${sb:-}" >/dev/null 2>&1 || { note "$tag: no branch to follow yet; left as it is"; return 0; }
+    sec="${PROJ_PUSH_SECRET[$name]}"
+    val="$(account_secret_value "$a" "$sec")"
+    if [[ -z "$val" ]]; then note "$tag: $sec is not delivered to ik-$a; cannot fetch the upstream; left as it is"; return 0; fi
+    tokf="$GIT_HOME/pushtok"
+    rm -f -- "$tokf"
+    ( umask 077; printf '%s\n' username=x-access-token "password=$val" > "$tokf" )
+    val=""
+    ACCT_GIT_PROTO="${up%%://*}"
+    acct_git "$a" "$wt" -c 'credential.helper=!f() { [ "$1" = get ] && cat <&9; }; f' -c http.followRedirects=false \
+      fetch --quiet --no-write-fetch-head --no-tags -- "$up" "+refs/heads/$sb:refs/remotes/origin/$sb" 9<"$tokf" || rc=$?
+    ACCT_GIT_PROTO=file
+    rm -f -- "$tokf"
+    if [[ $rc -ne 0 ]]; then
+      soft_fail "$tag: fetch of the upstream failed (rc $rc): $(tr '\n' ' ' <<<"$ACCT_ERR" | cut -c1-200)"; return 0
+    fi
+    target="refs/remotes/origin/$sb"
   else
-    def="$(git_root none --git-dir "$repo" symbolic-ref -q --short HEAD || true)"
-    if [[ -n "$def" ]] && git_root none check-ref-format --branch "$def" >/dev/null 2>&1; then target="refs/remotes/origin/$def"; fi
+    # Fetch the mirror (by path, not by the clone's remote config) into the
+    # remote-tracking refs. This moves no branch and touches no file.
+    acct_git "$a" "$wt" fetch --quiet --no-write-fetch-head --no-tags -- "$repo" '+refs/heads/*:refs/remotes/origin/*' || rc=$?
+    if [[ $rc -ne 0 ]]; then
+      soft_fail "$tag: fetch failed (rc $rc): $(tr '\n' ' ' <<<"$ACCT_ERR" | cut -c1-200)"; return 0
+    fi
+    # What the clone follows: origin/HEAD, else the mirror's default branch.
+    if acct_git "$a" "$wt" rev-parse --verify -q "refs/remotes/origin/HEAD^{commit}"; then
+      target="refs/remotes/origin/HEAD"
+    else
+      def="$(git_root none --git-dir "$repo" symbolic-ref -q --short HEAD || true)"
+      if [[ -n "$def" ]] && git_root none check-ref-format --branch "$def" >/dev/null 2>&1; then target="refs/remotes/origin/$def"; fi
+    fi
   fi
   tsha=""
   if [[ -n "$target" ]] && acct_git "$a" "$wt" rev-parse --verify -q "$target^{commit}"; then tsha="$ACCT_OUT"; fi
@@ -2637,6 +2996,7 @@ fastforward_clone() {
 
   branch=""; acct_git "$a" "$wt" symbolic-ref -q HEAD && branch="$ACCT_OUT" || true
   if [[ "$branch" != refs/heads/* ]]; then note "$tag: HEAD is detached; left as it is"; return 0; fi
+  if [[ $shared -eq 1 && "$branch" != "refs/heads/$sb" ]]; then note "$tag: on ${branch#refs/heads/}, not $sb; left as it is"; return 0; fi
   hsha=""; acct_git "$a" "$wt" rev-parse --verify -q "HEAD^{commit}" && hsha="$ACCT_OUT" || true
   if [[ ! "$hsha" =~ ^[0-9a-f]{40,64}$ ]]; then note "$tag: ${branch#refs/heads/} has no commits; left as it is"; return 0; fi
   if [[ "$hsha" == "$tsha" ]]; then note "$tag: ${branch#refs/heads/} is up to date"; return 0; fi
@@ -2671,7 +3031,9 @@ refresh_projects() {
   command -v git >/dev/null 2>&1 || die "git is not installed (run sync-accounts first)"
   resolve_accounts
   load_secrets
+  validate_project_secrets
   refresh_mirrors
+  note_project_access
   local a e
   for a in "${PROJECTS_FASTFORWARD[@]}"; do
     if ! has_account "$a"; then note "ik-$a: not created yet; skipped"; continue; fi
@@ -2957,6 +3319,7 @@ sync_accounts() {
   [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo)"
   resolve_accounts
   load_secrets
+  validate_project_secrets
   [[ ${#PROJECTS[@]} -eq 0 ]] || sync_projects
   [[ -z "$SECRETS_FILE" ]] || sync_secrets
   sync_projects_refresh_units
