@@ -204,6 +204,9 @@ One download per project, everyone on their own branch, and nobody able to affec
 | `PROJECTS_MEMBERS` | all managed accounts | Who gets a clone and (with `PROJECTS_READ=members`) read access. Narrowing it removes the ACL entry; the account's clone is left where it is. |
 | `PROJECTS_TOKEN_SECRET` | none | Name of a secret in `SECRETS_FILE` (scope it `root`): an https deploy token for private repos. |
 | `PROJECTS_TOKEN_SECRETS` | none | `("project=SECRET_NAME" ...)`: a project's **own** deploy token, for repos the default token cannot read. A listed project uses that secret; every other project uses `PROJECTS_TOKEN_SECRET` (or no token if that is unset too). Each project name must be in `PROJECTS` (once), each secret must be in `SECRETS_FILE` exactly once, and should be scoped `root`. A GitHub fine-grained token belongs to one owner, so an org's repos and a personal repo need one token each. |
+| `PROJECTS_ACCESS` | none | `("project=account [account...]" ...)`: restrict a project to exactly these accounts. See "Restricting a project" below. |
+| `PROJECTS_PUSH_TOKEN_SECRETS` | none | `("project=SECRET_NAME" ...)`: accounts push to that project's upstream with `$SECRET_NAME` from their session environment, no GitHub login needed. See "Pushing without a GitHub login". |
+| `PROJECTS_SHARED_MAIN` | none | `(project ...)`: a team repo everyone pushes straight to main. Each needs a `PROJECTS_PUSH_TOKEN_SECRETS` entry. See "Shared main". |
 | `PROJECTS_FASTFORWARD` | none | Accounts whose existing clones `refresh-projects` keeps current (agents, never people). Must be managed accounts. |
 | `PROJECTS_REFRESH_SCHEDULE` | `daily` | `OnCalendar` of `ikenga-projects-refresh.timer` (e.g. `*-*-* 02,14:00:00`). `off` = no timer, and an installed one is removed. |
 
@@ -220,6 +223,55 @@ SECRETS_FILE=/root/provision/secrets.scoped
 #   [root] ORG_GH_TOKEN=github_pat_...
 #   [root] PERSONAL_GH_TOKEN=github_pat_...
 ```
+
+#### Restricting a project (`PROJECTS_ACCESS`)
+
+For a repo only some accounts may see (a company hub with legal, finance and deals in it):
+
+```bash
+ACCOUNTS=(chinedum ada onyedikachi rex ruby)
+AGENT_ACCOUNTS=(rex ruby)
+PROJECTS+=("royalti-co=https://github.com/example-user/royalti-co.git#main")
+PROJECTS_TOKEN_SECRETS=("royalti-co=ROYALTI_CO_GH_TOKEN")   # a [root] secret
+PROJECTS_ACCESS=("royalti-co=rex ruby")
+```
+
+- **Mirror.** Readable by exactly the listed accounts (a read-only named-user ACL on every file and directory, plus the matching default ACLs and `default:other::---` on directories, so anything a later fetch writes starts closed whatever the umask). It is never world-readable, even with `PROJECTS_READ=world`; the top directory is `0750`, so no other account can enter it at all. A re-run **revokes** the entries (access and default) of any account no longer listed and closes a mirror that was created world-readable. Only the project's *name* (`<name>.git` in `PROJECTS_DIR`) stays visible in a directory listing.
+- **Clones.** Only for the listed accounts. A clone a non-listed account already has is **never deleted or modified**: it is reported ("not in PROJECTS_ACCESS, but already has a clone; left as it is") and is that account's to remove. That clone shares objects with the mirror, which the account can no longer read, but its checked-out files stay readable to that account: narrowing the list does not take back content already checked out.
+- **`refresh-projects`** fast-forwards only the clones of accounts in both `PROJECTS_FASTFORWARD` and the project's list.
+- **Narrows, never widens.** With a non-empty `PROJECTS_MEMBERS`, an access account missing from it is an error. A listed account must be a managed account (`ACCOUNTS`/`AGENT_ACCOUNTS`) and a plain login name; an empty list, a duplicate project, an unknown project and the reserved scope names (`everyone`, `agents`, `root`, `backup`) are refused before anything is written.
+- **Its tokens stay private.** If the project's deploy token (`PROJECTS_TOKEN_SECRETS`, else `PROJECTS_TOKEN_SECRET`) or its push token (`PROJECTS_PUSH_TOKEN_SECRETS`) is scoped so that it is delivered to an account that is not on the list, the run stops: either token reads the whole repo from GitHub. Scope the deploy token `[root]` and the push token `[<acct>]` once per listed account.
+- **Clones are closed too.** A listed account's clone of the project is set to mode `700` at its top directory when it is made and again on every run, so it stays private even under a home other users can enter (an adopted account may keep one). The files inside keep the account's umask.
+- `--dry-run` prints `project <name>: access: <accounts>` for each restricted project.
+
+#### Pushing without a GitHub login (`PROJECTS_PUSH_TOKEN_SECRETS`)
+
+Staff accounts have no `gh auth login`. Give them a token instead, as a scoped secret (a `SECRETS_FILE` line `[scope] NAME=value` is delivered as an environment variable of that account's sessions):
+
+```bash
+PROJECTS+=("royalti-company=https://github.com/Royalti-io/royalti-company.git#main")
+PROJECTS_TOKEN_SECRETS=("royalti-company=ROYALTI_COMPANY_GH_TOKEN")        # mirror fetch (may be the same secret)
+PROJECTS_PUSH_TOKEN_SECRETS=("royalti-company=ROYALTI_COMPANY_GH_TOKEN")
+# secrets.scoped:  [everyone] ROYALTI_COMPANY_GH_TOKEN=github_pat_...
+```
+
+- Every clone of the project gets a **repo-local credential helper scoped to the upstream URL** (`credential.<upstream-url>.helper`). It is a one-line shell function that prints `username=x-access-token` and `password=$NAME` **from the session's environment at push time**, and prints nothing if `$NAME` is unset. The token value is never written to a git config, a file in the clone, a log or an argv; only the variable's name is. Because the key is scoped to the URL, the helper is never offered to another repo or host.
+- **Validation.** The upstream must be `http(s)://` (it cannot carry credentials, as for every `PROJECTS` URL), and the secret must exist in `SECRETS_FILE` in a scope that reaches **every account of the project** (its effective set: `PROJECTS_MEMBERS` narrowed by `PROJECTS_ACCESS`); otherwise the run dies naming the account that would get no token. A secret that is also a deploy token raises no "scoped to accounts" warning.
+- **What it can reach on GitHub is not checked.** The provisioner only sees which accounts a secret is delivered to, not which repos the token itself can read. A push token scoped to many accounts must be a **fine-grained token limited to that one repository** (Contents read/write). A classic PAT, or a fine-grained token that also covers a restricted project's repo, would let every account clone that repo straight from GitHub, whatever `PROJECTS_ACCESS` says.
+- **Converge, and "never touch what the account set itself".** The helper is added to a clone when it is created, and to an existing clone that has none. The clone records `ikenga.pushTokenSecret=<NAME>` in its config when we set it. After that: a helper the account **removed** stays removed (noted); a **different** helper the account set for that URL is kept (noted); a helper that is still exactly the one we wrote for the secret named in the marker follows a renamed secret in the profile. Delete the marker to have it set again.
+
+#### Shared main (`PROJECTS_SHARED_MAIN`)
+
+For a team repo where everyone pushes straight to `main` (no per-account branch):
+
+```bash
+PROJECTS_SHARED_MAIN=(royalti-company)     # needs a PROJECTS_PUSH_TOKEN_SECRETS entry
+```
+
+- A clone checks out the branch named in the `PROJECTS` spec (`#main`; else the upstream's default) **tracking `origin/<branch>`**, not `<prefix><account>/main`.
+- `origin` is the **upstream URL for fetch and push**, not the local mirror (which is only as fresh as the last `refresh-projects`, so a push from behind it would be refused). The first clone still reads the mirror (`--reference`), so nothing is downloaded twice. Auth is the credential helper above.
+- `refresh-projects` fast-forwards such a clone from `origin` (the upstream), **as the account**, using that account's own value of the push secret passed through an inherited descriptor to a one-shot credential helper (never argv or a file the account owns). It still moves a clone only when it is clean, on that branch and strictly behind, and only for accounts in `PROJECTS_FASTFORWARD`.
+- A clone made before the project was shared-main (on `<account>/main`, origin = the mirror) is **not rewritten**: it is noted at each run with the commands to switch, still follows the mirror in `refresh-projects`, and still gets the push helper.
 
 **How the provisioner updates the mirror without trusting anything.** Root's `git fetch` runs with an empty environment (`env -i`), `HOME` in a root-only scratch directory, system and global config disabled, its working directory in that scratch directory, `core.hooksPath=/dev/null`, `core.fsmonitor=false`, no credential helper, no redirects, gc and maintenance off, and `GIT_ALLOW_PROTOCOL` narrowed to the one transport the profile URL uses. It fetches the profile's URL explicitly, so no `remote.*` or `url.*.insteadOf` in the repo is ever consulted, and it rewrites the mirror's `config` to a fixed canonical one on every run, empties `hooks/`, and removes symlinks and `alternates` files. The deploy token reaches `git` through `GIT_ASKPASS` (a script reading a `0600` file in the scratch directory) for http(s) URLs only: never argv, the URL or a repo config. With `PROJECTS_TOKEN_SECRETS` each secret has its own file there and each project is fetched with the file of the secret it resolves to; a project with no token (none of its own, no default) is fetched with no askpass at all, so it can never be handed another project's token. Errors are captured in a variable, not written to a file. Root writes nothing into an account's home or any other directory an account can write. `sync-accounts` converges an older group-writable layout back to this one.
 
