@@ -56,6 +56,23 @@ export function tokenFromHash(hash: string): string | null {
 	return t.startsWith('iki1.') ? t : null;
 }
 
+// The token is read once and the fragment is then dropped from the address
+// bar. A signed-in visit mounts this page a second time (inside the workspace
+// frame), and that mount would find an empty fragment and report the link as
+// incomplete, so the first token read is kept for the rest of the page visit.
+let capturedToken: string | null = null;
+
+/** The token from `hash`, else the one captured earlier in this page visit. */
+export function captureInviteToken(hash: string): string | null {
+	const t = tokenFromHash(hash);
+	if (t) capturedToken = t;
+	return t ?? capturedToken;
+}
+
+export function __resetInviteTokenForTests() {
+	capturedToken = null;
+}
+
 /** An `{ok:false, error, message}` body → the line the page shows. */
 export function inviteErrorCopy(
 	status: number,
@@ -117,7 +134,7 @@ type Phase =
 
 export function InvitePage() {
 	const [token] = useState(() =>
-		typeof window === 'undefined' ? null : tokenFromHash(window.location.hash)
+		typeof window === 'undefined' ? null : captureInviteToken(window.location.hash)
 	);
 	const [phase, setPhase] = useState<Phase>({ kind: 'loading' });
 	const [busy, setBusy] = useState(false);
