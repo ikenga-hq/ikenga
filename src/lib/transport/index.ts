@@ -237,7 +237,11 @@ export class WebRemoteTransport implements RpcTransport {
 		this.events = new EventsSocketClient(opts.openEventsSocket ?? (() => this.openEventsSocket()));
 	}
 
-	async invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+	async invoke<T>(
+		cmd: string,
+		args?: Record<string, unknown>,
+		opts: { outsideShare?: boolean } = {}
+	): Promise<T> {
 		const token = transportToken();
 		const headers: Record<string, string> = {
 			'Content-Type': 'application/json',
@@ -245,7 +249,7 @@ export class WebRemoteTransport implements RpcTransport {
 		if (token) {
 			headers['Authorization'] = `Bearer ${token}`;
 		}
-		const share = currentShare();
+		const share = opts.outsideShare ? null : currentShare();
 		if (share) headers['X-Ikenga-Share'] = share.projectKey;
 
 		const res = await fetch('/api/rpc', {
@@ -360,6 +364,23 @@ export class WebRemoteTransport implements RpcTransport {
 
 export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 	return getTransport().invoke<T>(cmd, args);
+}
+
+/**
+ * Invoke a command against the caller's OWN workspace even while a share is
+ * open: the share header is omitted, so the broker does not narrow the result
+ * to the shared project. Read-only use (the switcher's "Your projects" list);
+ * never route a write through this. On the desktop transport shares do not
+ * exist, so it is a plain `invoke`.
+ */
+export async function invokeOutsideShare<T>(
+	cmd: string,
+	args?: Record<string, unknown>
+): Promise<T> {
+	const t = getTransport();
+	return t instanceof WebRemoteTransport
+		? t.invoke<T>(cmd, args, { outsideShare: true })
+		: t.invoke<T>(cmd, args);
 }
 
 export async function listen<T>(

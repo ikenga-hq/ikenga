@@ -15,7 +15,10 @@
 //
 // The project chip is the one project switcher (the rail-foot
 // `ProjectIndicator` it was copied from is gone): store selectors, sort, and
-// an optimistic `setActiveProject` with the store's own rollback.
+// an optimistic `setActiveProject` with the store's own rollback. It also
+// lists the projects other people shared with you (T1 remote sessions) under
+// "Shared with you", and while inside a share it shows that project with a
+// "shared" marker and a "Leave shared project" item first.
 //
 // The branch chip reads the active project's repo through the git pkg's
 // `repo.snapshot` sidecar method — the same `pkgSidecarCall` path the
@@ -24,7 +27,16 @@
 // root is not a repo, the chip is hidden entirely (§3.2 row 10).
 
 import { useQuery } from '@tanstack/react-query';
-import { ChevronDown, Folder, FolderKanban, GitBranch, Plus, Sunrise } from 'lucide-react';
+import {
+	ChevronDown,
+	Folder,
+	FolderKanban,
+	GitBranch,
+	LogOut,
+	Plus,
+	Sunrise,
+	Users,
+} from 'lucide-react';
 import { useState } from 'react';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/components/ui/utils';
@@ -34,6 +46,12 @@ import { useShellStore } from '@/lib/shell/shell-store';
 import { gitStatus, isRemoteWebSession, pkgSidecarCall, type Project } from '@/lib/tauri-cmd';
 import { todayLocalDate } from '@/shell/home/daily-address';
 import { NativeMenuCascade } from './menu/cascade';
+import { leaveShare, openShare, pickOwnProject, ROLE_LABEL } from './people/shared-with-you';
+import {
+	useCurrentShare,
+	useOwnProjectsInShare,
+	useSharedProjects,
+} from './people/use-shared-projects';
 
 const GIT_PKG_ID = 'com.ikenga.git';
 /** Git pkg routes (its manifest's `ui.routes`): `/` is Changes. */
@@ -169,14 +187,22 @@ export function ProjectChip() {
 	const projects = useShellStore((s) => s.projects);
 	const activeProjectId = useShellStore((s) => s.activeProjectId);
 	const setActiveProject = useShellStore((s) => s.setActiveProject);
-	const active = projects.find((p) => p.id === activeProjectId);
-	const sorted = sortProjects(projects, activeProjectId);
+	const share = useCurrentShare();
+	const shares = useSharedProjects(open);
+	const active = share ? undefined : projects.find((p) => p.id === activeProjectId);
+	// In a share the store's active project is the shared one — it is not one
+	// of "your" projects, so nothing in the list is current. The store's list
+	// is broker-narrowed to the share, so fetch the real one outside the share.
+	const ownActiveId = share ? null : activeProjectId;
+	const ownProjects = useOwnProjectsInShare(share, open, projects);
+	const sorted = sortProjects(ownProjects ?? [], ownActiveId);
+	const loadingOwn = share !== null && ownProjects === null;
 	const switchHint = labelFor('palette.projects');
 
 	async function pick(id: string) {
 		setOpen(false);
 		try {
-			await setActiveProject(id);
+			await pickOwnProject(id, setActiveProject);
 		} catch {
 			// The store's optimistic flip already rolled back on error.
 		}
@@ -187,21 +213,38 @@ export function ProjectChip() {
 		usePaneStore.getState().navigateFocused('/settings/projects');
 	}
 
-	const name = active?.display_name ?? 'No project';
+	const name = share ? share.projectName : (active?.display_name ?? 'No project');
 	return (
 		<Popover open={open} onOpenChange={setOpen}>
 			<PopoverTrigger asChild>
 				<button
 					type="button"
 					data-testid="title-project-chip"
-					aria-label={`Project: ${name} — switch project (${switchHint})`}
+					aria-label={
+						share
+							? `Shared project: ${name}${share.ownerUsername ? ` by ${share.ownerUsername}` : ''} — switch project (${switchHint})`
+							: `Project: ${name} — switch project (${switchHint})`
+					}
 					title={active?.root_path ?? undefined}
+					data-shared={share ? 'true' : undefined}
 					className={CHIP}
 				>
-					<Folder aria-hidden className="h-3.5 w-3.5 text-[var(--tint-files-fg)]" />
+					{share ? (
+						<Users aria-hidden className="h-3.5 w-3.5 text-[var(--fg-muted)]" />
+					) : (
+						<Folder aria-hidden className="h-3.5 w-3.5 text-[var(--tint-files-fg)]" />
+					)}
 					<span className="max-w-[18rem] truncate text-sm font-semibold tracking-tight">
 						{name}
 					</span>
+					{share && (
+						<span
+							data-testid="title-project-chip-shared"
+							className="max-w-[10rem] truncate text-xs font-normal text-muted-foreground"
+						>
+							shared{share.ownerUsername ? ` by ${share.ownerUsername}` : ''}
+						</span>
+					)}
 					<ChevronDown aria-hidden className="h-3.5 w-3.5 text-muted-foreground" />
 					<kbd
 						aria-hidden
@@ -212,20 +255,38 @@ export function ProjectChip() {
 				</button>
 			</PopoverTrigger>
 			<PopoverContent side="bottom" align="start" className="w-64 p-2">
-				<div className="px-2 pb-2 pt-1 text-xs font-medium text-muted-foreground">
-					Switch project
-				</div>
+				{share && (
+					<div className="mb-2 border-b border-border pb-2">
+						<button
+							type="button"
+							data-testid="title-leave-shared"
+							onClick={() => {
+								setOpen(false);
+								leaveShare();
+							}}
+							className="flex w-full items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-left text-sm font-medium outline-none transition-colors motion-reduce:transition-none hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+						>
+							<LogOut aria-hidden className="h-3.5 w-3.5" />
+							Leave shared project
+						</button>
+					</div>
+				)}
+				{(!share || loadingOwn || sorted.length > 0) && (
+					<div className="px-2 pb-2 pt-1 text-xs font-medium text-muted-foreground">
+						{share ? 'Your projects' : 'Switch project'}
+					</div>
+				)}
 				<ul className="flex max-h-72 flex-col overflow-y-auto">
 					{sorted.map((p) => (
 						<li key={p.id}>
 							<button
 								type="button"
 								onClick={() => void pick(p.id)}
-								aria-current={p.id === activeProjectId ? 'true' : undefined}
+								aria-current={p.id === ownActiveId ? 'true' : undefined}
 								className={cn(
 									'flex w-full items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-left text-sm outline-none transition-colors motion-reduce:transition-none',
 									'hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset',
-									p.id === activeProjectId && 'bg-accent/60 font-medium',
+									p.id === ownActiveId && 'bg-accent/60 font-medium',
 									p.archived_at != null && 'opacity-60'
 								)}
 							>
@@ -236,7 +297,7 @@ export function ProjectChip() {
 								/>
 								{p.icon && <span className="text-sm leading-none">{p.icon}</span>}
 								<span className="flex-1 truncate">{p.display_name}</span>
-								{p.id === activeProjectId && (
+								{p.id === ownActiveId && (
 									<span className="text-xs text-muted-foreground">Active</span>
 								)}
 								{p.archived_at != null && (
@@ -245,30 +306,68 @@ export function ProjectChip() {
 							</button>
 						</li>
 					))}
-					{sorted.length === 0 && (
+					{loadingOwn && (
+						<li
+							data-testid="title-own-projects-loading"
+							className="px-2 py-3 text-center text-xs text-muted-foreground"
+						>
+							Loading your projects…
+						</li>
+					)}
+					{!share && sorted.length === 0 && (
 						<li className="px-2 py-3 text-center text-xs text-muted-foreground">
 							Loading projects…
 						</li>
 					)}
 				</ul>
-				<div className="mt-2 border-t border-border pt-2">
-					<button
-						type="button"
-						onClick={openProjectsSettings}
-						className="flex w-full items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-left text-sm text-muted-foreground outline-none transition-colors motion-reduce:transition-none hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
-					>
-						<Plus aria-hidden className="h-3.5 w-3.5" />
-						New project…
-					</button>
-					<button
-						type="button"
-						onClick={openProjectsSettings}
-						className="flex w-full items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-left text-sm text-muted-foreground outline-none transition-colors motion-reduce:transition-none hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
-					>
-						<FolderKanban aria-hidden className="h-3.5 w-3.5" />
-						Manage projects…
-					</button>
-				</div>
+				{shares.length > 0 && (
+					<div data-testid="title-shared-section" className="mt-2 border-t border-border pt-2">
+						<div className="px-2 pb-1 text-xs font-medium text-muted-foreground">
+							Shared with you
+						</div>
+						<ul className="flex max-h-40 flex-col overflow-y-auto">
+							{shares.map((s) => (
+								<li key={s.projectKey}>
+									<button
+										type="button"
+										onClick={() => {
+											setOpen(false);
+											openShare(s);
+										}}
+										className="flex w-full items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-left text-sm outline-none transition-colors motion-reduce:transition-none hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+									>
+										<Users aria-hidden className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+										<span className="flex-1 truncate">{s.projectName}</span>
+										<span className="max-w-[9rem] truncate text-xs text-muted-foreground">
+											{s.ownerUsername ?? 'someone'} · {ROLE_LABEL[s.role]}
+										</span>
+									</button>
+								</li>
+							))}
+						</ul>
+					</div>
+				)}
+				{/* In a share these act on the OWNER's settings through the share, so hide them. */}
+				{!share && (
+					<div className="mt-2 border-t border-border pt-2">
+						<button
+							type="button"
+							onClick={openProjectsSettings}
+							className="flex w-full items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-left text-sm text-muted-foreground outline-none transition-colors motion-reduce:transition-none hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+						>
+							<Plus aria-hidden className="h-3.5 w-3.5" />
+							New project…
+						</button>
+						<button
+							type="button"
+							onClick={openProjectsSettings}
+							className="flex w-full items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-left text-sm text-muted-foreground outline-none transition-colors motion-reduce:transition-none hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+						>
+							<FolderKanban aria-hidden className="h-3.5 w-3.5" />
+							Manage projects…
+						</button>
+					</div>
+				)}
 			</PopoverContent>
 		</Popover>
 	);

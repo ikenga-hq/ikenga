@@ -9,13 +9,17 @@
 //   the session chrome every browser boot root already renders.
 //
 // No Explorer change in v1 (P-28): the shared project is the only project a
-// share request can see, so the app simply shows it.
+// share request can see, so the app simply shows it. The project switcher
+// (title-row chip and the ⌘P palette) now also lists shares — see
+// `./use-shared-projects` — and reuses `openShare` / `leaveShare` below
+// rather than owning any share-mode logic of its own.
 
 import { ExternalLink, LogOut, Users } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
 import { Button } from '@/components/ui/button';
 import { accessSharesList, parseAccessError } from '@/lib/access/client';
+import { projectSetActive } from '@/lib/tauri-cmd';
 import {
 	currentShare,
 	onShareModeChange,
@@ -40,7 +44,7 @@ export interface ShareView {
 	addedAt: number;
 }
 
-const ROLE_LABEL: Record<ShareView['role'], string> = {
+export const ROLE_LABEL: Record<ShareView['role'], string> = {
 	operator: 'Operator',
 	reviewer: 'Reviewer',
 	guest: 'Guest',
@@ -78,6 +82,29 @@ export function openShare(v: ShareView | ShareSelection): void {
 export function leaveShare(): void {
 	setShareMode(null);
 	if (typeof window !== 'undefined') window.location.assign('/settings/members');
+}
+
+/** Pick one of your own projects from a switcher. Inside a share this leaves
+ *  the share first, then sets the active project over the (now non-share)
+ *  transport and reloads to `/` — the reload rehydrates the store. It must not
+ *  go through the store's `setActiveProject`: the store's active id is the
+ *  shared project's id, so picking an own project with the same id would hit
+ *  its `prev === id` early return and silently do nothing. */
+export async function pickOwnProject(
+	id: string,
+	setActiveProject: (id: string) => Promise<unknown>
+): Promise<void> {
+	if (!currentShare()) {
+		await setActiveProject(id);
+		return;
+	}
+	setShareMode(null);
+	try {
+		await projectSetActive(id);
+	} catch {
+		// Still leave the share; the reload lands on whatever is active.
+	}
+	if (typeof window !== 'undefined') window.location.assign('/');
 }
 
 export function SharedWithYou() {
