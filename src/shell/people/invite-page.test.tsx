@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { __resetShareModeForTests, currentShare } from '@/lib/transport';
 import {
+	__resetInviteTokenForTests,
 	InvitePage,
 	inviteErrorCopy,
 	selectionFromAccept,
@@ -30,6 +31,7 @@ beforeEach(() => {
 	vi.stubGlobal('fetch', fetchMock);
 	sessionStorage.clear();
 	__resetShareModeForTests();
+	__resetInviteTokenForTests();
 	window.history.replaceState(null, '', `/remote/invite#t=${TOKEN}`);
 });
 
@@ -75,6 +77,21 @@ describe('invite helpers', () => {
 });
 
 describe('InvitePage', () => {
+	it('a second mount after the fragment was dropped still has the token', async () => {
+		fetchMock.mockImplementation(async (url) => {
+			if (url === '/access/invite/inspect') return json(INFO);
+			if (url === '/auth/me') return json({}, 401);
+			return json({}, 404);
+		});
+		const first = render(<InvitePage />);
+		expect(await screen.findByRole('form', { name: 'Accept invite' })).toBeTruthy();
+		expect(window.location.hash).toBe('');
+		first.unmount();
+		render(<InvitePage />);
+		expect(await screen.findByRole('form', { name: 'Accept invite' })).toBeTruthy();
+		expect(screen.queryByText(/invite link is incomplete/)).toBeNull();
+	});
+
 	it('inspects, then creates an account and opens the share', async () => {
 		fetchMock.mockImplementation(async (url) => {
 			if (url === '/access/invite/inspect') return json(INFO);
