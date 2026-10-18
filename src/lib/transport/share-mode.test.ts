@@ -50,6 +50,26 @@ describe('share mode', () => {
 		expect(shareQueryParam()).toBe(`share=${encodeURIComponent(KEY)}`);
 	});
 
+	it('omits the share header when a call asks to run outside the share', async () => {
+		setShareMode({
+			projectKey: KEY,
+			projectId: 'royalti-co',
+			projectName: 'royalti-co',
+			ownerUsername: 'ada',
+			role: 'reviewer',
+			scope: 'project',
+		});
+		const t = new WebRemoteTransport();
+		await t.invoke('project_list', { includeArchived: true }, { outsideShare: true });
+		expect(
+			(fetchMock.mock.calls[0]![1]!.headers as Record<string, string>)['X-Ikenga-Share']
+		).toBeUndefined();
+		await t.invoke('project_list');
+		expect((fetchMock.mock.calls[1]![1]!.headers as Record<string, string>)['X-Ikenga-Share']).toBe(
+			KEY
+		);
+	});
+
 	it('survives a reload in the same tab (sessionStorage)', async () => {
 		setShareMode({
 			projectKey: KEY,

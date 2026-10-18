@@ -7,6 +7,7 @@ import {
 	Globe,
 	Inbox,
 	Layers,
+	LogOut,
 	Mail,
 	MessageSquare,
 	Newspaper,
@@ -39,6 +40,12 @@ import {
 	type PaneDisplayNameResolver,
 } from './panes/use-pane-display-names';
 import { routeLabelInfo } from './panes/pane-view-label';
+import { leaveShare, openShare, pickOwnProject, ROLE_LABEL } from './people/shared-with-you';
+import {
+	useCurrentShare,
+	useOwnProjectsInShare,
+	useSharedProjects,
+} from './people/use-shared-projects';
 import { ChromePickerDialog } from './chrome-picker/chrome-picker-dialog';
 import { ActionsGroup, ChiGroup, ManageGroup } from './palette-actions';
 import { ShortcutsView } from './shortcuts-view';
@@ -454,12 +461,20 @@ function ProjectsGroup({ onClose }: { onClose: () => void }) {
 	const activeProjectId = useShellStore((s) => s.activeProjectId);
 	const setActiveProject = useShellStore((s) => s.setActiveProject);
 	const navigateFocused = usePaneStore((s) => s.navigateFocused);
+	// Same shares + share-mode behaviour as the title-row project chip.
+	const share = useCurrentShare();
+	const shares = useSharedProjects(true);
+	const ownActiveId = share ? null : activeProjectId;
+	// The store's list is broker-narrowed to the share while inside one, so
+	// fetch the user's real list outside the share (palette is open: true).
+	const ownProjects = useOwnProjectsInShare(share, true, projects);
+	const loadingOwn = share !== null && ownProjects === null;
 
 	// Active first; archived last. Match the activity-bar indicator order so
 	// the palette and the popover read the same.
-	const sorted = projects.slice().sort((a, b) => {
-		if (a.id === activeProjectId) return -1;
-		if (b.id === activeProjectId) return 1;
+	const sorted = (ownProjects ?? []).slice().sort((a, b) => {
+		if (a.id === ownActiveId) return -1;
+		if (b.id === ownActiveId) return 1;
 		const aArc = a.archived_at != null ? 1 : 0;
 		const bArc = b.archived_at != null ? 1 : 0;
 		if (aArc !== bArc) return aArc - bArc;
@@ -472,7 +487,7 @@ function ProjectsGroup({ onClose }: { onClose: () => void }) {
 		// Defer so the dialog can unmount before the optimistic state flip
 		// triggers a re-render of the activity bar.
 		setTimeout(() => {
-			void setActiveProject(id);
+			void pickOwnProject(id, setActiveProject).catch(() => {});
 		}, 0);
 	}
 
@@ -483,52 +498,103 @@ function ProjectsGroup({ onClose }: { onClose: () => void }) {
 
 	return (
 		<>
-			<Command.Group heading="Projects" className="text-xs text-muted-foreground">
-				{sorted.map((p) => (
+			{share && (
+				<Command.Group heading="Shared project" className="text-xs text-muted-foreground">
 					<PaletteItem
-						key={p.id}
-						value={`${p.display_name} ${p.id} ${p.description ?? ''}`}
-						onSelect={() => pick(p.id)}
-						leading={
-							<>
-								<span
-									aria-hidden
-									className="inline-block h-3 w-3 shrink-0 rounded-full border border-border"
-									style={{ background: p.color ?? 'var(--fg-faint)' }}
-								/>
-								{p.icon ? (
-									<span className="leading-none">{p.icon}</span>
-								) : (
-									<FolderKanban className="h-4 w-4 shrink-0 text-muted-foreground" />
-								)}
-							</>
-						}
-						label={p.display_name}
+						value={`Leave shared project ${share.projectName}`}
+						onSelect={() => {
+							onClose();
+							setTimeout(leaveShare, 0);
+						}}
+						Icon={LogOut}
+						label="Leave shared project"
 						trailing={
-							<>
-								{p.id === activeProjectId && (
-									<span className="shrink-0 text-[10px] uppercase text-muted-foreground">
-										Active
-									</span>
-								)}
-								{p.archived_at != null && (
-									<span className="shrink-0 text-[10px] uppercase text-muted-foreground">
-										Archived
-									</span>
-								)}
-							</>
+							<span className="shrink-0 text-[10px] uppercase text-muted-foreground">
+								{share.projectName}
+							</span>
 						}
 					/>
-				))}
-				{sorted.length === 0 && (
-					<div role="status" className="px-3 py-3 text-xs text-muted-foreground">
-						No projects loaded.
-					</div>
-				)}
-			</Command.Group>
-			<Command.Group heading="Manage" className="text-xs text-muted-foreground">
-				<PaletteItem onSelect={openManage} Icon={FolderKanban} label="Open Projects settings…" />
-			</Command.Group>
+				</Command.Group>
+			)}
+			{(!share || loadingOwn || sorted.length > 0) && (
+				<Command.Group
+					heading={share ? 'Your projects' : 'Projects'}
+					className="text-xs text-muted-foreground"
+				>
+					{sorted.map((p) => (
+						<PaletteItem
+							key={p.id}
+							value={`${p.display_name} ${p.id} ${p.description ?? ''}`}
+							onSelect={() => pick(p.id)}
+							leading={
+								<>
+									<span
+										aria-hidden
+										className="inline-block h-3 w-3 shrink-0 rounded-full border border-border"
+										style={{ background: p.color ?? 'var(--fg-faint)' }}
+									/>
+									{p.icon ? (
+										<span className="leading-none">{p.icon}</span>
+									) : (
+										<FolderKanban className="h-4 w-4 shrink-0 text-muted-foreground" />
+									)}
+								</>
+							}
+							label={p.display_name}
+							trailing={
+								<>
+									{p.id === ownActiveId && (
+										<span className="shrink-0 text-[10px] uppercase text-muted-foreground">
+											Active
+										</span>
+									)}
+									{p.archived_at != null && (
+										<span className="shrink-0 text-[10px] uppercase text-muted-foreground">
+											Archived
+										</span>
+									)}
+								</>
+							}
+						/>
+					))}
+					{loadingOwn && (
+						<div role="status" className="px-3 py-3 text-xs text-muted-foreground">
+							Loading your projects…
+						</div>
+					)}
+					{!share && sorted.length === 0 && (
+						<div role="status" className="px-3 py-3 text-xs text-muted-foreground">
+							No projects loaded.
+						</div>
+					)}
+				</Command.Group>
+			)}
+			{shares.length > 0 && (
+				<Command.Group heading="Shared with you" className="text-xs text-muted-foreground">
+					{shares.map((s) => (
+						<PaletteItem
+							key={s.projectKey}
+							value={`${s.projectName} ${s.ownerUsername ?? ''} shared`}
+							onSelect={() => {
+								onClose();
+								setTimeout(() => openShare(s), 0);
+							}}
+							Icon={Users}
+							label={s.projectName}
+							trailing={
+								<span className="shrink-0 text-[10px] uppercase text-muted-foreground">
+									{s.ownerUsername ?? 'someone'} · {ROLE_LABEL[s.role]}
+								</span>
+							}
+						/>
+					))}
+				</Command.Group>
+			)}
+			{!share && (
+				<Command.Group heading="Manage" className="text-xs text-muted-foreground">
+					<PaletteItem onSelect={openManage} Icon={FolderKanban} label="Open Projects settings…" />
+				</Command.Group>
+			)}
 		</>
 	);
 }
