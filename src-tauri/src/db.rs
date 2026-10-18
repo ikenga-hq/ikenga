@@ -676,6 +676,12 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0071_artifact_comments_widen_sink",
         include_str!("../migrations/0071_artifact_comments_widen_sink.sql"),
     ),
+    // sales demo bookings; IF NOT EXISTS adopts the hand-made desktop table
+    (
+        72,
+        "0072_demos_booked",
+        include_str!("../migrations/0072_demos_booked.sql"),
+    ),
 ];
 
 /// Embedded migration set, kept in lockstep with `migrations/*.sql`. Tracked
@@ -2376,6 +2382,36 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(idx, 1);
+    }
+
+    /// 0072 creates `demos_booked` on a fresh install and leaves a hand-made
+    /// copy (rows and all) alone.
+    #[tokio::test]
+    async fn migration_0072_creates_demos_booked() {
+        let (db, _tmp) = fresh_db().await;
+        let pool = db.ensure_pool().await.expect("ensure_pool");
+        sqlx::query(
+            "INSERT INTO demos_booked (id, company, status, excluded_from_target)
+             VALUES ('d1', 'Acme', 'booked', 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert into demos_booked");
+        let cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('demos_booked')")
+            .fetch_all(&pool)
+            .await
+            .expect("table_info");
+        assert_eq!(cols.len(), 14, "columns: {cols:?}");
+        // Re-running the statement on an existing table is a no-op.
+        sqlx::query(include_str!("../migrations/0072_demos_booked.sql").split(";\n").find(|s| s.contains("CREATE TABLE")).unwrap())
+            .execute(&pool)
+            .await
+            .expect("re-run 0072");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM demos_booked")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(n, 1);
     }
 
     /// WP-S (Item 4): 0071 widens the sink column CHECK constraint on
