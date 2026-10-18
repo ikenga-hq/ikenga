@@ -4,7 +4,7 @@
   "stability": "unstable",
   "source": {
     "repo": "ikenga-hq/ikenga",
-    "version": "0.26.11",
+    "version": "0.26.12",
     "producer": "scripts/docs/iyke-routes.mjs",
     "path": "src-tauri/src/iyke/server.rs"
   },
