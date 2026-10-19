@@ -18,6 +18,7 @@ import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 
 import { settingsReadFile, settingsWriteField } from '@/lib/tauri-cmd';
+import { currentShare } from '@/lib/transport';
 import type { SettingsWriteOptions } from '@/lib/settings/types';
 import { scopedPersistName } from '@/lib/window/window-context';
 
@@ -119,6 +120,9 @@ let suppressKv = false;
 let appearanceWriteQueue: Promise<void> = Promise.resolve();
 
 function queueAppearanceWrite(options: SettingsWriteOptions): void {
+	// In a share every RPC reaches the Owner's daemon: never write this
+	// viewer's appearance into the Owner's personal settings.
+	if (currentShare() !== null) return;
 	const next = appearanceWriteQueue
 		.catch(() => {})
 		.then(() => settingsWriteField(options));
@@ -160,6 +164,8 @@ export const useIkengaStore = create<IkengaState>()(
 			},
 			setWorkspace: (workspace) => set({ workspace }),
 		hydrateAppearanceFromRust: async () => {
+			// A share reads the Owner's personal settings; keep this browser's.
+			if (currentShare() !== null) return;
 			let result: Awaited<ReturnType<typeof settingsReadFile>>;
 			try {
 				result = await settingsReadFile('personal');
