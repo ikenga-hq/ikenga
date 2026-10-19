@@ -1,5 +1,12 @@
 # ikenga-desktop
 
+## 0.26.13
+
+### Patch Changes
+
+- 8275b97: Accepting a share invite no longer loops back to the spent invite link. The workspace saved `/remote/invite` as an open tab, so the reload after accepting restored it and sent the browser back to the used link. Invite and pair pages are no longer restored with the saved layout.
+- 41d55cb: Opening a shared project no longer drops you into onboarding. In a share every request goes to the Owner's account, so the shell was loading the Owner's personal settings: an Owner who never onboarded (a bot account, say) sent every viewer to the first-run wizard, and changing the theme in a share would have changed the Owner's. While a share is open the shell now keeps the viewer's own settings and writes none.
+
 ## 0.26.12
 
 ### Patch Changes
