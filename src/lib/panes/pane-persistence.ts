@@ -81,7 +81,10 @@ export async function loadPaneTree(): Promise<PaneTreeSnapshot> {
 	const dropOnboardingTabs = ob.mode === 'first_run' && ob.completedAt !== null;
 	const filtered = filterTreeViews(
 		blob.root,
-		(view) => isViewLive(view, liveTerminalIds) && !isStaleOnboardingTab(view, dropOnboardingTabs)
+		(view) =>
+			isViewLive(view, liveTerminalIds) &&
+			!isStaleOnboardingTab(view, dropOnboardingTabs) &&
+			!isOneShotRoute(view)
 	);
 
 	if (!filtered) return { ...buildDefault(), closedHistory: blob.closedHistory ?? [] };
@@ -110,6 +113,15 @@ export async function loadPaneTree(): Promise<PaneTreeSnapshot> {
 		focusedId,
 		closedHistory: (blob.closedHistory ?? []).slice(-MAX_CLOSED_HISTORY),
 	};
+}
+
+// `/remote/invite` and `/remote/pair` consume a single-use token that rides
+// the URL fragment, which is never saved with the tab. Restoring one sends
+// the page back to a link that has already been used: accepting an invite
+// reloads `/`, the restored tab is active again, and the browser lands on
+// the spent invite every time.
+export function isOneShotRoute(view: PaneView): boolean {
+	return view.kind === 'route' && /^\/remote\/(invite|pair)(\/|$)/.test(view.path);
 }
 
 function isStaleOnboardingTab(view: PaneView, dropOnboardingTabs: boolean): boolean {
