@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { filterTreeViews } from './pane-persistence';
+import { filterTreeViews, isOneShotRoute } from './pane-persistence';
 import { addTab, getLeafIdsInOrder, leafCount, makeLeaf, splitLeaf } from './pane-reducer';
 import type { LeafNode, PaneNode, PaneView, SplitNode } from './types';
 
@@ -124,5 +124,26 @@ describe('filterTreeViews', () => {
 		expect(leafCount(r!)).toBe(2);
 		expect(r!.type).toBe('split');
 		expect((r as SplitNode).sizes).toEqual([50, 50]);
+	});
+});
+
+describe('isOneShotRoute', () => {
+	it('matches the single-use invite and pair pages only', () => {
+		expect(isOneShotRoute({ kind: 'route', path: '/remote/invite' })).toBe(true);
+		expect(isOneShotRoute({ kind: 'route', path: '/remote/pair' })).toBe(true);
+		expect(isOneShotRoute({ kind: 'route', path: '/remote/invite/x' })).toBe(true);
+		expect(isOneShotRoute({ kind: 'route', path: '/remote' })).toBe(false);
+		expect(isOneShotRoute({ kind: 'route', path: '/remote/inviter' })).toBe(false);
+		expect(isOneShotRoute({ kind: 'artifact', path: '/remote/invite' })).toBe(false);
+	});
+
+	it('a restored tree loses the invite tab and lands on the tab beside it', () => {
+		let root: PaneNode = newRoute('/');
+		const id = (root as LeafNode).id;
+		root = addTab(root, id, { kind: 'route', path: '/remote/invite' });
+		expect((root as LeafNode).activeTabIdx).toBe(1);
+		const r = filterTreeViews(root, (v) => !isOneShotRoute(v)) as LeafNode;
+		expect(r.tabs).toEqual([{ kind: 'route', path: '/' }]);
+		expect(r.activeTabIdx).toBe(0);
 	});
 });
