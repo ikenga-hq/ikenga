@@ -6,6 +6,7 @@ import { usePaneScope } from '@/shell/panes/views/route-view';
 import { OnboardingIykeMount } from '@/shell/onboarding-iyke-mount';
 import { startIykeTimerBridge } from '@/lib/notifications/iyke-timer-bridge';
 import { useShellStore } from '@/lib/shell/shell-store';
+import { currentShare } from '@/lib/transport';
 
 function RootRoute() {
 	// When this same root component renders inside a pane's memory router,
@@ -39,6 +40,9 @@ function RootRoute() {
 	useEffect(() => {
 		if (paneScope !== null) return;
 		if (location.pathname.startsWith('/onboarding')) return;
+		// A share viewer is in someone else's workspace: onboarding sets up
+		// your own, so it never applies there.
+		if (currentShare() !== null) return;
 		if (onboardingMode === 'first_run' && onboardingCompletedAt === null) {
 			void navigate({ to: '/onboarding' });
 		}

@@ -17,7 +17,7 @@ import type {
 	SettingsWriteOptions,
 } from '@/lib/settings/types';
 import { scopedPersistName } from '@/lib/window/window-context';
-import { isRemoteWebSession } from '@/lib/transport';
+import { currentShare, isRemoteWebSession } from '@/lib/transport';
 import {
 	type Project,
 	projectGetActive,
@@ -65,7 +65,18 @@ function hasTauriRuntime(): boolean {
  * "first run" state over the browser's and sent the user back to onboarding.
  */
 function hasSettingsBackend(): boolean {
-	return hasTauriRuntime() || isRemoteWebSession();
+	return (hasTauriRuntime() || isRemoteWebSession()) && !inShare();
+}
+
+/**
+ * A share is open: every RPC goes to the Owner's daemon, so its settings are the
+ * Owner's personal settings, not the viewer's. Reading them put a viewer into the
+ * Owner's onboarding (an Owner that never onboarded, like a bot account, is
+ * always `first_run`), and writing them would change the Owner's theme and name.
+ * While a share is open the viewer keeps the settings this browser already has.
+ */
+function inShare(): boolean {
+	return currentShare() !== null;
 }
 function parseKv<T>(raw: string | undefined): T | undefined {
 	if (raw == null) return undefined;
@@ -1536,6 +1547,7 @@ export const useShellStore = create<ShellState>()(
 
 			hydrateSettingsFromRust: () =>
 				enqueueSettingsHydration(async (hydrationTicket) => {
+					if (inShare()) return;
 					let legacy: Record<string, string> = {};
 					try {
 						legacy = await settingsGetAll();
