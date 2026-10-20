@@ -30,8 +30,11 @@
 //!   (4) send the contract's `approve` message, `source: "shell"`, approver =
 //!   the *authenticated viewer* (principal id and username from the
 //!   [`PrincipalCtx`], never the owner, never anything in the request body);
-//!   (5) only on `ok`, forward a rewritten `{draftId}` commit to the owner's
-//!   child, which flips the row to `committed`.
+//!   (5) only on `ok`, answer the client that the draft is approved. The
+//!   commit is NOT forwarded to the owner's child: in ledger mode the sender
+//!   sends an `awaiting`/`edited` draft on the strength of a matching ledger
+//!   approval (contract r2), so the owner's child takes no part in a share
+//!   approval, and the sender's claim can't race a child-side status flip.
 //!
 //! **Fail closed.** No socket, a refused connection, a timeout, a malformed
 //! reply, a sender refusal, a hash that does not match: the commit is never
@@ -641,9 +644,9 @@ fn draft_id_of(args: &Value) -> Option<String> {
 pub enum Gated {
     /// Forward the request as it came.
     Unchanged,
-    /// Forward this `{cmd, args}` instead (the approved commit, narrowed to
-    /// the one draft id the ledger was written for).
-    Rewritten(Value),
+    /// The ledger approval for this draft is recorded: answer the client,
+    /// forward nothing (the sender sends it from the ledger).
+    Approved { draft_id: String },
 }
 
 /// Share-mode checks and the ledger approval for the gated `pa_actions_*`
@@ -786,12 +789,8 @@ async fn approve_commit(
         hash = &info.payload_hash[..12],
         "share approval recorded in the sender ledger"
     );
-    // Forward exactly the draft the ledger was written for, and nothing else
-    // (no `seen`, no second id key).
-    Ok(Gated::Rewritten(json!({
-        "cmd": "pa_actions_commit",
-        "args": { "draftId": draft_id },
-    })))
+    // Nothing is forwarded: the sender sends the draft on this approval.
+    Ok(Gated::Approved { draft_id })
 }
 
 /// For tests and diagnostics.
@@ -1431,19 +1430,17 @@ mod tests {
     const DRAFT: &str = "ruby-reply:em-1001";
 
     #[tokio::test]
-    async fn an_operator_approves_as_themselves_and_the_commit_is_rewritten_to_the_one_draft() {
+    async fn an_operator_approves_as_themselves_for_exactly_the_one_draft() {
         let p = parties();
         let s = FakeSender::start(sender_for_vector("awaiting", OK_REPLY)).await;
         let n = narrowing(&p.ada, &p.ruby, Some(Role::Operator));
         let mut args = seen_args(DRAFT);
-        // Smuggle a second id key: only the approved id may reach the child.
+        // Smuggle a second id key: only the approved id is approved.
         args["draft_id"] = json!("some-other-draft");
         let out = gate(&s.cfg(), &pctx(&p.ada), &n, "pa_actions_commit", &args).await;
         assert_eq!(
             out.ok(),
-            Some(Gated::Rewritten(
-                json!({"cmd": "pa_actions_commit", "args": {"draftId": DRAFT}})
-            ))
+            Some(Gated::Approved { draft_id: DRAFT.to_string() })
         );
         assert_eq!(s.actions(), ["get_draft", "approve"]);
         let approve = &s.requests()[1];

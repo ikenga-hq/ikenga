@@ -257,8 +257,8 @@ fn owner_requests(r: &Rig) -> Vec<(HeaderMap, Value)> {
 }
 
 #[tokio::test]
-async fn an_operators_commit_is_approved_by_the_broker_as_them_then_forwarded_to_the_owners_child()
-{
+async fn an_operators_commit_is_approved_by_the_broker_as_them_and_never_reaches_the_owners_child(
+) {
     let (r, log) = rig(Role::Operator, Some(OK)).await;
     let ada = insert_account(&r.pool, "ada", 20_001, false).await;
     let cookie = login_cookie(&r.app, "ada").await;
@@ -266,8 +266,10 @@ async fn an_operators_commit_is_approved_by_the_broker_as_them_then_forwarded_to
     let (status, body) = rpc(&r.app, Some(&cookie), commit_body(&r.row, DRAFT)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(body["data"]["draftId"], DRAFT, "{body}");
+    assert_eq!(body["data"]["approved"], true, "{body}");
 
-    // The ledger approval was written first, as Ada (not the owner).
+    // The ledger approval was written, as Ada (not the owner).
     let reqs = log.lock().unwrap().clone();
     let actions: Vec<_> = reqs.iter().map(|q| q["action"].as_str().unwrap()).collect();
     assert_eq!(actions, ["get_draft", "approve"]);
@@ -276,24 +278,10 @@ async fn an_operators_commit_is_approved_by_the_broker_as_them_then_forwarded_to
     assert_eq!(reqs[1]["approver"]["username"], "ada");
     assert_ne!(reqs[1]["approver"]["id"], r.owner.id.to_string());
 
-    // The owner's child got ONE request: the commit, narrowed to the draft id,
-    // with the broker's share headers and no `seen`.
+    // The owner's child (the agent's daemon) takes no part: the sender sends
+    // the draft on the ledger approval (contract r2).
     let got = owner_requests(&r);
-    assert_eq!(got.len(), 1, "{got:?}");
-    assert_eq!(
-        got[0].1,
-        json!({"cmd": "pa_actions_commit", "args": {"draftId": DRAFT}})
-    );
-    assert_eq!(got[0].0.get("x-ikenga-share-role").unwrap(), "operator");
-    assert_eq!(
-        got[0]
-            .0
-            .get("x-ikenga-share-principal")
-            .unwrap()
-            .to_str()
-            .unwrap(),
-        ada.to_string()
-    );
+    assert!(got.is_empty(), "{got:?}");
 }
 
 #[tokio::test]

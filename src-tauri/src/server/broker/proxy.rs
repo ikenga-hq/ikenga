@@ -693,11 +693,21 @@ pub async fn rpc_proxy(
     }
     // Share mode: the Operator gate on the owner's drafts, and the ledger
     // approval for a commit, written by the broker as the authenticated
-    // viewer before the owner's child is told to commit (`approvals`).
+    // viewer; an approved commit is answered here and never forwarded
+    // (`approvals`).
     let bytes = match super::approvals::gate(&state.approvals, &ctx, &narrowing, &cmd, &args).await
     {
         Ok(super::approvals::Gated::Unchanged) => bytes,
-        Ok(super::approvals::Gated::Rewritten(body)) => Bytes::from(body.to_string()),
+        Ok(super::approvals::Gated::Approved { draft_id }) => {
+            return (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "ok": true,
+                    "data": { "draftId": draft_id, "approved": true },
+                })),
+            )
+                .into_response();
+        }
         Err(res) => return res,
     };
     // An admin's `fs_roots_*` call naming another principal goes to that

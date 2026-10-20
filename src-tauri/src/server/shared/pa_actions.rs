@@ -314,14 +314,20 @@ pub async fn commit(db: &PaDb, draft_id: &str) -> Result<PaActionCommittedEvent,
     let (channel, payload_json, edited_json) =
         row.ok_or_else(|| format!("draft {draft_id} not found or not committable"))?;
 
-    sqlx::query(
+    // Guarded like the read: a row claimed in between (by the sender, on a
+    // ledger approval) must not be flipped back to `committed`.
+    let flipped = sqlx::query(
         "UPDATE pa_action_drafts SET status = 'committed', committed_at = datetime('now') \
-         WHERE id = ?",
+         WHERE id = ? AND status IN ('awaiting', 'edited')",
     )
     .bind(draft_id)
     .execute(&pool)
     .await
-    .map_err(|e| format!("commit draft {draft_id}: {e}"))?;
+    .map_err(|e| format!("commit draft {draft_id}: {e}"))?
+    .rows_affected();
+    if flipped == 0 {
+        return Err(format!("draft {draft_id} not found or not committable"));
+    }
 
     Ok(PaActionCommittedEvent {
         draft_id: draft_id.to_string(),
