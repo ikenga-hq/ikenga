@@ -992,3 +992,42 @@
 	color: var(--danger);
 	border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
 }
+
+/* Share mode: the fields an approval binds to (see ShareBoundFields). */
+.ob-share-bound {
+	margin: 0 0 12px;
+	padding: 10px 12px;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	font-size: 12px;
+}
+.ob-share-bound-title {
+	font-weight: 600;
+	margin-bottom: 6px;
+}
+.ob-share-bound-group {
+	margin: 8px 0 2px;
+	color: var(--muted-foreground, inherit);
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	font-size: 10px;
+}
+.ob-share-bound-list {
+	margin: 0;
+}
+.ob-share-bound-row {
+	display: grid;
+	grid-template-columns: minmax(80px, 30%) 1fr;
+	gap: 8px;
+	padding: 2px 0;
+}
+.ob-share-bound-row dt {
+	font-family: var(--font-mono, monospace);
+	opacity: 0.75;
+	overflow-wrap: anywhere;
+}
+.ob-share-bound-row dd {
+	margin: 0;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}

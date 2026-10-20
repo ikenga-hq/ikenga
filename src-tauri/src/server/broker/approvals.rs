@@ -408,6 +408,13 @@ pub enum NotApprovable {
     Payload,
     /// A number outside `|n| <= 2^53 - 1` integers (contract §3.4 rule 4).
     Number,
+    /// `edited_json` is non-empty but this parser rejects it. The viewer's
+    /// `JSON.parse` accepts some documents `serde_json` does not (lone
+    /// surrogate escapes, nesting past 128, numbers past f64), so the edit the
+    /// viewer *read* cannot be hashed here. Omitting it would hash a row
+    /// without the edit, which an agent could later make the sender's hash by
+    /// clearing `edited_json`: refuse instead.
+    Edited,
 }
 
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
@@ -523,13 +530,10 @@ pub fn hashed_document(
     let mut h = Map::new();
     h.insert("draftId".into(), json!(draft_id));
     h.insert("payload".into(), payload);
-    // `edited` is omitted when `edited_json` is NULL, empty or not valid JSON.
-    if let Some(e) = row
-        .edited_json
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-    {
+    // `edited` is omitted only when `edited_json` is NULL or empty. Text this
+    // parser cannot read is NOT treated as absent (see `NotApprovable::Edited`).
+    if let Some(text) = row.edited_json.as_deref().filter(|s| !s.is_empty()) {
+        let e: Value = serde_json::from_str(text).map_err(|_| NotApprovable::Edited)?;
         h.insert("edited".into(), e);
     }
     h.insert(
@@ -950,6 +954,52 @@ mod tests {
         }
     }
 
+    /// `JSON.parse` (the viewer's UI, the sender) accepts these; `serde_json`
+    /// does not. Dropping the edit would make the seen row hash like the same
+    /// row with `edited_json` NULL, so an agent could show the viewer the edit,
+    /// then clear it after the approval is captured. They have no hash.
+    #[test]
+    fn an_edit_this_parser_cannot_read_is_not_approvable_not_omitted() {
+        let deep = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+        for edited in [
+            r#"{"body":"BENIGN","x":"\ud800"}"#.to_string(),
+            r#"{"body":"BENIGN","x":1e400}"#.to_string(),
+            format!(r#"{{"body":"BENIGN","x":{deep}}}"#),
+            "{not json".to_string(),
+        ] {
+            let row = SeenRow {
+                channel: "smtp".into(),
+                payload_json: r#"{"item":{"subject":"s","body":"MALICIOUS"}}"#.into(),
+                edited_json: Some(edited.clone()),
+                scheduled_at: None,
+            };
+            assert_eq!(
+                canonical_hash("d", &row, &Map::new()),
+                Err(NotApprovable::Edited),
+                "{edited}"
+            );
+            let info = DraftInfo {
+                status: "awaiting".into(),
+                // The sender's hash of the same row with `edited_json` NULL.
+                payload_hash: canonical_hash(
+                    "d",
+                    &SeenRow {
+                        edited_json: None,
+                        ..row.clone()
+                    },
+                    &Map::new(),
+                )
+                .unwrap(),
+                rendered_text: String::new(),
+            };
+            assert_eq!(
+                verify_seen("d", &row, &info),
+                Err(SeenMismatch::NotApprovable(NotApprovable::Edited)),
+                "{edited}"
+            );
+        }
+    }
+
     #[test]
     fn an_edit_or_a_schedule_or_a_channel_changes_the_hash() {
         let base = SeenRow {
@@ -977,12 +1027,10 @@ mod tests {
         }
         // meta / source siblings of `item` are not hashed (contract §3.2).
         assert_eq!(h(&other_id), h0);
-        // Empty or invalid `edited_json` leaves the key out, like NULL.
-        for e in ["", "{not json"] {
-            let mut r = base.clone();
-            r.edited_json = Some(e.into());
-            assert_eq!(h(&r), h0, "{e:?}");
-        }
+        // An empty `edited_json` leaves the key out, like NULL.
+        let mut r = base.clone();
+        r.edited_json = Some(String::new());
+        assert_eq!(h(&r), h0);
         // But a valid `null` edit is hashed as null.
         let mut r = base.clone();
         r.edited_json = Some("null".into());
