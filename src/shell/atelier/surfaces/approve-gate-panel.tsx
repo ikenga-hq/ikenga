@@ -35,6 +35,8 @@ import {
 	type WorkerHealth,
 } from '@/lib/queries/pa-actions';
 import { copyText } from '@/lib/clipboard';
+import type { PaDraftSeen } from '@/lib/tauri-cmd';
+import { boundFields } from './share-binding';
 
 // ── Types ─────────────────────────────────────────────────────────────────────────────────────
 // PausedDraft / DraftChannel are the shared run-then-pause contract — the renderer injects them
@@ -44,8 +46,10 @@ export type { DraftChannel, PausedDraft };
 
 export interface ApproveGatePanelProps {
 	drafts: PausedDraftView[];
-	/** Host fires the side effect after its 10s undo window (host.paActionsCommit). */
-	onApprove: (draftId: string) => void;
+	/** Host fires the side effect after its 10s undo window (host.paActionsCommit).
+	 *  In share mode (`shareNote` set) the second argument is the row the reviewer was
+	 *  shown when they pressed Approve; the host sends it with the commit. */
+	onApprove: (draftId: string, seen?: PaDraftSeen) => void;
 	/** pa-action-reject — draft discarded. */
 	onReject: (draftId: string) => void;
 	/** Persisted inline edits (⌘S). Optional — the harness logs them. */
@@ -58,6 +62,16 @@ export interface ApproveGatePanelProps {
 	 * activity, the panel renders the delivery-health strip above the split.
 	 */
 	health?: WorkerHealth;
+	/**
+	 * Share mode (box plan WP-5): set it to show this note above the queue and to turn on
+	 * the share rules: approve carries the row that was shown, and a draft with unsaved
+	 * local edits cannot be approved (the approval would not cover what is on screen).
+	 * Leave it unset on the desktop and in your own workspace: nothing changes there.
+	 */
+	shareNote?: string;
+	/** A failed approve / reject / edit, by draft id. Shown on the draft; the row comes
+	 *  back into the queue if the panel had already removed it. */
+	draftErrors?: Record<string, string>;
 }
 
 const LIST_W_DEFAULT = 420;
@@ -110,7 +124,11 @@ const IcoRefresh = svg(<path d="M13 8A5 5 0 1 1 8 3M13 3v5h-5" />);
 // ── Component ─────────────────────────────────────────────────────────────────────────────────
 
 export function ApproveGatePanel(props: ApproveGatePanelProps) {
-	const { drafts, onApprove, onReject, onEdit, onRetry, health } = props;
+	const { drafts, onApprove, onReject, onEdit, onRetry, health, shareNote, draftErrors } = props;
+	const shareMode = shareNote !== undefined;
+	// Notices the panel raises itself (an approval blocked by unsaved edits).
+	const [localErrors, setLocalErrors] = useState<Record<string, string>>({});
+	const errorFor = (id: string): string | undefined => localErrors[id] ?? draftErrors?.[id];
 
 	const [resolved, setResolved] = useState<Set<string>>(() => new Set());
 	// WP-11 — id of the row whose delivery-error popover is open (single-open).
@@ -121,16 +139,46 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 	const [checked, setChecked] = useState<Set<string>>(() => new Set());
 	const [listWidth, setListWidth] = useState<number | null>(null);
 	const [edits, setEdits] = useState<
-		Record<string, { subject: string; body: string; everEdited: boolean; savedAt: string | null }>
+		Record<
+			string,
+			{
+				subject: string;
+				body: string;
+				everEdited: boolean;
+				savedAt: string | null;
+				/** Share mode: the row's text when ⌘S ran, to tell "the box has not caught up yet"
+				 *  from "the box's draft changed after the save". */
+				rowAtSave: { subject: string; body: string } | null;
+			}
+		>
 	>({});
-	const [undo, setUndo] = useState<{ draftId: string; secondsLeft: number } | null>(null);
+	const [undo, setUndo] = useState<{
+		draftId: string;
+		secondsLeft: number;
+		seen?: PaDraftSeen;
+	} | null>(null);
 
 	const splitRef = useRef<HTMLDivElement>(null);
 	const rowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+	// The text a draft shows. On the desktop that is the local edit over the row. In a share it
+	// is the row the approval will be bound to, except while the viewer is typing or their
+	// save has not come back from the box yet: once the box's row is something other than
+	// what they saved (the agent rewrote it), the screen follows the row, never the stale edit.
+	const editFor = useCallback(
+		(d: PausedDraft) => {
+			const e = edits[d.id];
+			if (!e) return undefined;
+			if (!shareMode || e.savedAt === null) return e;
+			const same = (a: { subject: string; body: string }) =>
+				a.subject === d.subject && a.body === d.body;
+			if (same(e) || (e.rowAtSave && same(e.rowAtSave))) return e;
+			return undefined;
+		},
+		[edits, shareMode]
+	);
+	const selectedDraft = selectedId ? drafts.find((d) => d.id === selectedId) : undefined;
 	const bodyRef = useAutoGrowTextarea(
-		selectedId
-			? (edits[selectedId]?.body ?? drafts.find((d) => d.id === selectedId)?.body ?? '')
-			: ''
+		selectedDraft ? (editFor(selectedDraft)?.body ?? selectedDraft.body ?? '') : ''
 	);
 
 	// Keep selection valid as rows arrive/resolve. Auto-select the first draft
@@ -148,6 +196,21 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 	}, [visible, selectedId]);
 
 	const selected = visible.find((d) => d.id === selectedId) ?? null;
+
+	// A failed action brings its draft back: the panel removes a row optimistically when
+	// approve / reject fires, but nothing was done, so the draft must be on screen with
+	// the reason.
+	useEffect(() => {
+		const ids = Object.keys(draftErrors ?? {});
+		if (ids.length === 0) return;
+		setResolved((prev) => {
+			if (!ids.some((id) => prev.has(id))) return prev;
+			const next = new Set(prev);
+			for (const id of ids) next.delete(id);
+			return next;
+		});
+		setSelectedId(ids[0]);
+	}, [draftErrors]);
 
 	// WP-11 — dismiss the delivery-error popover on any outside click or Escape.
 	// The chip button + popover body stop propagation, so a bubbled click here is
@@ -172,8 +235,28 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 	const flat = useMemo(() => sections.flatMap(([, rows]) => rows), [sections]);
 
 	// derive the current (possibly edited) subject/body for a draft
-	const draftSubject = (d: PausedDraft) => edits[d.id]?.subject ?? d.subject;
-	const draftBody = (d: PausedDraft) => edits[d.id]?.body ?? d.body;
+	const draftSubject = (d: PausedDraft) => editFor(d)?.subject ?? d.subject;
+	const draftBody = (d: PausedDraft) => editFor(d)?.body ?? d.body;
+
+	// Share mode: a saved edit whose row the box then changed is dropped, and the viewer is told
+	// that what is on screen is now the box's version.
+	useEffect(() => {
+		if (!shareMode) return;
+		const stale = drafts.filter((d) => edits[d.id] && !editFor(d));
+		if (stale.length === 0) return;
+		setEdits((prev) => {
+			const next = { ...prev };
+			for (const d of stale) delete next[d.id];
+			return next;
+		});
+		setLocalErrors((prev) => {
+			const next = { ...prev };
+			for (const d of stale)
+				next[d.id] =
+					'The draft on the box changed after your edit. This is the box’s version now; review it before approving.';
+			return next;
+		});
+	}, [shareMode, drafts, edits, editFor]);
 	const isEdited = (d: PausedDraft) => d.everEdited || !!edits[d.id]?.everEdited;
 
 	// ── editing ──────────────────────────────────────────────────────────────────────────────
@@ -185,11 +268,14 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 					body: base.body,
 					everEdited: base.everEdited,
 					savedAt: null,
+					rowAtSave: null,
 				};
-				return { ...prev, [id]: { ...cur, ...patch } };
+				// In a share, typing after a save makes the edit unsaved again.
+				const savedAt = shareMode ? null : cur.savedAt;
+				return { ...prev, [id]: { ...cur, ...patch, savedAt } };
 			});
 		},
-		[]
+		[shareMode]
 	);
 
 	// Intentionally NOT memoized: it reads the live `edits` through draftSubject/draftBody, so it
@@ -201,16 +287,58 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 				body: d.body,
 				everEdited: d.everEdited,
 				savedAt: null,
+				rowAtSave: null,
 			};
-			return { ...prev, [d.id]: { ...cur, everEdited: true, savedAt: nowLabel() } };
+			return {
+				...prev,
+				[d.id]: {
+					...cur,
+					everEdited: true,
+					savedAt: nowLabel(),
+					rowAtSave: { subject: d.subject, body: d.body },
+				},
+			};
 		});
 		onEdit?.(d.id, { subject: draftSubject(d), body: draftBody(d) });
 	};
 
 	// ── approve / reject / handoff ─────────────────────────────────────────────────────────────
-	const startApprove = useCallback((d: PausedDraft) => {
-		setUndo({ draftId: d.id, secondsLeft: Math.round((d.consequence.undoMs ?? 10000) / 1000) });
-	}, []);
+	// Why this draft cannot be approved from a share right now, or null. The box approves the row
+	// it stores, so the screen must be that row: no unsaved typing, no saved edit the box has not
+	// yet returned, and a row the ledger can bind to.
+	const shareBlock = useCallback(
+		(d: PausedDraft): string | null => {
+			const e = editFor(d);
+			if (e && (e.subject !== d.subject || e.body !== d.body)) {
+				return e.savedAt === null
+					? 'You have unsaved edits. Save them (⌘S) first so the approval covers exactly what you see.'
+					: 'Your saved edit has not come back from the box yet. Wait a moment, then approve what you see.';
+			}
+			const bound = boundFields((d as PausedDraftView).seen);
+			return bound.ok ? null : bound.reason;
+		},
+		[editFor]
+	);
+	const startApprove = useCallback(
+		(d: PausedDraft) => {
+			const block = shareMode ? shareBlock(d) : null;
+			if (block) {
+				setLocalErrors((prev) => ({ ...prev, [d.id]: block }));
+				return;
+			}
+			setLocalErrors((prev) => {
+				if (!(d.id in prev)) return prev;
+				const { [d.id]: _gone, ...rest } = prev;
+				return rest;
+			});
+			setUndo({
+				draftId: d.id,
+				secondsLeft: Math.round((d.consequence.undoMs ?? 10000) / 1000),
+				seen: (d as PausedDraftView).seen,
+			});
+		},
+		[shareMode, shareBlock]
+	);
 
 	const cancelUndo = useCallback(() => setUndo(null), []);
 
@@ -218,7 +346,8 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 	useEffect(() => {
 		if (!undo) return;
 		if (undo.secondsLeft <= 0) {
-			onApprove(undo.draftId);
+			if (shareMode) onApprove(undo.draftId, undo.seen);
+			else onApprove(undo.draftId);
 			setResolved((prev) => new Set(prev).add(undo.draftId));
 			setUndo(null);
 			return;
@@ -228,7 +357,7 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 			1000
 		);
 		return () => clearTimeout(t);
-	}, [undo, onApprove]);
+	}, [undo, onApprove, shareMode]);
 
 	const reject = useCallback(
 		(id: string) => {
@@ -255,12 +384,16 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 	}, []);
 	const clearChecked = useCallback(() => setChecked(new Set()), []);
 	const approveAllChecked = useCallback(() => {
+		// A share approval is one reviewed draft at a time, never rows the viewer has not opened.
+		if (shareMode) return;
+		const sent = new Set<string>();
 		checked.forEach((id) => {
+			sent.add(id);
 			onApprove(id);
 		});
-		setResolved((prev) => new Set([...prev, ...checked]));
+		setResolved((prev) => new Set([...prev, ...sent]));
 		setChecked(new Set());
-	}, [checked, onApprove]);
+	}, [checked, onApprove, shareMode]);
 	const rejectAllChecked = useCallback(() => {
 		checked.forEach((id) => {
 			onReject(id);
@@ -336,7 +469,16 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 		listWidth != null ? ({ '--list-w': `${listWidth}px` } as CSSProperties) : undefined;
 
 	return (
-		<section className="ob-surface" aria-label="Draft approvals" {...focusMarkerProps('approve-gate')}>
+		<section
+			className="ob-surface"
+			aria-label="Draft approvals"
+			{...focusMarkerProps('approve-gate')}
+		>
+			{shareNote && (
+				<div className="ob-share-note" role="note">
+					{shareNote}
+				</div>
+			)}
 			{health && shouldShowHealthStrip(health) && <DeliveryHealthStrip health={health} />}
 			<div className="ob-split" ref={splitRef} style={splitStyle}>
 				{/* ── Left: draft queue ─────────────────────────────────────────────── */}
@@ -372,13 +514,15 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 						<div className="ob-bulk">
 							<span className="ob-bulk-count">{checked.size} selected</span>
 							<span className="ob-bulk-spacer" />
-							<button
-								type="button"
-								className="btn btn-sm ob-actions-primary"
-								onClick={approveAllChecked}
-							>
-								Approve all
-							</button>
+							{!shareMode && (
+								<button
+									type="button"
+									className="btn btn-sm ob-actions-primary"
+									onClick={approveAllChecked}
+								>
+									Approve all
+								</button>
+							)}
 							<button type="button" className="btn btn-sm" onClick={rejectAllChecked}>
 								Reject all
 							</button>
@@ -454,6 +598,7 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 													{CHANNEL_LABEL[d.channel]}
 												</span>
 												{isEdited(d) && <span className="ob-chip edited">EDITED</span>}
+												{errorFor(d.id) && <span className="ob-chip error">NOT APPROVED</span>}
 												<span className="ob-chip agent">{d.agent}</span>
 												<span className={`ob-chip sender${d.cold ? ' cold' : ''}`}>
 													{d.senderAddress}
@@ -538,6 +683,16 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 							</div>
 
 							<div className="ob-detail-body">
+								{errorFor(selected.id) && (
+									<div
+										className="ob-failed-callout ob-approval-error"
+										role="alert"
+										aria-label="Approval error"
+									>
+										<span className="ob-failed-callout-label">Not approved</span>
+										<span className="ob-approval-error-msg">{errorFor(selected.id)}</span>
+									</div>
+								)}
 								{/* WP-11 — dead-worker note: retry re-queues safely but nothing claims it
 								    until the worker is back. Shown only when a send-pipeline row is
 								    selected while the worker reads dead. */}
@@ -654,6 +809,8 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 									</div>
 								</div>
 
+								{shareMode && <ShareBoundFields seen={(selected as PausedDraftView).seen} />}
+
 								{selected.sequence && (
 									<div className="ob-seq-callout" role="region" aria-label="Sequence context">
 										<IcoSeq />
@@ -725,9 +882,12 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 								</div>
 								<span className="ob-actions-spacer" />
 								<span className="ob-actions-meta">
-									→ sends to {selected.consequence.target} · {selected.consequence.recipients}{' '}
-									{selected.consequence.recipients === 1 ? 'recipient' : 'recipients'} ·{' '}
-									{selected.consequence.channel} · {selected.consequence.time} · undo{' '}
+									→ sends to {selected.consequence.target} ·{' '}
+									{recipientCount(selected.consequence.recipients)}{' '}
+									{recipientCount(selected.consequence.recipients) === 1
+										? 'recipient'
+										: 'recipients'}{' '}
+									· {selected.consequence.channel} · {selected.consequence.time} · undo{' '}
 									{Math.round(selected.consequence.undoMs / 1000)}s
 								</span>
 								<button
@@ -825,12 +985,20 @@ function wordCount(s: string): number {
 	return t ? t.split(/\s+/).length : 0;
 }
 
+// A draft's `recipients` is a count in the fixtures but an array in the worker's drafts; a
+// non-number must never reach the DOM (an array as a React child throws and blanks the panel).
+function recipientCount(n: unknown): number {
+	if (typeof n === 'number' && Number.isFinite(n)) return n;
+	if (Array.isArray(n)) return n.length;
+	return 1;
+}
+
 // The full consequence, carried onto the primary's tooltip + accessible name so
 // the gate's safety premise (who/where/when + undo) survives even when the meta
 // row is space-constrained. The "Approve & Send —" prefix keeps the visible CTA
 // in the accessible name.
 function consequenceStrings(d: PausedDraft): { title: string; aria: string } {
-	const n = d.consequence.recipients;
+	const n = recipientCount(d.consequence.recipients);
 	const word = n === 1 ? 'recipient' : 'recipients';
 	const undoS = Math.round((d.consequence.undoMs ?? 10000) / 1000);
 	return {
@@ -1103,4 +1271,50 @@ function DeliveryChip({
 	}
 
 	return <span className={`dl-chip ${state}`}>{deliveryChipLabel(state, d)}</span>;
+}
+
+// Share mode: every field the approval is bound to, from the row the approval will carry (the
+// same `seen` that travels with the commit). The header above shows only the recipient line the
+// agent chose to display; the sender reads the real send list, cc, reply-to and threading from
+// the payload, so they are listed here, routing fields first, nothing truncated.
+function ShareBoundFields({ seen }: { seen: PaDraftSeen | undefined }) {
+	const view = boundFields(seen);
+	if (!view.ok) {
+		return (
+			<div className="ob-share-note" role="alert" aria-label="Approval covers">
+				{view.reason}
+			</div>
+		);
+	}
+	const groups: Array<[string, typeof view.fields]> = [
+		[
+			'Channel and schedule',
+			view.fields.filter((f) => f.group === 'channel' || f.group === 'schedule'),
+		],
+		['Draft content', view.fields.filter((f) => f.group === 'payload')],
+		['Your edit', view.fields.filter((f) => f.group === 'edit')],
+	];
+	return (
+		<section className="ob-share-bound" aria-label="Approval covers">
+			<div className="ob-share-bound-title">
+				Approving covers exactly these fields. The box sends from its own configured address.
+			</div>
+			{groups
+				.filter(([, fields]) => fields.length > 0)
+				.map(([title, fields]) => (
+					<div key={title}>
+						<div className="ob-share-bound-group">{title}</div>
+						<dl className="ob-share-bound-list">
+							{fields.map((f, i) => (
+								// biome-ignore lint/suspicious/noArrayIndexKey: a static, read-only list rebuilt per row
+								<div key={`${f.group}:${f.path}:${i}`} className="ob-share-bound-row">
+									<dt>{f.path || '(value)'}</dt>
+									<dd>{f.value}</dd>
+								</div>
+							))}
+						</dl>
+					</div>
+				))}
+		</section>
+	);
 }

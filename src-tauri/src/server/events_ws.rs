@@ -81,6 +81,13 @@ fn permitted(ctx: Option<&AccessCtx>) -> HashSet<Topic> {
     let Some(ctx) = ctx else {
         return HashSet::new();
     };
+    // Live events are the caller's own workspace only (the route already
+    // refuses a share). Some topics' gating arms are share-class (e.g.
+    // `pa_actions_list`, so an Operator can approve an owner's drafts), and a
+    // share must still get none of the owner's events.
+    if ctx.share.is_some() {
+        return HashSet::new();
+    }
     Topic::ALL
         .into_iter()
         .filter(|t| t.produced())
@@ -426,8 +433,9 @@ mod tests {
             owner_approval: false,
         });
         let p = permitted(Some(&c));
-        // `pa_actions_list` is an owner arm: never on a share.
-        assert!(!p.contains(&Topic::PaActionCommitted));
+        // Live events never reach a share, whatever a topic's gating arm allows
+        // (`pa_actions_list` is share-class for Operators).
+        assert!(p.is_empty());
     }
 
     #[test]

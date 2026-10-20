@@ -1,0 +1,144 @@
+{
+  "contract": 1,
+  "algorithm": "sha256",
+  "vectors": [
+    {
+      "name": "smtp-ruby-reply",
+      "about": "A threaded Ruby reply (smtp), no operator edit. meta and source are NOT hashed; the whole item is.",
+      "row": {
+        "id": "ruby-reply:em-1001",
+        "channel": "smtp",
+        "payload_json": "{\"item\":{\"id\":\"ruby-reply:em-1001\",\"recipient\":\"Pat Customer\",\"recipientEmail\":\"pat@example.com\",\"recipientsList\":[{\"name\":\"Pat Customer\",\"email\":\"pat@example.com\"}],\"subject\":\"Re: Invoice 42\",\"body\":\"Hi Pat,\\n\\nThanks for the note. The invoice is attached.\\n\\nRuby\",\"channel\":\"smtp\",\"bodyFormat\":\"text\",\"senderAddress\":\"ruby@royalti.io\",\"fromName\":\"Ruby at Royalti\",\"fromProvider\":\"SMTP · ruby@royalti.io\",\"cold\":false,\"scheduledIso\":null,\"scheduledLabel\":\"on approval\",\"threadCount\":\"reply\",\"cc\":[\"accounts@example.com\"],\"in_reply_to\":\"<abc123@mail.example.com>\",\"references\":[\"<root@mail.example.com>\",\"<abc123@mail.example.com>\"]},\"meta\":{\"actionId\":\"ruby/email-reply\",\"actionName\":\"Ruby email reply\",\"agent\":\"Ruby\",\"model\":\"Sonnet\"},\"source\":{\"kind\":\"ruby-email-reply\"}}",
+        "edited_json": null,
+        "scheduled_at": null
+      },
+      "env": {
+        "RUBY_IMAP_USER": "ruby@royalti.io"
+      },
+      "canonical": "{\"channel\":\"smtp\",\"draftId\":\"ruby-reply:em-1001\",\"payload\":{\"body\":\"Hi Pat,\\n\\nThanks for the note. The invoice is attached.\\n\\nRuby\",\"bodyFormat\":\"text\",\"cc\":[\"accounts@example.com\"],\"channel\":\"smtp\",\"cold\":false,\"fromName\":\"Ruby at Royalti\",\"fromProvider\":\"SMTP · ruby@royalti.io\",\"id\":\"ruby-reply:em-1001\",\"in_reply_to\":\"<abc123@mail.example.com>\",\"recipient\":\"Pat Customer\",\"recipientEmail\":\"pat@example.com\",\"recipientsList\":[{\"email\":\"pat@example.com\",\"name\":\"Pat Customer\"}],\"references\":[\"<root@mail.example.com>\",\"<abc123@mail.example.com>\"],\"scheduledIso\":null,\"scheduledLabel\":\"on approval\",\"senderAddress\":\"ruby@royalti.io\",\"subject\":\"Re: Invoice 42\",\"threadCount\":\"reply\"},\"scheduledAt\":null,\"sendIdentity\":{\"smtpFrom\":\"ruby@royalti.io\"}}",
+      "sha256": "7ef7b6c4eef08fde8fa02fc7901227ba949c8d8f64c698fbd2b5eaff1ff3ab28"
+    },
+    {
+      "name": "smtp-ruby-reply-edited-subject-body",
+      "about": "Same draft after the operator edited subject and body (edited_json): a different hash, so a prior approval is void.",
+      "row": {
+        "id": "ruby-reply:em-1001",
+        "channel": "smtp",
+        "payload_json": "{\"item\":{\"id\":\"ruby-reply:em-1001\",\"recipient\":\"Pat Customer\",\"recipientEmail\":\"pat@example.com\",\"recipientsList\":[{\"name\":\"Pat Customer\",\"email\":\"pat@example.com\"}],\"subject\":\"Re: Invoice 42\",\"body\":\"Hi Pat,\\n\\nThanks for the note. The invoice is attached.\\n\\nRuby\",\"channel\":\"smtp\",\"bodyFormat\":\"text\",\"senderAddress\":\"ruby@royalti.io\",\"fromName\":\"Ruby at Royalti\",\"fromProvider\":\"SMTP · ruby@royalti.io\",\"cold\":false,\"scheduledIso\":null,\"scheduledLabel\":\"on approval\",\"threadCount\":\"reply\",\"cc\":[\"accounts@example.com\"],\"in_reply_to\":\"<abc123@mail.example.com>\",\"references\":[\"<root@mail.example.com>\",\"<abc123@mail.example.com>\"]},\"meta\":{\"actionId\":\"ruby/email-reply\",\"actionName\":\"Ruby email reply\",\"agent\":\"Ruby\",\"model\":\"Sonnet\"},\"source\":{\"kind\":\"ruby-email-reply\"}}",
+        "edited_json": "{\"subject\":\"Re: Invoice 42 (corrected)\",\"body\":\"Hi Pat,\\n\\nCorrected invoice attached.\\n\\nRuby\"}",
+        "scheduled_at": null
+      },
+      "env": {
+        "RUBY_IMAP_USER": "ruby@royalti.io"
+      },
+      "canonical": "{\"channel\":\"smtp\",\"draftId\":\"ruby-reply:em-1001\",\"edited\":{\"body\":\"Hi Pat,\\n\\nCorrected invoice attached.\\n\\nRuby\",\"subject\":\"Re: Invoice 42 (corrected)\"},\"payload\":{\"body\":\"Hi Pat,\\n\\nThanks for the note. The invoice is attached.\\n\\nRuby\",\"bodyFormat\":\"text\",\"cc\":[\"accounts@example.com\"],\"channel\":\"smtp\",\"cold\":false,\"fromName\":\"Ruby at Royalti\",\"fromProvider\":\"SMTP · ruby@royalti.io\",\"id\":\"ruby-reply:em-1001\",\"in_reply_to\":\"<abc123@mail.example.com>\",\"recipient\":\"Pat Customer\",\"recipientEmail\":\"pat@example.com\",\"recipientsList\":[{\"email\":\"pat@example.com\",\"name\":\"Pat Customer\"}],\"references\":[\"<root@mail.example.com>\",\"<abc123@mail.example.com>\"],\"scheduledIso\":null,\"scheduledLabel\":\"on approval\",\"senderAddress\":\"ruby@royalti.io\",\"subject\":\"Re: Invoice 42\",\"threadCount\":\"reply\"},\"scheduledAt\":null,\"sendIdentity\":{\"smtpFrom\":\"ruby@royalti.io\"}}",
+      "sha256": "4dacf3a4a6dda8ee819d57b6150ab3e6e305ce768a009dd27fb64ef0a5a0f14f"
+    },
+    {
+      "name": "smtp-ruby-reply-edited-recipients",
+      "about": "An operator edit that carries recipients inside edited_json: every key of edited_json is hashed, so this differs from the unedited draft.",
+      "row": {
+        "id": "ruby-reply:em-1001",
+        "channel": "smtp",
+        "payload_json": "{\"item\":{\"id\":\"ruby-reply:em-1001\",\"recipient\":\"Pat Customer\",\"recipientEmail\":\"pat@example.com\",\"recipientsList\":[{\"name\":\"Pat Customer\",\"email\":\"pat@example.com\"}],\"subject\":\"Re: Invoice 42\",\"body\":\"Hi Pat,\\n\\nThanks for the note. The invoice is attached.\\n\\nRuby\",\"channel\":\"smtp\",\"bodyFormat\":\"text\",\"senderAddress\":\"ruby@royalti.io\",\"fromName\":\"Ruby at Royalti\",\"fromProvider\":\"SMTP · ruby@royalti.io\",\"cold\":false,\"scheduledIso\":null,\"scheduledLabel\":\"on approval\",\"threadCount\":\"reply\",\"cc\":[\"accounts@example.com\"],\"in_reply_to\":\"<abc123@mail.example.com>\",\"references\":[\"<root@mail.example.com>\",\"<abc123@mail.example.com>\"]},\"meta\":{\"actionId\":\"ruby/email-reply\",\"actionName\":\"Ruby email reply\",\"agent\":\"Ruby\",\"model\":\"Sonnet\"},\"source\":{\"kind\":\"ruby-email-reply\"}}",
+        "edited_json": "{\"recipients\":[{\"email\":\"someone-else@example.com\"}]}",
+        "scheduled_at": null
+      },
+      "env": {
+        "RUBY_IMAP_USER": "ruby@royalti.io"
+      },
+      "canonical": "{\"channel\":\"smtp\",\"draftId\":\"ruby-reply:em-1001\",\"edited\":{\"recipients\":[{\"email\":\"someone-else@example.com\"}]},\"payload\":{\"body\":\"Hi Pat,\\n\\nThanks for the note. The invoice is attached.\\n\\nRuby\",\"bodyFormat\":\"text\",\"cc\":[\"accounts@example.com\"],\"channel\":\"smtp\",\"cold\":false,\"fromName\":\"Ruby at Royalti\",\"fromProvider\":\"SMTP · ruby@royalti.io\",\"id\":\"ruby-reply:em-1001\",\"in_reply_to\":\"<abc123@mail.example.com>\",\"recipient\":\"Pat Customer\",\"recipientEmail\":\"pat@example.com\",\"recipientsList\":[{\"email\":\"pat@example.com\",\"name\":\"Pat Customer\"}],\"references\":[\"<root@mail.example.com>\",\"<abc123@mail.example.com>\"],\"scheduledIso\":null,\"scheduledLabel\":\"on approval\",\"senderAddress\":\"ruby@royalti.io\",\"subject\":\"Re: Invoice 42\",\"threadCount\":\"reply\"},\"scheduledAt\":null,\"sendIdentity\":{\"smtpFrom\":\"ruby@royalti.io\"}}",
+      "sha256": "380b9be357637415f8bfc785b422a3d1c21c459db3b94ce01256c5ab8acf2362"
+    },
+    {
+      "name": "smtp-ruby-reply-recipient-changed-in-payload",
+      "about": "The recipient list changed inside payload_json (recipientEmail and recipientsList): a different hash.",
+      "row": {
+        "id": "ruby-reply:em-1001",
+        "channel": "smtp",
+        "payload_json": "{\"item\":{\"id\":\"ruby-reply:em-1001\",\"recipient\":\"Pat Customer\",\"recipientEmail\":\"someone-else@example.com\",\"recipientsList\":[{\"email\":\"someone-else@example.com\"}],\"subject\":\"Re: Invoice 42\",\"body\":\"Hi Pat,\\n\\nThanks for the note. The invoice is attached.\\n\\nRuby\",\"channel\":\"smtp\",\"bodyFormat\":\"text\",\"senderAddress\":\"ruby@royalti.io\",\"fromName\":\"Ruby at Royalti\",\"fromProvider\":\"SMTP · ruby@royalti.io\",\"cold\":false,\"scheduledIso\":null,\"scheduledLabel\":\"on approval\",\"threadCount\":\"reply\",\"cc\":[\"accounts@example.com\"],\"in_reply_to\":\"<abc123@mail.example.com>\",\"references\":[\"<root@mail.example.com>\",\"<abc123@mail.example.com>\"]},\"meta\":{\"actionId\":\"ruby/email-reply\",\"actionName\":\"Ruby email reply\",\"agent\":\"Ruby\",\"model\":\"Sonnet\"},\"source\":{\"kind\":\"ruby-email-reply\"}}",
+        "edited_json": null,
+        "scheduled_at": null
+      },
+      "env": {
+        "RUBY_IMAP_USER": "ruby@royalti.io"
+      },
+      "canonical": "{\"channel\":\"smtp\",\"draftId\":\"ruby-reply:em-1001\",\"payload\":{\"body\":\"Hi Pat,\\n\\nThanks for the note. The invoice is attached.\\n\\nRuby\",\"bodyFormat\":\"text\",\"cc\":[\"accounts@example.com\"],\"channel\":\"smtp\",\"cold\":false,\"fromName\":\"Ruby at Royalti\",\"fromProvider\":\"SMTP · ruby@royalti.io\",\"id\":\"ruby-reply:em-1001\",\"in_reply_to\":\"<abc123@mail.example.com>\",\"recipient\":\"Pat Customer\",\"recipientEmail\":\"someone-else@example.com\",\"recipientsList\":[{\"email\":\"someone-else@example.com\"}],\"references\":[\"<root@mail.example.com>\",\"<abc123@mail.example.com>\"],\"scheduledIso\":null,\"scheduledLabel\":\"on approval\",\"senderAddress\":\"ruby@royalti.io\",\"subject\":\"Re: Invoice 42\",\"threadCount\":\"reply\"},\"scheduledAt\":null,\"sendIdentity\":{\"smtpFrom\":\"ruby@royalti.io\"}}",
+      "sha256": "4bb1414701c51febb76546aefde210737e83fe8497008324f5c8875211ccc275"
+    },
+    {
+      "name": "smtp-from-identity-changed",
+      "about": "Same row, but the send-time identity (RUBY_IMAP_USER) differs: a different hash. The approver is shown, and the hash binds, the mailbox that will send.",
+      "row": {
+        "id": "ruby-reply:em-1001",
+        "channel": "smtp",
+        "payload_json": "{\"item\":{\"id\":\"ruby-reply:em-1001\",\"recipient\":\"Pat Customer\",\"recipientEmail\":\"pat@example.com\",\"recipientsList\":[{\"name\":\"Pat Customer\",\"email\":\"pat@example.com\"}],\"subject\":\"Re: Invoice 42\",\"body\":\"Hi Pat,\\n\\nThanks for the note. The invoice is attached.\\n\\nRuby\",\"channel\":\"smtp\",\"bodyFormat\":\"text\",\"senderAddress\":\"ruby@royalti.io\",\"fromName\":\"Ruby at Royalti\",\"fromProvider\":\"SMTP · ruby@royalti.io\",\"cold\":false,\"scheduledIso\":null,\"scheduledLabel\":\"on approval\",\"threadCount\":\"reply\",\"cc\":[\"accounts@example.com\"],\"in_reply_to\":\"<abc123@mail.example.com>\",\"references\":[\"<root@mail.example.com>\",\"<abc123@mail.example.com>\"]},\"meta\":{\"actionId\":\"ruby/email-reply\",\"actionName\":\"Ruby email reply\",\"agent\":\"Ruby\",\"model\":\"Sonnet\"},\"source\":{\"kind\":\"ruby-email-reply\"}}",
+        "edited_json": null,
+        "scheduled_at": null
+      },
+      "env": {
+        "RUBY_IMAP_USER": "other@royalti.io"
+      },
+      "canonical": "{\"channel\":\"smtp\",\"draftId\":\"ruby-reply:em-1001\",\"payload\":{\"body\":\"Hi Pat,\\n\\nThanks for the note. The invoice is attached.\\n\\nRuby\",\"bodyFormat\":\"text\",\"cc\":[\"accounts@example.com\"],\"channel\":\"smtp\",\"cold\":false,\"fromName\":\"Ruby at Royalti\",\"fromProvider\":\"SMTP · ruby@royalti.io\",\"id\":\"ruby-reply:em-1001\",\"in_reply_to\":\"<abc123@mail.example.com>\",\"recipient\":\"Pat Customer\",\"recipientEmail\":\"pat@example.com\",\"recipientsList\":[{\"email\":\"pat@example.com\",\"name\":\"Pat Customer\"}],\"references\":[\"<root@mail.example.com>\",\"<abc123@mail.example.com>\"],\"scheduledIso\":null,\"scheduledLabel\":\"on approval\",\"senderAddress\":\"ruby@royalti.io\",\"subject\":\"Re: Invoice 42\",\"threadCount\":\"reply\"},\"scheduledAt\":null,\"sendIdentity\":{\"smtpFrom\":\"other@royalti.io\"}}",
+      "sha256": "d4501ec9f61e67ceb202a81372c59e1a6ef544251b4c981b8df0b4caff2ab9a4"
+    },
+    {
+      "name": "unicode-escapes-and-key-order",
+      "about": "String escaping (quote, backslash, newline, tab, U+0001, DEL, U+2028, an astral emoji) and key order by UTF-16 code unit: the key U+1D4B3 (surrogate pair D835 DCB3) sorts BEFORE U+FF5E, the opposite of UTF-8 byte order.",
+      "row": {
+        "id": "d-unicode",
+        "channel": "smtp",
+        "payload_json": "{\"item\":{\"channel\":\"smtp\",\"recipient\":\"Zoë\",\"recipientEmail\":\"zoe@example.com\",\"subject\":\"Quote \\\" backslash \\\\ tab \\t nl \\n ctl \\u0001 del  ls   emoji 😀\",\"body\":\"é ü 日本語\",\"scheduledIso\":null,\"～\":\"fullwidth tilde (BMP, U+FF5E)\",\"𝒳\":\"math script X (astral, U+1D4B3)\",\"zz\":1,\"aa\":9007199254740991}}",
+        "edited_json": null,
+        "scheduled_at": null
+      },
+      "env": {
+        "RUBY_IMAP_USER": "ruby@royalti.io"
+      },
+      "canonical": "{\"channel\":\"smtp\",\"draftId\":\"d-unicode\",\"payload\":{\"aa\":9007199254740991,\"body\":\"é ü 日本語\",\"channel\":\"smtp\",\"recipient\":\"Zoë\",\"recipientEmail\":\"zoe@example.com\",\"scheduledIso\":null,\"subject\":\"Quote \\\" backslash \\\\ tab \\t nl \\n ctl \\u0001 del  ls   emoji 😀\",\"zz\":1,\"𝒳\":\"math script X (astral, U+1D4B3)\",\"～\":\"fullwidth tilde (BMP, U+FF5E)\"},\"scheduledAt\":null,\"sendIdentity\":{\"smtpFrom\":\"ruby@royalti.io\"}}",
+      "sha256": "2fc2d2fa50e016bbcb2c4f2d4155ef76b122ffd0fb9596514dc571c6645af185"
+    },
+    {
+      "name": "listmonk-default-template",
+      "about": "listmonk with LISTMONK_TEMPLATE_ID unset: the send-time identity is the adapter default \"1\".",
+      "row": {
+        "id": "d-listmonk",
+        "channel": "listmonk",
+        "payload_json": "{\"item\":{\"channel\":\"listmonk\",\"recipient\":\"Newsletter\",\"recipientEmail\":null,\"subject\":\"October\",\"body\":\"<p>Hi</p>\",\"bodyFormat\":\"html\",\"scheduledIso\":\"2026-10-21T09:00:00Z\"}}",
+        "edited_json": null,
+        "scheduled_at": "2026-10-21 09:00:00"
+      },
+      "env": {},
+      "canonical": "{\"channel\":\"listmonk\",\"draftId\":\"d-listmonk\",\"payload\":{\"body\":\"<p>Hi</p>\",\"bodyFormat\":\"html\",\"channel\":\"listmonk\",\"recipient\":\"Newsletter\",\"recipientEmail\":null,\"scheduledIso\":\"2026-10-21T09:00:00Z\",\"subject\":\"October\"},\"scheduledAt\":\"2026-10-21 09:00:00\",\"sendIdentity\":{\"listmonkTemplateId\":\"1\"}}",
+      "sha256": "e7a48782f1f4056d9b86ca328a0529185a73bef75f44d7a63ff41b1d5464a857"
+    },
+    {
+      "name": "buffer-thread",
+      "about": "buffer: the channel id is the identity; nested objects and arrays (media.thread) are serialized with the same rules.",
+      "row": {
+        "id": "d-buffer",
+        "channel": "buffer",
+        "payload_json": "{\"item\":{\"channel\":\"buffer\",\"recipient\":\"LinkedIn · Royalti\",\"recipientEmail\":null,\"channelId\":\"ch_123\",\"subject\":\"\",\"body\":\"Post text\",\"scheduledIso\":null,\"media\":{\"kind\":\"thread\",\"thread\":[{\"text\":\"one\"},{\"text\":\"two\",\"imageUrls\":[\"https://example.com/a.png\"]}]}}}",
+        "edited_json": null,
+        "scheduled_at": null
+      },
+      "env": {},
+      "canonical": "{\"channel\":\"buffer\",\"draftId\":\"d-buffer\",\"payload\":{\"body\":\"Post text\",\"channel\":\"buffer\",\"channelId\":\"ch_123\",\"media\":{\"kind\":\"thread\",\"thread\":[{\"text\":\"one\"},{\"imageUrls\":[\"https://example.com/a.png\"],\"text\":\"two\"}]},\"recipient\":\"LinkedIn · Royalti\",\"recipientEmail\":null,\"scheduledIso\":null,\"subject\":\"\"},\"scheduledAt\":null,\"sendIdentity\":{\"bufferChannelId\":\"ch_123\"}}",
+      "sha256": "e550393aa634a59a15f81c18f29ca483897a67e440474162fe7787b1fa9c6684"
+    },
+    {
+      "name": "unwrapped-payload",
+      "about": "payload_json with no `item` wrapper: the whole parsed object is the payload.",
+      "row": {
+        "id": "d-raw",
+        "channel": "resend",
+        "payload_json": "{\"channel\":\"resend\",\"recipient\":\"Lee\",\"recipientEmail\":\"lee@example.com\",\"subject\":\"Hello\",\"body\":\"Hi Lee\",\"scheduledIso\":null}",
+        "edited_json": null,
+        "scheduled_at": null
+      },
+      "env": {},
+      "canonical": "{\"channel\":\"resend\",\"draftId\":\"d-raw\",\"payload\":{\"body\":\"Hi Lee\",\"channel\":\"resend\",\"recipient\":\"Lee\",\"recipientEmail\":\"lee@example.com\",\"scheduledIso\":null,\"subject\":\"Hello\"},\"scheduledAt\":null,\"sendIdentity\":{}}",
+      "sha256": "d8d12ef55f9b34b963bda18da8d58be72e6cd891b05ed4313c20a6096fc0539f"
+    }
+  ]
+}

@@ -6,7 +6,7 @@ import {
 } from '@ikenga/contract';
 import { queryOptions } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/query-keys';
-import { type PaActionDraftRow, paActionsList } from '@/lib/tauri-cmd';
+import { type PaActionDraftRow, type PaDraftSeen, paActionsList } from '@/lib/tauri-cmd';
 
 /** TanStack Query options for the gate's active draft set (or a status filter). */
 export function paActionsListQueryOptions(status?: string) {
@@ -90,6 +90,13 @@ export function pausedDraftFromRow(row: PaActionDraftRow): PausedDraft | null {
 	// optimistically marked the row resolved and removed it, so the gate looked
 	// like it had worked while nothing was ever written.
 	view.id = row.id;
+	// The row exactly as listed: a share approval binds to these bytes.
+	view.seen = {
+		channel: row.channel,
+		payloadJson: row.payloadJson,
+		editedJson: row.editedJson,
+		scheduledAt: row.scheduledAt,
+	};
 	view.delivery = {
 		dbStatus: row.status,
 		claimedAt: row.claimedAt,
@@ -132,7 +139,19 @@ export interface DraftDelivery {
 
 /** `PausedDraft` plus the worker-written delivery columns. Optional because
  *  fixtures and pre-worker rows omit it (the chip simply doesn't render). */
-export type PausedDraftView = PausedDraft & { delivery?: DraftDelivery };
+export type PausedDraftView = PausedDraft & { delivery?: DraftDelivery; seen?: PaDraftSeen };
+
+/** The text to show on a draft for a failed approve / reject / edit. Share
+ *  refusals arrive as `<code>: <sentence>`; show the sentence. */
+export function draftActionErrorMessage(err: unknown): string {
+	const raw = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+	const m =
+		/^(?:approval_unavailable|approval_refused|draft_changed|forbidden|invalid_request): (.+)$/s.exec(
+			raw
+		);
+	const text = (m ? m[1] : raw).trim();
+	return text || 'The action failed. Nothing was changed.';
+}
 
 export type WorkerHealthState = 'alive' | 'idle' | 'degraded' | 'dead';
 
