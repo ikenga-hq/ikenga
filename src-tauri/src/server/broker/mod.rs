@@ -22,6 +22,7 @@
 //! Under T1 the operator bearer grants nothing (§2.4, I-6): the broker mints
 //! none, accepts none, and `/api/shutdown` doesn't exist here.
 
+pub mod approvals;
 pub mod children;
 pub mod fs_roots_admin;
 pub mod health_probe;
@@ -114,6 +115,9 @@ pub struct BrokerState {
     pub access_t1: Option<Arc<crate::access::t1::T1Access>>,
     /// Limits on `POST /api/backup/import` uploads buffered by the broker.
     pub uploads: UploadGate,
+    /// Where the sender's approvals socket is (`approvals`): a share's
+    /// `pa_actions_commit` writes the ledger approval there, as the viewer.
+    pub approvals: approvals::ApprovalsConfig,
 }
 
 /// How many backup uploads one account may have in flight at once, and how
@@ -183,6 +187,7 @@ impl BrokerState {
             update: None,
             access_t1: None,
             uploads: UploadGate::new(2, Duration::from_secs(600)),
+            approvals: approvals::ApprovalsConfig::from_env(),
         })
     }
 }

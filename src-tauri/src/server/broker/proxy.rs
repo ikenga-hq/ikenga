@@ -691,6 +691,15 @@ pub async fn rpc_proxy(
             message,
         } => return json_error(status, code, &message),
     }
+    // Share mode: the Operator gate on the owner's drafts, and the ledger
+    // approval for a commit, written by the broker as the authenticated
+    // viewer before the owner's child is told to commit (`approvals`).
+    let bytes = match super::approvals::gate(&state.approvals, &ctx, &narrowing, &cmd, &args).await
+    {
+        Ok(super::approvals::Gated::Unchanged) => bytes,
+        Ok(super::approvals::Gated::Rewritten(body)) => Bytes::from(body.to_string()),
+        Err(res) => return res,
+    };
     // An admin's `fs_roots_*` call naming another principal goes to that
     // principal's child (`fs_roots_admin`); everything else is unchanged.
     let (narrowing, bytes) =

@@ -5075,10 +5075,25 @@ export async function paActionsUpdate(
 	return invoke('pa_actions_update', { draftId, patch });
 }
 
+/**
+ * The draft row a reviewer was shown, verbatim from `pa_actions_list`. A commit
+ * inside a share carries it so the broker can bind the ledger approval to
+ * exactly these bytes (box plan WP-5; the broker recomputes the canonical hash
+ * of this row and refuses if the box's draft differs).
+ */
+export interface PaDraftSeen {
+	channel: string;
+	payloadJson: string;
+	editedJson: string | null;
+	scheduledAt: string | null;
+}
+
 /** Commit a draft (post-undo). Flips it to committed + emits
- *  `pa-action-committed` for the external mutation worker. The shell never sends. */
-export async function paActionsCommit(draftId: string): Promise<void> {
-	return invoke('pa_actions_commit', { draftId });
+ *  `pa-action-committed` for the external mutation worker. The shell never sends.
+ *  In a share pass `seen` (the row as shown): the broker records the approval
+ *  in the sender's ledger as you, then commits. Outside a share leave it out. */
+export async function paActionsCommit(draftId: string, seen?: PaDraftSeen): Promise<void> {
+	return invoke('pa_actions_commit', seen ? { draftId, seen } : { draftId });
 }
 
 /** Reject a draft. Flips it to rejected + emits `pa-action-rejected`. */

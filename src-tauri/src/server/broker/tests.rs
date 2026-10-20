@@ -2180,3 +2180,6 @@ async fn arm_level_backup_upload_body_read_times_out() {
 
 /// `/ws/events` under T1 (principal isolation through the proxy).
 mod events;
+
+/// WP-5: approving a draft from inside a share (the ledger is the broker's).
+mod share_approve;

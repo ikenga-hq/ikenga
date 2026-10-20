@@ -972,3 +972,23 @@
 		transition: none;
 	}
 }
+
+/* Box plan WP-5: a note on approving inside a share, and a failed approve on the draft. */
+.ob-share-note {
+	padding: var(--space-2) var(--space-4);
+	border-bottom: 1px solid var(--border);
+	background: var(--bg-sunken);
+	font-size: var(--text-caption);
+	color: var(--fg-muted);
+}
+.ob-approval-error-msg {
+	flex: 1;
+	min-width: 0;
+	font-size: var(--text-caption);
+	color: var(--fg);
+	white-space: normal;
+}
+.ob-chip.error {
+	color: var(--danger);
+	border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+}

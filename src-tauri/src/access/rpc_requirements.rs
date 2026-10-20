@@ -271,12 +271,25 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("actions_trust_grant", req!(owner[Settings])),
     ("actions_trust_revoke", req!(owner[Settings])),
     // ── outbound approve gate ──
-    ("pa_actions_list", req!(owner[Sessions])),
+    // Box plan WP-5 (`04-ruby-review-and-send.md`): list / update / commit /
+    // reject reach the Owner's child through a share, so a share Operator can
+    // review the Owner's drafts (on the box: Ruby's, in "Ruby jobs"). The caps
+    // are unchanged, so a non-share caller sees exactly what it did before.
+    // The share rules live in the broker (`server::broker::approvals::gate`),
+    // not here: every one of the four needs the share ROLE to be Operator (a
+    // Reviewer, even one whose project row grants `approve`/`sessions`, gets
+    // nothing), and a commit is a ledger approval written by the broker as the
+    // authenticated viewer before the Owner's child is told to commit. The
+    // child must never be the thing that says a human approved. `pa_action_drafts`
+    // has no project column: an Operator of ANY share of the Owner sees ALL of
+    // the Owner's drafts. `pause` and `retry` stay Owner-only: a share never
+    // produces drafts, and a retry re-queues a send whose approval is spent.
+    ("pa_actions_list", req!(shared[Sessions])),
     ("pa_actions_pause", req!(owner[Approve])),
-    ("pa_actions_update", req!(owner[Approve])),
-    ("pa_actions_commit", req!(owner[Approve])),
+    ("pa_actions_update", req!(shared[Approve])),
+    ("pa_actions_commit", req!(shared[Approve])),
     ("pa_actions_retry", req!(owner[Approve])),
-    ("pa_actions_reject", req!(owner[Approve])),
+    ("pa_actions_reject", req!(shared[Approve])),
     // ── pkg diagnostics ──
     ("pkg_permission_violations_list", req!(owner[Settings])),
     ("pkg_permission_violations_clear", req!(owner[Settings])),
@@ -442,8 +455,8 @@ mod tests {
         assert_eq!(r.caps, CapSet::ALL);
     }
 
-    /// P-3 spot checks: raw DB, PTY, secrets and the approve gate are never
-    /// reachable through a share.
+    /// P-3 spot checks: raw DB, PTY, secrets and the approve gate's producer
+    /// and retry arms are never reachable through a share.
     #[test]
     fn p3_owner_class_families() {
         for cmd in [
@@ -453,7 +466,8 @@ mod tests {
             "pty_write",
             "secrets_get",
             "supabase_config_get",
-            "pa_actions_commit",
+            "pa_actions_pause",
+            "pa_actions_retry",
             "settings_get_all",
         ] {
             assert_eq!(requirement(cmd).class, ArmClass::Owner, "{cmd}");
@@ -462,6 +476,63 @@ mod tests {
             requirement("fs_write").caps.contains(super::Dispatch),
             "P-2"
         );
+    }
+
+    /// WP-5: the review arms are share-reachable with their unchanged caps;
+    /// the broker's Operator-role gate and ledger approval sit in front of them
+    /// (`server::broker::approvals`, Linux-only, so not named here). A change
+    /// here without that gate would hand a Reviewer the Owner's drafts.
+    #[test]
+    fn the_review_arms_are_shared_with_unchanged_caps() {
+        assert_eq!(requirement("pa_actions_list"), Requirement::shared(&[Sessions]));
+        for cmd in ["pa_actions_update", "pa_actions_commit", "pa_actions_reject"] {
+            assert_eq!(requirement(cmd), Requirement::shared(&[Approve]), "{cmd}");
+        }
+        assert_eq!(requirement("pa_actions_pause").class, ArmClass::Owner);
+        assert_eq!(requirement("pa_actions_retry").class, ArmClass::Owner);
+    }
+
+    /// WP-5, at the child: with a share's caps an Operator row reaches the four
+    /// review arms and is refused the producer / retry arms by CLASS; a
+    /// Reviewer's row (files, sessions) reaches only `list` at the cap level, so
+    /// the broker's role gate is what keeps a Reviewer out of it.
+    #[test]
+    fn a_share_member_reaches_the_review_arms_by_caps_and_never_the_owner_only_ones() {
+        use crate::access::caps::{Role, Tier};
+        use crate::access::ctx::{AccessCtx, RequestMeta, ShareCtx, Via};
+        let ctx = |role: Role| AccessCtx {
+            principal_id: crate::executor::PrincipalId::new_v7(),
+            via: Via::Relayed,
+            device_id: None,
+            tier: Tier::Full,
+            share: Some(ShareCtx {
+                project_key: "o/p".into(),
+                project_id: "p".into(),
+                member_principal_id: None,
+                member_device_id: None,
+                role: Some(role),
+                artifact_path: None,
+                owner_approval: false,
+            }),
+            share_headers: true,
+            caps: role.default_caps(),
+            admin_strength: false,
+            is_admin: false,
+            meta: RequestMeta::default(),
+        };
+        let op = ctx(Role::Operator);
+        for cmd in ["pa_actions_list", "pa_actions_update", "pa_actions_commit", "pa_actions_reject"] {
+            assert!(crate::access::authorize(&op, cmd).is_ok(), "{cmd}");
+        }
+        for cmd in ["pa_actions_pause", "pa_actions_retry"] {
+            assert_eq!(crate::access::authorize(&op, cmd).unwrap_err().message, "class=owner", "{cmd}");
+        }
+        let rev = ctx(Role::Reviewer);
+        assert!(crate::access::authorize(&rev, "pa_actions_list").is_ok());
+        for cmd in ["pa_actions_update", "pa_actions_commit", "pa_actions_reject"] {
+            assert_eq!(crate::access::authorize(&rev, cmd).unwrap_err().message, "missing=approve", "{cmd}");
+        }
+        assert!(crate::access::authorize(&ctx(Role::Guest), "pa_actions_list").is_err());
     }
 
     /// The Ngwa snapshot carries the principal's transcript usage, so it is
