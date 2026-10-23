@@ -321,6 +321,11 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 	);
 	const startApprove = useCallback(
 		(d: PausedDraft) => {
+			const spent = approveBlockReason(d, !!onRetry);
+			if (spent) {
+				setLocalErrors((prev) => ({ ...prev, [d.id]: spent }));
+				return;
+			}
 			const block = shareMode ? shareBlock(d) : null;
 			if (block) {
 				setLocalErrors((prev) => ({ ...prev, [d.id]: block }));
@@ -337,7 +342,7 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 				seen: (d as PausedDraftView).seen,
 			});
 		},
-		[shareMode, shareBlock]
+		[shareMode, shareBlock, onRetry]
 	);
 
 	const cancelUndo = useCallback(() => setUndo(null), []);
@@ -388,12 +393,14 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 		if (shareMode) return;
 		const sent = new Set<string>();
 		checked.forEach((id) => {
+			const d = drafts.find((x) => x.id === id);
+			if (d && approveBlockReason(d, !!onRetry)) return; // already approved / failed: nothing to approve
 			sent.add(id);
 			onApprove(id);
 		});
 		setResolved((prev) => new Set([...prev, ...sent]));
 		setChecked(new Set());
-	}, [checked, onApprove, shareMode]);
+	}, [checked, onApprove, shareMode, drafts, onRetry]);
 	const rejectAllChecked = useCallback(() => {
 		checked.forEach((id) => {
 			onReject(id);
@@ -895,7 +902,8 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 									className="btn ob-actions-primary"
 									aria-keyshortcuts="Meta+Enter"
 									aria-label={consequence?.aria}
-									title={consequence?.title}
+									title={approveBlockReason(selected, !!onRetry) ?? consequence?.title}
+									disabled={approveBlockReason(selected, !!onRetry) !== null}
 									onClick={() => startApprove(selected)}
 								>
 									<IcoCheck />
@@ -1027,6 +1035,27 @@ const HEALTH_STATE_LABEL: Record<WorkerHealth['state'], string> = {
  *  worker with an empty pipeline is unobservable, not newsworthy. */
 function shouldShowHealthStrip(h: WorkerHealth): boolean {
 	return (h.state !== 'alive' && h.state !== 'idle') || h.sending + h.queued + h.failed > 0;
+}
+
+/** Why a draft cannot be approved from where it stands, or null. A draft already approved,
+ *  sending, sent or failed has used its approval: pressing Approve again can only be refused,
+ *  and on a parked failure it reads as a button that "didn't work". */
+export function approveBlockReason(d: PausedDraft, canRetry: boolean): string | null {
+	const db = (d as PausedDraftView).delivery?.dbStatus ?? (d.status === 'failed' ? 'failed' : '');
+	switch (db) {
+		case 'failed':
+			return canRetry
+				? 'This draft failed to send. Use Retry to send it again.'
+				: 'This draft failed to send and cannot be approved again. Ask for a new draft.';
+		case 'committed':
+			return 'Already approved: waiting for the send worker.';
+		case 'sending':
+			return 'Already approved: sending now.';
+		case 'sent':
+			return 'Already sent.';
+		default:
+			return null;
+	}
 }
 
 function isSendPipelineStatus(dbStatus: string): boolean {

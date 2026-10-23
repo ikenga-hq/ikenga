@@ -307,3 +307,77 @@ describe('ApproveGatePanel in a share: every field the hash covers is shown', ()
 		expect(screen.getAllByText(/2 recipients/).length).toBeGreaterThan(0);
 	});
 });
+
+describe('ApproveGatePanel: a draft that cannot be approved again', () => {
+	const failed = (extra: Partial<PausedDraftView> = {}): PausedDraftView[] => [
+		{
+			...DRAFTS[0],
+			status: 'failed',
+			delivery: {
+				dbStatus: 'failed',
+				claimedAt: null,
+				committedAt: null,
+				sentAt: null,
+				lastAttemptAt: null,
+				externalId: null,
+				deliveryStatus: null,
+				deliveryCheckedAt: null,
+				attempts: 1,
+				scheduledAt: null,
+			},
+			...extra,
+		},
+	];
+
+	it('disables Approve & Send on a failed draft and says why (no Retry in a share)', () => {
+		const onApprove = vi.fn();
+		render(
+			<ApproveGatePanel drafts={failed()} onApprove={onApprove} onReject={vi.fn()} shareNote="n" />
+		);
+		const btn = screen.getByRole('button', { name: /Approve & Send/ }) as HTMLButtonElement;
+		expect(btn.disabled).toBe(true);
+		expect(btn.title).toMatch(/cannot be approved again/);
+		fireEvent.click(btn);
+		expect(onApprove).not.toHaveBeenCalled();
+	});
+
+	it('points to Retry instead when the host offers it', () => {
+		render(
+			<ApproveGatePanel
+				drafts={failed()}
+				onApprove={vi.fn()}
+				onReject={vi.fn()}
+				onRetry={vi.fn()}
+			/>
+		);
+		const btn = screen.getByRole('button', { name: /Approve & Send/ }) as HTMLButtonElement;
+		expect(btn.disabled).toBe(true);
+		expect(btn.title).toMatch(/Use Retry/);
+	});
+
+	it('an already approved or sending draft is not approvable again either', () => {
+		for (const [dbStatus, re] of [
+			['committed', /waiting for the send worker/],
+			['sending', /sending now/],
+		] as const) {
+			const drafts = failed({ status: 'awaiting' });
+			drafts[0].delivery = { ...drafts[0].delivery!, dbStatus };
+			const { unmount } = render(
+				<ApproveGatePanel drafts={drafts} onApprove={vi.fn()} onReject={vi.fn()} shareNote="n" />
+			);
+			expect(
+				(screen.getByRole('button', { name: /Approve & Send/ }) as HTMLButtonElement).title
+			).toMatch(re);
+			unmount();
+		}
+	});
+
+	it('an awaiting draft is still approvable', () => {
+		render(
+			<ApproveGatePanel drafts={DRAFTS} onApprove={vi.fn()} onReject={vi.fn()} shareNote="n" />
+		);
+		expect(
+			(screen.getByRole('button', { name: /Approve & Send/ }) as HTMLButtonElement).disabled
+		).toBe(false);
+	});
+});
