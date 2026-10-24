@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ptySpawn, ptyTerminalList, settingsGet, type TerminalDescriptor } from '@/lib/tauri-cmd';
+import { __resetShareModeForTests, setShareMode } from '@/lib/transport';
 import { openTabPty, stripSecretEnv, useTerminalStore } from './session-store';
 
 // The store loads the SQL shim lazily on persist; mocking it
@@ -456,6 +457,38 @@ describe('rehydrate: a failed read is not "no saved terminals"', () => {
 		expect(err?.message).toContain('settings store locked');
 		expect(useTerminalStore.getState().tabs.find((t) => t.id === id)?.status).toBe('spawning');
 		expect(ptySpawn).not.toHaveBeenCalled();
+	});
+
+	it("in a share the Owner's resume setting is not read and no notice is raised", async () => {
+		const id = useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+		useTerminalStore.getState().setStatus(id, 'running');
+		await useTerminalStore.getState().persistToDb();
+		useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false });
+
+		setShareMode({
+			projectKey: '0190a1b2-c3d4-7e5f-8a6b-1c2d3e4f5a6b/ruby-jobs',
+			projectId: 'ruby-jobs',
+			projectName: 'Ruby jobs',
+			ownerUsername: 'ruby',
+			role: 'operator',
+			scope: 'project',
+		});
+		try {
+			// What the broker answers for an Owner's personal setting inside a share.
+			vi.mocked(settingsGet).mockClear();
+			vi.mocked(settingsGet).mockRejectedValue(new Error('forbidden'));
+			vi.mocked(ptySpawn).mockClear();
+			await useTerminalStore.getState().rehydrateFromDb();
+
+			expect(settingsGet).not.toHaveBeenCalled();
+			expect(useTerminalStore.getState().restoreError).toBeNull();
+			expect(ptySpawn).not.toHaveBeenCalled();
+		} finally {
+			vi.mocked(settingsGet).mockReset();
+			vi.mocked(settingsGet).mockResolvedValue(null);
+			setShareMode(null);
+			__resetShareModeForTests();
+		}
 	});
 
 	it('an empty store is a clean empty restore with no error', async () => {

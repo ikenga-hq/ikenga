@@ -22,6 +22,14 @@
 //!   *role* decides, as the plan says: Onyedikachi (Reviewer) approves only
 //!   through Mattermost. A Reviewer or Guest gets nothing, not even the list
 //!   (it is customer mail); that is the safer of "read-only list" and "nothing".
+//! * `pa_actions_list` is forwarded, then the reply is decorated
+//!   ([`annotate_list`]): each `awaiting`/`edited` row the sender's ledger
+//!   already approves (contract r3 `approval_status`, a read-only exchange)
+//!   gains `ledgerApproval: {approver, at}`, so the Outbox can say "Approved by
+//!   @x, sending" in the gap before the sender flips the status. Display only:
+//!   a socket error leaves the rows unannotated, a `ledgerApproval` the child
+//!   put on a row itself is stripped, and nothing here approves, sends or
+//!   changes what `commit` requires.
 //! * `pa_actions_commit` is the approval. In order: (1) the viewer is an
 //!   Operator and is not the share's owner; (2) ask the sender socket for the
 //!   draft (`get_draft`: canonical hash, status, the text it would send);
@@ -71,6 +79,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Map, Value};
@@ -647,6 +656,9 @@ pub enum Gated {
     /// The ledger approval for this draft is recorded: answer the client,
     /// forward nothing (the sender sends it from the ledger).
     Approved { draft_id: String },
+    /// Forward the list, then mark the rows the ledger has already approved
+    /// ([`annotate_list`]). Display only: the annotation gates nothing.
+    AnnotateList,
 }
 
 /// Share-mode checks and the ledger approval for the gated `pa_actions_*`
@@ -685,6 +697,7 @@ pub async fn gate(
 
     match cmd {
         "pa_actions_commit" => approve_commit(cfg, ctx, args).await,
+        "pa_actions_list" => Ok(Gated::AnnotateList),
         _ => Ok(Gated::Unchanged),
     }
 }
@@ -791,6 +804,207 @@ async fn approve_commit(
     );
     // Nothing is forwarded: the sender sends the draft on this approval.
     Ok(Gated::Approved { draft_id })
+}
+
+// ─── Showing ledger approvals in the list (contract r3, display only) ──────
+
+/// Most ids one `approval_status` request may carry (contract r3).
+const STATUS_BATCH: usize = 200;
+/// The list is polled; a slow sender must not slow it by more than this.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+/// A list reply larger than this is not annotated (answered 502, like any
+/// proxy failure). Far past any honest outbox.
+const MAX_LIST_BODY: usize = 32 * 1024 * 1024;
+/// The key the UI reads. Set only by [`annotate_list`].
+const ANNOTATION_KEY: &str = "ledgerApproval";
+
+/// One approval the sender's ledger holds for a draft's current hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerApproval {
+    pub principal_id: String,
+    pub username: String,
+    pub at: String,
+}
+
+/// `approval_status` (contract r3): which of `ids` (at most [`STATUS_BATCH`])
+/// have an unconsumed approval for their current hash. Read-only. Ids the
+/// request did not name, malformed entries and consumed ones are dropped.
+pub async fn approval_status(
+    cfg: &ApprovalsConfig,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, LedgerApproval>, SenderError> {
+    let v = exchange(
+        cfg,
+        &json!({ "v": CONTRACT_VERSION, "action": "approval_status", "draftIds": ids }),
+    )
+    .await?;
+    let Some(map) = v.get("approvals").and_then(Value::as_object) else {
+        return Err(SenderError::Malformed("reply has no `approvals`".into()));
+    };
+    let mut out = std::collections::HashMap::new();
+    for (id, a) in map {
+        if !ids.iter().any(|i| i == id) {
+            continue;
+        }
+        if a.get("consumed").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let text = |p: &str| {
+            a.pointer(p)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let (Some(principal_id), Some(username), Some(at)) = (
+            text("/approver/principalId"),
+            text("/approver/username"),
+            text("/at"),
+        ) else {
+            continue;
+        };
+        out.insert(
+            id.clone(),
+            LedgerApproval {
+                principal_id,
+                username,
+                at,
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// The rows of a `pa_actions_list` reply (`{ok:true,data:[...]}`), if it is one.
+fn list_rows(reply: &mut Value) -> Option<&mut Vec<Value>> {
+    if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    reply.get_mut("data")?.as_array_mut()
+}
+
+fn is_list_reply(reply: &Value) -> bool {
+    reply.get("ok").and_then(Value::as_bool) == Some(true)
+        && reply.get("data").is_some_and(Value::is_array)
+}
+
+/// Remove every `ledgerApproval` from the rows of any reply whose `data` is an
+/// array, whatever its `ok` says: the client treats any truthy `ok` (`1`,
+/// `"yes"`) as success, so a strict `ok == true` test alone would let a forged
+/// mark through on `{"ok":1,...}`. Returns whether anything was removed.
+fn strip_annotations(reply: &mut Value) -> bool {
+    let Some(rows) = reply.get_mut("data").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut stripped = false;
+    for row in rows.iter_mut() {
+        if let Some(o) = row.as_object_mut() {
+            stripped |= o.remove(ANNOTATION_KEY).is_some();
+        }
+    }
+    stripped
+}
+
+/// Annotate a parsed list reply in place. Every `ledgerApproval` already on a
+/// row has been removed first ([`strip_annotations`]): the rows come from the
+/// owner's child (an agent), which must not be able to put words in a human's
+/// mouth. Then each awaiting/edited row the sender's ledger approves gets
+/// `ledgerApproval: {approver, at}`. A sender that cannot be asked leaves the
+/// rows unannotated.
+async fn annotate_value(cfg: &ApprovalsConfig, reply: &mut Value) {
+    let Some(rows) = list_rows(reply) else {
+        return;
+    };
+    let ids: Vec<String> = rows
+        .iter()
+        .filter(|r| matches!(r["status"].as_str(), Some("awaiting" | "edited")))
+        .filter_map(|r| r["id"].as_str())
+        .filter(|id| !id.is_empty() && id.len() <= MAX_DRAFT_ID)
+        .map(str::to_string)
+        .collect();
+    let mut approved = std::collections::HashMap::new();
+    for chunk in ids.chunks(STATUS_BATCH) {
+        match tokio::time::timeout(STATUS_TIMEOUT, approval_status(cfg, chunk)).await {
+            Ok(Ok(found)) => approved.extend(found),
+            Ok(Err(e)) => {
+                // Display only: the list is still correct without it. Polled
+                // every few seconds, so not a warning.
+                tracing::debug!(
+                    detail = e.detail(),
+                    "approval_status unavailable; list unannotated"
+                );
+                break;
+            }
+            Err(_) => {
+                tracing::debug!("approval_status timed out; list unannotated");
+                break;
+            }
+        }
+    }
+    for row in rows.iter_mut() {
+        let Some(a) = row["id"].as_str().and_then(|id| approved.get(id)) else {
+            continue;
+        };
+        if let Some(o) = row.as_object_mut() {
+            o.insert(
+                ANNOTATION_KEY.into(),
+                json!({
+                    "approver": { "principalId": a.principal_id, "username": a.username },
+                    "at": a.at,
+                }),
+            );
+        }
+    }
+}
+
+/// Add the ledger's approvals to a forwarded `pa_actions_list` response.
+/// A JSON reply that is not a `{ok:true,data:[...]}` list and carries no
+/// `ledgerApproval` passes through byte for byte. A 2xx body that is not JSON
+/// serde can read is answered 502: the client's `JSON.parse` accepts things
+/// serde refuses (a lone `\ud800` escape), so relaying it would relay rows
+/// that were never sanitised. This never changes a request, a status or an
+/// approval; it only decorates what the viewer is shown.
+pub async fn annotate_list(cfg: &ApprovalsConfig, resp: Response) -> Response {
+    if !resp.status().is_success() {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    if parts
+        .headers
+        .contains_key(axum::http::header::CONTENT_ENCODING)
+    {
+        // The rows could not be inspected (and so not sanitised).
+        tracing::warn!("pa_actions_list reply is content-encoded; refusing to relay it");
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    let bytes = match axum::body::to_bytes(body, MAX_LIST_BODY).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("pa_actions_list reply unreadable: {e}");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let mut reply = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("pa_actions_list reply is not JSON; refusing to relay it: {e}");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let stripped = strip_annotations(&mut reply);
+    let list = is_list_reply(&reply);
+    let out = if list || stripped {
+        if list {
+            annotate_value(cfg, &mut reply).await;
+        }
+        match serde_json::to_vec(&reply) {
+            Ok(v) => axum::body::Bytes::from(v),
+            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        }
+    } else {
+        bytes
+    };
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Response::from_parts(parts, axum::body::Body::from(out))
 }
 
 /// For tests and diagnostics.
@@ -1499,10 +1713,13 @@ mod tests {
         let p = parties();
         let s = FakeSender::start(sender_for_vector("awaiting", OK_REPLY)).await;
         let n = narrowing(&p.ada, &p.ruby, Some(Role::Operator));
-        for cmd in ["pa_actions_list", "pa_actions_update", "pa_actions_reject"] {
+        for cmd in ["pa_actions_update", "pa_actions_reject"] {
             let out = gate(&s.cfg(), &pctx(&p.ada), &n, cmd, &json!({"draftId": DRAFT})).await;
             assert_eq!(out.ok(), Some(Gated::Unchanged), "{cmd}");
         }
+        // A list is forwarded and then decorated; the gate itself asks nothing.
+        let out = gate(&s.cfg(), &pctx(&p.ada), &n, "pa_actions_list", &json!({})).await;
+        assert_eq!(out.ok(), Some(Gated::AnnotateList));
         assert!(s.requests().is_empty(), "only a commit touches the ledger");
     }
 
@@ -1764,6 +1981,271 @@ mod tests {
                 .unwrap()
                 .starts_with("approval_unavailable: "),
             "{body}"
+        );
+    }
+
+    // ── ledger approvals shown in the list (contract r3, display only) ──
+
+    /// `{ "<id>": <the sender's approval entry> }`.
+    fn approval_for(id: &str, who: &str) -> Value {
+        json!({ id: {
+            "approver": { "principalId": format!("pid-{who}"), "username": who },
+            "source": "mattermost", "at": "2026-10-24T10:00:00Z", "consumed": false,
+        }})
+    }
+
+    fn row(id: &str, status: &str) -> Value {
+        json!({ "id": id, "status": status, "channel": "email" })
+    }
+
+    fn list_response(rows: Value) -> Response {
+        Json(json!({ "ok": true, "data": rows })).into_response()
+    }
+
+    async fn body_of(r: Response) -> Value {
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// A sender whose `approval_status` answers from `approvals` (an object
+    /// keyed by draft id), whatever ids were asked.
+    fn status_sender(approvals: Value) -> Handler {
+        Arc::new(move |req: &Value| match req["action"].as_str().unwrap() {
+            "approval_status" => json!({ "ok": true, "approvals": approvals }).to_string(),
+            _ => json!({"ok": false, "error": "unknown_action"}).to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_ledger_approved_awaiting_or_edited_row_is_marked_and_the_rest_are_not() {
+        let mut approvals = approval_for("d-1", "ada");
+        approvals["d-2"] = approval_for("d-2", "bola")["d-2"].clone();
+        // The sender is only asked about awaiting/edited rows, but a sender
+        // that answers for another id must not annotate it.
+        approvals["d-3"] = approval_for("d-3", "eve")["d-3"].clone();
+        let s = FakeSender::start(status_sender(approvals)).await;
+        let rows = json!([
+            row("d-1", "awaiting"),
+            row("d-2", "edited"),
+            row("d-3", "committed"),
+            row("d-4", "awaiting"),
+        ]);
+        let out = body_of(annotate_list(&s.cfg(), list_response(rows)).await).await;
+        let data = out["data"].as_array().unwrap();
+        assert_eq!(data[0]["ledgerApproval"]["approver"]["username"], "ada");
+        assert_eq!(
+            data[0]["ledgerApproval"]["approver"]["principalId"],
+            "pid-ada"
+        );
+        assert_eq!(data[0]["ledgerApproval"]["at"], "2026-10-24T10:00:00Z");
+        assert_eq!(data[1]["ledgerApproval"]["approver"]["username"], "bola");
+        assert!(
+            data[2].get("ledgerApproval").is_none(),
+            "committed is not asked"
+        );
+        assert!(
+            data[3].get("ledgerApproval").is_none(),
+            "no approval, no mark"
+        );
+        // The row is otherwise as the child sent it.
+        assert_eq!(data[0]["status"], "awaiting");
+        assert_eq!(data[0]["channel"], "email");
+
+        // One read-only exchange, naming exactly the awaiting/edited ids.
+        let reqs = s.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0]["v"], 1);
+        assert_eq!(reqs[0]["action"], "approval_status");
+        assert_eq!(reqs[0]["draftIds"], json!(["d-1", "d-2", "d-4"]));
+    }
+
+    #[tokio::test]
+    async fn without_awaiting_rows_the_sender_is_not_asked() {
+        let s = FakeSender::start(status_sender(json!({}))).await;
+        let rows = json!([row("d-1", "sent"), row("d-2", "failed")]);
+        let out = body_of(annotate_list(&s.cfg(), list_response(rows.clone())).await).await;
+        assert_eq!(out["data"], rows);
+        assert!(s.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_sender_leaves_the_rows_unannotated_and_the_list_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ApprovalsConfig::at(dir.path().join("absent.sock"));
+        let rows = json!([row("d-1", "awaiting")]);
+        let out = body_of(annotate_list(&cfg, list_response(rows.clone())).await).await;
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["data"], rows);
+    }
+
+    #[tokio::test]
+    async fn a_refusing_malformed_or_silent_sender_changes_nothing() {
+        let rows = json!([row("d-1", "awaiting")]);
+        let replies: [&'static str; 4] = [
+            // an older sender that predates r3
+            r#"{"ok":false,"error":"unknown_action"}"#,
+            r#"{"ok":false,"error":"action_not_allowed_for_peer"}"#,
+            "not json",
+            r#"{"ok":true}"#,
+        ];
+        for reply in replies {
+            let s = FakeSender::start(Arc::new(move |_: &Value| reply.to_string())).await;
+            let out = body_of(annotate_list(&s.cfg(), list_response(rows.clone())).await).await;
+            assert_eq!(out["data"], rows, "{reply}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_socket_served_by_an_agent_uid_annotates_nothing() {
+        let s = FakeSender::start(status_sender(approval_for("d-1", "ada"))).await;
+        let cfg = ApprovalsConfig {
+            agent_uid_min: 0,
+            ..s.cfg()
+        };
+        let rows = json!([row("d-1", "awaiting")]);
+        let out = body_of(annotate_list(&cfg, list_response(rows.clone())).await).await;
+        assert_eq!(out["data"], rows);
+        assert!(s.requests().is_empty(), "nothing is even sent to it");
+    }
+
+    #[tokio::test]
+    async fn a_consumed_or_malformed_or_unrequested_approval_is_not_shown() {
+        let approvals = json!({
+            "d-1": { "approver": {"principalId": "p", "username": "ada"},
+                     "at": "t", "consumed": true },
+            "d-2": { "approver": {"principalId": "p"}, "at": "t" },
+            "d-3": { "approver": {"principalId": "p", "username": "ada"} },
+            "d-4": { "approver": {"principalId": 7, "username": "ada"}, "at": "t" },
+            "elsewhere": { "approver": {"principalId": "p", "username": "ada"}, "at": "t" },
+        });
+        let s = FakeSender::start(status_sender(approvals)).await;
+        let rows = json!([
+            row("d-1", "awaiting"),
+            row("d-2", "awaiting"),
+            row("d-3", "awaiting"),
+            row("d-4", "awaiting"),
+        ]);
+        let out = body_of(annotate_list(&s.cfg(), list_response(rows.clone())).await).await;
+        assert_eq!(out["data"], rows);
+    }
+
+    #[tokio::test]
+    async fn an_annotation_the_owners_child_wrote_is_removed() {
+        // The rows come from the owner's daemon, i.e. from the agent. It does
+        // not get to say "approved by @chinedum".
+        let mut forged = row("d-1", "awaiting");
+        forged["ledgerApproval"] =
+            json!({"approver": {"principalId": "x", "username": "chinedum"}, "at": "t"});
+        let mut forged_sent = row("d-2", "sent");
+        forged_sent["ledgerApproval"] = forged["ledgerApproval"].clone();
+        let rows = json!([forged, forged_sent]);
+
+        // With the sender down...
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ApprovalsConfig::at(dir.path().join("absent.sock"));
+        let out = body_of(annotate_list(&cfg, list_response(rows.clone())).await).await;
+        assert!(out["data"][0].get("ledgerApproval").is_none());
+        assert!(out["data"][1].get("ledgerApproval").is_none());
+
+        // ...and with it up but holding no approval.
+        let s = FakeSender::start(status_sender(json!({}))).await;
+        let out = body_of(annotate_list(&s.cfg(), list_response(rows)).await).await;
+        assert!(out["data"][0].get("ledgerApproval").is_none());
+        assert!(out["data"][1].get("ledgerApproval").is_none());
+    }
+
+    #[tokio::test]
+    async fn more_than_the_cap_is_asked_in_batches_of_at_most_200() {
+        let s = FakeSender::start(status_sender(json!({}))).await;
+        let rows: Vec<Value> = (0..450)
+            .map(|i| row(&format!("d-{i}"), "awaiting"))
+            .collect();
+        let out = body_of(annotate_list(&s.cfg(), list_response(json!(rows))).await).await;
+        assert_eq!(out["data"].as_array().unwrap().len(), 450);
+        let sizes: Vec<usize> = s
+            .requests()
+            .iter()
+            .map(|r| r["draftIds"].as_array().unwrap().len())
+            .collect();
+        assert_eq!(sizes, [200, 200, 50]);
+    }
+
+    #[tokio::test]
+    async fn replies_that_are_not_a_successful_list_pass_through_untouched() {
+        let s = FakeSender::start(status_sender(approval_for("d-1", "ada"))).await;
+        // The child's own error.
+        let err = Json(json!({"ok": false, "error": "boom"})).into_response();
+        assert_eq!(
+            body_of(annotate_list(&s.cfg(), err).await).await,
+            json!({"ok": false, "error": "boom"})
+        );
+        // A non-2xx status.
+        let bad = (StatusCode::BAD_GATEWAY, "nope").into_response();
+        let out = annotate_list(&s.cfg(), bad).await;
+        assert_eq!(out.status(), StatusCode::BAD_GATEWAY);
+        // Data that is not a list.
+        let odd = Json(json!({"ok": true, "data": {"x": 1}})).into_response();
+        assert_eq!(
+            body_of(annotate_list(&s.cfg(), odd).await).await,
+            json!({"ok": true, "data": {"x": 1}})
+        );
+        assert!(s.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_list_reply_serde_cannot_read_is_not_relayed() {
+        let s = FakeSender::start(status_sender(json!({}))).await;
+        // Not JSON at all.
+        let text = "plain".into_response();
+        assert_eq!(
+            annotate_list(&s.cfg(), text).await.status(),
+            StatusCode::BAD_GATEWAY
+        );
+        // A lone surrogate: serde refuses it, the browser's JSON.parse does
+        // not, so relaying the bytes would relay an unsanitised forged mark.
+        let forged = concat!(
+            r#"{"ok":true,"data":[{"id":"d-1","status":"awaiting","note":"\ud800","#,
+            r#""ledgerApproval":{"approver":{"principalId":"x","username":"chinedum"},"at":"t"}}]}"#
+        );
+        let r = Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(forged))
+            .unwrap();
+        assert_eq!(
+            annotate_list(&s.cfg(), r).await.status(),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forged_mark_under_a_truthy_but_not_true_ok_is_removed() {
+        // The client treats any truthy `ok` as success.
+        let s = FakeSender::start(status_sender(json!({}))).await;
+        let mut forged = row("d-1", "awaiting");
+        forged["ledgerApproval"] =
+            json!({"approver": {"principalId": "x", "username": "chinedum"}, "at": "t"});
+        let r = Json(json!({ "ok": 1, "data": [forged] })).into_response();
+        let out = body_of(annotate_list(&s.cfg(), r).await).await;
+        assert_eq!(out["ok"], 1);
+        assert!(out["data"][0].get("ledgerApproval").is_none(), "{out}");
+        assert_eq!(out["data"][0]["id"], "d-1");
+        assert!(s.requests().is_empty(), "only ok:true lists are annotated");
+    }
+
+    #[tokio::test]
+    async fn an_encoded_list_reply_is_not_relayed() {
+        let s = FakeSender::start(status_sender(json!({}))).await;
+        let mut r = list_response(json!([row("d-1", "awaiting")]));
+        r.headers_mut().insert(
+            axum::http::header::CONTENT_ENCODING,
+            axum::http::HeaderValue::from_static("gzip"),
+        );
+        assert_eq!(
+            annotate_list(&s.cfg(), r).await.status(),
+            StatusCode::BAD_GATEWAY
         );
     }
 }

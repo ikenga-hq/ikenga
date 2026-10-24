@@ -20,9 +20,11 @@
 //   info      — ConnectorBanner
 //
 // plans/pwa S1 adds two browser-only banners (both render nothing under
-// Tauri): PwaUpdateBanner ("Reload to update", `update` tier, after the
-// app-binary updater) and InstalledTokenBanner (an installed app on a T0 link
-// token, `info` tier). S4 adds PushOpenBanner (`info`): it consumes a
+// Tauri): PwaUpdateBanner ("Reload to update") and InstalledTokenBanner (an
+// installed app on a T0 link token, `info` tier). PwaUpdateBanner is NOT in
+// this queue: a waiting update lost to any higher-priority notice and could sit
+// unseen behind a `+N more` chip for days, so workspace.tsx mounts it above the
+// title row, always visible until the page reloads. S4 adds PushOpenBanner (`info`): it consumes a
 // notification tap and says when the ask was already answered elsewhere.
 //
 // The banner components are untouched — their own eligibility logic, dismiss
@@ -41,7 +43,6 @@ import { ConnectorBanner } from '@/shell/connector-banner';
 import { PkgAutoUpdater } from '@/shell/pkg-auto-updater';
 import { InstalledTokenBanner } from '@/shell/pwa/install-hint';
 import { PushOpenBanner } from '@/shell/pwa/push-open';
-import { PwaUpdateBanner } from '@/shell/pwa/pwa-update-banner';
 import { TerminalRestoreBanner } from '@/shell/terminal-restore-banner';
 import { TrustReviewBanner } from '@/shell/trust-review-banner';
 // WP-41: moved into src/shell/updater/ (absorbed folder) — see that folder's
@@ -67,7 +68,6 @@ export const BANNER_QUEUE: BannerQueueEntry[] = [
 	{ id: 'updater', tier: 'update', Component: UpdaterBanner },
 	{ id: 'server-update', tier: 'update', Component: ServerUpdateBanner },
 	{ id: 'pkg-auto-updater', tier: 'update', Component: PkgAutoUpdater },
-	{ id: 'pwa-update', tier: 'update', Component: PwaUpdateBanner },
 	{ id: 'connector', tier: 'info', Component: ConnectorBanner },
 	{ id: 'pwa-token-session', tier: 'info', Component: InstalledTokenBanner },
 	{ id: 'push-open', tier: 'info', Component: PushOpenBanner },

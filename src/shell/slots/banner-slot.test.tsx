@@ -56,9 +56,6 @@ vi.mock('@/shell/connector-banner', async () => ({
 vi.mock('@/shell/terminal-restore-banner', async () => ({
 	TerminalRestoreBanner: make(await import('react'), 'terminal-restore'),
 }));
-vi.mock('@/shell/pwa/pwa-update-banner', async () => ({
-	PwaUpdateBanner: make(await import('react'), 'pwa-update'),
-}));
 vi.mock('@/shell/pwa/install-hint', async () => ({
 	InstalledTokenBanner: make(await import('react'), 'pwa-token-session'),
 }));
@@ -96,7 +93,6 @@ describe('<BannerSlot />', () => {
 			'update:updater',
 			'update:server-update',
 			'update:pkg-auto-updater',
-			'update:pwa-update',
 			'info:connector',
 			'info:pwa-token-session',
 			'info:push-open',

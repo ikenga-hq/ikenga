@@ -10,6 +10,7 @@ import { useShellStore } from '@/lib/shell/shell-store';
 import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
 import { CommandPalette, useCommandPalette } from './command-palette';
 import { useCompanionStore } from './companion/companion-store';
+import { PwaUpdateBanner } from './pwa/pwa-update-banner';
 import { BannerSlot } from './slots/banner-slot';
 import { CompanionSlot } from './slots/companion-slot';
 import { IframePoolOverlay, RestOverlays } from './slots/overlay-slot';
@@ -120,6 +121,9 @@ export function Workspace() {
 
 	return (
 		<div className="flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground">
+			{/* A waiting PWA update is not one notice among several: it sits above everything,
+			 * outside the one-at-a-time banner slot, until the page is reloaded. */}
+			<PwaUpdateBanner />
 			<TitleRowSlot />
 			<BannerSlot />
 			{/* WP-41 (D-07 update-flow) — the one sheet + the post-restart toast,

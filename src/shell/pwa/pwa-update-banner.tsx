@@ -4,6 +4,11 @@
 // `src/lib/pwa/register.ts`). The `update` tier of the banner slot, and at the
 // top of the `/remote` client. Never renders under Tauri: the store is only
 // written by `registerServiceWorker`, which refuses there.
+//
+// A waiting update must be hard to miss, so this is mounted by `workspace.tsx`
+// above the title row and OUTSIDE the one-at-a-time banner slot (where it used
+// to lose to every higher-priority notice). It has no dismiss control and goes
+// away only when the page reloads onto the new version.
 
 import { RefreshCw } from 'lucide-react';
 import { Banner } from '@/components/ui/banner';
@@ -17,7 +22,7 @@ export function PwaUpdateBanner() {
 	return (
 		<Banner
 			data-state="pwa-update"
-			tone="info"
+			tone="warning"
 			icon={<RefreshCw />}
 			actions={
 				<Button size="sm" onClick={() => applyUpdate()}>
@@ -25,7 +30,8 @@ export function PwaUpdateBanner() {
 				</Button>
 			}
 		>
-			A new version of Ikenga is ready.
+			<span className="font-medium">A new version of Ikenga is ready.</span> This tab keeps running
+			the old one until you reload.
 		</Banner>
 	);
 }

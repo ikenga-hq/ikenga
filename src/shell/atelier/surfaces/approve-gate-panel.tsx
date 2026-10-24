@@ -35,7 +35,7 @@ import {
 	type WorkerHealth,
 } from '@/lib/queries/pa-actions';
 import { copyText } from '@/lib/clipboard';
-import type { PaDraftSeen } from '@/lib/tauri-cmd';
+import type { PaDraftSeen, PaLedgerApproval } from '@/lib/tauri-cmd';
 import { boundFields } from './share-binding';
 
 // ── Types ─────────────────────────────────────────────────────────────────────────────────────
@@ -690,6 +690,11 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 							</div>
 
 							<div className="ob-detail-body">
+								{selected.ledgerApproval && (
+									<div className="ob-share-note ob-ledger-approved" role="status">
+										{ledgerApprovalText(selected.ledgerApproval)}
+									</div>
+								)}
 								{errorFor(selected.id) && (
 									<div
 										className="ob-failed-callout ob-approval-error"
@@ -1041,7 +1046,8 @@ function shouldShowHealthStrip(h: WorkerHealth): boolean {
  *  sending, sent or failed has used its approval: pressing Approve again can only be refused,
  *  and on a parked failure it reads as a button that "didn't work". */
 export function approveBlockReason(d: PausedDraft, canRetry: boolean): string | null {
-	const db = (d as PausedDraftView).delivery?.dbStatus ?? (d.status === 'failed' ? 'failed' : '');
+	const view = d as PausedDraftView;
+	const db = view.delivery?.dbStatus ?? (d.status === 'failed' ? 'failed' : '');
 	switch (db) {
 		case 'failed':
 			return canRetry
@@ -1054,8 +1060,15 @@ export function approveBlockReason(d: PausedDraft, canRetry: boolean): string | 
 		case 'sent':
 			return 'Already sent.';
 		default:
-			return null;
+			// The sender's ledger holds an approval (a Mattermost thumbs-up, say) that the row's
+			// status has not caught up with yet: the box is about to send it.
+			return view.ledgerApproval ? ledgerApprovalText(view.ledgerApproval) : null;
 	}
+}
+
+/** "Approved by @ada, sending": who the ledger says approved, and that the box has it. */
+export function ledgerApprovalText(a: PaLedgerApproval): string {
+	return `Approved by @${a.approver.username}, sending`;
 }
 
 function isSendPipelineStatus(dbStatus: string): boolean {
@@ -1194,6 +1207,14 @@ function DeliveryChip({
 }) {
 	const d = draft.delivery;
 	const state = deliveryChipState(d, healthState);
+	if (!state && draft.ledgerApproval) {
+		return (
+			<span className="dl-chip sending" title={`Approved ${draft.ledgerApproval.at}`}>
+				<span className="dl-dot" aria-hidden="true" />
+				{ledgerApprovalText(draft.ledgerApproval)}
+			</span>
+		);
+	}
 	if (!state || !d) return null;
 
 	if (state === 'sending') {

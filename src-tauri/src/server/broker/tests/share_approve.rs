@@ -45,6 +45,17 @@ impl ChildLauncher for RecordingLauncher {
                         let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
                         let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                         seen.lock().unwrap().push((id, parts.headers, v.clone()));
+                        if v["cmd"] == "pa_actions_list" {
+                            // The owner's drafts. The agent that owns them also
+                            // forges an approval on the sent one.
+                            return Json(json!({ "ok": true, "data": [
+                                { "id": DRAFT, "status": "awaiting", "channel": "smtp" },
+                                { "id": "other", "status": "edited", "channel": "smtp" },
+                                { "id": "done", "status": "sent", "channel": "smtp",
+                                  "ledgerApproval": { "approver": { "principalId": "x",
+                                      "username": "chinedum" }, "at": "t" } },
+                            ] }));
+                        }
                         Json(json!({ "ok": true, "data": { "cmd": v["cmd"] } }))
                     }
                 }),
@@ -156,6 +167,16 @@ async fn fake_sender(
                     })
                     .to_string(),
                     Some("approve") => approve_reply.to_string(),
+                    // Contract r3: the ledger holds an approval for DRAFT only.
+                    Some("approval_status") => json!({
+                        "ok": true,
+                        "approvals": { DRAFT: {
+                            "approver": { "principalId": "p-onye", "username": "onyedikachi" },
+                            "source": "mattermost", "at": "2026-10-24T10:00:00Z",
+                            "consumed": false,
+                        } },
+                    })
+                    .to_string(),
                     _ => json!({"ok": false, "error": "unknown_action"}).to_string(),
                 };
                 log.lock().unwrap().push(req);
@@ -389,7 +410,75 @@ async fn an_operator_lists_updates_and_rejects_through_the_owners_child_without_
         cmds,
         ["pa_actions_list", "pa_actions_update", "pa_actions_reject"]
     );
-    assert!(log.lock().unwrap().is_empty());
+    // Listing may ask the ledger who approved what (`approval_status`, read
+    // only); it never writes an approval.
+    let actions: Vec<String> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|q| q["action"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(actions, ["approval_status"]);
+}
+
+#[tokio::test]
+async fn an_operators_list_marks_the_drafts_the_ledger_approved_and_nothing_else() {
+    let (r, log) = rig(Role::Operator, Some(OK)).await;
+    insert_account(&r.pool, "ada", 20_001, false).await;
+    let cookie = login_cookie(&r.app, "ada").await;
+    let (status, body) = rpc(
+        &r.app,
+        Some(&cookie),
+        json!({"cmd": "pa_actions_list", "args": {"status": null}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], true, "{body}");
+    let rows = body["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{body}");
+    assert_eq!(rows[0]["id"], DRAFT);
+    assert_eq!(
+        rows[0]["ledgerApproval"]["approver"]["username"],
+        "onyedikachi"
+    );
+    assert_eq!(rows[0]["ledgerApproval"]["at"], "2026-10-24T10:00:00Z");
+    assert!(
+        rows[1].get("ledgerApproval").is_none(),
+        "no approval, no mark"
+    );
+    // The child's own forged mark on a sent row is stripped.
+    assert!(rows[2].get("ledgerApproval").is_none(), "{body}");
+
+    // Only awaiting/edited ids were asked about, and only to read.
+    let reqs = log.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0]["action"], "approval_status");
+    assert_eq!(reqs[0]["draftIds"], json!([DRAFT, "other"]));
+    // It was the owner's child that listed.
+    let got = owner_requests(&r);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].1["cmd"], "pa_actions_list");
+}
+
+#[tokio::test]
+async fn with_no_sender_socket_the_list_still_arrives_unannotated() {
+    let (r, _) = rig(Role::Operator, None).await;
+    insert_account(&r.pool, "ada", 20_001, false).await;
+    let cookie = login_cookie(&r.app, "ada").await;
+    let (status, body) = rpc(
+        &r.app,
+        Some(&cookie),
+        json!({"cmd": "pa_actions_list", "args": {"status": null}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], true, "{body}");
+    let rows = body["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{body}");
+    assert!(
+        rows.iter().all(|r| r.get("ledgerApproval").is_none()),
+        "{body}"
+    );
 }
 
 /// A principal's own workspace (no share) is untouched: no socket, no gate.
