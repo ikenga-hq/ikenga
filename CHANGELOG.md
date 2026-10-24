@@ -1,5 +1,12 @@
 # ikenga-desktop
 
+## 0.27.1
+
+### Patch Changes
+
+- 2bbbe15: The Outbox approvals screen no longer offers Approve & Send on a draft that has already failed, been approved, or been sent (it now says why: "failed to send, use Retry" or "cannot be approved again", "already approved, waiting for the send worker", "sending now"). A network failure while approving shows "Couldn't reach the box (network error)…" with what to do, instead of the browser's raw "Failed to fetch"; an HTTP error from the box is explained the same way.
+- c8bd00d: In a shared project, the Outbox now shows "Approved by @name, sending" on a draft the box's approvals ledger has already approved (a Mattermost thumbs-up, say) instead of leaving it looking unapproved until the send worker catches up. Such a draft has no Approve button and is skipped by Approve all. This is display only: the box only annotates the list, and approving or sending works exactly as before. A waiting app update ("A new version of Ikenga is ready. Reload to update") is now a persistent banner across the top of the app until you reload, instead of one notice in a queue that other notices could hide. A share viewer no longer sees "Couldn't read the 'resume terminals' setting (forbidden)".
+
 ## 0.27.0
 
 ### Minor Changes
