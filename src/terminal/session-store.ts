@@ -10,7 +10,7 @@
  */
 
 import { create } from 'zustand';
-import { listen } from '@/lib/transport';
+import { currentShare, listen } from '@/lib/transport';
 import { ptyTerminalList, settingsGet, type TerminalDescriptor } from '@/lib/tauri-cmd';
 import { RESUME_TERMINALS_KEY } from '@/lib/shell-profiles';
 import type { AgentWrapOpts } from './claude-wrap';
@@ -384,6 +384,11 @@ export function makeTerminalId(): string {
 /** The resume-on-start setting, or `error` when it couldn't be read (the
  *  caller then skips auto-resume, but says why). */
 async function readResumeSetting(): Promise<{ resume: boolean; error: string | null }> {
+	// In a share every RPC goes to the Owner's daemon, so this would be the Owner's personal
+	// setting, which a share never reads (#504): the broker answers "forbidden", and that used to
+	// show every share viewer a "Couldn't read the resume terminals setting" notice. Not asking
+	// means not resuming, with nothing to report.
+	if (currentShare() !== null) return { resume: false, error: null };
 	try {
 		const v = await settingsGet(RESUME_TERMINALS_KEY);
 		if (v == null) return { resume: false, error: null };

@@ -5026,6 +5026,17 @@ export interface PaActionDraftRow {
 	/** null | accepted | delivered | bounced | complained | errored */
 	deliveryStatus: string | null;
 	deliveryCheckedAt: string | null;
+	/** Set only by the box broker, only on an `awaiting`/`edited` row seen through a share: the
+	 *  sender's approvals ledger already holds an approval for this draft's current version, so it
+	 *  is about to be sent. Display only; it never gates anything. */
+	ledgerApproval?: PaLedgerApproval | null;
+}
+
+/** An approval the sender's ledger holds for a draft (a Mattermost thumbs-up or a shell approval). */
+export interface PaLedgerApproval {
+	approver: { principalId: string; username: string };
+	/** ISO time the approval was recorded. */
+	at: string;
 }
 
 /** One draft in a pause batch. `payload` (DraftItem + ApproveGateMeta) is stored

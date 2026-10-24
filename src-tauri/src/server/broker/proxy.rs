@@ -695,9 +695,14 @@ pub async fn rpc_proxy(
     // approval for a commit, written by the broker as the authenticated
     // viewer; an approved commit is answered here and never forwarded
     // (`approvals`).
+    let mut annotate_list = false;
     let bytes = match super::approvals::gate(&state.approvals, &ctx, &narrowing, &cmd, &args).await
     {
         Ok(super::approvals::Gated::Unchanged) => bytes,
+        Ok(super::approvals::Gated::AnnotateList) => {
+            annotate_list = true;
+            bytes
+        }
         Ok(super::approvals::Gated::Approved { draft_id }) => {
             return (
                 StatusCode::OK,
@@ -717,6 +722,23 @@ pub async fn rpc_proxy(
             Ok(routed) => routed,
             Err(res) => return res,
         };
+    if annotate_list {
+        // The rows are read and rewritten here, so ask the child for an
+        // uncompressed body.
+        let mut headers = parts.headers.clone();
+        headers.remove(axum::http::header::ACCEPT_ENCODING);
+        let resp = forward(
+            &state,
+            &narrowing,
+            &ctx,
+            Method::POST,
+            "/api/rpc",
+            &headers,
+            bytes,
+        )
+        .await;
+        return super::approvals::annotate_list(&state.approvals, resp).await;
+    }
     forward(
         &state,
         &narrowing,

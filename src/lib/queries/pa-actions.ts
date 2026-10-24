@@ -6,7 +6,12 @@ import {
 } from '@ikenga/contract';
 import { queryOptions } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/query-keys';
-import { type PaActionDraftRow, type PaDraftSeen, paActionsList } from '@/lib/tauri-cmd';
+import {
+	type PaActionDraftRow,
+	type PaDraftSeen,
+	type PaLedgerApproval,
+	paActionsList,
+} from '@/lib/tauri-cmd';
 
 /** TanStack Query options for the gate's active draft set (or a status filter). */
 export function paActionsListQueryOptions(status?: string) {
@@ -109,6 +114,8 @@ export function pausedDraftFromRow(row: PaActionDraftRow): PausedDraft | null {
 		attempts: row.attempts,
 		scheduledAt: row.scheduledAt,
 	};
+	const ledgerApproval = ledgerApprovalOf(row);
+	if (ledgerApproval) view.ledgerApproval = ledgerApproval;
 	return view;
 }
 
@@ -139,7 +146,22 @@ export interface DraftDelivery {
 
 /** `PausedDraft` plus the worker-written delivery columns. Optional because
  *  fixtures and pre-worker rows omit it (the chip simply doesn't render). */
-export type PausedDraftView = PausedDraft & { delivery?: DraftDelivery; seen?: PaDraftSeen };
+export type PausedDraftView = PausedDraft & {
+	delivery?: DraftDelivery;
+	seen?: PaDraftSeen;
+	/** The sender's ledger already holds an approval for this draft (a share's list only). */
+	ledgerApproval?: PaLedgerApproval;
+};
+
+/** The ledger approval on a listed row, if it is well formed and the row is still waiting for
+ *  one. Anything else (a sent row, a half-filled object) is ignored: this only decorates. */
+export function ledgerApprovalOf(row: PaActionDraftRow): PaLedgerApproval | undefined {
+	if (row.status !== 'awaiting' && row.status !== 'edited') return undefined;
+	const a = row.ledgerApproval;
+	const username = a?.approver?.username;
+	if (typeof username !== 'string' || username === '') return undefined;
+	return a as PaLedgerApproval;
+}
 
 /** The text to show on a draft for a failed approve / reject / edit. Share
  *  refusals arrive as `<code>: <sentence>`; show the sentence. */
