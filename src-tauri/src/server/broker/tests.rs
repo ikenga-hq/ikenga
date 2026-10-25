@@ -2183,3 +2183,6 @@ mod events;
 
 /// WP-5: approving a draft from inside a share (the ledger is the broker's).
 mod share_approve;
+
+/// WP-D: the per-person view of outreach drafts (Ada her rows, Chinedum all).
+mod share_outreach;
