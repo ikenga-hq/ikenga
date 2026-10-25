@@ -5,6 +5,12 @@ import {
 	type PausedDraft,
 } from '@ikenga/contract';
 import { queryOptions } from '@tanstack/react-query';
+import {
+	type OutreachBlock,
+	type OutreachPause,
+	type OutreachRowStatus,
+	outreachOf,
+} from '@/lib/outreach';
 import { queryKeys } from '@/lib/query-keys';
 import {
 	type PaActionDraftRow,
@@ -116,6 +122,18 @@ export function pausedDraftFromRow(row: PaActionDraftRow): PausedDraft | null {
 	};
 	const ledgerApproval = ledgerApprovalOf(row);
 	if (ledgerApproval) view.ledgerApproval = ledgerApproval;
+	// Outreach (WP-D): the hash-bound block says whose row this is and its place in that person's
+	// queue; the box adds the sender's state. The block is read from the payload as listed.
+	const outreach = outreachOf(item);
+	if (outreach) {
+		view.outreach = outreach;
+		// One ranked queue: the Overdue / Today / This week split would cut it into pieces.
+		view.section = OUTREACH_SECTION;
+		const status = outreachStatusOf(row);
+		if (status) view.outreachStatus = status;
+		const pause = outreachPauseOf(row);
+		if (pause) view.outreachPause = pause;
+	}
 	return view;
 }
 
@@ -151,7 +169,31 @@ export type PausedDraftView = PausedDraft & {
 	seen?: PaDraftSeen;
 	/** The sender's ledger already holds an approval for this draft (a share's list only). */
 	ledgerApproval?: PaLedgerApproval;
+	/** Publisher outreach: whose draft this is and its place in that person's queue. */
+	outreach?: OutreachBlock;
+	/** The sender's state for an outreach draft (a share's list only). Display only. */
+	outreachStatus?: OutreachRowStatus;
+	/** Set while the sender's global pause is open (a share's list only). Display only. */
+	outreachPause?: OutreachPause;
 };
+
+/** The panel section every outreach draft is listed in, so its ranking is one queue. */
+export const OUTREACH_SECTION = 'Outreach';
+
+/** The sender's state on a listed outreach row, if well formed. Anything else is ignored: this
+ *  only decorates, and a row with no label is shown unlabelled. */
+export function outreachStatusOf(row: PaActionDraftRow): OutreachRowStatus | undefined {
+	const s = row.outreachStatus;
+	if (!s || typeof s.state !== 'string' || s.state === '') return undefined;
+	return s;
+}
+
+/** The open pause on a listed row. An empty object still means "paused". */
+export function outreachPauseOf(row: PaActionDraftRow): OutreachPause | undefined {
+	const p = row.outreachPause;
+	if (p === null || p === undefined || typeof p !== 'object') return undefined;
+	return p;
+}
 
 /** The ledger approval on a listed row, if it is well formed and the row is still waiting for
  *  one. Anything else (a sent row, a half-filled object) is ignored: this only decorates. */

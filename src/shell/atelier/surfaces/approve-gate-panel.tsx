@@ -29,8 +29,16 @@ import { CHANNEL_LABEL, type DraftChannel, type PausedDraft } from '@ikenga/cont
 import { focusMarkerProps } from '@/lib/keymap/context-keys';
 import { useCommands } from '@/lib/keymap/dispatcher';
 import {
+	type OutreachRowStatus,
+	orderOutreach,
+	outreachHoldNote,
+	outreachPauseText,
+	outreachStateLabel,
+} from '@/lib/outreach';
+import {
 	type DeliveryChipState,
 	deliveryChipState,
+	OUTREACH_SECTION,
 	type PausedDraftView,
 	type WorkerHealth,
 } from '@/lib/queries/pa-actions';
@@ -232,6 +240,15 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 	// display order = sections (Overdue → Today → This week), flattened.
 	// J/K navigation and the "N of M" counter follow THIS order, not the prop order.
 	const sections = useMemo(() => groupBySection(visible), [visible]);
+	// Outreach (WP-D): the sender's pause, and whether more than one person's queue is on screen.
+	const pauseText = useMemo(
+		() => outreachPauseText(visible.find((d) => d.outreachPause)?.outreachPause),
+		[visible]
+	);
+	const outreachAssignees = useMemo(
+		() => new Set(visible.flatMap((d) => (d.outreach ? [d.outreach.assignee] : []))),
+		[visible]
+	);
 	const flat = useMemo(() => sections.flatMap(([, rows]) => rows), [sections]);
 
 	// derive the current (possibly edited) subject/body for a draft
@@ -394,6 +411,9 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 		const sent = new Set<string>();
 		checked.forEach((id) => {
 			const d = drafts.find((x) => x.id === id);
+			// An outreach email is approved one at a time, by the person it is assigned to,
+			// after reading it: never as part of a batch.
+			if (d?.outreach) return;
 			if (d && approveBlockReason(d, !!onRetry)) return; // already approved / failed: nothing to approve
 			sent.add(id);
 			onApprove(id);
@@ -401,6 +421,15 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 		setResolved((prev) => new Set([...prev, ...sent]));
 		setChecked(new Set());
 	}, [checked, onApprove, shareMode, drafts, onRetry]);
+	// "Approve all" has nothing to approve when every selected row is an outreach email.
+	const bulkApprovable = useMemo(
+		() => [...checked].some((id) => !drafts.find((x) => x.id === id)?.outreach),
+		[checked, drafts]
+	);
+	const bulkHasOutreach = useMemo(
+		() => [...checked].some((id) => drafts.find((x) => x.id === id)?.outreach),
+		[checked, drafts]
+	);
 	const rejectAllChecked = useCallback(() => {
 		checked.forEach((id) => {
 			onReject(id);
@@ -486,6 +515,11 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 					{shareNote}
 				</div>
 			)}
+			{pauseText && (
+				<div className="ob-share-note ob-outreach-paused" role="status">
+					{pauseText}
+				</div>
+			)}
 			{health && shouldShowHealthStrip(health) && <DeliveryHealthStrip health={health} />}
 			<div className="ob-split" ref={splitRef} style={splitStyle}>
 				{/* ── Left: draft queue ─────────────────────────────────────────────── */}
@@ -521,11 +555,15 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 						<div className="ob-bulk">
 							<span className="ob-bulk-count">{checked.size} selected</span>
 							<span className="ob-bulk-spacer" />
+							{bulkHasOutreach && (
+								<span className="ob-bulk-note">Outreach emails are approved one at a time.</span>
+							)}
 							{!shareMode && (
 								<button
 									type="button"
 									className="btn btn-sm ob-actions-primary"
 									onClick={approveAllChecked}
+									disabled={!bulkApprovable}
 								>
 									Approve all
 								</button>
@@ -594,6 +632,13 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 											<div className="ob-row-subject">{draftSubject(d)}</div>
 											<div className="ob-row-preview">{d.bodyPreview}</div>
 											<div className="ob-row-chips">
+												<OutreachChips
+													draft={d}
+													showAssignee={outreachAssignees.size > 1}
+													ledgerChipShown={
+														!deliveryChipState(d.delivery, health?.state) && !!d.ledgerApproval
+													}
+												/>
 												<DeliveryChip
 													draft={d}
 													healthState={health?.state}
@@ -692,7 +737,12 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 							<div className="ob-detail-body">
 								{selected.ledgerApproval && (
 									<div className="ob-share-note ob-ledger-approved" role="status">
-										{ledgerApprovalText(selected.ledgerApproval)}
+										{ledgerApprovalText(selected.ledgerApproval, selected.outreachStatus)}
+									</div>
+								)}
+								{!selected.ledgerApproval && outreachStateLabel(selected.outreachStatus) && (
+									<div className="ob-share-note ob-outreach-state" role="status">
+										This email is {outreachHoldNote(selected.outreachStatus)}.
 									</div>
 								)}
 								{errorFor(selected.id) && (
@@ -967,19 +1017,25 @@ function useAutoGrowTextarea(value: string, minHeight = 240) {
 	return ref;
 }
 
-function groupBySection(drafts: PausedDraft[]): Array<[string, PausedDraft[]]> {
-	const order = ['Overdue', 'Today', 'This week'];
-	const map = new Map<string, PausedDraft[]>();
+function groupBySection(drafts: PausedDraftView[]): Array<[string, PausedDraftView[]]> {
+	const order = ['Overdue', 'Today', 'This week', OUTREACH_SECTION];
+	const map = new Map<string, PausedDraftView[]>();
 	for (const d of drafts) {
 		const list = map.get(d.section) ?? [];
 		list.push(d);
 		map.set(d.section, list);
 	}
-	return [...map.entries()].sort((a, b) => {
-		const ai = order.indexOf(a[0]);
-		const bi = order.indexOf(b[0]);
-		return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
-	});
+	return (
+		[...map.entries()]
+			.sort((a, b) => {
+				const ai = order.indexOf(a[0]);
+				const bi = order.indexOf(b[0]);
+				return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+			})
+			// Outreach emails go out in send_rank order: within a section, by assignee and then rank
+			// (a viewer who sees one person's queue sees it in rank order). Other drafts keep their places.
+			.map(([name, rows]) => [name, orderOutreach(rows)])
+	);
 }
 
 function initials(name: string): string {
@@ -1062,13 +1118,17 @@ export function approveBlockReason(d: PausedDraft, canRetry: boolean): string | 
 		default:
 			// The sender's ledger holds an approval (a Mattermost thumbs-up, say) that the row's
 			// status has not caught up with yet: the box is about to send it.
-			return view.ledgerApproval ? ledgerApprovalText(view.ledgerApproval) : null;
+			return view.ledgerApproval
+				? ledgerApprovalText(view.ledgerApproval, view.outreachStatus)
+				: null;
 	}
 }
 
-/** "Approved by @ada, sending": who the ledger says approved, and that the box has it. */
-export function ledgerApprovalText(a: PaLedgerApproval): string {
-	return `Approved by @${a.approver.username}, sending`;
+/** "Approved by @ada, sending": who the ledger says approved, and that the box has it. For an
+ *  outreach email the sender may be holding an approved row (over the day's cap, paused, on the
+ *  do-not-contact list): then the note says that instead of "sending", which would not be true. */
+export function ledgerApprovalText(a: PaLedgerApproval, status?: OutreachRowStatus): string {
+	return `Approved by @${a.approver.username}, ${outreachHoldNote(status) ?? 'sending'}`;
 }
 
 function isSendPipelineStatus(dbStatus: string): boolean {
@@ -1189,6 +1249,43 @@ function deliveryChipLabel(state: DeliveryChipState, d: { committedAt: string | 
 	}
 }
 
+/** Outreach (WP-D): the row's place in its person's queue, whose queue it is when more than one
+ *  is on screen, and the sender's state when no approval chip already says it. Labels are what
+ *  the box reported and gate nothing; a row with none shows none. */
+function OutreachChips({
+	draft,
+	showAssignee,
+	ledgerChipShown,
+}: {
+	draft: PausedDraftView;
+	showAssignee: boolean;
+	ledgerChipShown: boolean;
+}) {
+	const o = draft.outreach;
+	if (!o) return null;
+	const label = outreachStateLabel(draft.outreachStatus);
+	return (
+		<>
+			{typeof o.send_rank === 'number' && (
+				<span
+					className="ob-chip outreach-rank"
+					title={`Place ${o.send_rank} in @${o.assignee}'s send order`}
+				>
+					#{o.send_rank}
+				</span>
+			)}
+			{showAssignee && (
+				<span className="ob-chip outreach-assignee" title="Whose email this is">
+					@{o.assignee}
+				</span>
+			)}
+			{label && !ledgerChipShown && (
+				<span className={`dl-chip held state-${draft.outreachStatus?.state}`}>{label}</span>
+			)}
+		</>
+	);
+}
+
 /** Leading delivery chip on a queue row. Failed rows render an interactive
  *  `error_text` popover (Copy error + Retry reuse the existing wiring); every
  *  other state is a static status chip. */
@@ -1211,7 +1308,7 @@ function DeliveryChip({
 		return (
 			<span className="dl-chip sending" title={`Approved ${draft.ledgerApproval.at}`}>
 				<span className="dl-dot" aria-hidden="true" />
-				{ledgerApprovalText(draft.ledgerApproval)}
+				{ledgerApprovalText(draft.ledgerApproval, draft.outreachStatus)}
 			</span>
 		);
 	}

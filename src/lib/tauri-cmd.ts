@@ -5030,6 +5030,26 @@ export interface PaActionDraftRow {
 	 *  sender's approvals ledger already holds an approval for this draft's current version, so it
 	 *  is about to be sent. Display only; it never gates anything. */
 	ledgerApproval?: PaLedgerApproval | null;
+	/** Set only by the box broker, only on an outreach row (`item.outreach`) seen through a
+	 *  share: the sender's state for it (queued for tomorrow, suppressed, ...). Display only. */
+	outreachStatus?: PaOutreachRowStatus | null;
+	/** Set only by the box broker, on an outreach row, while the sender's global pause (30
+	 *  sends) is open. Display only. */
+	outreachPause?: PaOutreachPause | null;
+}
+
+/** The sender's note on one outreach draft (approvals contract r5 §4.6). */
+export interface PaOutreachRowStatus {
+	state: string;
+	reason?: string;
+	updatedAt?: string;
+}
+
+/** The sender's open global pause (approvals contract r5 §4.6). Every member is optional. */
+export interface PaOutreachPause {
+	at?: string;
+	sentCount?: number;
+	threshold?: number;
 }
 
 /** An approval the sender's ledger holds for a draft (a Mattermost thumbs-up or a shell approval). */
