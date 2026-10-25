@@ -728,18 +728,36 @@ pub async fn gate(
             // not shown every outreach row first proves the row is one they may
             // see: the row is read from the owner's database, not from the
             // request (a `seen` row is the client's word).
+            //
+            // Every check on the request itself (the id, a commit's `seen`, an
+            // update's `patch`) runs BEFORE the row is looked up, in the order
+            // the owner's child runs them. Otherwise a malformed request would
+            // be refused one way for an id the viewer may not see (the lookup
+            // runs first) and another way for an id that does not exist, and the
+            // difference is an oracle for "this draft exists and is not yours".
+            let commit = if cmd == CMD_COMMIT {
+                Some(commit_args(args)?)
+            } else {
+                None
+            };
+            if cmd == CMD_UPDATE && draft_id_of(args).is_some() && args.get("patch").is_none() {
+                return Err(Json(RpcResponse::error(format!(
+                    "{CMD_UPDATE}: {}",
+                    crate::server::shared::pa_actions::PATCH_REQUIRED
+                )))
+                .into_response());
+            }
             if view != OutreachView::All {
                 let Some(draft_id) =
                     draft_id_of(args).filter(|d| !d.is_empty() && d.len() <= MAX_DRAFT_ID)
                 else {
                     return Err(access_error(Code::InvalidRequest, "`draftId` is required"));
                 };
-                require_visible(rows, &view, cmd, &draft_id).await?;
+                require_visible(cfg, rows, &view, cmd, &draft_id).await?;
             }
-            if cmd == "pa_actions_commit" {
-                approve_commit(cfg, ctx, args, &view).await
-            } else {
-                Ok(Gated::Unchanged)
+            match commit {
+                Some((draft_id, seen)) => approve_commit(cfg, ctx, &draft_id, seen, &view).await,
+                None => Ok(Gated::Unchanged),
             }
         }
     }
@@ -767,16 +785,12 @@ fn check_role(
     Ok(())
 }
 
-async fn approve_commit(
-    cfg: &ApprovalsConfig,
-    ctx: &PrincipalCtx,
-    args: &Value,
-    view: &OutreachView,
-) -> Result<Gated, Response> {
-    let bad = |m: &str| access_error(Code::InvalidRequest, m);
+/// A commit's draft id and the row the viewer held. Checked before anything is
+/// looked up (see [`gate`]).
+fn commit_args(args: &Value) -> Result<(String, SeenRow), Response> {
     let Some(draft_id) = draft_id_of(args).filter(|d| !d.is_empty() && d.len() <= MAX_DRAFT_ID)
     else {
-        return Err(bad("`draftId` is required"));
+        return Err(access_error(Code::InvalidRequest, "`draftId` is required"));
     };
     // A share approval binds to what the viewer saw. A client that cannot say
     // what that was (an old UI) is refused, not guessed at.
@@ -788,8 +802,17 @@ async fn approve_commit(
             json!({ "reason": "missing_seen" }),
         ));
     };
+    Ok((draft_id, seen))
+}
 
-    let info = match get_draft(cfg, &draft_id).await {
+async fn approve_commit(
+    cfg: &ApprovalsConfig,
+    ctx: &PrincipalCtx,
+    draft_id: &str,
+    seen: SeenRow,
+    view: &OutreachView,
+) -> Result<Gated, Response> {
+    let info = match get_draft(cfg, draft_id).await {
         Ok(i) => i,
         Err(e) => return Err(sender_error(&e)),
     };
@@ -856,7 +879,9 @@ async fn approve_commit(
         "share approval recorded in the sender ledger"
     );
     // Nothing is forwarded: the sender sends the draft on this approval.
-    Ok(Gated::Approved { draft_id })
+    Ok(Gated::Approved {
+        draft_id: draft_id.to_string(),
+    })
 }
 
 // ─── Outreach drafts: who sees and acts on which row ───────────────────────
@@ -1068,6 +1093,7 @@ fn not_found(cmd: &str, draft_id: &str) -> Response {
 }
 
 async fn require_visible(
+    cfg: &ApprovalsConfig,
     rows: &dyn RowSource,
     view: &OutreachView,
     cmd: &str,
@@ -1076,6 +1102,16 @@ async fn require_visible(
     match rows.find(draft_id).await {
         Ok(Some(row)) if !view.permits(&classify(&row)) => {
             tracing::warn!(cmd, draft = %draft_id, "outreach row hidden from this viewer");
+            if cmd == CMD_COMMIT {
+                // A commit for an id that is missing asks the sender about it and
+                // answers what the sender says (`draft_not_found`, or that it is
+                // unreachable). Ask for the hidden one too and answer the same
+                // way, so a sender that is down does not tell the two apart.
+                // The reply is never used: the viewer is told the row is missing.
+                if let Err(e) = get_draft(cfg, draft_id).await {
+                    return Err(sender_error(&e));
+                }
+            }
             Err(not_found(cmd, draft_id))
         }
         Ok(_) => Ok(()),
@@ -2240,7 +2276,8 @@ mod tests {
         let s = FakeSender::start(sender_for_vector("awaiting", OK_REPLY)).await;
         let n = narrowing(&p.ada, &p.ruby, Some(Role::Operator));
         for cmd in ["pa_actions_update", "pa_actions_reject"] {
-            let out = gate(&s.cfg(), &pctx(&p.ada), &n, cmd, &json!({"draftId": DRAFT})).await;
+            let args = json!({"draftId": DRAFT, "patch": {}});
+            let out = gate(&s.cfg(), &pctx(&p.ada), &n, cmd, &args).await;
             assert_eq!(out.ok(), Some(Gated::Unchanged), "{cmd}");
         }
         // A list is forwarded and then decorated; the gate itself asks nothing.
@@ -3016,11 +3053,9 @@ mod tests {
         )
         .await;
         assert!(r.is_err());
-        assert!(
-            s.requests().is_empty(),
-            "the sender is not even asked: {:?}",
-            s.actions()
-        );
+        // The sender is asked to read the id (so a down sender answers as it does
+        // for a missing id) and never to approve it.
+        assert_eq!(s.actions(), ["get_draft"], "{:?}", s.actions());
     }
 
     #[tokio::test]
@@ -3029,7 +3064,7 @@ mod tests {
         let rows = two_outreach_rows();
         for id in [MINE, "ruby-reply:em-1"] {
             for cmd in ["pa_actions_update", "pa_actions_reject"] {
-                let out = gate_with(&rows, &p.ada, cmd, json!({"draftId": id})).await;
+                let out = gate_with(&rows, &p.ada, cmd, json!({"draftId": id, "patch": {}})).await;
                 assert_eq!(out.ok(), Some(Gated::Unchanged), "{cmd} {id}");
             }
         }
@@ -3109,7 +3144,7 @@ mod tests {
             let args = if cmd == "pa_actions_commit" {
                 seen_args(MINE)
             } else {
-                json!({"draftId": MINE})
+                json!({"draftId": MINE, "patch": {}})
             };
             let body = error_of(gate_with(&rows, &p.ada, cmd, args).await).await;
             assert!(

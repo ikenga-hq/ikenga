@@ -127,6 +127,13 @@ impl ChildLauncher for OutreachLauncher {
                                 Json(json!({"ok": true, "data": out}))
                             }
                             "pa_actions_update" | "pa_actions_reject" | "pa_actions_commit" => {
+                                // The real child reads `patch` before it touches the DB.
+                                if cmd == "pa_actions_update" && args.get("patch").is_none() {
+                                    return Json(json!({
+                                        "ok": false,
+                                        "error": format!("{cmd}: {}", core::PATCH_REQUIRED),
+                                    }));
+                                }
                                 let allowed: &[&str] = match cmd.as_str() {
                                     "pa_actions_update" => &["awaiting", "edited"],
                                     "pa_actions_reject" => &ACTIVE,
@@ -459,10 +466,13 @@ async fn ada_cannot_edit_approve_or_reject_a_chinedum_row_and_it_reads_as_a_miss
             .all(|q| q["action"] != "approve"),
         "no approval was written"
     );
-    // The sender was never even asked about Chinedum's rows: a hidden commit stops at the broker.
+    // The sender is asked only to read a hidden id (so a down sender answers the
+    // same as for a missing id), never to approve it.
     for q in r.sender.lock().unwrap().iter() {
         let asked = q["draftId"].as_str().unwrap_or("");
-        assert!(![C_FIRST, C_COMMITTED, C_SENT].contains(&asked), "{q}");
+        if [C_FIRST, C_COMMITTED, C_SENT].contains(&asked) {
+            assert_eq!(q["action"], "get_draft", "{q}");
+        }
     }
     // And the row is exactly as it was.
     let rows = r.db.rows.lock().unwrap().clone();
@@ -664,4 +674,89 @@ async fn a_reviewer_is_shown_nothing_at_all() {
     .await;
     assert_eq!(b["ok"], false, "{b}");
     assert!(b["error"].as_str().unwrap().starts_with("forbidden: "));
+}
+
+/// A hidden id and an id that exists nowhere must answer identically whatever is
+/// wrong with the request, or the difference tells the viewer the row is there.
+async fn same_answer(r: &Rig, cookie: &str, hidden: Value, ghost: Value, hid: &str, tag: &str) {
+    let (s1, got) = rpc(&r.app, Some(cookie), hidden).await;
+    let (s2, want) = rpc(&r.app, Some(cookie), ghost).await;
+    assert_eq!(s1, s2, "{tag}");
+    assert_eq!(
+        got.to_string().replace(hid, "<id>"),
+        want.to_string().replace(GHOST, "<id>"),
+        "{tag}: a hidden row is told apart from a missing one"
+    );
+}
+
+#[tokio::test]
+async fn a_commit_without_a_valid_seen_does_not_tell_a_hidden_row_from_a_missing_one() {
+    let r = rig(Role::Operator, Some(quiet())).await;
+    let ada = as_user(&r, "ada", 20_001).await;
+    for bad in [None, Some(json!({})), Some(json!("x")), Some(json!(7))] {
+        for hid in [C_FIRST, C_COMMITTED, C_SENT, A_FIRST] {
+            let mk = |id: &str| {
+                let mut args = json!({ "draftId": id });
+                if let Some(b) = &bad {
+                    args["seen"] = b.clone();
+                }
+                json!({"cmd": "pa_actions_commit", "args": args})
+            };
+            same_answer(
+                &r,
+                &ada,
+                mk(hid),
+                mk(GHOST),
+                hid,
+                &format!("seen {bad:?} {hid}"),
+            )
+            .await;
+        }
+    }
+    assert!(r.db.mutations.lock().unwrap().is_empty());
+    assert!(r
+        .sender
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|q| q["action"] != "approve"));
+}
+
+#[tokio::test]
+async fn an_update_without_a_patch_does_not_tell_a_hidden_row_from_a_missing_one() {
+    let r = rig(Role::Operator, Some(quiet())).await;
+    let ada = as_user(&r, "ada", 20_001).await;
+    for hid in [C_FIRST, C_COMMITTED, C_SENT, A_FIRST] {
+        let mk = |id: &str| json!({"cmd": "pa_actions_update", "args": {"draftId": id}});
+        same_answer(
+            &r,
+            &ada,
+            mk(hid),
+            mk(GHOST),
+            hid,
+            &format!("no patch {hid}"),
+        )
+        .await;
+    }
+    // A patch that is JSON null is a value, not a missing one: still the refusal for a hidden id.
+    let mk = |id: &str| json!({"cmd": "pa_actions_update", "args": {"draftId": id, "patch": null}});
+    same_answer(&r, &ada, mk(C_FIRST), mk(GHOST), C_FIRST, "null patch").await;
+    assert!(r.db.mutations.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn with_the_sender_down_a_hidden_commit_answers_as_a_missing_id_does() {
+    let r = rig(Role::Operator, None).await;
+    let ada = as_user(&r, "ada", 20_001).await;
+    for hid in [C_FIRST, C_SENT] {
+        same_answer(
+            &r,
+            &ada,
+            commit_of(hid),
+            commit_of(GHOST),
+            hid,
+            &format!("down {hid}"),
+        )
+        .await;
+    }
 }

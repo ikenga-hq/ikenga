@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+	type MaybeOutreach,
 	orderOutreach,
 	outreachHoldNote,
 	outreachOf,
@@ -91,7 +92,7 @@ describe('orderOutreach', () => {
 	});
 
 	it('leaves rows that are not outreach exactly where they were', () => {
-		const rows = [
+		const rows: (MaybeOutreach & { id: string })[] = [
 			{ id: 'plain-1' },
 			{ id: 'o3', ...block('ada', 3) },
 			{ id: 'plain-2' },

@@ -275,6 +275,12 @@ pub async fn list(db: &PaDb, status: Option<&str>) -> Result<Vec<PaActionDraftRo
     Ok(rows.into_iter().map(row_to_draft).collect())
 }
 
+/// What `pa_actions_update` answers (after its `pa_actions_update: ` prefix) when
+/// the request has no `patch`. The child checks this before it reads the DB, and
+/// the box broker answers the same words itself for a draft the viewer may not
+/// see, so a request without a patch cannot tell a hidden row from a missing one.
+pub const PATCH_REQUIRED: &str = "`patch` is required";
+
 /// What `update` answers for a draft that is missing or not editable. Public
 /// because the box broker answers a draft the viewer may not see with exactly
 /// these words (`broker::approvals`), so a hidden row reads as a missing one.
