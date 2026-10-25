@@ -459,6 +459,11 @@ async fn ada_cannot_edit_approve_or_reject_a_chinedum_row_and_it_reads_as_a_miss
             .all(|q| q["action"] != "approve"),
         "no approval was written"
     );
+    // The sender was never even asked about Chinedum's rows: a hidden commit stops at the broker.
+    for q in r.sender.lock().unwrap().iter() {
+        let asked = q["draftId"].as_str().unwrap_or("");
+        assert!(![C_FIRST, C_COMMITTED, C_SENT].contains(&asked), "{q}");
+    }
     // And the row is exactly as it was.
     let rows = r.db.rows.lock().unwrap().clone();
     assert_eq!(
