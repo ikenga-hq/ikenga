@@ -1,5 +1,11 @@
 # ikenga-desktop
 
+## 0.27.2
+
+### Patch Changes
+
+- 3a56072: In a shared project, the Outbox now gives each person their own publisher-outreach queue. The box broker (not the page) filters the owner's drafts by the outreach block each one carries: Ada sees and can edit, approve or reject only her own outreach emails, Chinedum sees all of them, and any other member sees none (the Ruby reply drafts are unchanged). A draft a member may not see cannot be fetched, edited, approved or rejected by id either, and answers like an id that does not exist, including for a request that is malformed (a commit without `seen`, an update without `patch`) or made while the approval service is down. A member who has the share can still reach the owner's session tools, so this separates the Outbox, it does not keep the drafts secret from them. Outreach emails are listed in send order (by their rank, grouped by person in Chinedum's view), carry their rank, and show the sender's state: "queued for tomorrow" for an approved email the day's cap is holding, "suppressed", and a banner "Sending is paused until Chinedum resumes" while sending is paused. These labels are display only and fail soft: if the sender cannot be reached the emails still show, unlabelled. Outreach emails are approved one at a time: Approve all skips them. The set of viewers can be changed with `IKENGA_OUTREACH_VIEWERS` on the box (default `ada=ada,chinedum=*`).
+
 ## 0.27.1
 
 ### Patch Changes
