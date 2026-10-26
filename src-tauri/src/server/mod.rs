@@ -1777,6 +1777,8 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["executor"]["tier"], "t0");
         assert_eq!(json["executor"]["principal_isolation"], false);
+        // The capability handshake a policy-needing client gates on.
+        assert_eq!(json["capabilities"], serde_json::json!(["chi.toolPolicy"]));
     }
 
     // ── WP-19: pkg-kernel read parity over /api/rpc ─────────────────────────

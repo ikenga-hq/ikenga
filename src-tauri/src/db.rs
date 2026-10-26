@@ -682,6 +682,12 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0072_demos_booked",
         include_str!("../migrations/0072_demos_booked.sql"),
     ),
+    // per-run chi tool policy, stored so chi_resume re-applies it (fail closed)
+    (
+        73,
+        "0073_chi_cache_tool_policy",
+        include_str!("../migrations/0073_chi_cache_tool_policy.sql"),
+    ),
 ];
 
 /// Embedded migration set, kept in lockstep with `migrations/*.sql`. Tracked

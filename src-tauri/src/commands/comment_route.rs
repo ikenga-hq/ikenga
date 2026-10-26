@@ -105,6 +105,7 @@ pub async fn comment_route(
                 parent_id: None,
                 resume_session_id: None,
                 persistent: false,
+                tool_policy: None,
             };
             let run = spawn_chi_run(
                 db.inner().clone(),

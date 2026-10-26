@@ -239,6 +239,7 @@ async fn call_engine(app: &AppHandle, call: EngineCall) -> Result<String, String
                 parent_id: None,
                 resume_session_id,
                 persistent,
+                tool_policy: None,
             };
             spawn_chi_run(db, &cache, &runtime, Some(app), opts, SEAT_RUN_OWNER).await?
         }
@@ -1010,7 +1011,7 @@ mod tests {
 
     // ── engine capability (§6.1) ────────────────────────────────────────
 
-    /// Walks `build_engine_command_with`'s match arms in
+    /// Walks `build_engine_command_policy`'s match arms in
     /// `server/shared/chi_exec.rs` (moved from `commands/chi.rs` by WP-P10):
     /// every arm needs a capability row; an arm that refuses to build can't
     /// hold a seat, and every other arm can.
@@ -1018,12 +1019,12 @@ mod tests {
     fn every_chi_engine_arm_has_a_capability_row() {
         let src = include_str!("../server/shared/chi_exec.rs");
         let start = src
-            .find("fn build_engine_command_with(")
-            .expect("build_engine_command_with in chi_exec.rs");
+            .find("fn build_engine_command_policy(")
+            .expect("build_engine_command_policy in chi_exec.rs");
         let body = &src[start..];
         let end = body
             .find("\n}\n")
-            .expect("end of build_engine_command_with");
+            .expect("end of build_engine_command_policy");
         let body = &body[..end];
         let arm = regex::Regex::new(r#"(?m)^\s*"([a-z0-9][a-z0-9-]*)"\s*=>(.*)$"#).unwrap();
         let mut arms: Vec<String> = Vec::new();

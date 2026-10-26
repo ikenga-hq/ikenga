@@ -159,6 +159,7 @@ fn opts(engine_id: &str, prompt: &str, cwd: Option<&str>) -> ChiRunOpts {
         parent_id: None,
         resume_session_id: None,
         persistent: false,
+        tool_policy: None,
     }
 }
 
@@ -261,6 +262,7 @@ async fn chi_cache_round_trip() {
         parent_id: None,
         resume_session_id: None,
         persistent: false,
+        tool_policy: None,
     };
 
     cache_insert(&db, &run_id, &opts, &output_path, "cli")
@@ -795,6 +797,7 @@ async fn spawn_failure_marks_the_run_failed() {
         parent_id: None,
         resume_session_id: None,
         persistent: false,
+        tool_policy: None,
     };
     cache_insert(&db, &run_id, &opts, &cache.run_output_path(&run_id), "cli")
         .await
@@ -845,6 +848,7 @@ async fn terminal_run_statuses_produce_run_notifications() {
         parent_id: None,
         resume_session_id: None,
         persistent: false,
+        tool_policy: None,
     };
     let failed_id = uuid::Uuid::new_v4().to_string();
     let done_id = uuid::Uuid::new_v4().to_string();
@@ -942,6 +946,7 @@ async fn detached_row(
         parent_id: None,
         resume_session_id: None,
         persistent: true,
+        tool_policy: None,
     };
     cache_insert(db, run_id, &opts, &output_path, "cli")
         .await
@@ -1146,6 +1151,7 @@ async fn detached_chi_runner_smoke() {
         parent_id: None,
         resume_session_id: None,
         persistent: true,
+        tool_policy: None,
     };
     let res = spawn_run(&env, &NoInProcessEngines, opts, "cli")
         .await
@@ -2326,4 +2332,480 @@ async fn a_persistent_run_on_broken_wsl_fails_before_chi_runner() {
     assert_eq!(rows[0].error.as_deref(), Some(err.as_str()));
     assert_eq!(rows[0].pid, None, "no chi-runner was spawned");
     assert_eq!(open_wsl_rows(&db).await, ["wsl:network:ubuntu"]);
+}
+
+// ── per-run tool policy (`opts.toolPolicy`) ─────────────────────────────
+
+fn sample_policy() -> ToolPolicy {
+    ToolPolicy::from_value(&serde_json::json!({
+        "tools": ["Read", "Bash"],
+        "allowedTools": ["Read", "Bash(./scripts/submit.sh:*)"],
+        "disallowedTools": ["Bash(curl:*)", "Bash(rm *)"],
+        "mode": "dontAsk",
+        "strictMcp": true,
+        "settingSources": [],
+    }))
+    .unwrap()
+}
+
+/// Everything a policy adds to a Claude Code run, in order, for
+/// [`sample_policy`].
+const SAMPLE_POLICY_FLAGS: &[&str] = &[
+    "--tools",
+    "Read,Bash",
+    "--allowedTools",
+    "Read",
+    "Bash(./scripts/submit.sh:*)",
+    "--disallowedTools",
+    "Bash(curl:*)",
+    "Bash(rm *)",
+    "--strict-mcp-config",
+    "--setting-sources",
+    "",
+    "--disable-slash-commands",
+];
+
+/// A policy run's argv, exactly: the base argv with the policy's mode, then
+/// resume and model as ever, then the policy flags. A run with no policy is
+/// the argv it always was, and `build_engine_command_with` is that run.
+#[tokio::test]
+async fn policy_run_argv_is_exact_and_a_normal_run_is_unchanged() {
+    let r = FakeResolver::native(&["claude"]);
+    let policy = sample_policy();
+
+    let normal = build_engine_command_with(&r, "claude-code", "/tmp", Some("opus"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        args_of(&normal),
+        [
+            "--permission-prompt-tool",
+            "stdio",
+            "--permission-mode",
+            "default",
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            "opus",
+        ]
+    );
+    let none = build_engine_command_policy(
+        &r,
+        "claude-code",
+        "/tmp",
+        Some("opus"),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(args_of(&none), args_of(&normal), "no policy = byte-for-byte");
+
+    // The caller's `mode` does not matter: the policy's is the run's.
+    let run = build_engine_command_policy(
+        &r,
+        "claude-code",
+        "/tmp",
+        Some("opus"),
+        Some("bypassPermissions"),
+        None,
+        Some(&policy),
+    )
+    .await
+    .unwrap();
+    let mut want: Vec<String> = [
+        "--permission-prompt-tool",
+        "stdio",
+        "--permission-mode",
+        "dontAsk",
+        "--print",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--model",
+        "opus",
+    ]
+    .map(String::from)
+    .to_vec();
+    want.extend(SAMPLE_POLICY_FLAGS.iter().map(|s| s.to_string()));
+    assert_eq!(args_of(&run), want);
+
+    // Resume keeps the policy flags, after `--resume`/`--model`.
+    let resumed = build_engine_command_policy(
+        &r,
+        "claude-code",
+        "/tmp",
+        Some("opus"),
+        None,
+        Some("sess-1"),
+        Some(&policy),
+    )
+    .await
+    .unwrap();
+    let args = args_of(&resumed);
+    let i = args.iter().position(|a| a == "--resume").unwrap();
+    assert_eq!(args[i + 1], "sess-1");
+    assert_eq!(&args[args.len() - SAMPLE_POLICY_FLAGS.len()..], SAMPLE_POLICY_FLAGS);
+    // The prompt is never on argv (it rides stdin): nothing after the flags.
+    assert_eq!(args.last().map(String::as_str), Some("--disable-slash-commands"));
+}
+
+#[tokio::test]
+async fn policy_argv_edge_shapes() {
+    let r = FakeResolver::native(&["claude"]);
+    // No tools at all, no rule lists, project settings.
+    let p = ToolPolicy::from_value(&serde_json::json!({
+        "tools": [], "mode": "default", "strictMcp": true, "settingSources": ["project"],
+    }))
+    .unwrap();
+    let cmd = build_engine_command_policy(&r, "claude-code", "/tmp", None, None, None, Some(&p))
+        .await
+        .unwrap();
+    let args = args_of(&cmd);
+    assert_eq!(args[args.iter().position(|a| a == "--permission-mode").unwrap() + 1], "default");
+    let at = args.iter().position(|a| a == "--tools").unwrap();
+    assert_eq!(
+        &args[at..],
+        [
+            "--tools",
+            "",
+            "--strict-mcp-config",
+            "--setting-sources",
+            "project",
+            "--disable-slash-commands"
+        ],
+        "`--tools \"\"` is the empty set; empty rule lists add no flag"
+    );
+
+    // A policy on any other engine is refused, never dropped.
+    for engine in ["codex", "opencode", "pi", "antigravity-cli"] {
+        let err = build_engine_command_policy(
+            &FakeResolver::native(&["codex", "opencode", "pi", "agy"]),
+            engine,
+            "/tmp",
+            None,
+            None,
+            None,
+            Some(&sample_policy()),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(err.contains("only supported for the claude-code engine"), "{engine}: {err}");
+    }
+}
+
+/// Unknown or malformed policy fields are errors, never ignored.
+#[test]
+fn malformed_tool_policy_is_rejected() {
+    use serde_json::json;
+    let ok = || {
+        json!({
+            "tools": ["Read"], "allowedTools": ["Read"], "disallowedTools": [],
+            "mode": "dontAsk", "strictMcp": true, "settingSources": [],
+        })
+    };
+    assert!(ToolPolicy::from_value(&ok()).is_ok());
+    // snake_case spellings are accepted like the rest of chi_run's opts.
+    assert!(ToolPolicy::from_value(&json!({
+        "tools": ["Read"], "allowed_tools": ["Read"], "disallowed_tools": [],
+        "mode": "default", "strict_mcp": true, "setting_sources": ["project"],
+    }))
+    .is_ok());
+
+    let with = |k: &str, v: serde_json::Value| {
+        let mut p = ok();
+        p[k] = v;
+        p
+    };
+    let without = |k: &str| {
+        let mut p = ok();
+        p.as_object_mut().unwrap().remove(k);
+        p
+    };
+    let bad: Vec<(&str, serde_json::Value)> = vec![
+        ("unknown field", with("bypass", json!(true))),
+        ("unknown mode", with("mode", json!("plan"))),
+        ("bypass mode", with("mode", json!("bypassPermissions"))),
+        ("strictMcp false", with("strictMcp", json!(false))),
+        ("strictMcp missing", without("strictMcp")),
+        ("tools missing", without("tools")),
+        ("mode missing", without("mode")),
+        ("tools not a list", with("tools", json!("Read"))),
+        ("tools default set", with("tools", json!(["default"]))),
+        ("tools Default set", with("tools", json!(["Default"]))),
+        ("tools comma", with("tools", json!(["Read,Bash"]))),
+        ("tools empty name", with("tools", json!([""]))),
+        ("tools pattern", with("tools", json!(["Bash(ls)"]))),
+        ("tools number", with("tools", json!([1]))),
+        ("allowed flag-like", with("allowedTools", json!(["--dangerously-skip-permissions"]))),
+        ("allowed newline", with("allowedTools", json!(["Read\nBash"]))),
+        ("allowed padded", with("allowedTools", json!([" Read"]))),
+        ("allowed empty", with("allowedTools", json!([""]))),
+        ("allowed huge", with("allowedTools", json!(["x".repeat(1025)]))),
+        ("disallowed flag-like", with("disallowedTools", json!(["-x"]))),
+        ("settingSources user", with("settingSources", json!(["user"]))),
+        ("settingSources dup", with("settingSources", json!(["project", "project"]))),
+        ("settingSources string", with("settingSources", json!("project"))),
+        ("not an object", json!("dontAsk")),
+        ("array", json!([])),
+    ];
+    for (why, v) in bad {
+        assert!(ToolPolicy::from_value(&v).is_err(), "{why} must be rejected: {v}");
+    }
+
+    // At the `chi_run` argument level: absent is "no policy"; null is an error.
+    assert_eq!(policy_from_args(&json!({ "prompt": "p" })).unwrap(), None);
+    assert!(policy_from_args(&json!({ "toolPolicy": ok() })).unwrap().is_some());
+    assert!(policy_from_args(&json!({ "tool_policy": ok() })).unwrap().is_some());
+    assert!(policy_from_args(&json!({ "toolPolicy": null })).is_err());
+    assert!(policy_from_args(&json!({ "toolPolicy": "x" })).is_err());
+    let mut broken = ok();
+    broken["bypass"] = json!(1);
+    assert!(policy_from_args(&json!({ "toolPolicy": broken })).is_err());
+
+    // The desktop's own `ChiRunOpts` deserialisation is strict the same way.
+    let base = json!({ "engineId": "claude-code", "prompt": "p" });
+    let mut with_policy = base.clone();
+    with_policy["toolPolicy"] = ok();
+    let o: ChiRunOpts = serde_json::from_value(with_policy).unwrap();
+    assert_eq!(o.tool_policy.unwrap().tools, ["Read"]);
+    let mut bad_policy = base;
+    bad_policy["toolPolicy"] = json!({ "tools": [], "mode": "dontAsk", "strictMcp": true, "x": 1 });
+    assert!(serde_json::from_value::<ChiRunOpts>(bad_policy).is_err());
+}
+
+/// The capability a client gates policy runs on.
+#[test]
+fn the_daemon_advertises_the_tool_policy_capability() {
+    assert_eq!(CAPABILITIES, ["chi.toolPolicy"]);
+    assert_eq!(CAPABILITY_TOOL_POLICY, "chi.toolPolicy");
+}
+
+#[cfg(unix)]
+async fn run_with_policy(
+    env: &ChiEnv,
+    cwd: &Path,
+    persistent: bool,
+    policy: Option<ToolPolicy>,
+) -> Result<ChiRunResult, String> {
+    let mut o = opts("claude-code", "hello", Some(cwd.to_string_lossy().as_ref()));
+    o.persistent = persistent;
+    o.tool_policy = policy;
+    spawn_run(env, &NoInProcessEngines, o, "cli").await
+}
+
+/// End to end against the stub claude: the policy is on the real argv, is
+/// stored with the run (mode included), is re-applied on resume, and fails
+/// closed when the stored policy is missing or unreadable.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_policy_run_applies_stores_and_reapplies_its_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let env = stub_engines_env(&root);
+    let cwd = root.join("policy-run");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let argv = || {
+        std::fs::read_to_string(cwd.join("argv"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    let res = run_with_policy(&env, &cwd, false, Some(sample_policy()))
+        .await
+        .unwrap();
+    assert_eq!(res.error, None);
+    let run_id = res.run_id;
+    assert!(wait_for(|| async { row_status(&env.db, &run_id).await == "done" }).await);
+    let args = argv();
+    assert!(args.windows(2).any(|w| w == ["--permission-mode", "dontAsk"]), "{args:?}");
+    assert_eq!(&args[args.len() - SAMPLE_POLICY_FLAGS.len()..], SAMPLE_POLICY_FLAGS);
+    let row = cache_get(&env.db, &run_id).await.unwrap().unwrap();
+    assert_eq!(row.mode.as_deref(), Some("dontAsk"), "the row records the policy's mode");
+    assert_eq!(
+        cache_load_policy(&env.db, &run_id).await.unwrap(),
+        Some(sample_policy())
+    );
+
+    // Resume: same policy, applied again.
+    std::fs::remove_file(cwd.join("argv")).unwrap();
+    resume_run(&env, &NoInProcessEngines, run_id.clone(), "again".into())
+        .await
+        .unwrap();
+    assert!(wait_for(|| async { cwd.join("argv").exists() }).await);
+    assert!(wait_for(|| async { row_status(&env.db, &run_id).await == "done" }).await);
+    let args = argv();
+    assert!(args.windows(2).any(|w| w == ["--resume", "sess-claude"]), "{args:?}");
+    assert!(args.windows(2).any(|w| w == ["--permission-mode", "dontAsk"]), "{args:?}");
+    assert_eq!(&args[args.len() - SAMPLE_POLICY_FLAGS.len()..], SAMPLE_POLICY_FLAGS);
+
+    // Fail closed: a policy run whose stored policy is gone, or no longer a
+    // valid policy, does not resume — and the row is left untouched.
+    let pool = env.db.ensure_pool().await.unwrap();
+    for (why, stored) in [
+        ("missing", None),
+        ("not json", Some("{nope")),
+        ("unknown field", Some(r#"{"tools":[],"mode":"dontAsk","strictMcp":true,"x":1}"#)),
+        ("strictMcp off", Some(r#"{"tools":[],"mode":"dontAsk","strictMcp":false}"#)),
+    ] {
+        sqlx::query("UPDATE chi_cache SET tool_policy = ? WHERE run_id = ?")
+            .bind(stored)
+            .bind(&run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        std::fs::remove_file(cwd.join("argv")).ok();
+        let err = resume_run(&env, &NoInProcessEngines, run_id.clone(), "x".into())
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{why}: resume must fail closed"));
+        assert!(err.contains("refusing to resume"), "{why}: {err}");
+        assert_eq!(row_status(&env.db, &run_id).await, "done", "{why}: row untouched");
+        assert!(!cwd.join("argv").exists(), "{why}: no engine was started");
+    }
+
+    // The bit alone (no policy text) also fails closed; and a plain run
+    // (bit clear, no text) is not a policy run.
+    sqlx::query("UPDATE chi_cache SET tool_policy = NULL, policy_run = 0 WHERE run_id = ?")
+        .bind(&run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(cache_load_policy(&env.db, &run_id).await.unwrap(), None);
+}
+
+/// A policy is validated before anything exists: a bad one (or one for an
+/// engine that cannot apply it) fails the call and leaves no run behind.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unusable_policy_fails_chi_run_without_a_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let env = stub_engines_env(&root);
+    let cwd = root.join("bad-policy");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut lax = sample_policy();
+    lax.strict_mcp = false;
+    let err = run_with_policy(&env, &cwd, false, Some(lax)).await.err().unwrap();
+    assert!(err.contains("strictMcp"), "{err}");
+
+    let mut o = opts("codex", "hello", Some(cwd.to_string_lossy().as_ref()));
+    o.tool_policy = Some(sample_policy());
+    let err = spawn_run(&env, &NoInProcessEngines, o, "cli").await.err().unwrap();
+    assert!(err.contains("only supported for the claude-code engine"), "{err}");
+
+    assert!(cache_list(&env.db, None, 10).await.unwrap().is_empty());
+    assert!(!cwd.join("argv").exists(), "no engine started");
+}
+
+/// `persistent` + policy: the detached chi-runner builds its own argv and
+/// cannot apply a policy, so the run stays in-process and says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_persistent_policy_run_never_goes_to_chi_runner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let env = stub_engines_env(&root);
+    let cwd = root.join("persistent-policy");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let res = run_with_policy(&env, &cwd, true, Some(sample_policy()))
+        .await
+        .unwrap();
+    assert_eq!(res.status, "running");
+    assert_eq!(res.error.as_deref(), Some(POLICY_NOT_DETACHABLE_WARNING));
+    let run_id = res.run_id;
+    assert!(wait_for(|| async { row_status(&env.db, &run_id).await == "done" }).await);
+    let row = cache_get(&env.db, &run_id).await.unwrap().unwrap();
+    assert_eq!(row.pid, None, "ran in-process");
+    let argv = std::fs::read_to_string(cwd.join("argv")).unwrap();
+    assert!(argv.contains("--disable-slash-commands"), "{argv}");
+    let confs = std::fs::read_dir(&env.cache_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".conf.json"))
+        .count();
+    assert_eq!(confs, 0, "no runner conf was written");
+}
+
+/// A policy run without a policy is untouched: no policy flags, a normal
+/// row, and a detached request is not downgraded.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_run_without_a_policy_gets_no_policy_flags() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let env = stub_engines_env(&root);
+    let cwd = root.join("no-policy");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let res = run_with_policy(&env, &cwd, false, None).await.unwrap();
+    let run_id = res.run_id;
+    assert!(wait_for(|| async { row_status(&env.db, &run_id).await == "done" }).await);
+    let argv = std::fs::read_to_string(cwd.join("argv")).unwrap();
+    for flag in ["--tools", "--allowedTools", "--strict-mcp-config", "--setting-sources", "dontAsk"] {
+        assert!(!argv.contains(flag), "{flag} leaked into a normal run: {argv}");
+    }
+    assert_eq!(cache_load_policy(&env.db, &run_id).await.unwrap(), None);
+}
+
+/// A claude that asks for a decision anyway (stdin is closed after the
+/// prompt, so nobody could answer): printed once, written once per process.
+#[cfg(unix)]
+fn asking_claude() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    static STUB: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    STUB.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("ikenga-chi-ask-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("claude");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+cat > /dev/null
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-ask"}'
+printf '%s\n' '{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"touch x"},"tool_use_id":"t1"}}'
+exec sleep 30
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    })
+    .clone()
+}
+
+/// Defence in depth behind `dontAsk`: if the engine asks anyway, a policy run
+/// is failed (and its child killed) instead of parking in `awaiting_auth`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_policy_run_that_is_asked_to_decide_fails_instead_of_parking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let mut env = stub_env(&root);
+    env.resolver = Arc::new(StubResolver(asking_claude()));
+    let cwd = root.join("asked");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let res = run_with_policy(&env, &cwd, false, Some(sample_policy()))
+        .await
+        .unwrap();
+    let run_id = res.run_id;
+    assert!(
+        wait_for(|| async { row_status(&env.db, &run_id).await == "failed" }).await,
+        "status: {}",
+        row_status(&env.db, &run_id).await
+    );
+    let row = cache_get(&env.db, &run_id).await.unwrap().unwrap();
+    assert!(row.error.as_deref().unwrap().contains("never waits"), "{:?}", row.error);
 }
