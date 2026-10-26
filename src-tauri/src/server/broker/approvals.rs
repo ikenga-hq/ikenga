@@ -30,6 +30,16 @@
 //!   a socket error leaves the rows unannotated, a `ledgerApproval` the child
 //!   put on a row itself is stripped, and nothing here approves, sends or
 //!   changes what `commit` requires.
+//! * **Outreach drafts are scoped per person** (box plan `2026-10-25-box-outreach-sender`,
+//!   WP-D). A draft whose payload carries `item.outreach.assignee` belongs to that
+//!   person: in a share, [`OutreachViewers`] maps the authenticated viewer to
+//!   everything (`chinedum`), to their own rows (`ada`) or to nothing (anyone not in
+//!   the table). The list is filtered here ([`annotate_list`]) and `update` /
+//!   `commit` / `reject` by id first look the row up in the owner's child
+//!   ([`RowSource`]) and answer a row the viewer may not see exactly as they answer
+//!   an id that does not exist. This is access control; the sender's own approver
+//!   rule (`approver_not_assignee`) is a second, independent gate. Rows that are not
+//!   outreach behave as they always did.
 //! * `pa_actions_commit` is the approval. In order: (1) the viewer is an
 //!   Operator and is not the share's owner; (2) ask the sender socket for the
 //!   draft (`get_draft`: canonical hash, status, the text it would send);
@@ -90,7 +100,7 @@ use tokio::net::UnixStream;
 use super::proxy::Narrowing;
 use crate::access::t1::BrokerCtx;
 use crate::access::{AccessError, Code, Role, ShareCtx};
-use crate::server::auth::PrincipalCtx;
+use crate::server::auth::{BoxFuture, PrincipalCtx};
 use crate::server::rpc::RpcResponse;
 
 /// Environment variable naming the sender's approvals socket.
@@ -125,6 +135,8 @@ pub struct ApprovalsConfig {
     /// A socket served by a uid at or above this is refused (an agent
     /// account could otherwise plant a socket that answers `ok`).
     pub agent_uid_min: u32,
+    /// Which outreach rows each share viewer may see and act on.
+    pub viewers: OutreachViewers,
 }
 
 impl Default for ApprovalsConfig {
@@ -132,6 +144,7 @@ impl Default for ApprovalsConfig {
         Self {
             socket: PathBuf::from(DEFAULT_SOCKET),
             agent_uid_min: DEFAULT_AGENT_UID_MIN,
+            viewers: OutreachViewers::default(),
         }
     }
 }
@@ -139,7 +152,11 @@ impl Default for ApprovalsConfig {
 impl ApprovalsConfig {
     /// [`SOCKET_ENV`] if set and non-empty, else [`DEFAULT_SOCKET`].
     pub fn from_env() -> Self {
-        Self::from_value(std::env::var_os(SOCKET_ENV))
+        let mut c = Self::from_value(std::env::var_os(SOCKET_ENV));
+        if let Some(v) = std::env::var_os(VIEWERS_ENV) {
+            c.viewers = OutreachViewers::parse(&v.to_string_lossy());
+        }
+        c
     }
 
     fn from_value(v: Option<std::ffi::OsString>) -> Self {
@@ -639,12 +656,15 @@ fn sender_error(e: &SenderError) -> Response {
     rpc_error(e.code(), &e.message(), json!({ "senderCode": e.detail() }))
 }
 
-/// The draft id of an RPC's args (`draftId` or `draft_id`, as the desktop
-/// commands accept both).
+/// The draft id of an RPC's args, read exactly as the owner's child reads it
+/// (`targ`: the first of `draftId` / `draft_id` that is present and not null, and
+/// it must be a string), so the id this gate checks is the id the child acts on.
+/// `None` when there is none or it is not a string.
 fn draft_id_of(args: &Value) -> Option<String> {
     ["draftId", "draft_id"]
         .into_iter()
-        .find_map(|k| args.get(k).and_then(Value::as_str))
+        .find_map(|k| args.get(k).filter(|v| !v.is_null()))
+        .and_then(Value::as_str)
         .map(str::to_string)
 }
 
@@ -656,9 +676,10 @@ pub enum Gated {
     /// The ledger approval for this draft is recorded: answer the client,
     /// forward nothing (the sender sends it from the ledger).
     Approved { draft_id: String },
-    /// Forward the list, then mark the rows the ledger has already approved
-    /// ([`annotate_list`]). Display only: the annotation gates nothing.
-    AnnotateList,
+    /// Forward the list, then drop the rows this viewer may not see and mark the
+    /// rest ([`annotate_list`]). The row filter is access control; the marks
+    /// (ledger approvals, outreach status) are display only and gate nothing.
+    AnnotateList(OutreachView),
 }
 
 /// Share-mode checks and the ledger approval for the gated `pa_actions_*`
@@ -669,6 +690,7 @@ pub async fn gate(
     cfg: &ApprovalsConfig,
     ctx: &PrincipalCtx,
     narrowing: &Narrowing,
+    rows: &dyn RowSource,
     cmd: &str,
     args: &Value,
 ) -> Result<Gated, Response> {
@@ -695,10 +717,49 @@ pub async fn gate(
 
     check_role(share, ctx, owner.map(|o| o.id))?;
 
+    // Which outreach rows this viewer may see. Decided from the authenticated
+    // principal, never from anything in the request.
+    let view = cfg.viewers.view_for(&ctx.principal.username);
+
     match cmd {
-        "pa_actions_commit" => approve_commit(cfg, ctx, args).await,
-        "pa_actions_list" => Ok(Gated::AnnotateList),
-        _ => Ok(Gated::Unchanged),
+        "pa_actions_list" => Ok(Gated::AnnotateList(view)),
+        _ => {
+            // update / commit / reject act on one draft by id. A viewer who is
+            // not shown every outreach row first proves the row is one they may
+            // see: the row is read from the owner's database, not from the
+            // request (a `seen` row is the client's word).
+            //
+            // Every check on the request itself (the id, a commit's `seen`, an
+            // update's `patch`) runs BEFORE the row is looked up, in the order
+            // the owner's child runs them. Otherwise a malformed request would
+            // be refused one way for an id the viewer may not see (the lookup
+            // runs first) and another way for an id that does not exist, and the
+            // difference is an oracle for "this draft exists and is not yours".
+            let commit = if cmd == CMD_COMMIT {
+                Some(commit_args(args)?)
+            } else {
+                None
+            };
+            if cmd == CMD_UPDATE && draft_id_of(args).is_some() && args.get("patch").is_none() {
+                return Err(Json(RpcResponse::error(format!(
+                    "{CMD_UPDATE}: {}",
+                    crate::server::shared::pa_actions::PATCH_REQUIRED
+                )))
+                .into_response());
+            }
+            if view != OutreachView::All {
+                let Some(draft_id) =
+                    draft_id_of(args).filter(|d| !d.is_empty() && d.len() <= MAX_DRAFT_ID)
+                else {
+                    return Err(access_error(Code::InvalidRequest, "`draftId` is required"));
+                };
+                require_visible(cfg, rows, &view, cmd, &draft_id).await?;
+            }
+            match commit {
+                Some((draft_id, seen)) => approve_commit(cfg, ctx, &draft_id, seen, &view).await,
+                None => Ok(Gated::Unchanged),
+            }
+        }
     }
 }
 
@@ -724,15 +785,12 @@ fn check_role(
     Ok(())
 }
 
-async fn approve_commit(
-    cfg: &ApprovalsConfig,
-    ctx: &PrincipalCtx,
-    args: &Value,
-) -> Result<Gated, Response> {
-    let bad = |m: &str| access_error(Code::InvalidRequest, m);
+/// A commit's draft id and the row the viewer held. Checked before anything is
+/// looked up (see [`gate`]).
+fn commit_args(args: &Value) -> Result<(String, SeenRow), Response> {
     let Some(draft_id) = draft_id_of(args).filter(|d| !d.is_empty() && d.len() <= MAX_DRAFT_ID)
     else {
-        return Err(bad("`draftId` is required"));
+        return Err(access_error(Code::InvalidRequest, "`draftId` is required"));
     };
     // A share approval binds to what the viewer saw. A client that cannot say
     // what that was (an old UI) is refused, not guessed at.
@@ -744,8 +802,17 @@ async fn approve_commit(
             json!({ "reason": "missing_seen" }),
         ));
     };
+    Ok((draft_id, seen))
+}
 
-    let info = match get_draft(cfg, &draft_id).await {
+async fn approve_commit(
+    cfg: &ApprovalsConfig,
+    ctx: &PrincipalCtx,
+    draft_id: &str,
+    seen: SeenRow,
+    view: &OutreachView,
+) -> Result<Gated, Response> {
+    let info = match get_draft(cfg, draft_id).await {
         Ok(i) => i,
         Err(e) => return Err(sender_error(&e)),
     };
@@ -783,6 +850,15 @@ async fn approve_commit(
         }
     }
 
+    // The row hashes to the sender's, so `seen` IS the row the sender holds:
+    // its own assignee must be one this viewer may act on (the lookup in
+    // `gate` read the owner's database; this reads the bytes being approved).
+    if !view.permits(&classify(
+        &json!({ "id": draft_id, "payloadJson": seen.payload_json }),
+    )) {
+        return Err(not_found(CMD_COMMIT, &draft_id));
+    }
+
     // The approver is the authenticated viewer, taken from the credential the
     // broker resolved. Nothing in the request body names one.
     if let Err(e) = approve(
@@ -803,7 +879,346 @@ async fn approve_commit(
         "share approval recorded in the sender ledger"
     );
     // Nothing is forwarded: the sender sends the draft on this approval.
-    Ok(Gated::Approved { draft_id })
+    Ok(Gated::Approved {
+        draft_id: draft_id.to_string(),
+    })
+}
+
+// ─── Outreach drafts: who sees and acts on which row ───────────────────────
+//
+// Contract r5 §3.8: an outreach draft's `payload.item.outreach` block is hashed
+// into the approval and names the person it belongs to (`assignee`). The Outbox
+// of a share is that person's queue: Ada works her rows, Chinedum sees them all.
+// The rule lives here, in the broker, because the rows come from the owner's
+// child (an agent) and the browser is the viewer's: a filter in the UI alone
+// would be a convenience, not a control.
+
+/// Environment variable that replaces the viewer table: `viewer=assignee`
+/// pairs, comma separated; `*` as the assignee means every row. Example
+/// (the default): `ada=ada,chinedum=*`. The left side is the viewer's box
+/// **username** (the same name `OUTREACH_APPROVERS_*` lists as `shell:<name>`);
+/// an entry that does not parse is ignored, so a typo narrows access.
+pub const VIEWERS_ENV: &str = "IKENGA_OUTREACH_VIEWERS";
+
+/// What a share viewer may see of the owner's outreach drafts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutreachView {
+    /// Every outreach row (the founder).
+    All,
+    /// Only rows whose `item.outreach.assignee` is exactly this.
+    Assignee(String),
+    /// No outreach row at all (any viewer not in the table).
+    Nothing,
+}
+
+impl OutreachView {
+    /// May a viewer with this view see and act on a row of this kind?
+    /// Non-outreach rows are not this module's business and stay visible.
+    pub fn permits(&self, kind: &RowKind) -> bool {
+        match (self, kind) {
+            (_, RowKind::Plain) => true,
+            (OutreachView::All, RowKind::Outreach { .. }) => true,
+            (OutreachView::Nothing, RowKind::Outreach { .. }) => false,
+            (OutreachView::Assignee(me), RowKind::Outreach { assignee }) => {
+                assignee.as_deref() == Some(me.as_str())
+            }
+        }
+    }
+}
+
+/// The viewer to view mapping. Explicit, small and exact: a username that is
+/// not in the table sees no outreach rows. Names are compared exactly (no case
+/// folding), so a differently spelled account falls to [`OutreachView::Nothing`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutreachViewers {
+    table: Vec<(String, OutreachView)>,
+}
+
+impl Default for OutreachViewers {
+    fn default() -> Self {
+        Self {
+            table: vec![
+                ("ada".to_string(), OutreachView::Assignee("ada".to_string())),
+                ("chinedum".to_string(), OutreachView::All),
+            ],
+        }
+    }
+}
+
+impl OutreachViewers {
+    /// Parse [`VIEWERS_ENV`]'s value. Anything malformed is dropped.
+    pub fn parse(spec: &str) -> Self {
+        let valid = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 256
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'@' | b'-'))
+        };
+        let mut table = Vec::new();
+        for entry in spec.split(',') {
+            let Some((viewer, target)) = entry.split_once('=') else {
+                continue;
+            };
+            let (viewer, target) = (viewer.trim(), target.trim());
+            if !valid(viewer) {
+                continue;
+            }
+            let view = if target == "*" {
+                OutreachView::All
+            } else if valid(target) {
+                OutreachView::Assignee(target.to_string())
+            } else {
+                continue;
+            };
+            table.push((viewer.to_string(), view));
+        }
+        Self { table }
+    }
+
+    /// What `username` (the authenticated principal's) may see.
+    pub fn view_for(&self, username: &str) -> OutreachView {
+        self.table
+            .iter()
+            .find(|(v, _)| v == username)
+            .map(|(_, view)| view.clone())
+            .unwrap_or(OutreachView::Nothing)
+    }
+}
+
+/// Whether a draft row is an outreach draft, and whose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowKind {
+    Plain,
+    /// `assignee` is `None` when the row does not name one (or names two).
+    Outreach {
+        assignee: Option<String>,
+    },
+}
+
+const OUTREACH_ACTION_ID: &str = "ruby/outreach-email";
+
+/// Classify a `pa_actions_list` row (or `{id, payloadJson}` of a seen row).
+///
+/// A row is outreach if ANY signal says so: the id (`outreach:` /
+/// `outreach-fu:`), the batch (`outreach...`), the action (`ruby/outreach-email`),
+/// `payload.source.kind == "outreach_email"`, or an `outreach` member on the
+/// item. Over-detecting is the safe side: the only cost of a false "outreach" is
+/// that a viewer other than Chinedum does not see that row. The assignee is
+/// read from the hashed item (`payload.item.outreach.assignee`; the whole payload
+/// stands in for the item when it has none, as the hash does) and is `None`
+/// unless every place that names one agrees.
+pub fn classify(row: &Value) -> RowKind {
+    let text = |k: &str| row.get(k).and_then(Value::as_str).unwrap_or("");
+    let payload: Option<Value> = row
+        .get("payloadJson")
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str(s).ok());
+
+    let mut outreach = text("id").starts_with("outreach:")
+        || text("id").starts_with("outreach-fu:")
+        || text("batchId").starts_with("outreach")
+        || text("actionId") == OUTREACH_ACTION_ID;
+    let mut assignees: Vec<Option<String>> = Vec::new();
+    if let Some(p) = payload.as_ref().filter(|p| p.is_object()) {
+        if p.pointer("/source/kind").and_then(Value::as_str) == Some("outreach_email") {
+            outreach = true;
+        }
+        let item = p.get("item").filter(|i| js_truthy(i)).unwrap_or(p);
+        for block in [item.get("outreach"), p.get("outreach")]
+            .into_iter()
+            .flatten()
+            .filter(|b| !b.is_null())
+        {
+            outreach = true;
+            assignees.push(
+                block
+                    .get("assignee")
+                    .and_then(Value::as_str)
+                    .filter(|a| !a.is_empty())
+                    .map(str::to_string),
+            );
+        }
+    }
+    if !outreach {
+        return RowKind::Plain;
+    }
+    let assignee = match assignees.as_slice() {
+        [] => None,
+        [first, rest @ ..] if rest.iter().all(|a| a == first) => first.clone(),
+        _ => None,
+    };
+    RowKind::Outreach { assignee }
+}
+
+/// Keep only the rows `view` permits; a row that is not an object is not a row
+/// this viewer is shown. Returns how many were removed.
+fn filter_rows(rows: &mut Vec<Value>, view: &OutreachView) -> usize {
+    let before = rows.len();
+    rows.retain(|r| r.is_object() && view.permits(&classify(r)));
+    before - rows.len()
+}
+
+/// Reads one draft of the owner by id, for the by-id commands. Implemented by the
+/// proxy over the owner's child; faked in tests.
+pub trait RowSource: Send + Sync {
+    /// The row with this id, in any status (`None` when the owner has no such
+    /// draft). `Err` = it could not be read: the caller fails closed.
+    fn find<'a>(&'a self, draft_id: &'a str) -> BoxFuture<'a, Result<Option<Value>, ()>>;
+}
+
+const CMD_UPDATE: &str = "pa_actions_update";
+const CMD_COMMIT: &str = "pa_actions_commit";
+const CMD_REJECT: &str = "pa_actions_reject";
+
+/// The answer for a draft the viewer may not see: byte for byte what the same
+/// command answers for an id that does not exist, so it cannot be used to learn
+/// that the row is there. (The id is the viewer's own, echoed back.)
+fn not_found(cmd: &str, draft_id: &str) -> Response {
+    use crate::server::shared::pa_actions as core;
+    match cmd {
+        CMD_UPDATE => Json(RpcResponse::error(format!(
+            "{CMD_UPDATE}: {}",
+            core::update_refusal(draft_id)
+        )))
+        .into_response(),
+        CMD_REJECT => Json(RpcResponse::error(format!(
+            "{CMD_REJECT}: {}",
+            core::reject_refusal(draft_id)
+        )))
+        .into_response(),
+        // A commit asks the sender about the id first; a missing one is
+        // `draft_not_found`.
+        _ => sender_error(&SenderError::Refused("draft_not_found".to_string())),
+    }
+}
+
+async fn require_visible(
+    cfg: &ApprovalsConfig,
+    rows: &dyn RowSource,
+    view: &OutreachView,
+    cmd: &str,
+    draft_id: &str,
+) -> Result<(), Response> {
+    match rows.find(draft_id).await {
+        Ok(Some(row)) if !view.permits(&classify(&row)) => {
+            tracing::warn!(cmd, draft = %draft_id, "outreach row hidden from this viewer");
+            if cmd == CMD_COMMIT {
+                // A commit for an id that is missing asks the sender about it and
+                // answers what the sender says (`draft_not_found`, or that it is
+                // unreachable). Ask for the hidden one too and answer the same
+                // way, so a sender that is down does not tell the two apart.
+                // The reply is never used: the viewer is told the row is missing.
+                if let Err(e) = get_draft(cfg, draft_id).await {
+                    return Err(sender_error(&e));
+                }
+            }
+            Err(not_found(cmd, draft_id))
+        }
+        Ok(_) => Ok(()),
+        Err(()) => Err(access_error(
+            Code::Internal,
+            "could not check which drafts you may act on; nothing was changed",
+        )),
+    }
+}
+
+// ─── Outreach status labels (contract r5 §4.6, display only) ───────────────
+
+/// The row states the sender reports; anything else is not shown.
+const OUTREACH_STATES: [&str; 5] = [
+    "queued_for_tomorrow",
+    "paused",
+    "suppressed",
+    "blocked",
+    "sent",
+];
+/// Keys the UI reads; set only by [`annotate_list`], removed from every reply first.
+const STATUS_KEY: &str = "outreachStatus";
+const PAUSE_KEY: &str = "outreachPause";
+
+/// The sender's note on one outreach draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutreachNote {
+    pub state: String,
+    pub reason: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// The open global pause (30 sends), if any. Fields are tolerated missing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OutreachPause {
+    pub at: Option<String>,
+    pub sent_count: Option<i64>,
+    pub threshold: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OutreachStatus {
+    pub pause: Option<OutreachPause>,
+    pub rows: std::collections::HashMap<String, OutreachNote>,
+}
+
+/// `outreach_status` (contract r5 §4.6): the sender's pause and per-row notes
+/// for `ids` (at most [`STATUS_BATCH`]). Read-only. The reply's per-sender
+/// counts are not kept: the viewer is shown a row's state, not the other
+/// person's progress.
+pub async fn outreach_status(
+    cfg: &ApprovalsConfig,
+    ids: &[String],
+) -> Result<OutreachStatus, SenderError> {
+    let v = exchange(
+        cfg,
+        &json!({ "v": CONTRACT_VERSION, "action": "outreach_status", "draftIds": ids }),
+    )
+    .await?;
+    let Some(o) = v.get("outreach").and_then(Value::as_object) else {
+        return Err(SenderError::Malformed("reply has no `outreach`".into()));
+    };
+    let short = |s: &str, max: usize, ok: fn(u8) -> bool| {
+        !s.is_empty() && s.len() <= max && s.bytes().all(ok)
+    };
+    let pause = o
+        .get("pause")
+        .filter(|p| !p.is_null())
+        .map(|p| OutreachPause {
+            at: p
+                .get("at")
+                .and_then(Value::as_str)
+                .filter(|s| short(s, 40, |b| b.is_ascii_graphic()))
+                .map(str::to_string),
+            sent_count: p.get("sentCount").and_then(Value::as_i64),
+            threshold: p.get("threshold").and_then(Value::as_i64),
+        });
+    let mut rows = std::collections::HashMap::new();
+    if let Some(map) = o.get("rows").and_then(Value::as_object) {
+        for (id, n) in map {
+            if !ids.iter().any(|i| i == id) {
+                continue;
+            }
+            let Some(state) = n
+                .get("state")
+                .and_then(Value::as_str)
+                .filter(|s| OUTREACH_STATES.contains(s))
+            else {
+                continue;
+            };
+            let word = |k: &str, max: usize| {
+                n.get(k)
+                    .and_then(Value::as_str)
+                    .filter(|s| short(s, max, |b| b.is_ascii_graphic()))
+                    .map(str::to_string)
+            };
+            rows.insert(
+                id.clone(),
+                OutreachNote {
+                    state: state.to_string(),
+                    reason: word("reason", 128),
+                    updated_at: word("updatedAt", 40),
+                },
+            );
+        }
+    }
+    Ok(OutreachStatus { pause, rows })
 }
 
 // ─── Showing ledger approvals in the list (contract r3, display only) ──────
@@ -814,7 +1229,7 @@ const STATUS_BATCH: usize = 200;
 const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
 /// A list reply larger than this is not annotated (answered 502, like any
 /// proxy failure). Far past any honest outbox.
-const MAX_LIST_BODY: usize = 32 * 1024 * 1024;
+pub(super) const MAX_LIST_BODY: usize = 32 * 1024 * 1024;
 /// The key the UI reads. Set only by [`annotate_list`].
 const ANNOTATION_KEY: &str = "ledgerApproval";
 
@@ -887,10 +1302,11 @@ fn is_list_reply(reply: &Value) -> bool {
         && reply.get("data").is_some_and(Value::is_array)
 }
 
-/// Remove every `ledgerApproval` from the rows of any reply whose `data` is an
-/// array, whatever its `ok` says: the client treats any truthy `ok` (`1`,
-/// `"yes"`) as success, so a strict `ok == true` test alone would let a forged
-/// mark through on `{"ok":1,...}`. Returns whether anything was removed.
+/// Remove every marker this module sets (`ledgerApproval`, `outreachStatus`,
+/// `outreachPause`) from the rows of any reply whose `data` is an array,
+/// whatever its `ok` says: the client treats any truthy `ok` (`1`, `"yes"`) as
+/// success, so a strict `ok == true` test alone would let a forged mark through
+/// on `{"ok":1,...}`. Returns whether anything was removed.
 fn strip_annotations(reply: &mut Value) -> bool {
     let Some(rows) = reply.get_mut("data").and_then(Value::as_array_mut) else {
         return false;
@@ -898,29 +1314,20 @@ fn strip_annotations(reply: &mut Value) -> bool {
     let mut stripped = false;
     for row in rows.iter_mut() {
         if let Some(o) = row.as_object_mut() {
-            stripped |= o.remove(ANNOTATION_KEY).is_some();
+            for key in [ANNOTATION_KEY, STATUS_KEY, PAUSE_KEY] {
+                stripped |= o.remove(key).is_some();
+            }
         }
     }
     stripped
 }
 
-/// Annotate a parsed list reply in place. Every `ledgerApproval` already on a
-/// row has been removed first ([`strip_annotations`]): the rows come from the
-/// owner's child (an agent), which must not be able to put words in a human's
-/// mouth. Then each awaiting/edited row the sender's ledger approves gets
-/// `ledgerApproval: {approver, at}`. A sender that cannot be asked leaves the
-/// rows unannotated.
-async fn annotate_value(cfg: &ApprovalsConfig, reply: &mut Value) {
-    let Some(rows) = list_rows(reply) else {
-        return;
-    };
-    let ids: Vec<String> = rows
-        .iter()
-        .filter(|r| matches!(r["status"].as_str(), Some("awaiting" | "edited")))
-        .filter_map(|r| r["id"].as_str())
-        .filter(|id| !id.is_empty() && id.len() <= MAX_DRAFT_ID)
-        .map(str::to_string)
-        .collect();
+/// Ask the ledger which of `ids` it has approved (display only; any failure
+/// is an empty answer).
+async fn ledger_lookup(
+    cfg: &ApprovalsConfig,
+    ids: &[String],
+) -> std::collections::HashMap<String, LedgerApproval> {
     let mut approved = std::collections::HashMap::new();
     for chunk in ids.chunks(STATUS_BATCH) {
         match tokio::time::timeout(STATUS_TIMEOUT, approval_status(cfg, chunk)).await {
@@ -940,11 +1347,107 @@ async fn annotate_value(cfg: &ApprovalsConfig, reply: &mut Value) {
             }
         }
     }
+    approved
+}
+
+/// Ask the sender for the pause and the notes on `ids` (display only; any
+/// failure is an empty answer, so the rows show unlabelled).
+async fn outreach_lookup(cfg: &ApprovalsConfig, ids: &[String]) -> OutreachStatus {
+    let mut out = OutreachStatus::default();
+    for chunk in ids.chunks(STATUS_BATCH) {
+        match tokio::time::timeout(STATUS_TIMEOUT, outreach_status(cfg, chunk)).await {
+            Ok(Ok(found)) => {
+                if out.pause.is_none() {
+                    out.pause = found.pause;
+                }
+                out.rows.extend(found.rows);
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    detail = e.detail(),
+                    "outreach_status unavailable; rows unlabelled"
+                );
+                break;
+            }
+            Err(_) => {
+                tracing::debug!("outreach_status timed out; rows unlabelled");
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Annotate a parsed list reply in place. Every marker already on a row has
+/// been removed first ([`strip_annotations`]): the rows come from the owner's
+/// child (an agent), which must not be able to put words in a human's mouth, and
+/// the rows this viewer may not see are already gone. Then each awaiting/edited
+/// row the sender's ledger approves gets `ledgerApproval: {approver, at}`, and
+/// each outreach row gets the sender's `outreachStatus` and, while sending is
+/// paused, `outreachPause`. A sender that cannot be asked leaves the rows
+/// unannotated.
+async fn annotate_value(cfg: &ApprovalsConfig, reply: &mut Value) {
+    let Some(rows) = list_rows(reply) else {
+        return;
+    };
+    let valid = |id: &&str| !id.is_empty() && id.len() <= MAX_DRAFT_ID;
+    let ledger_ids: Vec<String> = rows
+        .iter()
+        .filter(|r| matches!(r["status"].as_str(), Some("awaiting" | "edited")))
+        .filter_map(|r| r["id"].as_str())
+        .filter(valid)
+        .map(str::to_string)
+        .collect();
+    let outreach_ids: Vec<String> = rows
+        .iter()
+        .filter(|r| {
+            matches!(
+                r["status"].as_str(),
+                Some("awaiting" | "edited" | "committed")
+            )
+        })
+        .filter(|r| matches!(classify(r), RowKind::Outreach { .. }))
+        .filter_map(|r| r["id"].as_str())
+        .filter(valid)
+        .map(str::to_string)
+        .collect();
+    let (approved, outreach) = tokio::join!(
+        async {
+            if ledger_ids.is_empty() {
+                Default::default()
+            } else {
+                ledger_lookup(cfg, &ledger_ids).await
+            }
+        },
+        async {
+            if outreach_ids.is_empty() {
+                OutreachStatus::default()
+            } else {
+                outreach_lookup(cfg, &outreach_ids).await
+            }
+        }
+    );
+    let pause = outreach.pause.as_ref().map(|p| {
+        let mut o = Map::new();
+        if let Some(at) = &p.at {
+            o.insert("at".into(), json!(at));
+        }
+        if let Some(n) = p.sent_count {
+            o.insert("sentCount".into(), json!(n));
+        }
+        if let Some(n) = p.threshold {
+            o.insert("threshold".into(), json!(n));
+        }
+        Value::Object(o)
+    });
     for row in rows.iter_mut() {
-        let Some(a) = row["id"].as_str().and_then(|id| approved.get(id)) else {
+        let Some(id) = row["id"].as_str().map(str::to_string) else {
             continue;
         };
-        if let Some(o) = row.as_object_mut() {
+        let Some(o) = row.as_object_mut() else {
+            continue;
+        };
+        if let Some(a) = approved.get(&id) {
             o.insert(
                 ANNOTATION_KEY.into(),
                 json!({
@@ -953,17 +1456,35 @@ async fn annotate_value(cfg: &ApprovalsConfig, reply: &mut Value) {
                 }),
             );
         }
+        if outreach_ids.contains(&id) {
+            if let Some(n) = outreach.rows.get(&id) {
+                let mut note = Map::new();
+                note.insert("state".into(), json!(n.state));
+                if let Some(r) = &n.reason {
+                    note.insert("reason".into(), json!(r));
+                }
+                if let Some(u) = &n.updated_at {
+                    note.insert("updatedAt".into(), json!(u));
+                }
+                o.insert(STATUS_KEY.into(), Value::Object(note));
+            }
+            if let Some(p) = &pause {
+                o.insert(PAUSE_KEY.into(), p.clone());
+            }
+        }
     }
 }
 
-/// Add the ledger's approvals to a forwarded `pa_actions_list` response.
-/// A JSON reply that is not a `{ok:true,data:[...]}` list and carries no
-/// `ledgerApproval` passes through byte for byte. A 2xx body that is not JSON
-/// serde can read is answered 502: the client's `JSON.parse` accepts things
-/// serde refuses (a lone `\ud800` escape), so relaying it would relay rows
-/// that were never sanitised. This never changes a request, a status or an
-/// approval; it only decorates what the viewer is shown.
-pub async fn annotate_list(cfg: &ApprovalsConfig, resp: Response) -> Response {
+/// Filter a forwarded `pa_actions_list` response to what `view` may see, then
+/// add the ledger's approvals and the outreach status. A JSON reply that is
+/// not a `{ok:true,data:[...]}` list and carries no marker passes through byte
+/// for byte (for a viewer who is not shown every outreach row, a `data` that is
+/// present but not a list is refused 502, since it cannot be filtered). A 2xx body
+/// that is not JSON serde can read is answered 502: the client's `JSON.parse`
+/// accepts things serde refuses (a lone `\ud800` escape), so relaying it would relay
+/// rows that were never sanitised or filtered. This never changes a request,
+/// a status or an approval.
+pub async fn annotate_list(cfg: &ApprovalsConfig, resp: Response, view: &OutreachView) -> Response {
     if !resp.status().is_success() {
         return resp;
     }
@@ -991,8 +1512,21 @@ pub async fn annotate_list(cfg: &ApprovalsConfig, resp: Response) -> Response {
         }
     };
     let stripped = strip_annotations(&mut reply);
+    // Access control, before anything is asked of the sender and whatever `ok`
+    // says (the client reads `data` under any truthy `ok`).
+    let mut filtered = false;
+    if *view != OutreachView::All {
+        match reply.get_mut("data") {
+            Some(Value::Array(rows)) => filtered = filter_rows(rows, view) > 0,
+            None | Some(Value::Null) => {}
+            Some(_) => {
+                tracing::warn!("pa_actions_list data is not a list; refusing to relay it");
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
+        }
+    }
     let list = is_list_reply(&reply);
-    let out = if list || stripped {
+    let out = if list || stripped || filtered {
         if list {
             annotate_value(cfg, &mut reply).await;
         }
@@ -1362,6 +1896,7 @@ mod tests {
             ApprovalsConfig {
                 socket: self.path.clone(),
                 agent_uid_min: u32::MAX,
+                ..ApprovalsConfig::default()
             }
         }
 
@@ -1543,6 +2078,31 @@ mod tests {
 
     // ── the gate ────────────────────────────────────────────────────────
 
+    /// An owner with no drafts: the by-id lookups find nothing.
+    struct NoRows;
+
+    impl RowSource for NoRows {
+        fn find<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Option<Value>, ()>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    /// The gate over an owner with no outreach rows (the original cases).
+    async fn gate(
+        cfg: &ApprovalsConfig,
+        ctx: &PrincipalCtx,
+        narrowing: &Narrowing,
+        cmd: &str,
+        args: &Value,
+    ) -> Result<Gated, Response> {
+        super::gate(cfg, ctx, narrowing, &NoRows, cmd, args).await
+    }
+
+    /// The list as Chinedum sees it: nothing filtered.
+    async fn annotate_list(cfg: &ApprovalsConfig, resp: Response) -> Response {
+        super::annotate_list(cfg, resp, &OutreachView::All).await
+    }
+
     fn principal(name: &str) -> Principal {
         Principal {
             id: PrincipalId::new_v7(),
@@ -1654,7 +2214,9 @@ mod tests {
         let out = gate(&s.cfg(), &pctx(&p.ada), &n, "pa_actions_commit", &args).await;
         assert_eq!(
             out.ok(),
-            Some(Gated::Approved { draft_id: DRAFT.to_string() })
+            Some(Gated::Approved {
+                draft_id: DRAFT.to_string()
+            })
         );
         assert_eq!(s.actions(), ["get_draft", "approve"]);
         let approve = &s.requests()[1];
@@ -1714,12 +2276,16 @@ mod tests {
         let s = FakeSender::start(sender_for_vector("awaiting", OK_REPLY)).await;
         let n = narrowing(&p.ada, &p.ruby, Some(Role::Operator));
         for cmd in ["pa_actions_update", "pa_actions_reject"] {
-            let out = gate(&s.cfg(), &pctx(&p.ada), &n, cmd, &json!({"draftId": DRAFT})).await;
+            let args = json!({"draftId": DRAFT, "patch": {}});
+            let out = gate(&s.cfg(), &pctx(&p.ada), &n, cmd, &args).await;
             assert_eq!(out.ok(), Some(Gated::Unchanged), "{cmd}");
         }
         // A list is forwarded and then decorated; the gate itself asks nothing.
         let out = gate(&s.cfg(), &pctx(&p.ada), &n, "pa_actions_list", &json!({})).await;
-        assert_eq!(out.ok(), Some(Gated::AnnotateList));
+        assert_eq!(
+            out.ok(),
+            Some(Gated::AnnotateList(OutreachView::Assignee("ada".into())))
+        );
         assert!(s.requests().is_empty(), "only a commit touches the ledger");
     }
 
@@ -2247,5 +2813,703 @@ mod tests {
             annotate_list(&s.cfg(), r).await.status(),
             StatusCode::BAD_GATEWAY
         );
+    }
+
+    // ── outreach drafts: the per-person view (WP-D) ─────────────────────
+
+    /// An outreach draft row as the owner's child lists it (contract r5 §3.8).
+    fn outreach_row(id: &str, assignee: &str, status: &str) -> Value {
+        let payload = json!({
+            "item": {
+                "recipientEmail": "p@pub.example", "subject": "s", "body": "b",
+                "outreach": { "assignee": assignee, "from_identity": assignee,
+                              "send_rank": 3, "template": "A", "region": "uk-eu",
+                              "company": "Pub", "step": "first" },
+            },
+            "meta": { "agent": "Ruby" },
+            "source": { "kind": "outreach_email" },
+        });
+        json!({ "id": id, "batchId": "outreach:2026-10-25", "actionId": "ruby/outreach-email",
+                "status": status, "channel": "smtp", "payloadJson": payload.to_string() })
+    }
+
+    fn ids_of(v: &Value) -> Vec<String> {
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_row_is_outreach_on_any_signal_and_its_assignee_must_be_unambiguous() {
+        let plain = row("ruby-reply:em-1", "awaiting");
+        assert_eq!(classify(&plain), RowKind::Plain);
+        // A reply draft with a payload that has no outreach block stays plain.
+        let mut reply = plain.clone();
+        reply["payloadJson"] = json!({"item": {"subject": "x"}, "meta": {}})
+            .to_string()
+            .into();
+        assert_eq!(classify(&reply), RowKind::Plain);
+        // A payload that does not parse is plain unless something else says outreach.
+        let mut junk = plain.clone();
+        junk["payloadJson"] = json!("{not json");
+        assert_eq!(classify(&junk), RowKind::Plain);
+
+        let ada = |r: &Value| {
+            classify(r)
+                == RowKind::Outreach {
+                    assignee: Some("ada".into()),
+                }
+        };
+        assert!(ada(&outreach_row("outreach:aa", "ada", "awaiting")));
+
+        // Each signal alone is enough, and then the assignee is unknown.
+        let unknown = RowKind::Outreach { assignee: None };
+        assert_eq!(classify(&json!({"id": "outreach:zz"})), unknown);
+        assert_eq!(classify(&json!({"id": "outreach-fu:zz"})), unknown);
+        assert_eq!(
+            classify(&json!({"id": "x", "batchId": "outreach-fixture:2026-10-25"})),
+            unknown
+        );
+        assert_eq!(
+            classify(&json!({"id": "x", "actionId": "ruby/outreach-email"})),
+            unknown
+        );
+        for payload in [
+            json!({"source": {"kind": "outreach_email"}, "item": {}}),
+            json!({"item": {"outreach": {}}}),
+            json!({"item": {"outreach": {"assignee": 7}}}),
+            // No `item`: the whole payload stands in for it, as in the hash.
+            json!({"outreach": {"assignee": ""}}),
+        ] {
+            let r = json!({"id": "x", "payloadJson": payload.to_string()});
+            assert_eq!(classify(&r), unknown, "{payload}");
+        }
+        // The payload as its own item.
+        let bare =
+            json!({"id": "x", "payloadJson": json!({"outreach": {"assignee": "ada"}}).to_string()});
+        assert!(ada(&bare));
+        // An item that disagrees with the payload about whose it is: unknown.
+        let split = json!({"id": "x", "payloadJson": json!({
+            "item": {"outreach": {"assignee": "ada"}}, "outreach": {"assignee": "chinedum"},
+        }).to_string()});
+        assert_eq!(classify(&split), unknown);
+    }
+
+    #[test]
+    fn who_sees_what_is_an_explicit_exact_table() {
+        let v = OutreachViewers::default();
+        assert_eq!(v.view_for("chinedum"), OutreachView::All);
+        assert_eq!(v.view_for("ada"), OutreachView::Assignee("ada".into()));
+        for other in ["onyedikachi", "Ada", "CHINEDUM", "ada ", "", "ik-ruby"] {
+            assert_eq!(v.view_for(other), OutreachView::Nothing, "{other:?}");
+        }
+        // The env replacement: malformed entries are dropped, never widened.
+        let v = OutreachViewers::parse("ada.o=ada, boss=* ,bad,=x,eve=,mal=a b,x=*y");
+        assert_eq!(v.view_for("ada.o"), OutreachView::Assignee("ada".into()));
+        assert_eq!(v.view_for("boss"), OutreachView::All);
+        for dropped in ["bad", "", "eve", "mal", "x", "ada", "chinedum"] {
+            assert_eq!(v.view_for(dropped), OutreachView::Nothing, "{dropped:?}");
+        }
+        assert_eq!(
+            OutreachViewers::parse("").view_for("chinedum"),
+            OutreachView::Nothing
+        );
+    }
+
+    #[test]
+    fn a_view_permits_exactly_its_own_rows_and_every_plain_one() {
+        let ada = RowKind::Outreach {
+            assignee: Some("ada".into()),
+        };
+        let chi = RowKind::Outreach {
+            assignee: Some("chinedum".into()),
+        };
+        let unk = RowKind::Outreach { assignee: None };
+        let mine = OutreachView::Assignee("ada".into());
+        assert!(mine.permits(&ada) && !mine.permits(&chi) && !mine.permits(&unk));
+        assert!(OutreachView::All.permits(&ada) && OutreachView::All.permits(&chi));
+        assert!(OutreachView::All.permits(&unk));
+        assert!(!OutreachView::Nothing.permits(&ada) && !OutreachView::Nothing.permits(&unk));
+        for v in [&mine, &OutreachView::All, &OutreachView::Nothing] {
+            assert!(v.permits(&RowKind::Plain));
+        }
+    }
+
+    /// The owner's drafts for the by-id lookups; `fail` = the child cannot be read.
+    struct FakeRows {
+        rows: Vec<Value>,
+        fail: bool,
+        asked: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeRows {
+        fn of(rows: Vec<Value>) -> Self {
+            Self {
+                rows,
+                fail: false,
+                asked: Arc::default(),
+            }
+        }
+    }
+
+    impl RowSource for FakeRows {
+        fn find<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Value>, ()>> {
+            self.asked.lock().unwrap().push(id.to_string());
+            Box::pin(async move {
+                if self.fail {
+                    return Err(());
+                }
+                Ok(self.rows.iter().find(|r| r["id"] == id).cloned())
+            })
+        }
+    }
+
+    const MINE: &str = "outreach:00000000000000aa";
+    const HIS: &str = "outreach:00000000000000bb";
+
+    fn two_outreach_rows() -> FakeRows {
+        FakeRows::of(vec![
+            outreach_row(MINE, "ada", "awaiting"),
+            outreach_row(HIS, "chinedum", "awaiting"),
+            outreach_row("outreach:00000000000000cc", "chinedum", "sent"),
+            row("ruby-reply:em-1", "awaiting"),
+        ])
+    }
+
+    async fn gate_with(
+        rows: &dyn RowSource,
+        who: &Principal,
+        cmd: &str,
+        args: Value,
+    ) -> Result<Gated, Response> {
+        let p = parties();
+        let n = narrowing(who, &p.ruby, Some(Role::Operator));
+        let s = FakeSender::start(sender_for_vector("awaiting", OK_REPLY)).await;
+        super::gate(&s.cfg(), &pctx(who), &n, rows, cmd, &args).await
+    }
+
+    #[tokio::test]
+    async fn ada_cannot_update_reject_or_approve_a_row_that_is_chinedums_and_it_reads_as_missing() {
+        let p = parties();
+        let rows = two_outreach_rows();
+        for (cmd, args) in [
+            (
+                "pa_actions_update",
+                json!({"draftId": HIS, "patch": {"body": "x"}}),
+            ),
+            ("pa_actions_reject", json!({"draftId": HIS})),
+            ("pa_actions_commit", seen_args(HIS)),
+        ] {
+            // The same command on an id that exists nowhere.
+            let ghost = args.to_string().replace(HIS, "outreach:ffffffffffffffff");
+            let ghost: Value = serde_json::from_str(&ghost).unwrap();
+            let hidden = error_of(gate_with(&rows, &p.ada, cmd, args).await).await;
+            let missing = if cmd == "pa_actions_commit" {
+                // A missing id reaches the sender, which answers draft_not_found.
+                let s = FakeSender::start(sender_for_vector("awaiting", OK_REPLY)).await;
+                let n = narrowing(&p.ada, &p.ruby, Some(Role::Operator));
+                error_of(super::gate(&s.cfg(), &pctx(&p.ada), &n, &NoRows, cmd, &ghost).await).await
+            } else {
+                // A missing id passes the gate and the owner's child refuses it.
+                let out = gate_with(&NoRows, &p.ada, cmd, ghost.clone()).await;
+                assert_eq!(out.ok(), Some(Gated::Unchanged), "{cmd}");
+                let core =
+                    crate::server::shared::pa_actions::update_refusal("outreach:ffffffffffffffff");
+                let core_reject =
+                    crate::server::shared::pa_actions::reject_refusal("outreach:ffffffffffffffff");
+                let want = if cmd == "pa_actions_update" {
+                    core
+                } else {
+                    core_reject
+                };
+                json!({"ok": false, "error": format!("{cmd}: {want}")})
+            };
+            // Same shape; the only difference is the id the viewer typed.
+            let norm = |v: &Value, id: &str| v.to_string().replace(id, "<id>");
+            assert_eq!(
+                norm(&hidden, HIS),
+                norm(&missing, "outreach:ffffffffffffffff"),
+                "{cmd}: a hidden row must read as a missing one"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hidden_commit_never_reaches_the_sender() {
+        let p = parties();
+        let rows = two_outreach_rows();
+        let s = FakeSender::start(sender_for_vector("awaiting", OK_REPLY)).await;
+        let n = narrowing(&p.ada, &p.ruby, Some(Role::Operator));
+        let r = super::gate(
+            &s.cfg(),
+            &pctx(&p.ada),
+            &n,
+            &rows,
+            "pa_actions_commit",
+            &seen_args(HIS),
+        )
+        .await;
+        assert!(r.is_err());
+        // The sender is asked to read the id (so a down sender answers as it does
+        // for a missing id) and never to approve it.
+        assert_eq!(s.actions(), ["get_draft"], "{:?}", s.actions());
+    }
+
+    #[tokio::test]
+    async fn ada_acts_on_her_own_rows_and_on_non_outreach_drafts() {
+        let p = parties();
+        let rows = two_outreach_rows();
+        for id in [MINE, "ruby-reply:em-1"] {
+            for cmd in ["pa_actions_update", "pa_actions_reject"] {
+                let out = gate_with(&rows, &p.ada, cmd, json!({"draftId": id, "patch": {}})).await;
+                assert_eq!(out.ok(), Some(Gated::Unchanged), "{cmd} {id}");
+            }
+        }
+        // Her own outreach row reaches the approval (the fake row hashes as the vector's).
+        let rows = FakeRows::of(vec![outreach_row(DRAFT, "ada", "awaiting")]);
+        let out = gate_with(&rows, &p.ada, "pa_actions_commit", seen_args(DRAFT)).await;
+        assert_eq!(
+            out.ok(),
+            Some(Gated::Approved {
+                draft_id: DRAFT.to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn chinedum_acts_on_every_row_without_a_lookup() {
+        let mut p = parties();
+        p.ada = principal("chinedum");
+        let rows = two_outreach_rows();
+        for id in [MINE, HIS] {
+            let out = gate_with(&rows, &p.ada, "pa_actions_reject", json!({"draftId": id})).await;
+            assert_eq!(out.ok(), Some(Gated::Unchanged), "{id}");
+        }
+        assert!(
+            rows.asked.lock().unwrap().is_empty(),
+            "the founder is not looked up"
+        );
+        let out = gate_with(&rows, &p.ada, "pa_actions_list", json!({})).await;
+        assert_eq!(out.ok(), Some(Gated::AnnotateList(OutreachView::All)));
+    }
+
+    #[tokio::test]
+    async fn another_operator_acts_on_no_outreach_row_but_still_on_plain_drafts() {
+        let bob = principal("bob");
+        let rows = two_outreach_rows();
+        for id in [MINE, HIS] {
+            for cmd in [
+                "pa_actions_update",
+                "pa_actions_reject",
+                "pa_actions_commit",
+            ] {
+                let args = if cmd == "pa_actions_commit" {
+                    seen_args(id)
+                } else {
+                    json!({"draftId": id})
+                };
+                assert!(
+                    gate_with(&rows, &bob, cmd, args).await.is_err(),
+                    "{cmd} {id}"
+                );
+            }
+        }
+        let out = gate_with(
+            &rows,
+            &bob,
+            "pa_actions_reject",
+            json!({"draftId": "ruby-reply:em-1"}),
+        )
+        .await;
+        assert_eq!(out.ok(), Some(Gated::Unchanged));
+        let out = gate_with(&rows, &bob, "pa_actions_list", json!({})).await;
+        assert_eq!(out.ok(), Some(Gated::AnnotateList(OutreachView::Nothing)));
+    }
+
+    #[tokio::test]
+    async fn when_the_row_cannot_be_read_the_action_is_refused_not_guessed() {
+        let p = parties();
+        let rows = FakeRows {
+            fail: true,
+            ..two_outreach_rows()
+        };
+        for cmd in [
+            "pa_actions_update",
+            "pa_actions_reject",
+            "pa_actions_commit",
+        ] {
+            let args = if cmd == "pa_actions_commit" {
+                seen_args(MINE)
+            } else {
+                json!({"draftId": MINE, "patch": {}})
+            };
+            let body = error_of(gate_with(&rows, &p.ada, cmd, args).await).await;
+            assert!(
+                body["error"].as_str().unwrap().starts_with("internal: "),
+                "{cmd}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_id_checked_is_the_id_the_child_would_act_on() {
+        let p = parties();
+        let rows = two_outreach_rows();
+        // draftId wins over draft_id for the child; the gate reads it the same way.
+        let out = gate_with(
+            &rows,
+            &p.ada,
+            "pa_actions_reject",
+            json!({"draftId": MINE, "draft_id": HIS}),
+        )
+        .await;
+        assert_eq!(out.ok(), Some(Gated::Unchanged));
+        let out = gate_with(
+            &rows,
+            &p.ada,
+            "pa_actions_reject",
+            json!({"draftId": HIS, "draft_id": MINE}),
+        )
+        .await;
+        assert!(out.is_err(), "the first key is the one acted on");
+        // A null draftId falls through to draft_id, as the child does.
+        let out = gate_with(
+            &rows,
+            &p.ada,
+            "pa_actions_reject",
+            json!({"draftId": null, "draft_id": HIS}),
+        )
+        .await;
+        assert!(out.is_err());
+        // A non-string first id would make the child fail; it must not fall through to a second key.
+        for bad in [
+            json!({"draftId": 7, "draft_id": MINE}),
+            json!({"draftId": ["x"], "draft_id": MINE}),
+            json!({}),
+        ] {
+            let body = error_of(gate_with(&rows, &p.ada, "pa_actions_reject", bad).await).await;
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("invalid_request: "),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_approval_binds_the_assignee_of_the_row_it_is_for_even_if_the_lookup_missed_it() {
+        // The owner's database says nothing (a race), but the row the viewer says
+        // they saw hashes to the sender's and is Chinedum's: still not Ada's to approve.
+        let p = parties();
+        let seen = SeenRow {
+            channel: "smtp".into(),
+            payload_json: outreach_row(HIS, "chinedum", "awaiting")["payloadJson"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            edited_json: None,
+            scheduled_at: None,
+        };
+        let hash = canonical_hash(HIS, &seen, &identity_from_rendered(RENDERED)).unwrap();
+        let s = FakeSender::start(Arc::new(move |req: &Value| {
+            match req["action"].as_str().unwrap() {
+                "get_draft" => json!({"ok": true, "draftId": HIS, "status": "awaiting",
+                                   "payloadHash": hash, "renderedText": RENDERED})
+                .to_string(),
+                "approve" => OK_REPLY.to_string(),
+                _ => json!({"ok": false, "error": "unknown_action"}).to_string(),
+            }
+        }))
+        .await;
+        let n = narrowing(&p.ada, &p.ruby, Some(Role::Operator));
+        let args = json!({"draftId": HIS, "seen": {
+            "channel": seen.channel, "payloadJson": seen.payload_json,
+            "editedJson": null, "scheduledAt": null }});
+        let r = super::gate(
+            &s.cfg(),
+            &pctx(&p.ada),
+            &n,
+            &NoRows,
+            "pa_actions_commit",
+            &args,
+        )
+        .await;
+        assert!(r.is_err());
+        assert_eq!(s.actions(), ["get_draft"], "no approval was written");
+    }
+
+    // ── the list, filtered and labelled ─────────────────────────────────
+
+    fn mixed_list() -> Value {
+        json!([
+            outreach_row(HIS, "chinedum", "awaiting"),
+            outreach_row(MINE, "ada", "awaiting"),
+            row("ruby-reply:em-1", "awaiting"),
+            outreach_row("outreach:00000000000000dd", "ada", "edited"),
+            json!({"id": "outreach:00000000000000ee", "status": "awaiting", "payloadJson": "{bad"}),
+        ])
+    }
+
+    #[tokio::test]
+    async fn a_list_is_filtered_to_the_viewer_before_anything_else_is_asked() {
+        let s = FakeSender::start(Arc::new(|r: &Value| match r["action"].as_str().unwrap() {
+            "approval_status" => json!({"ok": true, "approvals": {}}).to_string(),
+            "outreach_status" => {
+                json!({"ok": true, "outreach": {"pause": null, "counts": {}, "rows": {}}})
+                    .to_string()
+            }
+            _ => json!({"ok": false, "error": "unknown_action"}).to_string(),
+        }))
+        .await;
+        let cases = [
+            (
+                OutreachView::All,
+                vec![
+                    HIS,
+                    MINE,
+                    "ruby-reply:em-1",
+                    "outreach:00000000000000dd",
+                    "outreach:00000000000000ee",
+                ],
+            ),
+            (
+                OutreachView::Assignee("ada".into()),
+                vec![MINE, "ruby-reply:em-1", "outreach:00000000000000dd"],
+            ),
+            (OutreachView::Nothing, vec!["ruby-reply:em-1"]),
+        ];
+        for (view, want) in cases {
+            let out =
+                body_of(super::annotate_list(&s.cfg(), list_response(mixed_list()), &view).await)
+                    .await;
+            assert_eq!(ids_of(&out), want, "{view:?}");
+        }
+        // Ada's sender questions named only her rows.
+        s.seen.lock().unwrap().clear();
+        let me = OutreachView::Assignee("ada".into());
+        let _ =
+            body_of(super::annotate_list(&s.cfg(), list_response(mixed_list()), &me).await).await;
+        let mut asked = Vec::new();
+        for r in s.requests() {
+            asked.extend(
+                r["draftIds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string()),
+            );
+        }
+        assert!(!asked.is_empty());
+        assert!(
+            !asked.iter().any(|i| i == HIS || i.ends_with("ee")),
+            "{asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_filter_applies_whatever_the_ok_says_and_a_list_it_cannot_read_is_not_relayed() {
+        let s = FakeSender::start(status_sender(json!({}))).await;
+        let me = OutreachView::Assignee("ada".into());
+        // The client treats a truthy `ok` as success: Chinedum's row must not slip through.
+        let r = Json(json!({"ok": 1, "data": mixed_list()})).into_response();
+        let out = body_of(super::annotate_list(&s.cfg(), r, &me).await).await;
+        assert!(!ids_of(&out).iter().any(|i| i == HIS), "{out}");
+        let r = Json(json!({"ok": "yes", "data": mixed_list()})).into_response();
+        let out = body_of(super::annotate_list(&s.cfg(), r, &OutreachView::Nothing).await).await;
+        assert_eq!(ids_of(&out), ["ruby-reply:em-1"]);
+        // Rows that are not objects are not shown to a restricted viewer.
+        let r =
+            Json(json!({"ok": true, "data": ["x", 1, null, row("ruby-reply:em-1", "awaiting")]}))
+                .into_response();
+        let out = body_of(super::annotate_list(&s.cfg(), r, &me).await).await;
+        assert_eq!(ids_of(&out), ["ruby-reply:em-1"]);
+        // A data member that is neither a list nor absent cannot be filtered.
+        for data in [json!({"rows": mixed_list()}), json!("x"), json!(5)] {
+            let r = Json(json!({"ok": true, "data": data})).into_response();
+            assert_eq!(
+                super::annotate_list(&s.cfg(), r, &me).await.status(),
+                StatusCode::BAD_GATEWAY
+            );
+        }
+        // An error reply (no data) still passes.
+        let r = Json(json!({"ok": false, "error": "boom"})).into_response();
+        assert_eq!(
+            body_of(super::annotate_list(&s.cfg(), r, &me).await).await,
+            json!({"ok": false, "error": "boom"})
+        );
+    }
+
+    fn status_reply(pause: Value, rows: Value) -> Handler {
+        Arc::new(move |r: &Value| match r["action"].as_str().unwrap() {
+            "outreach_status" => json!({"ok": true, "outreach": {
+                "pause": pause, "counts": {"lagosDay": "2026-10-26", "total": 30, "cap": 15,
+                "pauseAt": 30, "today": {"ada": 9, "chinedum": 21}}, "rows": rows}})
+            .to_string(),
+            "approval_status" => json!({"ok": true, "approvals": {}}).to_string(),
+            _ => json!({"ok": false, "error": "unknown_action"}).to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn outreach_rows_are_labelled_from_the_sender_and_the_pause_rides_on_them() {
+        let pause = json!({"id": 4, "at": "2026-10-26T09:00:00Z", "sentCount": 30, "threshold": 30, "cardPostId": "post-secret"});
+        let notes = json!({
+            MINE: {"state": "queued_for_tomorrow", "reason": "queued_for_tomorrow", "updatedAt": "2026-10-26T08:00:00Z"},
+            "outreach:00000000000000dd": {"state": "suppressed", "reason": "suppressed:company"},
+            "ruby-reply:em-1": {"state": "blocked"},
+            HIS: {"state": "blocked"},
+        });
+        let s = FakeSender::start(status_reply(pause, notes)).await;
+        let me = OutreachView::Assignee("ada".into());
+        let out =
+            body_of(super::annotate_list(&s.cfg(), list_response(mixed_list()), &me).await).await;
+        let data = out["data"].as_array().unwrap();
+        let by = |id: &str| data.iter().find(|r| r["id"] == id).unwrap().clone();
+        assert_eq!(by(MINE)["outreachStatus"]["state"], "queued_for_tomorrow");
+        assert_eq!(
+            by(MINE)["outreachStatus"]["updatedAt"],
+            "2026-10-26T08:00:00Z"
+        );
+        assert_eq!(
+            by("outreach:00000000000000dd")["outreachStatus"]["state"],
+            "suppressed"
+        );
+        assert_eq!(
+            by("outreach:00000000000000dd")["outreachStatus"]["reason"],
+            "suppressed:company"
+        );
+        // The pause is on her outreach rows, without the chat post id or any count of the other sender.
+        assert_eq!(
+            by(MINE)["outreachPause"],
+            json!({"at": "2026-10-26T09:00:00Z", "sentCount": 30, "threshold": 30})
+        );
+        // A plain draft is never labelled, whatever the sender says about its id.
+        assert!(by("ruby-reply:em-1").get("outreachStatus").is_none());
+        assert!(by("ruby-reply:em-1").get("outreachPause").is_none());
+        assert!(!out.to_string().contains("post-secret"));
+        assert!(!out.to_string().contains("\"today\""));
+        // One outreach_status exchange, naming only her outreach rows.
+        let q: Vec<Value> = s
+            .requests()
+            .into_iter()
+            .filter(|r| r["action"] == "outreach_status")
+            .collect();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0]["draftIds"], json!([MINE, "outreach:00000000000000dd"]));
+    }
+
+    #[tokio::test]
+    async fn status_labels_fail_soft_and_unknown_values_are_not_shown() {
+        // Sender down: rows still arrive, unlabelled.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ApprovalsConfig::at(dir.path().join("absent.sock"));
+        let out = body_of(
+            super::annotate_list(&cfg, list_response(mixed_list()), &OutreachView::All).await,
+        )
+        .await;
+        assert_eq!(ids_of(&out).len(), 5);
+        assert!(out["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r.get("outreachStatus").is_none() && r.get("outreachPause").is_none()));
+        // A sender from before r5, or one that answers garbage.
+        for reply in [
+            r#"{"ok":false,"error":"unknown_action"}"#,
+            "nope",
+            r#"{"ok":true}"#,
+            r#"{"ok":true,"outreach":[]}"#,
+        ] {
+            let s = FakeSender::start(Arc::new(move |_: &Value| reply.to_string())).await;
+            let out = body_of(
+                super::annotate_list(&s.cfg(), list_response(mixed_list()), &OutreachView::All)
+                    .await,
+            )
+            .await;
+            assert_eq!(ids_of(&out).len(), 5, "{reply}");
+            assert!(
+                out["data"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|r| r.get("outreachStatus").is_none()),
+                "{reply}"
+            );
+        }
+        // Unknown states, odd reasons, ids nobody asked about, tolerated-missing fields.
+        let notes = json!({
+            MINE: {"state": "<script>", "reason": "x"},
+            "outreach:00000000000000dd": {"state": "paused", "reason": "has space and\nnewline"},
+            "elsewhere": {"state": "paused"},
+        });
+        let s = FakeSender::start(status_reply(json!({}), notes)).await;
+        let out = body_of(
+            super::annotate_list(
+                &s.cfg(),
+                list_response(mixed_list()),
+                &OutreachView::Assignee("ada".into()),
+            )
+            .await,
+        )
+        .await;
+        let data = out["data"].as_array().unwrap();
+        let by = |id: &str| data.iter().find(|r| r["id"] == id).unwrap().clone();
+        assert!(by(MINE).get("outreachStatus").is_none());
+        assert_eq!(
+            by("outreach:00000000000000dd")["outreachStatus"],
+            json!({"state": "paused"})
+        );
+        // An open pause with no detail still raises the banner.
+        assert_eq!(by(MINE)["outreachPause"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn labels_and_approvals_a_child_wrote_itself_are_removed_for_every_viewer() {
+        let mut forged = outreach_row(MINE, "ada", "awaiting");
+        forged["outreachStatus"] = json!({"state": "sent"});
+        forged["outreachPause"] = json!({"sentCount": 1});
+        forged["ledgerApproval"] =
+            json!({"approver": {"principalId": "x", "username": "chinedum"}, "at": "t"});
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ApprovalsConfig::at(dir.path().join("absent.sock"));
+        for view in [
+            OutreachView::All,
+            OutreachView::Assignee("ada".into()),
+            OutreachView::Nothing,
+        ] {
+            let r =
+                Json(json!({"ok": 1, "data": [forged.clone(), row("p", "sent")]})).into_response();
+            let out = body_of(super::annotate_list(&cfg, r, &view).await).await;
+            for r in out["data"].as_array().unwrap() {
+                for k in ["outreachStatus", "outreachPause", "ledgerApproval"] {
+                    assert!(r.get(k).is_none(), "{view:?} {k}: {r}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn without_outreach_rows_the_sender_is_not_asked_about_outreach() {
+        let s = FakeSender::start(status_reply(json!(null), json!({}))).await;
+        let rows = json!([
+            row("d-1", "awaiting"),
+            outreach_row(HIS, "chinedum", "awaiting")
+        ]);
+        let out = body_of(
+            super::annotate_list(
+                &s.cfg(),
+                list_response(rows),
+                &OutreachView::Assignee("ada".into()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(ids_of(&out), ["d-1"]);
+        assert_eq!(s.actions(), ["approval_status"]);
     }
 }

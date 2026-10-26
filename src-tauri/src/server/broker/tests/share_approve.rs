@@ -74,9 +74,9 @@ impl ChildLauncher for RecordingLauncher {
 }
 
 /// Every viewer is a member of `owner`'s project "ruby-jobs" with `role`.
-struct ShareOf {
-    owner: Principal,
-    role: Role,
+pub(super) struct ShareOf {
+    pub(super) owner: Principal,
+    pub(super) role: Role,
 }
 
 impl Narrower for ShareOf {
@@ -222,6 +222,7 @@ async fn rig(role: Role, socket: Option<&'static str>) -> (Rig, Arc<Mutex<Vec<Va
             state.approvals = ApprovalsConfig {
                 socket: path,
                 agent_uid_min: u32::MAX,
+                ..ApprovalsConfig::default()
             };
             (log, row)
         }
@@ -277,9 +278,19 @@ fn owner_requests(r: &Rig) -> Vec<(HeaderMap, Value)> {
         .collect()
 }
 
+/// What reached the owner's child other than the broker's own reads of the
+/// owner's drafts (`pa_actions_list`: before a by-id command it checks the
+/// row is one this viewer may act on, `share_outreach`). Those change nothing.
+fn owner_writes(r: &Rig) -> Vec<(HeaderMap, Value)> {
+    owner_requests(r)
+        .into_iter()
+        .filter(|(_, b)| b["cmd"] != "pa_actions_list")
+        .collect()
+}
+
 #[tokio::test]
-async fn an_operators_commit_is_approved_by_the_broker_as_them_and_never_reaches_the_owners_child(
-) {
+async fn an_operators_commit_is_approved_by_the_broker_as_them_and_never_reaches_the_owners_child()
+{
     let (r, log) = rig(Role::Operator, Some(OK)).await;
     let ada = insert_account(&r.pool, "ada", 20_001, false).await;
     let cookie = login_cookie(&r.app, "ada").await;
@@ -301,7 +312,7 @@ async fn an_operators_commit_is_approved_by_the_broker_as_them_and_never_reaches
 
     // The owner's child (the agent's daemon) takes no part: the sender sends
     // the draft on the ledger approval (contract r2).
-    let got = owner_requests(&r);
+    let got = owner_writes(&r);
     assert!(got.is_empty(), "{got:?}");
 }
 
@@ -352,7 +363,7 @@ async fn with_no_sender_socket_an_operators_commit_fails_closed() {
         "{body}"
     );
     assert!(
-        owner_requests(&r).is_empty(),
+        owner_writes(&r).is_empty(),
         "no commit without a ledger approval"
     );
 }
@@ -381,7 +392,7 @@ async fn a_sender_refusal_is_shown_and_the_commit_is_not_forwarded() {
         2,
         "get_draft then the refused approve"
     );
-    assert!(owner_requests(&r).is_empty());
+    assert!(owner_writes(&r).is_empty());
 }
 
 #[tokio::test]
@@ -408,7 +419,15 @@ async fn an_operator_lists_updates_and_rejects_through_the_owners_child_without_
         .collect();
     assert_eq!(
         cmds,
-        ["pa_actions_list", "pa_actions_update", "pa_actions_reject"]
+        // Ada is not shown every outreach row, so the broker reads the owner's
+        // drafts before each by-id command to check the row is hers to act on.
+        [
+            "pa_actions_list",
+            "pa_actions_list",
+            "pa_actions_update",
+            "pa_actions_list",
+            "pa_actions_reject"
+        ]
     );
     // Listing may ask the ledger who approved what (`approval_status`, read
     // only); it never writes an approval.

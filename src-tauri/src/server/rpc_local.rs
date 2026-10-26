@@ -735,7 +735,7 @@ pub(super) async fn pa_actions_update(state: &AppState, args: &Value) -> RpcResp
         let patch = args
             .get("patch")
             .cloned()
-            .ok_or_else(|| "`patch` is required".to_string())?;
+            .ok_or_else(|| pa_actions::PATCH_REQUIRED.to_string())?;
         pa_actions::update(pa_db(state)?, &draft_id, &patch).await
     }
     .await;

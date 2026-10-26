@@ -695,26 +695,33 @@ pub async fn rpc_proxy(
     // approval for a commit, written by the broker as the authenticated
     // viewer; an approved commit is answered here and never forwarded
     // (`approvals`).
-    let mut annotate_list = false;
-    let bytes = match super::approvals::gate(&state.approvals, &ctx, &narrowing, &cmd, &args).await
-    {
-        Ok(super::approvals::Gated::Unchanged) => bytes,
-        Ok(super::approvals::Gated::AnnotateList) => {
-            annotate_list = true;
-            bytes
-        }
-        Ok(super::approvals::Gated::Approved { draft_id }) => {
-            return (
-                StatusCode::OK,
-                axum::Json(serde_json::json!({
-                    "ok": true,
-                    "data": { "draftId": draft_id, "approved": true },
-                })),
-            )
-                .into_response();
-        }
-        Err(res) => return res,
+    let mut annotate_list = None;
+    let owner_rows = OwnerRows {
+        state: &state,
+        narrowing: &narrowing,
+        ctx: &ctx,
     };
+    let bytes =
+        match super::approvals::gate(&state.approvals, &ctx, &narrowing, &owner_rows, &cmd, &args)
+            .await
+        {
+            Ok(super::approvals::Gated::Unchanged) => bytes,
+            Ok(super::approvals::Gated::AnnotateList(view)) => {
+                annotate_list = Some(view);
+                bytes
+            }
+            Ok(super::approvals::Gated::Approved { draft_id }) => {
+                return (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "ok": true,
+                        "data": { "draftId": draft_id, "approved": true },
+                    })),
+                )
+                    .into_response();
+            }
+            Err(res) => return res,
+        };
     // An admin's `fs_roots_*` call naming another principal goes to that
     // principal's child (`fs_roots_admin`); everything else is unchanged.
     let (narrowing, bytes) =
@@ -722,9 +729,9 @@ pub async fn rpc_proxy(
             Ok(routed) => routed,
             Err(res) => return res,
         };
-    if annotate_list {
-        // The rows are read and rewritten here, so ask the child for an
-        // uncompressed body.
+    if let Some(view) = annotate_list {
+        // The rows are read, filtered to what the viewer may see and rewritten
+        // here, so ask the child for an uncompressed body.
         let mut headers = parts.headers.clone();
         headers.remove(axum::http::header::ACCEPT_ENCODING);
         let resp = forward(
@@ -737,7 +744,7 @@ pub async fn rpc_proxy(
             bytes,
         )
         .await;
-        return super::approvals::annotate_list(&state.approvals, resp).await;
+        return super::approvals::annotate_list(&state.approvals, resp, &view).await;
     }
     forward(
         &state,
@@ -749,6 +756,67 @@ pub async fn rpc_proxy(
         bytes,
     )
     .await
+}
+
+/// The owner's drafts, read through the owner's child with the viewer's own share
+/// headers, for `approvals::gate`'s by-id checks: which row is this id, whatever
+/// its status. A reply the broker cannot read in full is an error (the caller
+/// fails closed), never "no such row".
+struct OwnerRows<'a> {
+    state: &'a BrokerState,
+    narrowing: &'a Narrowing,
+    ctx: &'a PrincipalCtx,
+}
+
+impl super::approvals::RowSource for OwnerRows<'_> {
+    fn find<'a>(&'a self, draft_id: &'a str) -> BoxFuture<'a, Result<Option<Value>, ()>> {
+        Box::pin(async move {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            // `None` is the gate's active set (awaiting, edited, committed,
+            // failed); the rest are the statuses it leaves out. The commands
+            // that follow cannot act on those, but their answer must not tell
+            // a viewer that a row they may not see exists.
+            for status in [None, Some("sent"), Some("sending"), Some("rejected")] {
+                let body = serde_json::json!({
+                    "cmd": "pa_actions_list",
+                    "args": { "status": status },
+                });
+                let resp = forward(
+                    self.state,
+                    self.narrowing,
+                    self.ctx,
+                    Method::POST,
+                    "/api/rpc",
+                    &headers,
+                    Bytes::from(body.to_string()),
+                )
+                .await;
+                if !resp.status().is_success()
+                    || resp
+                        .headers()
+                        .contains_key(axum::http::header::CONTENT_ENCODING)
+                {
+                    return Err(());
+                }
+                let bytes = axum::body::to_bytes(resp.into_body(), super::approvals::MAX_LIST_BODY)
+                    .await
+                    .map_err(|_| ())?;
+                let reply: Value = serde_json::from_slice(&bytes).map_err(|_| ())?;
+                if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+                    return Err(());
+                }
+                let rows = reply.get("data").and_then(Value::as_array).ok_or(())?;
+                if let Some(row) = rows.iter().find(|r| r["id"].as_str() == Some(draft_id)) {
+                    return Ok(Some(row.clone()));
+                }
+            }
+            Ok(None)
+        })
+    }
 }
 
 /// Whether `principal`'s account is app-locked (WP-C), asked of its child as

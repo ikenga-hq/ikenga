@@ -1031,3 +1031,25 @@
 	white-space: pre-wrap;
 	overflow-wrap: anywhere;
 }
+
+/* WP-D · publisher outreach: rank and assignee chips, the sender's hold state, the pause banner. */
+.ob-chip.outreach-rank {
+	font-variant-numeric: tabular-nums;
+}
+.dl-chip.held {
+	color: var(--fg-muted);
+	border-style: dashed;
+}
+.dl-chip.held.state-suppressed,
+.dl-chip.held.state-blocked {
+	color: var(--danger);
+	border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+}
+.ob-outreach-paused {
+	color: var(--fg);
+	border-left: 3px solid var(--live);
+}
+.ob-bulk-note {
+	font-size: var(--text-caption);
+	color: var(--fg-muted);
+}

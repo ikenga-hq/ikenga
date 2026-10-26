@@ -275,6 +275,25 @@ pub async fn list(db: &PaDb, status: Option<&str>) -> Result<Vec<PaActionDraftRo
     Ok(rows.into_iter().map(row_to_draft).collect())
 }
 
+/// What `pa_actions_update` answers (after its `pa_actions_update: ` prefix) when
+/// the request has no `patch`. The child checks this before it reads the DB, and
+/// the box broker answers the same words itself for a draft the viewer may not
+/// see, so a request without a patch cannot tell a hidden row from a missing one.
+pub const PATCH_REQUIRED: &str = "`patch` is required";
+
+/// What `update` answers for a draft that is missing or not editable. Public
+/// because the box broker answers a draft the viewer may not see with exactly
+/// these words (`broker::approvals`), so a hidden row reads as a missing one.
+pub fn update_refusal(draft_id: &str) -> String {
+    format!("draft {draft_id} not found or not editable")
+}
+
+/// What `reject` answers for a draft that is missing or already terminal (see
+/// [`update_refusal`]).
+pub fn reject_refusal(draft_id: &str) -> String {
+    format!("draft {draft_id} not found or already terminal")
+}
+
 /// Store operator edits in `edited_json`; `awaiting` → `edited`. Only while
 /// the row is still in the gate.
 pub async fn update(db: &PaDb, draft_id: &str, patch: &Value) -> Result<(), String> {
@@ -293,7 +312,7 @@ pub async fn update(db: &PaDb, draft_id: &str, patch: &Value) -> Result<(), Stri
     .map_err(|e| format!("update draft {draft_id}: {e}"))?
     .rows_affected();
     if affected == 0 {
-        return Err(format!("draft {draft_id} not found or not editable"));
+        return Err(update_refusal(draft_id));
     }
     Ok(())
 }
@@ -385,7 +404,7 @@ pub async fn reject(db: &PaDb, draft_id: &str) -> Result<(), String> {
     .map_err(|e| format!("reject draft {draft_id}: {e}"))?
     .rows_affected();
     if affected == 0 {
-        return Err(format!("draft {draft_id} not found or already terminal"));
+        return Err(reject_refusal(draft_id));
     }
     Ok(())
 }
