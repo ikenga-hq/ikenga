@@ -420,6 +420,9 @@ pub(super) fn chi_run_opts(args: &Value) -> Result<chi_exec::ChiRunOpts, String>
         parent_id: opt_str(src, &["parentId", "parent_id"])?,
         resume_session_id: opt_str(src, &["resumeSessionId", "resume_session_id"])?,
         persistent: opt_bool(src, &["persistent"])?.unwrap_or(false),
+        // Strict: a policy that does not parse fails the call (an explicit
+        // `null` too); it never degrades to "no policy".
+        tool_policy: chi_exec::policy_from_args(src)?,
     })
 }
 
@@ -2747,6 +2750,35 @@ mod tests {
                 e(json!({ "engineId": 7, "prompt": "p" })),
                 "`engineId` must be a string"
             );
+        }
+
+        /// `opts.toolPolicy` rides the daemon arm's decoder: parsed strictly,
+        /// nested or flat, and never silently dropped.
+        #[test]
+        fn chi_run_opts_decodes_a_strict_tool_policy() {
+            let policy = json!({
+                "tools": ["Read"], "allowedTools": ["Read"], "disallowedTools": [],
+                "mode": "dontAsk", "strictMcp": true, "settingSources": [],
+            });
+            let nested = chi_run_opts(&json!({ "opts": {
+                "engineId": "claude-code", "prompt": "p", "toolPolicy": policy,
+            }}))
+            .unwrap();
+            let p = nested.tool_policy.expect("policy decoded");
+            assert_eq!(p.tools, ["Read"]);
+            assert_eq!(p.mode.as_claude_flag(), "dontAsk");
+            let none = chi_run_opts(&json!({ "engineId": "claude-code", "prompt": "p" })).unwrap();
+            assert!(none.tool_policy.is_none());
+
+            let e = |p: Value| {
+                chi_run_opts(&json!({ "engineId": "claude-code", "prompt": "p", "toolPolicy": p }))
+                    .err()
+                    .unwrap()
+            };
+            assert!(e(Value::Null).contains("not null"));
+            assert!(e(json!({ "tools": [], "mode": "dontAsk", "strictMcp": true, "extra": 1 }))
+                .contains("invalid toolPolicy"));
+            assert!(e(json!({ "tools": [], "mode": "plan", "strictMcp": true })).contains("invalid toolPolicy"));
         }
 
         #[tokio::test]

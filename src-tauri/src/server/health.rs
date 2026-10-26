@@ -32,6 +32,11 @@ pub struct HealthResponse {
     /// full report is in the log and `operator/probe.json`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe: Option<crate::executor::ProbeStamp>,
+    /// Optional protocol features this daemon implements, by name. A client
+    /// that depends on one (the bridge on `chi.toolPolicy`) must refuse to
+    /// proceed against a daemon that does not list it; an old daemon has no
+    /// such field at all, which reads the same way.
+    pub capabilities: &'static [&'static str],
 }
 
 pub async fn health_handler() -> impl IntoResponse {
@@ -59,12 +64,20 @@ pub fn health_for(executor: &dyn crate::executor::SessionExecutor) -> HealthResp
         uptime_secs: uptime,
         executor: executor.capabilities(),
         probe: executor.probe_stamp(),
+        capabilities: crate::server::shared::chi_exec::CAPABILITIES,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `chi.toolPolicy` is advertised, as a top-level array of strings.
+    #[test]
+    fn health_advertises_the_chi_tool_policy_capability() {
+        let json = serde_json::to_value(health_for(&crate::executor::InProcessExecutor)).unwrap();
+        assert_eq!(json["capabilities"], serde_json::json!(["chi.toolPolicy"]));
+    }
 
     #[test]
     fn t0_health_has_no_probe_field() {

@@ -239,6 +239,7 @@ async fn call_engine(app: &AppHandle, call: EngineCall) -> Result<String, String
                 parent_id: None,
                 resume_session_id,
                 persistent,
+                tool_policy: None,
             };
             spawn_chi_run(db, &cache, &runtime, Some(app), opts, SEAT_RUN_OWNER).await?
         }

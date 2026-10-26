@@ -5239,6 +5239,25 @@ export interface ChiCacheRow {
 	expires_at?: string;
 }
 
+/** A Claude Code run's tool limit (`opts.toolPolicy`; Rust `ToolPolicy`).
+ *  Strict: unknown fields, `null`, or a non-claude-code engine fail the call.
+ *  Only send it to a daemon whose `/api/health` `capabilities` lists
+ *  `chi.toolPolicy`. */
+export interface ChiToolPolicy {
+	/** Exact built-in tool set (`--tools`); `[]` = none. */
+	tools: string[];
+	/** `--allowedTools` rules, one argv element each. */
+	allowedTools?: string[];
+	/** `--disallowedTools` rules. */
+	disallowedTools?: string[];
+	/** `dontAsk` denies anything not allowed immediately. */
+	mode: 'default' | 'dontAsk';
+	/** Must be `true`: no MCP server loads. */
+	strictMcp: true;
+	/** `[]` or `['project']`. */
+	settingSources?: string[];
+}
+
 export interface ChiRunOpts extends Record<string, unknown> {
 	engineId: string;
 	prompt: string;
@@ -5251,6 +5270,8 @@ export interface ChiRunOpts extends Record<string, unknown> {
 	/** Launch via the tmux multiplexer so the session survives an app
 	 *  restart (falls back to in-process). Rust `ChiRunOpts.persistent`. */
 	persistent?: boolean;
+	/** Tool limit for a claude-code run; see {@link ChiToolPolicy}. */
+	toolPolicy?: ChiToolPolicy;
 }
 
 /** Start a new Chi run. The engine child is spawned in WP-02; WP-01 mints

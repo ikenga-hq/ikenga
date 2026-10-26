@@ -685,6 +685,7 @@ mod tests {
             parent_id: None,
             resume_session_id: None,
             persistent: false,
+            tool_policy: None,
         };
         let err = spawn_chi_run(db.clone(), &cache, &runtime, None, opts, "cli")
             .await
@@ -717,6 +718,7 @@ mod tests {
             parent_id: None,
             resume_session_id: None,
             persistent: false,
+            tool_policy: None,
         };
         let err = spawn_chi_run(db.clone(), &cache, &runtime, None, opts, "cli")
             .await

@@ -543,6 +543,7 @@ pub(super) async fn comment_route(state: &AppState, args: &Value) -> RpcResponse
                     parent_id: None,
                     resume_session_id: None,
                     persistent: false,
+                    tool_policy: None,
                 };
                 let env = super::rpc_local::chi_env(state)?;
                 let run =

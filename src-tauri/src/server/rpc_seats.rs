@@ -187,6 +187,7 @@ async fn call_engine(env: &ChiEnv, call: EngineCall) -> Result<String, String> {
                 parent_id: None,
                 resume_session_id,
                 persistent,
+                tool_policy: None,
             };
             chi_exec::spawn_run(env, &NoInProcessEngines, opts, SEAT_RUN_OWNER).await?
         }

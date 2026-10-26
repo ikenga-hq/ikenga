@@ -41,6 +41,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::Mutex;
 
+mod tool_policy;
+pub use tool_policy::{policy_from_args, ToolPolicy, CAPABILITIES, CAPABILITY_TOOL_POLICY};
+use tool_policy::POLICY_ENGINE;
+
 use super::acp_mode::AcpSessionMode;
 use super::agents::WslLookup;
 use super::chi::{
@@ -80,6 +84,12 @@ pub struct ChiRunOpts {
     /// `chi_cache.pid`.
     #[serde(default)]
     pub persistent: bool,
+    /// The run's tool policy (`opts.toolPolicy`). Claude Code only. Stored
+    /// with the run and re-applied on resume; a policy run never goes to the
+    /// detached chi-runner (which builds its own argv and cannot apply it).
+    /// Absent = the run's argv is exactly what it always was.
+    #[serde(default, rename = "toolPolicy")]
+    pub tool_policy: Option<ToolPolicy>,
 }
 
 /// Rebuild a run's opts from its cache row for `chi_resume` — only the fields
@@ -97,6 +107,7 @@ pub(crate) fn row_into_resume_opts(row: &ChiCacheRow, prompt: String) -> ChiRunO
         parent_id: None,
         resume_session_id: None,
         persistent: false,
+        tool_policy: None,
     }
 }
 
@@ -807,6 +818,73 @@ pub(crate) async fn cache_insert(
     Ok(())
 }
 
+/// The error for a policy on an engine that cannot apply one.
+fn policy_engine_error(engine_id: &str) -> String {
+    format!(
+        "toolPolicy is only supported for the claude-code engine (got {engine_id}): refusing to \
+         run it without the limit"
+    )
+}
+
+/// What a policy run that asked to be `persistent` carries in `error`: it ran
+/// in-process, because the detached chi-runner builds its own argv and cannot
+/// apply a tool policy. Durability is lost; the policy is not.
+pub(crate) const POLICY_NOT_DETACHABLE_WARNING: &str =
+    "persistent run fell back to in-process: a toolPolicy run cannot use the detached \
+     chi-runner (it builds its own argv and cannot apply the policy), so it will not survive \
+     a restart";
+
+/// Record that `run_id` is a policy run and keep the policy. `policy_run`
+/// is the durable "this run is limited" bit, so a stored policy that later
+/// goes missing or unreadable is distinguishable from a run that never had one.
+pub(crate) async fn cache_store_policy(
+    db: &PaDb,
+    run_id: &str,
+    policy: &ToolPolicy,
+) -> Result<(), String> {
+    let json = policy.to_stored()?;
+    let pool = db.ensure_pool().await?;
+    let res = sqlx::query("UPDATE chi_cache SET policy_run = 1, tool_policy = ? WHERE run_id = ?")
+        .bind(json)
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("chi_cache store tool policy: {e}"))?;
+    if res.rows_affected() != 1 {
+        return Err(format!("chi_cache store tool policy: no row for {run_id}"));
+    }
+    Ok(())
+}
+
+/// The policy `run_id` was started with: `Ok(None)` for a run that never had
+/// one, `Ok(Some)` for a policy run, and an **error** for a policy run whose
+/// stored policy is missing or no longer parses — a resume must then fail
+/// closed instead of running unrestricted.
+pub(crate) async fn cache_load_policy(
+    db: &PaDb,
+    run_id: &str,
+) -> Result<Option<ToolPolicy>, String> {
+    let pool = db.ensure_pool().await?;
+    let row = sqlx::query("SELECT policy_run, tool_policy FROM chi_cache WHERE run_id = ?")
+        .bind(run_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| format!("chi_cache read tool policy: {e}"))?
+        .ok_or_else(|| format!("chi run not found: {run_id}"))?;
+    let policy_run: i64 = row.try_get("policy_run").unwrap_or(0);
+    let stored: Option<String> = row.try_get("tool_policy").unwrap_or(None);
+    match (policy_run != 0 || stored.is_some(), stored) {
+        (false, _) => Ok(None),
+        (true, None) => Err(format!(
+            "chi run {run_id} is a toolPolicy run but its stored policy is missing: refusing to \
+             resume it without the limit"
+        )),
+        (true, Some(json)) => ToolPolicy::from_stored(&json).map(Some).map_err(|e| {
+            format!("chi run {run_id}: stored policy unusable, refusing to resume: {e}")
+        }),
+    }
+}
+
 pub(crate) async fn cache_update_status(
     db: &PaDb,
     run_id: &str,
@@ -1188,6 +1266,9 @@ pub(crate) fn runner_model(engine_id: &str, model: Option<&str>) -> Option<Strin
 
 /// Return the command for the requested engine. It takes no prompt: every
 /// engine reads it from stdin ([`stdin_payload`]), never from argv (I-7).
+/// The policy-less form of [`build_engine_command_policy`] (what the runs
+/// call, with their policy, is that one).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn build_engine_command_with(
     resolver: &dyn EngineResolver,
     engine_id: &str,
@@ -1196,13 +1277,34 @@ pub(crate) async fn build_engine_command_with(
     mode: Option<&str>,
     resume_id: Option<&str>,
 ) -> Result<SpawnSpec, String> {
+    build_engine_command_policy(resolver, engine_id, cwd, model, mode, resume_id, None).await
+}
+
+/// [`build_engine_command_with`] plus an optional tool policy. With `None` the
+/// argv is exactly the policy-less one. With `Some`, the engine must be
+/// Claude Code: the policy's mode replaces `mode`, and its flags come last.
+pub(crate) async fn build_engine_command_policy(
+    resolver: &dyn EngineResolver,
+    engine_id: &str,
+    cwd: &str,
+    model: Option<&str>,
+    mode: Option<&str>,
+    resume_id: Option<&str>,
+    policy: Option<&ToolPolicy>,
+) -> Result<SpawnSpec, String> {
     let s = |v: &str| v.to_string();
+    if policy.is_some() && engine_id != POLICY_ENGINE {
+        return Err(policy_engine_error(engine_id));
+    }
     match engine_id {
         "claude-code" => {
-            let permission_mode = mode
-                .and_then(AcpSessionMode::from_acp_id)
-                .unwrap_or_default()
-                .as_claude_flag();
+            let permission_mode = match policy {
+                Some(p) => p.mode.as_claude_flag(),
+                None => mode
+                    .and_then(AcpSessionMode::from_acp_id)
+                    .unwrap_or_default()
+                    .as_claude_flag(),
+            };
 
             let launch = resolve_engine("claude", resolver, cwd).await?;
             let mut args: Vec<String> = [
@@ -1226,6 +1328,9 @@ pub(crate) async fn build_engine_command_with(
             // when the run names no model; `iyke chi run --model` still wins.
             if let Some(m) = chi_claude_model(model) {
                 args.extend([s("--model"), m]);
+            }
+            if let Some(p) = policy {
+                args.extend(p.claude_args());
             }
             Ok(engine_command(&launch, &args, cwd, true))
         }
@@ -1428,6 +1533,7 @@ async fn start_reader(
     output_path: PathBuf,
     engine: EngineChild,
     prompt: String,
+    deny_prompts: bool,
 ) {
     let (child, stdin, stdout, stderr) = engine;
     let child = Arc::new(Mutex::new(child));
@@ -1528,6 +1634,7 @@ async fn start_reader(
                     cancelled,
                     stdout,
                     stderr,
+                    deny_prompts,
                 )
                 .await
             }
@@ -1562,6 +1669,11 @@ fn is_truncated(output: &str) -> bool {
 /// Background task for a Claude Code one-off (its prompt envelope already
 /// written to stdin by [`start_reader`]). Reads `stdout`, writes partial
 /// output to `output_path`, and updates `chi_cache` as the run progresses.
+/// The error a toolPolicy run ends with when the engine asks for a decision.
+const POLICY_PROMPT_ERROR: &str =
+    "toolPolicy run stopped: the engine asked for a permission or an answer, and a policy run \
+     never waits for one";
+
 async fn claude_one_off_task(
     db: Arc<PaDb>,
     run_id: String,
@@ -1570,6 +1682,7 @@ async fn claude_one_off_task(
     cancelled: Arc<AtomicBool>,
     stdout: tokio::process::ChildStdout,
     stderr: Option<tokio::process::ChildStderr>,
+    deny_prompts: bool,
 ) {
     let stderr_tail = log_stderr("claude", stderr);
 
@@ -1581,8 +1694,11 @@ async fn claude_one_off_task(
     let mut external_id: Option<String> = None;
     let mut saw_done = false;
     let mut stop_reason: Option<String> = None;
+    // A toolPolicy run never waits for an answer: if the engine asks anyway,
+    // the run is killed and failed rather than parked in `awaiting_auth`.
+    let mut policy_violation: Option<&'static str> = None;
 
-    loop {
+    'read: loop {
         match reader.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
@@ -1618,6 +1734,14 @@ async fn claude_one_off_task(
                             saw_done = true;
                             stop_reason = s.clone();
                         }
+                        // Any request (`permission`, or `can_use_tool` from
+                        // claude 2.1.x) is one nobody will answer.
+                        ChatEvent::ControlRequest { .. } if deny_prompts => {
+                            policy_violation = Some(POLICY_PROMPT_ERROR);
+                        }
+                        ChatEvent::AskUserQuestion { .. } if deny_prompts => {
+                            policy_violation = Some(POLICY_PROMPT_ERROR);
+                        }
                         ChatEvent::ControlRequest { subtype, .. } if subtype == "permission" => {
                             cache_update_status(&db, &run_id, "awaiting_auth", None)
                                 .await
@@ -1630,6 +1754,10 @@ async fn claude_one_off_task(
                         }
                         _ => {}
                     }
+                }
+                if policy_violation.is_some() {
+                    let _ = child.lock().await.start_kill();
+                    break 'read;
                 }
 
                 // Periodically flush partial output to disk.
@@ -1645,6 +1773,8 @@ async fn claude_one_off_task(
     // Determine final status.
     let (status, error) = if cancelled.load(Ordering::SeqCst) {
         ("cancelled", None)
+    } else if let Some(reason) = policy_violation {
+        ("failed", Some(reason))
     } else if saw_done {
         if stop_reason.as_deref() == Some("error") {
             ("failed", Some("claude reported stop_reason error"))
@@ -2095,12 +2225,32 @@ pub(crate) async fn spawn_run(
     owner: &str,
 ) -> Result<ChiRunResult, String> {
     guard_identity()?;
+    let mut opts = opts;
+    // A malformed or misplaced policy fails the call before any row exists.
+    if let Some(policy) = &opts.tool_policy {
+        policy.validate()?;
+        if opts.engine_id != POLICY_ENGINE {
+            return Err(policy_engine_error(&opts.engine_id));
+        }
+        // The policy's mode is the run's mode (and what the row records).
+        opts.mode = Some(policy.mode.as_claude_flag().to_string());
+    }
     env.ensure_cache_dir()?;
     let run_id = uuid::Uuid::new_v4().to_string();
     let output_path = env.run_output_path(&run_id);
 
     // Initial one-off TTL is 1 hour; long-lived sessions will refresh this.
     cache_insert(&env.db, &run_id, &opts, &output_path, owner).await?;
+    if let Some(policy) = &opts.tool_policy {
+        // Stored before anything can start, so a resume always finds it. If it
+        // cannot be stored the run does not start.
+        if let Err(e) = cache_store_policy(&env.db, &run_id, policy).await {
+            cache_update_done(&env.db, &run_id, "failed", Some(&e), false, None)
+                .await
+                .ok();
+            return Err(e);
+        }
+    }
 
     let cwd = env.run_cwd(opts.cwd.as_deref());
 
@@ -2122,7 +2272,13 @@ pub(crate) async fn spawn_run(
     // [`RUNNER_STDIN_ENGINES`] their prompt on stdin: any other engine stays
     // in-process, where its prompt goes to stdin too (I-7).
     let mut fallback_warning: Option<String> = None;
-    if opts.persistent && !RUNNER_STDIN_ENGINES.contains(&opts.engine_id.as_str()) {
+    if opts.persistent && opts.tool_policy.is_some() {
+        tracing::warn!(
+            target: "ikenga::chi",
+            "chi run {run_id}: {POLICY_NOT_DETACHABLE_WARNING}"
+        );
+        fallback_warning = Some(POLICY_NOT_DETACHABLE_WARNING.to_string());
+    } else if opts.persistent && !RUNNER_STDIN_ENGINES.contains(&opts.engine_id.as_str()) {
         let warning = not_detachable_warning(&opts.engine_id);
         tracing::warn!(target: "ikenga::chi", "chi run {run_id}: {warning}");
         fallback_warning = Some(warning);
@@ -2195,13 +2351,14 @@ pub(crate) async fn spawn_run(
     }
 
     // ── In-process (non-persistent) path ─────────────────────────────────────
-    let cmd = build_engine_command_with(
+    let cmd = build_engine_command_policy(
         &env.reporting_resolver(),
         &opts.engine_id,
         &cwd,
         opts.model.as_deref(),
         opts.mode.as_deref(),
         opts.resume_session_id.as_deref(),
+        opts.tool_policy.as_ref(),
     )
     .await;
     let engine = spawn_engine_or_fail(&env.db, &run_id, cmd).await?;
@@ -2213,6 +2370,7 @@ pub(crate) async fn spawn_run(
         output_path,
         engine,
         opts.prompt.clone(),
+        opts.tool_policy.is_some(),
     )
     .await;
 
@@ -2231,6 +2389,14 @@ pub(crate) async fn resume_run(
     let mut row = cache_get(&env.db, &run_id)
         .await?
         .ok_or_else(|| format!("chi run not found: {run_id}"))?;
+
+    // A policy run resumes under the same policy, or not at all: read it
+    // before anything else changes (a missing or unreadable stored policy
+    // fails closed here, with the row untouched).
+    let policy = cache_load_policy(&env.db, &run_id).await?;
+    if policy.is_some() && row.engine_id != POLICY_ENGINE {
+        return Err(policy_engine_error(&row.engine_id));
+    }
 
     // The output file this turn will write. On the daemon a row's path is
     // confined to the cache dir before anything reads or writes it: `db_exec`
@@ -2283,13 +2449,14 @@ pub(crate) async fn resume_run(
     cache_update_status(&env.db, &run_id, "running", None).await?;
 
     let cwd = env.run_cwd(row.cwd.as_deref());
-    let cmd = build_engine_command_with(
+    let cmd = build_engine_command_policy(
         &env.reporting_resolver(),
         &row.engine_id,
         &cwd,
         row.model.as_deref(),
         row.mode.as_deref(),
         Some(&resume_id),
+        policy.as_ref(),
     )
     .await;
     let engine = spawn_engine_or_fail(&env.db, &run_id, cmd).await?;
@@ -2300,6 +2467,7 @@ pub(crate) async fn resume_run(
         output_path,
         engine,
         prompt,
+        policy.is_some(),
     )
     .await;
 
