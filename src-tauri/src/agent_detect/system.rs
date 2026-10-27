@@ -90,7 +90,9 @@ impl SecretsBackend {
             StoreErrorKind::Locked if error.is_not_configured() => Self::VaultNotConfigured,
             StoreErrorKind::Locked => Self::VaultLocked,
             StoreErrorKind::Unavailable => Self::KeychainUnavailable(message),
-            StoreErrorKind::Invalid | StoreErrorKind::Unknown => Self::Failed(message),
+            StoreErrorKind::Invalid | StoreErrorKind::Unknown | StoreErrorKind::Quarantined => {
+                Self::Failed(message)
+            }
         }
     }
 }

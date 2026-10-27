@@ -385,3 +385,7 @@ reason = "Repairs WSL networking on the user's own Windows machine: runs wsl.exe
 [wsl_health_probe]
 tag = "desktop-only-forever"
 reason = "Probes the local WSL VM (wsl.exe), the Windows Application event log (PowerShell Get-WinEvent) and the user's .wslconfig on the desktop's own machine, and raises the fix.wsl_network notification whose fixes only the desktop can run."
+
+[secrets_quarantined]
+tag = "desktop-only-forever"
+reason = "Lists names left over from the one-time Stronghold-to-keychain migration; the daemon never ran that migration and has no quarantine."

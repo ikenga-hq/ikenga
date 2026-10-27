@@ -28,6 +28,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { cn } from '@/components/ui/utils';
 import {
+	quarantinedSecretsQueryOptions,
 	secretsLockStateQueryOptions,
 	useDeleteScopedSecret,
 	useLockSecrets,
@@ -56,6 +57,7 @@ import {
 	type VaultAxis,
 	vaultAxis,
 } from '@/shell/secrets/principal-axis';
+import { NeedsReentryGroup } from '@/shell/secrets/needs-reentry';
 import { useUnlockSheet } from '@/shell/secrets/unlock-sheet';
 
 type TabKind = 'workspace' | 'project' | 'pkg';
@@ -87,6 +89,9 @@ function SecretsPage() {
 	const readOnlyDefault = axis === 'operator' && vaultAvailable;
 	const vaultUnlocked = (vaultAvailable && configured && !locked) || readOnlyDefault;
 	const writable = vaultUnlocked && !readOnlyDefault;
+
+	// Secrets a partly failed keychain migration left behind. Names only.
+	const quarantineQuery = useQuery({ ...quarantinedSecretsQueryOptions(), enabled: !share });
 
 	const activeProjectId = useShellStore((s) => s.activeProjectId);
 	const projects = useShellStore((s) => s.projects);
@@ -188,6 +193,8 @@ function SecretsPage() {
 					error={status.data?.error ?? null}
 				/>
 			)}
+
+			<NeedsReentryGroup entries={quarantineQuery.data ?? []} writable={writable} />
 
 			<ScopeTabList
 				tab={tab}

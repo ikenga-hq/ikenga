@@ -195,6 +195,7 @@ pub(crate) fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         secrets::secrets_delete,
         secrets::secrets_list_keys,
         secrets::secrets_index_names,
+        secrets::secrets_quarantined,
         secrets::secrets_vault_status,
         secrets::secrets_set_passphrase,
         secrets::secrets_unlock,

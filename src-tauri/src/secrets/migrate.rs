@@ -33,7 +33,16 @@ const MARKER_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationOutcome {
     NoLegacyVault,
-    Migrated { count: usize },
+    Migrated {
+        count: usize,
+    },
+    /// Migrated, but `quarantined` entries could not be verified in the
+    /// keychain and stay only in the kept legacy snapshot until re-entered
+    /// or deleted. `count` is the number that did migrate.
+    MigratedWithQuarantine {
+        count: usize,
+        quarantined: usize,
+    },
     AlreadyComplete,
 }
 
@@ -46,6 +55,14 @@ struct MigrationMarker {
     count: usize,
     #[serde(default)]
     index_names: Vec<String>,
+    /// Names quarantined at migration time (names only; the live list is
+    /// owned by the store). Absent in markers written before quarantine
+    /// existed, which parse as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    quarantined: Vec<String>,
+    /// Integrity binding for `quarantined`; empty iff `quarantined` is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    quarantined_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +238,8 @@ where
             .map(|value| value == marker.source_sha256)
             .unwrap_or(true)
         {
+            retire_legacy_if_quarantine_cleared(&paths, marker, store)?;
+            log_quarantine_once(store);
             return Ok(MigrationOutcome::AlreadyComplete);
         }
     } else {
@@ -238,10 +257,19 @@ where
     let legacy_fingerprint = legacy_fingerprint
         .ok_or_else(|| "a different legacy snapshot is required for migration".to_string())?;
     let values = load_legacy(&paths.legacy, &paths.key)?;
-    let count = store
-        .replace_all(&values)
+    let replaced = store
+        .replace_all_quarantining(&values)
         .map_err(|error| format!("keychain migration failed: {error}"))?;
-    verify_store(store, &values)?;
+    let count = replaced.count;
+    let mut quarantined = replaced.quarantined;
+    quarantined.sort();
+    quarantined.dedup();
+    let migrated_values: BTreeMap<String, String> = values
+        .iter()
+        .filter(|(name, _)| !quarantined.contains(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    verify_store(store, &migrated_values)?;
 
     copy_atomic(&paths.legacy, &paths.backup)?;
     let source_sha256 = fingerprint(&paths.legacy)?;
@@ -263,15 +291,36 @@ where
         index_sha256,
         count,
         index_names,
+        quarantined_sha256: if quarantined.is_empty() {
+            String::new()
+        } else {
+            quarantine_fingerprint(&quarantined)
+        },
+        quarantined,
     };
     write_json(&paths.marker, &marker)?;
     let persisted_marker: MigrationMarker = read_json(&paths.marker)?;
     if persisted_marker != marker
         || persisted_marker.index_sha256 != index_fingerprint(store)?
-        || persisted_marker.count != values.len()
+        || persisted_marker.count != values.len() - persisted_marker.quarantined.len()
         || !index_contains_names(&paths.index, &persisted_marker.index_names)?
     {
         return Err("migration marker verification failed".into());
+    }
+    if !persisted_marker.quarantined.is_empty() {
+        // The quarantined values exist only in the legacy snapshot (and its
+        // backup) right now: keep both until each name is re-entered or
+        // deleted. Names only in the log.
+        log::warn!(
+            "[secrets] migrated {count}, quarantined {}: {:?}; legacy snapshot kept",
+            persisted_marker.quarantined.len(),
+            persisted_marker.quarantined
+        );
+        QUARANTINE_LOGGED.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Ok(MigrationOutcome::MigratedWithQuarantine {
+            count,
+            quarantined: persisted_marker.quarantined.len(),
+        });
     }
     if fingerprint(&paths.legacy)? == persisted_marker.source_sha256
         && fingerprint(&paths.backup)? == persisted_marker.backup_sha256
@@ -314,6 +363,25 @@ fn validate_migration_marker(
     let index = SecretIndex::load(&paths.index)
         .map_err(|error| format!("migration index verification failed: {error}"))?;
     let current_names = index.names();
+    if marker.quarantined.is_empty() {
+        if !marker.quarantined_sha256.is_empty() {
+            return Err("migration marker quarantine fingerprint has no names".into());
+        }
+    } else {
+        if marker.quarantined.iter().collect::<BTreeSet<_>>().len() != marker.quarantined.len() {
+            return Err("migration marker quarantine list has duplicates".into());
+        }
+        if quarantine_fingerprint(&marker.quarantined) != marker.quarantined_sha256 {
+            return Err("migration marker quarantine list does not match its fingerprint".into());
+        }
+        if marker
+            .quarantined
+            .iter()
+            .any(|name| marker.index_names.contains(name))
+        {
+            return Err("migration marker lists a name as both migrated and quarantined".into());
+        }
+    }
     if !marker.index_names.is_empty() {
         if marker.index_names.len() != marker.count
             || marker.index_names.iter().collect::<BTreeSet<_>>().len() != marker.index_names.len()
@@ -328,6 +396,75 @@ fn validate_migration_marker(
                 return Err(format!("migration index is missing `{name}`"));
             }
         }
+    }
+    Ok(())
+}
+
+/// Names the migration marker records as quarantined, or `None` when there
+/// is no readable marker in `data_dir`. Used by the store to validate its
+/// live quarantine list; marker integrity itself is checked by the migration.
+pub(crate) fn marker_quarantined_names(data_dir: &Path) -> Option<BTreeSet<String>> {
+    let bytes = fs::read(data_dir.join(MIGRATION_MARKER_FILENAME)).ok()?;
+    let marker: MigrationMarker = serde_json::from_slice(&bytes).ok()?;
+    Some(marker.quarantined.into_iter().collect())
+}
+
+fn quarantine_fingerprint(names: &[String]) -> String {
+    let mut names = names.to_vec();
+    names.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"ikenga-quarantine-v1");
+    for name in names {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+static QUARANTINE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// One aggregate line per process start (not per project switch): names only.
+fn log_quarantine_once(store: &dyn SecretsStore) {
+    let names = store.quarantined_names();
+    if names.is_empty() || QUARANTINE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    log::warn!(
+        "[secrets] {} secret(s) need re-entry (kept in the legacy snapshot): {:?}",
+        names.len(),
+        names
+    );
+}
+
+/// Once the store's live quarantine is empty (every name re-entered or
+/// deleted) the usual retirement of the legacy snapshot runs, exactly as for
+/// a clean migration: only if legacy and backup still match the marker. The
+/// verified backup stays, so rollback keeps working. Chosen over keeping the
+/// legacy file forever: it would leave a plaintext-equivalent copy of
+/// secrets the user has since deleted, and the backup already preserves the
+/// rollback path. If the live list is lost, the effect is the same
+/// retirement, with the backup intact.
+fn retire_legacy_if_quarantine_cleared(
+    paths: &MigrationPaths,
+    marker: &MigrationMarker,
+    store: &dyn SecretsStore,
+) -> Result<(), String> {
+    if marker.quarantined.is_empty() || !store.quarantined_names().is_empty() {
+        return Ok(());
+    }
+    if !paths.legacy.exists() {
+        return Ok(());
+    }
+    let Some(backup) = paths.existing_backup() else {
+        return Ok(());
+    };
+    if fingerprint(&paths.legacy)? == marker.source_sha256
+        && fingerprint(&backup)? == marker.backup_sha256
+    {
+        fs::remove_file(&paths.legacy).map_err(|error| {
+            format!("remove legacy snapshot {}: {error}", paths.legacy.display())
+        })?;
+        log::info!("[secrets] quarantine cleared; legacy snapshot retired (backup kept)");
     }
     Ok(())
 }
@@ -679,6 +816,8 @@ mod tests {
                 index_sha256,
                 count: index_names.len(),
                 index_names,
+                quarantined: Vec::new(),
+                quarantined_sha256: String::new(),
             },
         )
         .unwrap();
@@ -887,5 +1026,272 @@ mod tests {
         })
         .unwrap();
         assert_eq!(outcome, MigrationOutcome::AlreadyComplete);
+    }
+
+    // ── per-entry quarantine ────────────────────────────────────────────
+
+    use crate::secrets::keyring_store::testing::{
+        migration_store, reopened_store, FaultBackend, Faults,
+    };
+    use crate::secrets::keyring_store::QUARANTINE_FILENAME;
+
+    const BAD: &str = "workspace::GOOGLE_CALENDAR_PRIVATE_KEY";
+
+    fn q_values() -> BTreeMap<String, String> {
+        let mut values = BTreeMap::new();
+        values.insert(BAD.to_string(), "line-one\nline-two\r\n".to_string());
+        values.insert("workspace::ONE".to_string(), "secret-one".to_string());
+        values.insert("workspace::TWO".to_string(), "secret-two".to_string());
+        values.insert(
+            "project::alpha::THREE".to_string(),
+            "secret-three".to_string(),
+        );
+        values
+    }
+
+    struct Quarantined {
+        dir: tempfile::TempDir,
+        paths: MigrationPaths,
+        backend: Arc<FaultBackend>,
+    }
+
+    use std::sync::Arc;
+
+    fn quarantined_migration() -> (Quarantined, MigrationOutcome) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = MigrationPaths::new(dir.path());
+        fs::write(&paths.legacy, b"legacy-snapshot").unwrap();
+        let backend = Arc::new(FaultBackend::default());
+        backend
+            .faults
+            .lock()
+            .unwrap()
+            .drop_names
+            .insert(BAD.to_string());
+        let store = migration_store(&paths.index, backend.clone());
+        let values = q_values();
+        let outcome = migrate_with(dir.path(), &store, |_, _| Ok(values.clone())).unwrap();
+        (
+            Quarantined {
+                dir,
+                paths,
+                backend,
+            },
+            outcome,
+        )
+    }
+
+    #[test]
+    fn one_bad_entry_is_quarantined_with_legacy_and_backup_kept() {
+        let (q, outcome) = quarantined_migration();
+        assert_eq!(
+            outcome,
+            MigrationOutcome::MigratedWithQuarantine {
+                count: 3,
+                quarantined: 1
+            }
+        );
+        // Legacy and verified backup both kept: the value lives only there.
+        assert_eq!(fs::read(&q.paths.legacy).unwrap(), b"legacy-snapshot");
+        assert_eq!(fs::read(&q.paths.backup).unwrap(), b"legacy-snapshot");
+        let marker: MigrationMarker = read_json(&q.paths.marker).unwrap();
+        assert_eq!(marker.quarantined, vec![BAD.to_string()]);
+        assert_eq!(marker.count, 3);
+        assert!(!marker.index_names.contains(&BAD.to_string()));
+        validate_migration_marker(&q.paths, &marker).unwrap();
+
+        // The store is available with the verified entries.
+        let store = reopened_store(&q.paths.index, q.backend.clone());
+        let mut expected = q_values();
+        expected.remove(BAD);
+        assert_eq!(store.export_all().unwrap(), expected);
+        assert_eq!(store.quarantined_names(), vec![BAD.to_string()]);
+        assert!(store.get(BAD).unwrap_err().is_quarantined());
+    }
+
+    #[test]
+    fn no_value_reaches_marker_index_or_quarantine_files() {
+        let (q, _) = quarantined_migration();
+        for file in [
+            &q.paths.marker,
+            &q.paths.index,
+            &q.dir.path().join(QUARANTINE_FILENAME),
+        ] {
+            let text = fs::read_to_string(file).unwrap();
+            for value in q_values().values() {
+                assert!(!text.contains(value.as_str()), "{}", file.display());
+            }
+        }
+    }
+
+    #[test]
+    fn rerun_is_already_complete_and_still_quarantined() {
+        let (q, _) = quarantined_migration();
+        let store = reopened_store(&q.paths.index, q.backend.clone());
+        let outcome = migrate_with(q.dir.path(), &store, |_, _| {
+            Err("must not reload the legacy snapshot".to_string())
+        })
+        .unwrap();
+        assert_eq!(outcome, MigrationOutcome::AlreadyComplete);
+        assert!(q.paths.legacy.exists());
+        assert!(q.paths.backup.exists());
+        assert_eq!(store.quarantined_names(), vec![BAD.to_string()]);
+    }
+
+    fn assert_retires_after(
+        clear: impl FnOnce(&crate::secrets::keyring_store::KeyringStore, &Quarantined),
+    ) {
+        let (q, _) = quarantined_migration();
+        let store = reopened_store(&q.paths.index, q.backend.clone());
+        // Still quarantined: nothing is retired.
+        migrate_with(q.dir.path(), &store, |_, _| Err("unused".into())).unwrap();
+        assert!(q.paths.legacy.exists());
+
+        clear(&store, &q);
+        assert!(store.quarantined_names().is_empty());
+        let outcome = migrate_with(q.dir.path(), &store, |_, _| Err("unused".into())).unwrap();
+        assert_eq!(outcome, MigrationOutcome::AlreadyComplete);
+        assert!(
+            !q.paths.legacy.exists(),
+            "legacy retired once nothing is quarantined"
+        );
+        assert_eq!(fs::read(&q.paths.backup).unwrap(), b"legacy-snapshot");
+        // And it stays complete on the next start.
+        let again = migrate_with(q.dir.path(), &store, |_, _| Err("unused".into())).unwrap();
+        assert_eq!(again, MigrationOutcome::AlreadyComplete);
+    }
+
+    #[test]
+    fn re_entering_the_secret_clears_quarantine_and_retires_legacy() {
+        assert_retires_after(|store, q| {
+            *q.backend.faults.lock().unwrap() = Faults::default();
+            store.set(BAD, "re-entered").unwrap();
+            assert_eq!(store.get(BAD).unwrap().as_deref(), Some("re-entered"));
+        });
+    }
+
+    #[test]
+    fn deleting_the_secret_clears_quarantine_and_retires_legacy() {
+        assert_retires_after(|store, _| {
+            store.delete(BAD).unwrap();
+        });
+    }
+
+    #[test]
+    fn all_entries_failing_fails_closed_with_nothing_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = MigrationPaths::new(dir.path());
+        fs::write(&paths.legacy, b"legacy-snapshot").unwrap();
+        let backend = Arc::new(FaultBackend::default());
+        for name in q_values().keys() {
+            backend
+                .faults
+                .lock()
+                .unwrap()
+                .drop_names
+                .insert(name.clone());
+        }
+        let store = migration_store(&paths.index, backend.clone());
+        let values = q_values();
+        let error = migrate_with(dir.path(), &store, |_, _| Ok(values.clone())).unwrap_err();
+        assert!(error.contains("keychain migration failed"));
+        assert!(paths.legacy.exists());
+        assert!(!paths.marker.exists());
+        assert!(!paths.backup.exists());
+        assert_eq!(backend.item_count(), 0);
+    }
+
+    #[test]
+    fn majority_failing_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = MigrationPaths::new(dir.path());
+        fs::write(&paths.legacy, b"legacy-snapshot").unwrap();
+        let backend = Arc::new(FaultBackend::default());
+        for name in [BAD, "workspace::ONE", "workspace::TWO"] {
+            backend
+                .faults
+                .lock()
+                .unwrap()
+                .drop_names
+                .insert(name.to_string());
+        }
+        let store = migration_store(&paths.index, backend.clone());
+        let values = q_values();
+        assert!(migrate_with(dir.path(), &store, |_, _| Ok(values.clone())).is_err());
+        assert!(!paths.marker.exists());
+        assert!(paths.legacy.exists());
+        assert_eq!(backend.item_count(), 0);
+    }
+
+    #[test]
+    fn unreachable_keychain_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = MigrationPaths::new(dir.path());
+        fs::write(&paths.legacy, b"legacy-snapshot").unwrap();
+        let backend = Arc::new(FaultBackend::default());
+        backend.faults.lock().unwrap().unreachable = true;
+        let store = migration_store(&paths.index, backend);
+        let values = q_values();
+        assert!(migrate_with(dir.path(), &store, |_, _| Ok(values.clone())).is_err());
+        assert!(!paths.marker.exists());
+        assert!(paths.legacy.exists());
+    }
+
+    #[test]
+    fn rollback_inputs_survive_quarantine() {
+        // `rollback` itself opens the production keychain service, so it is
+        // not run here. Everything it relies on is checked instead: the
+        // backup restores the original snapshot byte for byte, and
+        // retiring the store (`replace_all(&{})`) also drops the quarantine.
+        let (q, _) = quarantined_migration();
+        fs::remove_file(&q.paths.legacy).unwrap();
+        let restored = restore_original_snapshot(&q.paths, &q.paths.backup).unwrap();
+        assert_eq!(restored, fingerprint(&q.paths.backup).unwrap());
+        assert_eq!(fs::read(&q.paths.legacy).unwrap(), b"legacy-snapshot");
+        let store = reopened_store(&q.paths.index, q.backend.clone());
+        store.replace_all(&BTreeMap::new()).unwrap();
+        assert!(store.quarantined_names().is_empty());
+        assert!(!q.dir.path().join(QUARANTINE_FILENAME).exists());
+    }
+
+    #[test]
+    fn tampered_quarantine_list_is_rejected() {
+        let (q, _) = quarantined_migration();
+        let original: MigrationMarker = read_json(&q.paths.marker).unwrap();
+
+        let mut added = original.clone();
+        added.quarantined.push("workspace::EXTRA".to_string());
+        assert!(validate_migration_marker(&q.paths, &added).is_err());
+
+        let mut swapped = original.clone();
+        swapped.quarantined = vec!["workspace::OTHER".to_string()];
+        assert!(validate_migration_marker(&q.paths, &swapped).is_err());
+
+        let mut emptied = original.clone();
+        emptied.quarantined.clear();
+        assert!(validate_migration_marker(&q.paths, &emptied).is_err());
+
+        let mut overlap = original.clone();
+        overlap.quarantined = vec!["workspace::ONE".to_string()];
+        overlap.quarantined_sha256 = quarantine_fingerprint(&overlap.quarantined);
+        assert!(validate_migration_marker(&q.paths, &overlap).is_err());
+
+        validate_migration_marker(&q.paths, &original).unwrap();
+        // Tampering with the file on disk is caught by the migration entry point too.
+        write_json(&q.paths.marker, &added).unwrap();
+        let store = reopened_store(&q.paths.index, q.backend.clone());
+        assert!(migrate_with(q.dir.path(), &store, |_, _| Err("unused".into())).is_err());
+    }
+
+    #[test]
+    fn markers_without_the_quarantine_fields_parse_as_empty() {
+        let (q, _) = quarantined_migration();
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&q.paths.marker).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("quarantined");
+        json.as_object_mut().unwrap().remove("quarantined_sha256");
+        let parsed: MigrationMarker = serde_json::from_value(json).unwrap();
+        assert!(parsed.quarantined.is_empty());
+        assert!(parsed.quarantined_sha256.is_empty());
     }
 }

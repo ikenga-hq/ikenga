@@ -8,6 +8,8 @@ import {
 	secretsListKeys,
 	secretsListKeysScoped,
 	secretsLock,
+	secretsQuarantined,
+	type QuarantinedSecret,
 	secretsLockState,
 	secretsSet,
 	secretsSetPassphrase,
@@ -135,6 +137,42 @@ export function useDeleteScopedSecret() {
 	const qc = useQueryClient();
 	return useMutation<void, Error, { scope: VaultScope; key: string }>({
 		mutationFn: ({ scope, key }) => secretsDeleteScoped(scope, key),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: queryKeys.secrets.all });
+		},
+	});
+}
+
+// ─── Needs re-entry (partially failed keychain migration) ─────────────────
+
+export type { QuarantinedSecret };
+
+export function quarantinedSecretsQueryOptions() {
+	return queryOptions({
+		queryKey: [...queryKeys.secrets.all, 'quarantined'] as const,
+		queryFn: () => secretsQuarantined(),
+		staleTime: 5_000,
+	});
+}
+
+/** Enter the value again. A legacy bare name goes through the unscoped
+ *  command, everything else through its own scope. */
+export function useSetQuarantinedSecret() {
+	const qc = useQueryClient();
+	return useMutation<void, Error, { entry: QuarantinedSecret; value: string }>({
+		mutationFn: ({ entry, value }) =>
+			entry.scope ? secretsSetScoped(entry.scope, entry.key, value) : secretsSet(entry.name, value),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: queryKeys.secrets.all });
+		},
+	});
+}
+
+export function useDeleteQuarantinedSecret() {
+	const qc = useQueryClient();
+	return useMutation<void, Error, QuarantinedSecret>({
+		mutationFn: (entry) =>
+			entry.scope ? secretsDeleteScoped(entry.scope, entry.key) : secretsDelete(entry.name),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: queryKeys.secrets.all });
 		},

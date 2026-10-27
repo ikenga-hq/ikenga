@@ -14,6 +14,10 @@ pub enum StoreErrorKind {
     Unavailable,
     Invalid,
     Unknown,
+    /// The entry exists only in the legacy snapshot because it could not be
+    /// verified in the keychain during migration. It has to be set again or
+    /// deleted (see [`SecretsStore::quarantined_names`]).
+    Quarantined,
 }
 
 const NOT_CONFIGURED_MESSAGE: &str = "secrets passphrase is not configured";
@@ -63,6 +67,21 @@ impl StoreError {
         Self::uncommitted(message)
     }
 
+    /// A read of an entry that is quarantined (needs re-entry).
+    pub fn quarantined(name: &str) -> Self {
+        Self::with_kind(
+            StoreErrorKind::Quarantined,
+            format!(
+                "secret `{name}` needs to be entered again (it could not be moved to the keychain)"
+            ),
+            false,
+        )
+    }
+
+    pub fn is_quarantined(&self) -> bool {
+        self.kind == StoreErrorKind::Quarantined
+    }
+
     pub fn kind(&self) -> StoreErrorKind {
         self.kind
     }
@@ -73,6 +92,7 @@ impl StoreError {
             StoreErrorKind::Unavailable => "unavailable",
             StoreErrorKind::Invalid => "invalid",
             StoreErrorKind::Unknown => "unknown",
+            StoreErrorKind::Quarantined => "quarantined",
         }
     }
 
@@ -149,6 +169,15 @@ pub enum StoreOwner {
     Principal(String),
 }
 
+/// Result of [`SecretsStore::replace_all_quarantining`]: how many entries
+/// were stored and verified, and the NAMES (never values) of entries that
+/// could not be verified and were left out.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReplaceOutcome {
+    pub count: usize,
+    pub quarantined: Vec<String>,
+}
+
 pub trait SecretsStore: Send + Sync {
     fn get(&self, name: &str) -> Result<Option<String>, StoreError>;
 
@@ -184,6 +213,27 @@ pub trait SecretsStore: Send + Sync {
     }
 
     fn replace_all(&self, values: &BTreeMap<String, String>) -> Result<usize, StoreError>;
+
+    /// [`SecretsStore::replace_all`] that tolerates a minority of entries
+    /// failing their individual read-back verification: those are left out
+    /// (and reported by name) instead of failing the whole replacement.
+    /// Stores without per-entry verification keep the strict default.
+    fn replace_all_quarantining(
+        &self,
+        values: &BTreeMap<String, String>,
+    ) -> Result<ReplaceOutcome, StoreError> {
+        let count = self.replace_all(values)?;
+        Ok(ReplaceOutcome {
+            count,
+            quarantined: Vec::new(),
+        })
+    }
+
+    /// Names that still need re-entry after a partially failed migration.
+    /// Empty for every store that has no quarantine.
+    fn quarantined_names(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     fn probe(&self) -> Result<(), StoreError>;
 

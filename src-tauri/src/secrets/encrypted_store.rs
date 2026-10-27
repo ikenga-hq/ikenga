@@ -165,6 +165,10 @@ impl SecretsStore for EncryptedStore {
         self.inner.list_meta()
     }
 
+    fn quarantined_names(&self) -> Vec<String> {
+        self.inner.quarantined_names()
+    }
+
     fn export_all(&self) -> Result<BTreeMap<String, String>, StoreError> {
         match self.mode()? {
             VaultMode::Unconfigured => {
