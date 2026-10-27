@@ -873,6 +873,15 @@ export async function secretsIndexNames(): Promise<string[]> {
 	return invoke('secrets_index_names');
 }
 
+/** A secret that could not be moved into the keychain during the one-time
+ *  migration and has to be entered again. Names only, never a value.
+ *  `scope` is null for a legacy bare name. */
+export type QuarantinedSecret = { name: string; scope: VaultScope | null; key: string };
+
+export async function secretsQuarantined(): Promise<QuarantinedSecret[]> {
+	return invoke('secrets_quarantined');
+}
+
 /** The operator default's names alone (`IKENGA_SECRET_*`, bare) — the
  *  daemon's layer under a principal's own store (review WP76-RV1). A
  *  browser-only verb: the desktop keychain has no default layer, so only

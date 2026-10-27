@@ -323,6 +323,7 @@ commands.allow = [
   "secrets_list_keys_scoped",
   "secrets_lock",
   "secrets_lock_state",
+  "secrets_quarantined",
   "secrets_set",
   "secrets_set_passphrase",
   "secrets_set_scoped",

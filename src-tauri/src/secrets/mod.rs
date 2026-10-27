@@ -25,8 +25,8 @@ pub use encrypted_store::EncryptedStore;
 pub use keyring_store::KeyringStore;
 pub use principal_store::{PrincipalStore, WrapKey};
 pub use store::{
-    SecretMeta, SecretsStore, SharedSecretStore, SharedSecretStoreSlot, StoreError, StoreErrorKind,
-    StoreOwner, UnavailableSecretStore,
+    ReplaceOutcome, SecretMeta, SecretsStore, SharedSecretStore, SharedSecretStoreSlot, StoreError,
+    StoreErrorKind, StoreOwner, UnavailableSecretStore,
 };
 pub use unlock::{
     LockState, UnlockError, UnlockState, VaultMode, DEFAULT_IDLE_TIMEOUT, UNLOCK_ENVELOPE_FILENAME,
