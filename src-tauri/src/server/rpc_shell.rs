@@ -614,7 +614,7 @@ pub(super) async fn project_create(state: &AppState, args: &Value) -> RpcRespons
         };
         let pool = pa_db(state)?.ensure_pool().await?;
         check_stored_root(state, create.root_path.as_deref())?;
-        projects::create_project(&pool, create).await
+        projects::create_project_announcing(&pool, create, &*state.events).await
     }
     .await;
     respond("project_create", r)
@@ -631,7 +631,7 @@ pub(super) async fn project_update(state: &AppState, args: &Value) -> RpcRespons
         if let Some(root) = &patch.root_path {
             check_stored_root(state, root.as_deref())?;
         }
-        projects::update_project(&pool, &id, patch).await
+        projects::update_project_announcing(&pool, &id, patch, &*state.events).await
     }
     .await;
     respond("project_update", r)
@@ -641,7 +641,7 @@ pub(super) async fn project_archive(state: &AppState, args: &Value) -> RpcRespon
     let r = async {
         let id: String = targ(args, &["id"])?;
         let pool = pa_db(state)?.ensure_pool().await?;
-        projects::archive_project(&pool, &id).await
+        projects::archive_project_announcing(&pool, &id, &*state.events).await
     }
     .await;
     respond("project_archive", r)

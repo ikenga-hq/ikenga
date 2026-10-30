@@ -15,8 +15,9 @@ use tauri::{AppHandle, Emitter};
 
 use crate::commands::db::PaDb;
 use crate::commands::projects::{
-    archive_project, create_project, get_active_project_id, get_project, list_projects,
-    set_active_project_id, update_project, CreateArgs, Project, ProjectPatch,
+    archive_project_announcing, create_project_announcing, get_active_project_id, get_project,
+    list_projects, set_active_project_id, update_project_announcing, CreateArgs, Project,
+    ProjectPatch,
 };
 
 fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, String) {
@@ -61,10 +62,14 @@ pub async fn get_project_list(
 
 pub async fn post_project_create(
     Extension(db): Extension<Arc<PaDb>>,
+    Extension(app): Extension<AppHandle>,
     Json(body): Json<CreateArgs>,
 ) -> Result<Json<Project>, (StatusCode, String)> {
     let pool = db.ensure_pool().await.map_err(map_err)?;
-    create_project(&pool, body).await.map(Json).map_err(map_err)
+    create_project_announcing(&pool, body, &app)
+        .await
+        .map(Json)
+        .map_err(map_err)
 }
 
 // ── POST /iyke/project/update ───────────────────────────────────────────
@@ -78,10 +83,11 @@ pub struct UpdateBody {
 
 pub async fn post_project_update(
     Extension(db): Extension<Arc<PaDb>>,
+    Extension(app): Extension<AppHandle>,
     Json(body): Json<UpdateBody>,
 ) -> Result<Json<Project>, (StatusCode, String)> {
     let pool = db.ensure_pool().await.map_err(map_err)?;
-    update_project(&pool, &body.id, body.patch)
+    update_project_announcing(&pool, &body.id, body.patch, &app)
         .await
         .map(Json)
         .map_err(map_err)
@@ -96,10 +102,13 @@ pub struct IdBody {
 
 pub async fn post_project_archive(
     Extension(db): Extension<Arc<PaDb>>,
+    Extension(app): Extension<AppHandle>,
     Json(body): Json<IdBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pool = db.ensure_pool().await.map_err(map_err)?;
-    archive_project(&pool, &body.id).await.map_err(map_err)?;
+    archive_project_announcing(&pool, &body.id, &app)
+        .await
+        .map_err(map_err)?;
     Ok(Json(json!({ "ok": true, "id": body.id })))
 }
 

@@ -1,5 +1,6 @@
-// Phase 0 project-switch subscriber. Listens for the Rust-side
-// `projects:active-changed` Tauri event and:
+// Project subscribers. Listens for two Rust-side Tauri events:
+//
+// `projects:active-changed` (a switch):
 //
 //   1. Invalidates every TanStack Query whose key starts with
 //      `'project-scoped'`. Phase 0 doesn't define those queries yet — this
@@ -10,6 +11,12 @@
 //      indicator stays in sync after MCP-driven switches (the Iyke MCP
 //      can call `project_set_active` without going through the shell store).
 //
+// `projects:list-changed` (a create / update / archive, from any surface):
+//
+//   Refreshes the list and nothing else. A new project must not invalidate
+//   `project-scoped` queries — the active project did not change — so this
+//   handler deliberately shares no code with the one above.
+//
 // Mounted at workspace level — exactly once per process.
 
 import { useEffect } from 'react';
@@ -17,35 +24,48 @@ import type { UnlistenFn } from '@/lib/transport';
 
 import { queryClient } from '@/lib/query-client';
 import { useShellStore } from '@/lib/shell/shell-store';
-import { projectListenActiveChanged } from '@/lib/tauri-cmd';
+import { projectListenActiveChanged, projectListenListChanged } from '@/lib/tauri-cmd';
 
 export function useProjectsSync(): void {
 	const refreshProjects = useShellStore((s) => s.refreshProjects);
 
 	useEffect(() => {
-		let unlisten: UnlistenFn | null = null;
+		const unlisteners: UnlistenFn[] = [];
 		let cancelled = false;
-		void (async () => {
+
+		// Registers one listener; if the effect was torn down while the
+		// registration was in flight, unlistens immediately.
+		const register = async (subscribe: () => Promise<UnlistenFn>) => {
 			try {
-				const fn = await projectListenActiveChanged(() => {
-					// Pull the fresh list so an MCP-driven switch shows up in
-					// the activity-bar indicator immediately.
-					void refreshProjects();
-					// Invalidate every project-scoped query in flight.
-					queryClient.invalidateQueries({ queryKey: ['project-scoped'] });
-				});
+				const fn = await subscribe();
 				if (cancelled) {
 					fn();
 					return;
 				}
-				unlisten = fn;
+				unlisteners.push(fn);
 			} catch {
 				// Tauri unavailable (test env / pre-setup boot).
 			}
-		})();
+		};
+
+		void register(() =>
+			projectListenActiveChanged(() => {
+				// Pull the fresh list so an MCP-driven switch shows up in
+				// the activity-bar indicator immediately.
+				void refreshProjects();
+				// Invalidate every project-scoped query in flight.
+				queryClient.invalidateQueries({ queryKey: ['project-scoped'] });
+			})
+		);
+		void register(() =>
+			projectListenListChanged(() => {
+				void refreshProjects();
+			})
+		);
+
 		return () => {
 			cancelled = true;
-			if (unlisten) unlisten();
+			for (const fn of unlisteners) fn();
 		};
 	}, [refreshProjects]);
 }

@@ -27,6 +27,71 @@ use sqlx::{Row, SqlitePool};
 pub const ACTIVE_PROJECT_KEY: &str = "shell.activeProjectId";
 pub const DEFAULT_PROJECT_ID: &str = "default";
 
+/// Emitted whenever a project row is created, updated or archived, so a
+/// shell that did not make the change (an agent via the iyke bridge, a
+/// browser session) re-reads the list. Payload: [`ListChanged`]. Frozen as
+/// gate G-EVENT (plans/2026-10-30-agent-project-create).
+///
+/// Deliberately not `projects:active-changed`: that handler also invalidates
+/// every `project-scoped` query, which a mere create must not do.
+pub const LIST_CHANGED_EVENT: &str = "projects:list-changed";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListChangeKind {
+    Created,
+    Updated,
+    Archived,
+}
+
+/// Wire payload of [`LIST_CHANGED_EVENT`]: `{ "id": "...", "kind": "created" }`.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ListChanged<'a> {
+    pub id: &'a str,
+    pub kind: ListChangeKind,
+}
+
+/// Where a project mutation announces itself: the desktop's `AppHandle`
+/// (Tauri event bus) or the daemon's `EventBus`. A trait so the
+/// `*_announcing` helpers below are testable without a webview runtime.
+pub trait ListChangedSink {
+    fn list_changed(&self, id: &str, kind: ListChangeKind);
+}
+
+/// `create_project`, then announce `created`. Nothing is announced on error.
+pub async fn create_project_announcing(
+    pool: &SqlitePool,
+    args: CreateArgs,
+    sink: &dyn ListChangedSink,
+) -> Result<Project, String> {
+    let project = create_project(pool, args).await?;
+    sink.list_changed(&project.id, ListChangeKind::Created);
+    Ok(project)
+}
+
+/// `update_project`, then announce `updated`. Nothing is announced on error.
+pub async fn update_project_announcing(
+    pool: &SqlitePool,
+    id: &str,
+    patch: ProjectPatch,
+    sink: &dyn ListChangedSink,
+) -> Result<Project, String> {
+    let project = update_project(pool, id, patch).await?;
+    sink.list_changed(&project.id, ListChangeKind::Updated);
+    Ok(project)
+}
+
+/// `archive_project`, then announce `archived`. Nothing is announced on error.
+pub async fn archive_project_announcing(
+    pool: &SqlitePool,
+    id: &str,
+    sink: &dyn ListChangedSink,
+) -> Result<(), String> {
+    archive_project(pool, id).await?;
+    sink.list_changed(id, ListChangeKind::Archived);
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -158,6 +223,19 @@ pub struct CreateArgs {
     pub description: Option<String>,
 }
 
+/// A stored root, compared the way `iyke project switch` compares paths:
+/// trimmed, `\` read as `/`, trailing separators dropped (`/` stays `/`).
+/// Blank stays blank, which callers treat as "no root".
+pub fn normalize_root(p: &str) -> String {
+    let s = p.trim().replace('\\', "/");
+    let t = s.trim_end_matches('/');
+    if t.is_empty() && s.starts_with('/') {
+        "/".to_string()
+    } else {
+        t.to_string()
+    }
+}
+
 pub async fn create_project(pool: &SqlitePool, args: CreateArgs) -> Result<Project, String> {
     validate_slug(&args.id)?;
     let display = args.display_name.trim();
@@ -166,6 +244,29 @@ pub async fn create_project(pool: &SqlitePool, args: CreateArgs) -> Result<Proje
             "invalid display_name length: {} (1..=120)",
             display.chars().count()
         ));
+    }
+
+    // One live project per root: `iyke project switch <path>` errors on an
+    // ambiguous path, and an agent retrying a create must not mint a twin.
+    // Archived rows do not count, so a root can be re-registered.
+    if let Some(want) = args.root_path.as_deref().map(normalize_root) {
+        if !want.is_empty() {
+            let live: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT id, root_path FROM projects
+                 WHERE archived_at IS NULL AND root_path IS NOT NULL",
+            )
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("check duplicate root: {e}"))?;
+            if let Some((owner, _)) = live
+                .iter()
+                .find(|(_, r)| r.as_deref().map(normalize_root).as_deref() == Some(want.as_str()))
+            {
+                return Err(format!(
+                    "project root already exists: {want} (project {owner})"
+                ));
+            }
+        }
     }
 
     let next_position: i64 =
@@ -1126,6 +1227,151 @@ mod tests {
         assert_eq!(listed_active.len(), 1);
         let listed_all = list_projects(&pool, true).await.unwrap();
         assert_eq!(listed_all.len(), 2);
+    }
+
+    fn rooted(id: &str, root: Option<&str>) -> CreateArgs {
+        CreateArgs {
+            id: id.into(),
+            display_name: id.into(),
+            root_path: root.map(Into::into),
+            ..music_args()
+        }
+    }
+
+    #[test]
+    fn normalize_root_matches_the_cli_switch_rules() {
+        assert_eq!(normalize_root("  C:\\Users\\ned\\ikenga\\ "), "C:/Users/ned/ikenga");
+        assert_eq!(normalize_root("/home/x/repo///"), "/home/x/repo");
+        assert_eq!(normalize_root("/"), "/");
+        assert_eq!(normalize_root("   "), "");
+    }
+
+    #[tokio::test]
+    async fn a_live_root_cannot_be_registered_twice() {
+        let pool = fresh_pool().await;
+        create_project(&pool, rooted("a", Some("/work/repo"))).await.unwrap();
+
+        // Same root, spelled differently: trailing slash, backslashes, padding.
+        for dup in ["/work/repo", "/work/repo/", " /work/repo ", "\\work\\repo"] {
+            let e = create_project(&pool, rooted("b", Some(dup))).await.unwrap_err();
+            assert!(e.contains("already exists") && e.contains("(project a)"), "{dup:?}: {e}");
+        }
+        // Nothing was inserted by the refusals.
+        assert_eq!(list_projects(&pool, false).await.unwrap().len(), 2);
+
+        // A different root, and any number of root-less projects, are fine.
+        create_project(&pool, rooted("c", Some("/work/other"))).await.unwrap();
+        create_project(&pool, rooted("d", None)).await.unwrap();
+        create_project(&pool, rooted("e", Some("  "))).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_archived_root_can_be_registered_again() {
+        let pool = fresh_pool().await;
+        create_project(&pool, rooted("a", Some("/work/repo"))).await.unwrap();
+        archive_project(&pool, "a").await.unwrap();
+        create_project(&pool, rooted("b", Some("/work/repo/"))).await.unwrap();
+    }
+
+    /// Records every announcement, standing in for the `AppHandle` the Tauri
+    /// command and the iyke bridge route pass (neither can be built without a
+    /// webview runtime) and for the daemon's `EventBus`.
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<(String, ListChangeKind)>>);
+
+    impl ListChangedSink for Recorder {
+        fn list_changed(&self, id: &str, kind: ListChangeKind) {
+            self.0.lock().unwrap().push((id.to_string(), kind));
+        }
+    }
+
+    impl Recorder {
+        fn seen(&self) -> Vec<(String, ListChangeKind)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn music_args() -> CreateArgs {
+        CreateArgs {
+            id: "music".into(),
+            display_name: "Music".into(),
+            root_path: None,
+            icon: None,
+            color: None,
+            description: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_update_archive_each_announce_exactly_once() {
+        let pool = fresh_pool().await;
+        let rec = Recorder::default();
+
+        create_project_announcing(&pool, music_args(), &rec)
+            .await
+            .unwrap();
+        assert_eq!(rec.seen(), vec![("music".to_string(), ListChangeKind::Created)]);
+
+        let patch = ProjectPatch {
+            display_name: Some("Music!".into()),
+            ..ProjectPatch::default()
+        };
+        update_project_announcing(&pool, "music", patch, &rec)
+            .await
+            .unwrap();
+        assert_eq!(rec.seen().len(), 2);
+        assert_eq!(rec.seen()[1], ("music".to_string(), ListChangeKind::Updated));
+
+        archive_project_announcing(&pool, "music", &rec)
+            .await
+            .unwrap();
+        assert_eq!(rec.seen().len(), 3);
+        assert_eq!(rec.seen()[2], ("music".to_string(), ListChangeKind::Archived));
+    }
+
+    #[tokio::test]
+    async fn failed_mutations_announce_nothing() {
+        let pool = fresh_pool().await;
+        let rec = Recorder::default();
+
+        // Duplicate of the seeded Default, invalid slug, unknown id, archive Default.
+        let dup = CreateArgs {
+            id: "default".into(),
+            ..music_args()
+        };
+        assert!(create_project_announcing(&pool, dup, &rec).await.is_err());
+        let bad = CreateArgs {
+            id: "Bad Id".into(),
+            ..music_args()
+        };
+        assert!(create_project_announcing(&pool, bad, &rec).await.is_err());
+        assert!(
+            update_project_announcing(&pool, "nope", ProjectPatch::default(), &rec)
+                .await
+                .is_err()
+        );
+        assert!(archive_project_announcing(&pool, "nope", &rec)
+            .await
+            .is_err());
+        assert!(archive_project_announcing(&pool, "default", &rec)
+            .await
+            .is_err());
+        assert!(rec.seen().is_empty(), "an error must not announce");
+    }
+
+    #[test]
+    fn list_changed_wire_shape_is_the_frozen_g_event_contract() {
+        assert_eq!(LIST_CHANGED_EVENT, "projects:list-changed");
+        for (kind, word) in [
+            (ListChangeKind::Created, "created"),
+            (ListChangeKind::Updated, "updated"),
+            (ListChangeKind::Archived, "archived"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(ListChanged { id: "p", kind }).unwrap(),
+                serde_json::json!({ "id": "p", "kind": word })
+            );
+        }
     }
 
     #[tokio::test]

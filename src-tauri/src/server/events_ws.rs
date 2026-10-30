@@ -385,6 +385,7 @@ mod tests {
         let files = permitted(Some(&ctx(CapSet::of(&[Cap::Files]))));
         assert!(files.contains(&Topic::SettingsChanged));
         assert!(files.contains(&Topic::ProjectsActiveChanged));
+        assert!(files.contains(&Topic::ProjectsListChanged));
         assert!(files.contains(&Topic::ActionsChanged));
         assert!(!files.contains(&Topic::NotificationsChanged));
         assert!(!files.contains(&Topic::PaActionCommitted));
