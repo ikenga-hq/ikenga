@@ -146,6 +146,9 @@ const KINDS: &[(&str, Category, bool)] = &[
     ("secrets.kek_rotated", Category::Access, false),
     // WP-P9: an admin asked root to apply a server update.
     ("server.update_requested", Category::Access, false),
+    // WP-K: a credential group of the box sender's vault was set, replaced or
+    // cleared from Settings (key names only, never values).
+    ("sender.vault_changed", Category::Access, false),
 ];
 
 /// `kind` as the list's `'static` spelling, or `None` outside §6.5.

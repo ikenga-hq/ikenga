@@ -267,6 +267,28 @@ pub struct DraftInfo {
 
 /// One request/reply on the sender socket (newline-delimited JSON).
 async fn exchange(cfg: &ApprovalsConfig, request: &Value) -> Result<Value, SenderError> {
+    let v = exchange_value(cfg, request, EXCHANGE_TIMEOUT).await?;
+    match v.get("ok").and_then(Value::as_bool) {
+        Some(true) => Ok(v),
+        _ => Err(SenderError::Refused(
+            v.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+        )),
+    }
+}
+
+/// [`exchange`] without judging `ok`: the parsed reply object whether the
+/// sender said `ok: true` or `ok: false` (the `vault.*` refusals carry fixed
+/// extra fields, `test`, `tested`, `retryAfterSec`), with its own time limit
+/// (a login test takes longer than the 10 s of an approval). Still `Err` for
+/// every transport or framing problem, and for a reply with no boolean `ok`.
+pub(super) async fn exchange_value(
+    cfg: &ApprovalsConfig,
+    request: &Value,
+    exchange_timeout: Duration,
+) -> Result<Value, SenderError> {
     let stream = match tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(&cfg.socket)).await
     {
         Ok(Ok(s)) => s,
@@ -309,7 +331,7 @@ async fn exchange(cfg: &ApprovalsConfig, request: &Value) -> Result<Value, Sende
         reader.read_line(&mut reply).await?;
         Ok::<String, std::io::Error>(reply)
     };
-    let reply = match tokio::time::timeout(EXCHANGE_TIMEOUT, run).await {
+    let reply = match tokio::time::timeout(exchange_timeout, run).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => return Err(SenderError::Unavailable(format!("socket io: {e}"))),
         Err(_) => return Err(SenderError::Unavailable("the sender did not answer".into())),
@@ -328,13 +350,7 @@ async fn exchange(cfg: &ApprovalsConfig, request: &Value) -> Result<Value, Sende
         return Err(SenderError::Malformed("reply is not an object".into()));
     };
     match obj.get("ok").and_then(Value::as_bool) {
-        Some(true) => Ok(v),
-        Some(false) => Err(SenderError::Refused(
-            obj.get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string(),
-        )),
+        Some(_) => Ok(v),
         None => Err(SenderError::Malformed("reply has no `ok`".into())),
     }
 }
