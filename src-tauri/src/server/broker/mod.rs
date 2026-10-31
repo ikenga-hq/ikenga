@@ -27,6 +27,7 @@ pub mod children;
 pub mod fs_roots_admin;
 pub mod health_probe;
 pub mod proxy;
+pub mod vault;
 pub mod ws_registry;
 
 use std::net::SocketAddr;
@@ -259,6 +260,9 @@ pub fn router(
             "/api/server/update/apply",
             post(crate::server::update::broker_apply),
         )
+        // Sender credentials from Settings (WP-K): relayed to the sender's
+        // socket as the session's principal; never proxied to a child.
+        .route("/api/sender/vault/:op", post(vault::vault_op))
         // `/api/shutdown` and anything else under /api: no such route here,
         // and an unauthenticated caller can't even learn that.
         .route("/api/*rest", any(api_not_found))

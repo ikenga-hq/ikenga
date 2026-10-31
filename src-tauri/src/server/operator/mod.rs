@@ -51,7 +51,7 @@ pub mod reaper;
 pub mod rotate_kek;
 mod safe_fs;
 pub mod secrets_kek;
-mod sys;
+pub(crate) mod sys;
 
 use std::fs;
 use std::io;
