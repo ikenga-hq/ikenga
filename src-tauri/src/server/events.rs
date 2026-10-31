@@ -35,6 +35,7 @@
 //! |---|---|---|
 //! | `settings://changed` | the settings manager's notifier, after its own writes | `{ path }` |
 //! | `projects:active-changed` | `project_set_active` | `{ id }` |
+//! | `projects:list-changed` | `project_create` / `project_update` / `project_archive` | `{ id, kind: "created" \| "updated" \| "archived" }` |
 //! | `actions://changed` | `actions_write` / `keybindings_write` (a written file), trust grant / revoke | `{ path, file, scope, reason? }` |
 //! | `notifications://changed` | every `notifications::record` / read / mute change, via [`EventBus::subscribe`]'s bridge | `NotificationEvent`, `muted` stamped |
 //! | `pa-action-paused` / `-committed` / `-retried` / `-rejected` | the `pa_actions_*` arms | the desktop's structs |
@@ -70,6 +71,8 @@ pub const CAPACITY: usize = 256;
 pub enum Topic {
     SettingsChanged,
     ProjectsActiveChanged,
+    /// A project row was created, updated or archived (not a switch).
+    ProjectsListChanged,
     ActionsChanged,
     NotificationsChanged,
     PaActionPaused,
@@ -91,9 +94,10 @@ pub enum Topic {
 }
 
 impl Topic {
-    pub const ALL: [Topic; 13] = [
+    pub const ALL: [Topic; 14] = [
         Topic::SettingsChanged,
         Topic::ProjectsActiveChanged,
+        Topic::ProjectsListChanged,
         Topic::ActionsChanged,
         Topic::NotificationsChanged,
         Topic::PaActionPaused,
@@ -112,6 +116,7 @@ impl Topic {
         match self {
             Topic::SettingsChanged => "settings://changed",
             Topic::ProjectsActiveChanged => "projects:active-changed",
+            Topic::ProjectsListChanged => super::shared::projects::LIST_CHANGED_EVENT,
             Topic::ActionsChanged => "actions://changed",
             Topic::NotificationsChanged => notifications::EVENT_NAME,
             Topic::PaActionPaused => "pa-action-paused",
@@ -136,6 +141,9 @@ impl Topic {
         match self {
             Topic::SettingsChanged => "settings_read_file",
             Topic::ProjectsActiveChanged => "project_get_active",
+            // The list is what `project_list` returns; same requirement
+            // (`shared[Files]`), so no `rpc_requirements` change.
+            Topic::ProjectsListChanged => "project_list",
             Topic::ActionsChanged => "actions_read_files",
             Topic::NotificationsChanged => "notifications_list",
             Topic::PaActionPaused
@@ -184,6 +192,15 @@ impl std::fmt::Debug for EventBus {
         f.debug_struct("EventBus")
             .field("subscribers", &self.tx.receiver_count())
             .finish()
+    }
+}
+
+impl super::shared::projects::ListChangedSink for EventBus {
+    fn list_changed(&self, id: &str, kind: super::shared::projects::ListChangeKind) {
+        self.publish(
+            Topic::ProjectsListChanged,
+            super::shared::projects::ListChanged { id, kind },
+        );
     }
 }
 

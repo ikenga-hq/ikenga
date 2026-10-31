@@ -93,6 +93,11 @@ export const queryKeys = {
 		all: ['server-update'] as const,
 		status: () => ['server-update', 'status'] as const,
 	},
+	// WP-K sender credentials (box only; names, lengths and times, never values).
+	senderVault: {
+		all: ['sender-vault'] as const,
+		status: () => ['sender-vault', 'status'] as const,
+	},
 	// Admin Server card (`server_health`): browser sessions only, admins / T0 owner.
 	serverHealth: {
 		all: ['server-health'] as const,

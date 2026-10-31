@@ -11,6 +11,7 @@ import { ApiKeysSectionBody } from './-components/api-keys';
 import { ClaudeSummarySectionBody } from './-components/claude-summary';
 import { ConnectorCardsSection } from './-components/connector-cards';
 import { IykeMcpSection } from './-components/iyke-mcp';
+import { SenderVaultSection } from './-components/sender-vault';
 import { SettingRow } from './-components/setting-row';
 
 function IntegrationsPage() {
@@ -54,6 +55,8 @@ function IntegrationsPage() {
 				</header>
 				<ConnectorCardsSection />
 			</section>
+
+			<SenderVaultSection />
 
 			<section className="overflow-hidden rounded-lg border border-[var(--border-soft)] bg-card">
 				<header className="border-b border-[var(--border-soft)] bg-[var(--bg-sunken)] px-4 py-2.5">
