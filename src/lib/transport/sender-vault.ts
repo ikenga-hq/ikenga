@@ -24,8 +24,9 @@ export interface VaultGroupStatus {
 	label: string | null;
 	shared: boolean;
 	names: VaultKeyStatus[];
-	/** NAME -> value length in characters; only names that are set. */
-	present: Record<string, number>;
+	/** NAME -> value length in characters; only names that are set. `null`: set, but the
+	 *  length of another person's mailbox secret is not shown. */
+	present: Record<string, number | null>;
 	missing: string[];
 	complete: boolean;
 	lastChanged: string | null;

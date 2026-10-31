@@ -49,6 +49,7 @@ use std::time::Duration;
 use super::approvals::{exchange_value, ApprovalsConfig, SenderError, CONTRACT_VERSION};
 use super::BrokerState;
 use crate::access::audit::Event;
+use crate::access::caps::Cap;
 use crate::server::auth::{json_error, Credential, PrincipalCtx};
 use crate::server::operator::accounts;
 
@@ -398,7 +399,7 @@ async fn relay_inner(
             Some(g) => base(json!({ "group": g.id() })),
             None => base(json!({})),
         };
-        let reply = send(cfg, &request, STATUS_TIMEOUT).await?;
+        let reply = send(cfg, &request, STATUS_TIMEOUT, false).await?;
         return Ok(sanitize_status(&reply));
     }
 
@@ -441,7 +442,7 @@ async fn relay_inner(
     } else {
         TEST_TIMEOUT
     };
-    let reply = send(cfg, &request, timeout).await?;
+    let reply = send(cfg, &request, timeout, matches!(op, Op::Set | Op::Clear)).await?;
     let (data, event, names) = sanitize_write(&reply, op);
     if !names.is_empty() {
         audit.names = names;
@@ -458,7 +459,7 @@ async fn lookup_person(
     let request = json!({
         "v": CONTRACT_VERSION, "action": "vault.status", "source": "shell", "approver": approver,
     });
-    let reply = send(cfg, &request, STATUS_TIMEOUT).await?;
+    let reply = send(cfg, &request, STATUS_TIMEOUT, false).await?;
     Ok(reply
         .get("person")
         .and_then(Value::as_str)
@@ -466,22 +467,56 @@ async fn lookup_person(
         .map(str::to_string))
 }
 
-/// One exchange; an `ok:false` reply becomes the mapped [`VaultError`].
+/// One exchange; an `ok:false` reply becomes the mapped [`VaultError`]. The
+/// socket must be served by the sender's own uid (`cfg.sender_uid`); with no
+/// such uid configured the operation fails closed. `writes`: the request may
+/// change the vault, so a failure after it was sent is reported as an unknown
+/// outcome, not as "nothing was changed".
 async fn send(
     cfg: &ApprovalsConfig,
     request: &Value,
     timeout: Duration,
+    writes: bool,
 ) -> Result<Value, VaultError> {
-    match exchange_value(cfg, request, timeout).await {
+    let Some(uid) = cfg.sender_uid else {
+        tracing::warn!("sender vault: no sender uid configured; refusing");
+        return Err(VaultError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sender_unavailable",
+            "The box's sender service is not reachable. Nothing was changed. Try again in a moment.",
+        ));
+    };
+    match exchange_value(cfg, request, timeout, Some(uid)).await {
         Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => Ok(v),
         Ok(v) => Err(map_refusal(&v)),
-        Err(e) => Err(map_transport(&e)),
+        Err(e) => Err(map_transport(&e, writes)),
     }
 }
 
-fn map_transport(e: &SenderError) -> VaultError {
+/// Whether the request had certainly not reached the sender's handler.
+fn not_sent(e: &SenderError) -> bool {
+    match e {
+        SenderError::Unavailable(d) => {
+            d.starts_with("connect ")
+                || d.contains("is served by uid")
+                || d.contains("an agent account")
+                || d.starts_with("cannot read the socket")
+        }
+        _ => false,
+    }
+}
+
+fn map_transport(e: &SenderError, writes: bool) -> VaultError {
     // The detail (socket path, io error) goes to the log, never to the browser.
     tracing::warn!(detail = %e.detail(), "sender vault: socket exchange failed");
+    if writes && !not_sent(e) {
+        // The request was written; the sender may have applied it.
+        return VaultError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "outcome_unknown",
+            "The box did not answer in time; the change may or may not have been saved. Refresh to check.",
+        );
+    }
     match e {
         SenderError::Unavailable(_) => VaultError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -609,6 +644,10 @@ fn short_text(v: Option<&Value>, max: usize) -> Option<String> {
 /// `vault.status` rendered from an allow-list: group metadata, key names,
 /// integer lengths and times. A string where a length belongs is dropped.
 pub fn sanitize_status(reply: &Value) -> Value {
+    let own_person = reply
+        .get("person")
+        .and_then(Value::as_str)
+        .filter(|p| is_person(p));
     let groups: Vec<Value> = reply
         .get("groups")
         .and_then(Value::as_array)
@@ -634,13 +673,19 @@ pub fn sanitize_status(reply: &Value) -> Value {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    // Lengths of other people's mailbox secrets are not shown
+                    // (an admin sees which keys exist, not how long they are).
+                    let others = matches!(Group::parse(id), Some(Group::Outreach(ref p)) if Some(p.as_str()) != own_person);
                     let present: Map<String, Value> = g
                         .get("present")
                         .and_then(Value::as_object)
                         .map(|p| {
                             p.iter()
                                 .filter(|(k, _)| is_key_name(k))
-                                .filter_map(|(k, v)| int_of(Some(v)).map(|n| (k.clone(), json!(n))))
+                                .filter_map(|(k, v)| {
+                                    int_of(Some(v))
+                                        .map(|n| (k.clone(), if others { Value::Null } else { json!(n) }))
+                                })
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -774,6 +819,34 @@ fn data_response(data: Value) -> Response {
     (StatusCode::OK, Json(json!({ "ok": true, "data": data }))).into_response()
 }
 
+/// What the handler established about the request before relaying it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Admission {
+    /// The account exists and is not disabled.
+    pub account_enabled: bool,
+    /// P-26: a password session, or a `full` device.
+    pub strong: bool,
+    /// The request came through a share (or carried share headers).
+    pub in_share: bool,
+    /// The credential's effective caps include Settings.
+    pub has_settings: bool,
+}
+
+/// The handler's own refusals, before any socket call. The route is not in
+/// the broker's `route_requirement` path (that table is consulted on the
+/// child), so the Settings capability is checked here explicitly.
+pub fn admit(a: &Admission) -> Result<(), VaultError> {
+    if a.account_enabled && a.strong && !a.in_share && a.has_settings {
+        Ok(())
+    } else {
+        Err(VaultError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "forbidden",
+        ))
+    }
+}
+
 /// `POST /api/sender/vault/:op` (broker only). The caller is the session's
 /// principal; the account is re-read now, so a demotion or a disable takes
 /// effect on the next request.
@@ -794,8 +867,7 @@ pub async fn vault_op(
     }
     .await;
     let account = match account {
-        Ok(Some(a)) if !a.is_disabled() => a,
-        Ok(_) => return json_error(StatusCode::FORBIDDEN, "forbidden", "forbidden"),
+        Ok(a) => a,
         Err(e) => {
             tracing::error!("sender vault: account lookup failed: {e}");
             return json_error(
@@ -806,23 +878,37 @@ pub async fn vault_op(
         }
     };
 
-    // P-26, and never through a share: a credential below admin strength
-    // (a View/Dispatch/Approve device) or a share member cannot reach this.
-    let (strong, actx) = match &state.access_t1 {
+    let (strong, in_share, has_settings, actx) = match &state.access_t1 {
         Some(t1) => match t1.ctx_for(&ctx, &parts).await {
-            Ok(b) => {
-                let ok =
-                    b.access.admin_strength && b.access.share.is_none() && !b.access.share_headers;
-                (ok, Some(b.access))
-            }
-            Err(_) => (false, None),
+            Ok(b) => (
+                b.access.admin_strength,
+                b.access.share.is_some() || b.access.share_headers,
+                b.access.caps.contains(Cap::Settings),
+                Some(b.access),
+            ),
+            Err(_) => (false, true, false, None),
         },
-        None => (matches!(ctx.via, Credential::Session { .. }), None),
+        // No access layer (unit tests): only a password session.
+        None => (
+            matches!(ctx.via, Credential::Session { .. }),
+            false,
+            true,
+            None,
+        ),
     };
-    if !strong {
-        tracing::warn!(principal = %ctx.principal.id, "sender vault: refused (credential not strong enough, or a share)");
-        return json_error(StatusCode::FORBIDDEN, "forbidden", "forbidden");
+    let admission = Admission {
+        account_enabled: account.as_ref().is_some_and(|a| !a.is_disabled()),
+        strong,
+        in_share,
+        has_settings,
+    };
+    if let Err(e) = admit(&admission) {
+        tracing::warn!(principal = %ctx.principal.id, "sender vault: refused at admission");
+        return e.into_response();
     }
+    let Some(account) = account else {
+        return json_error(StatusCode::FORBIDDEN, "forbidden", "forbidden");
+    };
 
     let Ok(raw) = axum::body::to_bytes(body, MAX_BODY).await else {
         return json_error(
@@ -836,7 +922,7 @@ pub async fn vault_op(
         username: account.username.clone(),
         is_admin: account.is_admin,
     };
-    let (audit, out) = run(&state.approvals, &caller, op, &raw).await;
+    let (audit, out) = handle(&state.approvals, &admission, &caller, op, &raw).await;
     if op != Op::Status {
         record(&state, &caller, actx.as_ref(), &audit).await;
     }
@@ -844,6 +930,30 @@ pub async fn vault_op(
         Ok(data) => data_response(data),
         Err(e) => e.into_response(),
     }
+}
+
+/// Admission, then parse and relay; the handler minus the broker state, so a
+/// refusal is testable without one. A refusal makes no socket call.
+pub async fn handle(
+    cfg: &ApprovalsConfig,
+    admission: &Admission,
+    caller: &Caller,
+    op: Op,
+    raw: &Bytes,
+) -> (Audit, Result<Value, VaultError>) {
+    if let Err(e) = admit(admission) {
+        return (
+            Audit {
+                action: op.name(),
+                group: None,
+                names: Vec::new(),
+                result: e.code.clone(),
+                event: None,
+            },
+            Err(e),
+        );
+    }
+    run(cfg, caller, op, raw).await
 }
 
 /// Parse and relay. Split from the handler so it runs without a broker.

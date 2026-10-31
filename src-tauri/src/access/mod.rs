@@ -581,10 +581,6 @@ pub fn route_requirement(path: &str) -> Option<Requirement> {
         Some(Requirement::operator())
     } else if matches!(path, "/api/backup/export" | "/api/backup/import") {
         Some(Requirement::owner(&[Cap::Settings]))
-    } else if path.starts_with("/api/sender/vault/") {
-        // WP-K: the box sender's credentials. Owner-class (never a share) and
-        // a Settings-capable credential; the handler adds admin strength.
-        Some(Requirement::owner(&[Cap::Settings]))
     } else if path.starts_with("/ws/pty/") {
         Some(Requirement::owner(&[Cap::Sessions]))
     } else if path.starts_with("/ws/chat/") {
@@ -953,11 +949,7 @@ mod tests {
                 "{p}"
             );
         }
-        for p in [
-            "/api/backup/export",
-            "/api/backup/import",
-            "/api/sender/vault/set",
-        ] {
+        for p in ["/api/backup/export", "/api/backup/import"] {
             let req = route_requirement(p).unwrap();
             assert_eq!(req.class, ArmClass::Owner, "{p}");
             assert_eq!(req.caps, CapSet::of(&[Cap::Settings]), "{p}");

@@ -10,6 +10,11 @@ use tokio::net::UnixListener;
 
 const CANARY: &str = "canary-S3cr3t-9f2e71";
 
+fn me() -> u32 {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
 type Handler = Arc<dyn Fn(&Value) -> String + Send + Sync>;
 
 struct FakeSender {
@@ -55,6 +60,7 @@ impl FakeSender {
         ApprovalsConfig {
             socket: self.path.clone(),
             agent_uid_min: u32::MAX,
+            sender_uid: Some(me()),
             ..ApprovalsConfig::default()
         }
     }
@@ -442,6 +448,7 @@ async fn an_unreachable_or_garbled_sender_fails_closed() {
     let cfg = ApprovalsConfig {
         socket: PathBuf::from("/nonexistent/approvals.sock"),
         agent_uid_min: u32::MAX,
+        sender_uid: Some(me()),
         ..ApprovalsConfig::default()
     };
     let (_, out) = relay(&cfg, &member(), Op::Clear, req("outreach:ADAUGO", None)).await;
@@ -453,6 +460,16 @@ async fn an_unreachable_or_garbled_sender_fails_closed() {
         &admin(),
         Op::Clear,
         req("outreach:ADAUGO", None),
+    )
+    .await;
+    // A write whose reply cannot be read may still have been applied.
+    assert_eq!(code(&out), "outcome_unknown");
+    // A test or a status changes nothing: the plain wording.
+    let (_, out) = relay(
+        &fake.cfg(),
+        &admin(),
+        Op::Test,
+        req("outreach:ADAUGO", Some(values("ADAUGO"))),
     )
     .await;
     assert_eq!(code(&out), "sender_error");
@@ -517,4 +534,161 @@ fn authorise_matrix() {
     assert!(authorise(Op::Status, &other, &a, Some("ADAUGO")).is_ok());
     assert!(authorise(Op::Set, &other, &a, Some("ADAUGO")).is_err());
     assert!(authorise(Op::Test, &other, &a, Some("ADAUGO")).is_err());
+}
+
+// --- repair round: admission, uid pin, unknown outcome, lengths ---------------
+
+fn admission() -> Admission {
+    Admission {
+        account_enabled: true,
+        strong: true,
+        in_share: false,
+        has_settings: true,
+    }
+}
+
+#[tokio::test]
+async fn the_handler_refuses_a_share_a_weak_credential_a_disabled_account_and_no_settings_cap() {
+    let fake = FakeSender::start(sender("ADAUGO", false)).await;
+    let body = Bytes::from(json!({"group": "outreach:ADAUGO"}).to_string());
+    let ok = admission();
+    let cases = [
+        Admission {
+            in_share: true,
+            ..ok
+        },
+        Admission {
+            strong: false,
+            ..ok
+        },
+        Admission {
+            account_enabled: false,
+            ..ok
+        },
+        Admission {
+            has_settings: false,
+            ..ok
+        },
+    ];
+    for a in cases {
+        for op in [Op::Status, Op::Set, Op::Test, Op::Clear] {
+            let (audit, out) = handle(&fake.cfg(), &a, &member(), op, &body).await;
+            assert_eq!(code(&out), "forbidden", "{a:?} {op:?}");
+            assert_eq!(audit.result, "forbidden");
+        }
+    }
+    assert!(
+        fake.requests().is_empty(),
+        "a refusal never reaches the sender"
+    );
+    // The same request with a good admission does.
+    let (_, out) = handle(&fake.cfg(), &ok, &member(), Op::Clear, &body).await;
+    assert!(out.is_ok(), "{out:?}");
+}
+
+#[tokio::test]
+async fn the_handler_refuses_an_extra_body_field_before_any_socket_call() {
+    let fake = FakeSender::start(sender("ADAUGO", false)).await;
+    let body = Bytes::from(
+        json!({"group": "outreach:ADAUGO", "approver": {"id": "x", "username": "chinedum"}})
+            .to_string(),
+    );
+    let (_, out) = handle(&fake.cfg(), &admission(), &member(), Op::Clear, &body).await;
+    assert_eq!(code(&out), "invalid_request");
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn the_socket_must_be_served_by_the_configured_sender_uid() {
+    let fake = FakeSender::start(sender("ADAUGO", false)).await;
+    // Served by this process's uid, but the sender is configured as another.
+    let wrong = ApprovalsConfig {
+        sender_uid: Some(me() + 1),
+        ..fake.cfg()
+    };
+    let (_, out) = relay(&wrong, &member(), Op::Clear, req("outreach:ADAUGO", None)).await;
+    assert_eq!(code(&out), "sender_unavailable");
+    assert!(
+        fake.requests().is_empty(),
+        "nothing is sent to a wrong-uid socket"
+    );
+    // No sender uid configured at all: fail closed.
+    let none = ApprovalsConfig {
+        sender_uid: None,
+        ..fake.cfg()
+    };
+    let (_, out) = relay(
+        &none,
+        &member(),
+        Op::Status,
+        VaultRequest {
+            group: None,
+            values: None,
+        },
+    )
+    .await;
+    assert_eq!(code(&out), "sender_unavailable");
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_write_that_gets_no_answer_is_an_unknown_outcome_not_nothing_changed() {
+    // The sender takes the request and hangs up without a reply.
+    let h: Handler = Arc::new(|req: &Value| {
+        if req["action"] == "vault.status" {
+            json!({"ok": true, "person": "ADAUGO"}).to_string()
+        } else {
+            String::new()
+        }
+    });
+    let fake = FakeSender::start(h).await;
+    for op in [Op::Set, Op::Clear] {
+        let r = req("outreach:ADAUGO", Some(values("ADAUGO")));
+        let (_, out) = relay(&fake.cfg(), &member(), op, r).await;
+        let e = out.unwrap_err();
+        assert_eq!(e.code, "outcome_unknown", "{op:?}");
+        assert!(e.message.contains("may or may not have been saved"));
+        assert!(!e.message.contains("Nothing was changed"));
+    }
+    // A test never changes anything, so it keeps the plain wording.
+    let (_, out) = relay(
+        &fake.cfg(),
+        &member(),
+        Op::Test,
+        req("outreach:ADAUGO", Some(values("ADAUGO"))),
+    )
+    .await;
+    assert_eq!(code(&out), "sender_error");
+    // A timeout after the request was sent maps the same way for a write.
+    let e = map_transport(
+        &SenderError::Unavailable("the sender did not answer".into()),
+        true,
+    );
+    assert_eq!(e.code, "outcome_unknown");
+    let e = map_transport(
+        &SenderError::Unavailable("connect /x: refused".into()),
+        true,
+    );
+    assert_eq!(e.code, "sender_unavailable");
+}
+
+#[test]
+fn other_peoples_password_lengths_are_not_shown_to_an_admin() {
+    let g = |p: &str| {
+        json!({"group": format!("outreach:{p}"), "label": "x", "shared": false, "names": [],
+               "present": {format!("OUTREACH_{p}_SMTP_PASS"): 14}, "missing": [], "complete": false})
+    };
+    let shared = json!({"group": "buffer", "label": "Buffer", "shared": true, "names": [],
+                        "present": {"BUFFER_API_KEY": 40}, "missing": [], "complete": true});
+    let out = sanitize_status(&json!({
+        "ok": true, "person": "CHINEDUM", "admin": true, "groups": [g("CHINEDUM"), g("ADAUGO"), shared]
+    }));
+    let groups = out["groups"].as_array().unwrap();
+    assert_eq!(groups[0]["present"]["OUTREACH_CHINEDUM_SMTP_PASS"], 14);
+    assert!(groups[1]["present"]["OUTREACH_ADAUGO_SMTP_PASS"].is_null());
+    assert!(groups[1]["present"]
+        .as_object()
+        .unwrap()
+        .contains_key("OUTREACH_ADAUGO_SMTP_PASS"));
+    assert_eq!(groups[2]["present"]["BUFFER_API_KEY"], 40);
 }

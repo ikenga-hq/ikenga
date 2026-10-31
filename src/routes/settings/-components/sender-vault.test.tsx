@@ -4,7 +4,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { VaultResult, VaultStatus } from '@/lib/transport/sender-vault';
 import { __setT1SessionForTests } from '@/lib/transport/t1-session';
@@ -47,7 +47,10 @@ function ok<T>(data: T): VaultResult<T> {
 }
 
 function setup(s: VaultStatus, admin: boolean, replies: VaultResult<unknown>[] = []) {
-	const api = vi.fn(async () => replies.shift() ?? ok({ group: 'x', test: 'ok', tested: 'login' }));
+	const api = vi.fn(
+		async (..._args: unknown[]) =>
+			replies.shift() ?? ok({ group: 'x', test: 'ok', tested: 'login' })
+	);
 	const onChanged = vi.fn();
 	render(<SenderVaultCards status={s} admin={admin} api={api as never} onChanged={onChanged} />);
 	return { api, onChanged, user: userEvent.setup() };
@@ -109,8 +112,8 @@ describe('visibility', () => {
 
 	it('on the box it asks the server (POST, cookie) and shows the member card', async () => {
 		__setT1SessionForTests(true, { principal_id: 'p', username: 'ada', is_admin: false });
-		const fetchMock = vi.fn<typeof fetch>(
-			async () =>
+		const fetchMock = vi.fn(
+			async (_input: RequestInfo | URL, _init?: RequestInit) =>
 				new Response(JSON.stringify({ ok: true, data: status() }), {
 					status: 200,
 					headers: { 'Content-Type': 'application/json' },
@@ -133,6 +136,8 @@ describe('write-only inputs', () => {
 		const pw = screen.getByTestId('field-OUTREACH_ADAUGO_SMTP_PASS') as HTMLInputElement;
 		expect(pw.type).toBe('password');
 		expect(pw.getAttribute('autocomplete')).toBe('new-password');
+		expect(pw.hasAttribute('data-1p-ignore')).toBe(true);
+		expect(pw.getAttribute('data-lpignore')).toBe('true');
 		expect(pw.value).toBe('');
 		const host = screen.getByTestId('field-OUTREACH_ADAUGO_SMTP_HOST') as HTMLInputElement;
 		expect(host.value).toBe('');
@@ -171,10 +176,7 @@ describe('save flow', () => {
 		await user.click(screen.getByTestId('vault-outreach-save'));
 		await waitFor(() => expect(onChanged).toHaveBeenCalled());
 		expect(api.mock.calls.map((c) => c[0])).toEqual(['set']);
-		const [, body] = api.mock.calls[0] as unknown as [
-			string,
-			{ group: string; values: Record<string, string> },
-		];
+		const body = api.mock.calls[0]?.[1] as { group: string; values: Record<string, string> };
 		expect(body.group).toBe('outreach:ADAUGO');
 		expect(body.values.OUTREACH_ADAUGO_SMTP_PASS).toBe(SECRET);
 		expect(body.values.OUTREACH_ADAUGO_SMTP_PORT).toBe('465');

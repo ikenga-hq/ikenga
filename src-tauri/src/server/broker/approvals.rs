@@ -137,7 +137,18 @@ pub struct ApprovalsConfig {
     pub agent_uid_min: u32,
     /// Which outreach rows each share viewer may see and act on.
     pub viewers: OutreachViewers,
+    /// The uid the sender runs as (`ikenga-sender`, looked up once at
+    /// startup; `IKENGA_SENDER_UID` overrides). The `vault.*` operations
+    /// carry credentials, so they require the socket to be served by exactly
+    /// this uid, not merely "some uid below `agent_uid_min`". `None` (user
+    /// not found): vault operations fail closed. Approvals are unchanged.
+    pub sender_uid: Option<u32>,
 }
+
+/// The passwd name of the sender's account.
+pub const SENDER_USER: &str = "ikenga-sender";
+/// Overrides the lookup of [`SENDER_USER`].
+pub const SENDER_UID_ENV: &str = "IKENGA_SENDER_UID";
 
 impl Default for ApprovalsConfig {
     fn default() -> Self {
@@ -145,6 +156,7 @@ impl Default for ApprovalsConfig {
             socket: PathBuf::from(DEFAULT_SOCKET),
             agent_uid_min: DEFAULT_AGENT_UID_MIN,
             viewers: OutreachViewers::default(),
+            sender_uid: None,
         }
     }
 }
@@ -156,6 +168,14 @@ impl ApprovalsConfig {
         if let Some(v) = std::env::var_os(VIEWERS_ENV) {
             c.viewers = OutreachViewers::parse(&v.to_string_lossy());
         }
+        c.sender_uid = match std::env::var(SENDER_UID_ENV) {
+            Ok(v) => v.trim().parse().ok().filter(|u| *u != 0),
+            Err(_) => crate::server::operator::sys::user_by_name(SENDER_USER)
+                .ok()
+                .flatten()
+                .map(|p| p.uid)
+                .filter(|u| *u != 0),
+        };
         c
     }
 
@@ -267,7 +287,7 @@ pub struct DraftInfo {
 
 /// One request/reply on the sender socket (newline-delimited JSON).
 async fn exchange(cfg: &ApprovalsConfig, request: &Value) -> Result<Value, SenderError> {
-    let v = exchange_value(cfg, request, EXCHANGE_TIMEOUT).await?;
+    let v = exchange_value(cfg, request, EXCHANGE_TIMEOUT, None).await?;
     match v.get("ok").and_then(Value::as_bool) {
         Some(true) => Ok(v),
         _ => Err(SenderError::Refused(
@@ -284,10 +304,12 @@ async fn exchange(cfg: &ApprovalsConfig, request: &Value) -> Result<Value, Sende
 /// extra fields, `test`, `tested`, `retryAfterSec`), with its own time limit
 /// (a login test takes longer than the 10 s of an approval). Still `Err` for
 /// every transport or framing problem, and for a reply with no boolean `ok`.
+/// `pin_uid`: when set, the socket must be served by exactly that uid.
 pub(super) async fn exchange_value(
     cfg: &ApprovalsConfig,
     request: &Value,
     exchange_timeout: Duration,
+    pin_uid: Option<u32>,
 ) -> Result<Value, SenderError> {
     let stream = match tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(&cfg.socket)).await
     {
@@ -307,6 +329,12 @@ pub(super) async fn exchange_value(
     };
     // The server end must be the sender, not an agent's imitation of it.
     match stream.peer_cred() {
+        Ok(c) if pin_uid.is_some_and(|u| c.uid() != u) => {
+            return Err(SenderError::Unavailable(format!(
+                "the socket is served by uid {}, not the sender",
+                c.uid()
+            )))
+        }
         Ok(c) if c.uid() < cfg.agent_uid_min => {}
         Ok(c) => {
             return Err(SenderError::Unavailable(format!(

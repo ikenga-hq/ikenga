@@ -66,6 +66,8 @@ const ERROR_COPY: Record<string, string> = {
 	rate_limited: 'Too many attempts. Wait a few minutes and try again.',
 	vault_unconfigured: 'Setting credentials from here is not turned on for this box.',
 	sender_unavailable: 'The box sender is not reachable. Nothing was changed.',
+	outcome_unknown:
+		'The box did not answer in time; the change may or may not have been saved. Refresh to check.',
 };
 
 export function outreachFields(person: string): FieldSpec[] {
@@ -261,7 +263,11 @@ export function CredentialCard({
 					{fields.map((f) => (
 						<div key={f.key}>
 							{f.label}:{' '}
-							{present[f.key] !== undefined ? `set (${present[f.key]} characters)` : 'not set'}
+							{present[f.key] === undefined
+								? 'not set'
+								: typeof present[f.key] === 'number'
+									? `set (${present[f.key]} characters)`
+									: 'set'}
 						</div>
 					))}
 					{setCount > 0 && (
@@ -314,6 +320,10 @@ export function CredentialCard({
 								disabled={busy}
 								onChange={(e) => setValues((cur) => ({ ...cur, [f.key]: e.target.value }))}
 								className="h-8 font-mono text-xs"
+								data-1p-ignore
+								data-lpignore="true"
+								data-bwignore
+								data-form-type="other"
 								data-testid={`field-${f.key}`}
 							/>
 						</label>
