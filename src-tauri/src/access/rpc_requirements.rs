@@ -358,6 +358,7 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     // (`access::is_broker_arm`) and `server::host_health::authorize` is the
     // admin rule (T1 admin / T0 owner, admin strength, never a share).
     ("server_health", req!(access)),
+    ("outbox_approvals_status", req!(access)),
     // WP-P9: the broker's cross-principal open-terminal count.
     ("server_open_terminals", req!(internal)),
     ("permission_relay_put", req!(operator)),

@@ -54,6 +54,8 @@ const VALID_TAGS: &[&str] = &["WP-19", "WP-18b", "WP-20", "desktop-only-forever"
 ///   subscription to manage.
 /// * `server_health` — the admin Server card's host snapshot; the desktop
 ///   shows no server card (it is the machine the person is sitting at).
+/// * `outbox_approvals_status` — whether the box's sender approvals socket is
+///   live; the shell's Outbox entry asks it. The desktop has no sender socket.
 /// * `server_open_terminals` (WP-P9) — `internal`: the T1 broker asks each
 ///   running child how many terminals an update restart would end.
 /// * `term_hooks_*` (gap audit rank 11) — a daemon terminal's claude hook
@@ -70,6 +72,7 @@ const DAEMON_ONLY_VERBS: &[&str] = &[
     "fs_home",
     "git_status",
     "notifications_record_access",
+    "outbox_approvals_status",
     "permission_relay_put",
     "permission_relay_resolve",
     "permission_relay_take",

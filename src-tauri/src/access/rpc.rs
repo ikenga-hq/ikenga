@@ -172,6 +172,8 @@ pub async fn dispatch(
         | "access_push_test" => crate::server::push::rpc::dispatch(env, ctx, cmd, args).await,
         // Host health for the admin Server card (admin only).
         "server_health" => crate::server::host_health::dispatch(env, ctx).await,
+        // Is the sender approvals socket live? Any authenticated caller; a bool.
+        "outbox_approvals_status" => Ok(crate::server::outbox_status::status().await),
         other => Err(AccessError::new(
             Code::NotFound,
             format!("no access command `{other}`"),

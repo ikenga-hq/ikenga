@@ -1014,6 +1014,7 @@ pub async fn rpc_handler(
         | "access_push_list"
         | "access_push_test"
         | "server_health"
+        | "outbox_approvals_status"
         | "permission_relay_put"
         | "permission_relay_take"
         | "permission_relay_resolve"

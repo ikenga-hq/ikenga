@@ -34,6 +34,8 @@ pub mod health;
 pub mod hook_asks;
 /// Host health for the admin Server card (`server_health`).
 pub mod host_health;
+/// Whether the sender approvals backend is live (`outbox_approvals_status`).
+pub mod outbox_status;
 /// T1 operator: the operator root, `operator/accounts.db`, passwords and the
 /// provisioning core (G-PRINCIPAL §4, §6, §7; WP-20). Linux-only, like T1.
 #[cfg(target_os = "linux")]
