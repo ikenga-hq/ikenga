@@ -3,12 +3,22 @@
   "kind": "ikenga.changelog",
   "source": {
     "repo": "ikenga-hq/ikenga",
-    "version": "0.28.1",
+    "version": "0.29.0",
     "producer": "scripts/docs/changelog-json.mjs",
     "path": "CHANGELOG.md",
     "package": "ikenga-desktop"
   },
   "versions": [
+    {
+      "version": "0.29.0",
+      "tag": "v0.29.0",
+      "bump": "minor",
+      "counts": {
+        "major": 0,
+        "minor": 1,
+        "patch": 1
+      }
+    },
     {
       "version": "0.28.1",
       "tag": "v0.28.1",
