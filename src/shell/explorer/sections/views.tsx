@@ -57,7 +57,7 @@ export function ViewsSection(_ctx: ExplorerSectionContext) {
 		void addPin({
 			kind: 'route',
 			target: APPROVALS_ROUTE,
-			label: 'Outbox',
+			label: 'Outbox approvals',
 			iconLucide: 'send',
 		}).catch(() => {});
 	}, [addPin]);
@@ -135,9 +135,15 @@ export function ViewsSection(_ctx: ExplorerSectionContext) {
 function OutboxRow({ onOpen }: { onOpen: () => void }) {
 	const pending = usePendingApprovalsCount();
 	return (
-		<ListRow size="sm" onActivate={onOpen} title="Outbox" className="w-full gap-1.5 px-2">
+		<ListRow
+			size="sm"
+			onActivate={onOpen}
+			title="Outbox approvals"
+			aria-label="Outbox approvals"
+			className="w-full gap-1.5 px-2"
+		>
 			<Send className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-			<span className="flex-1 truncate text-xs">Outbox</span>
+			<span className="flex-1 truncate text-xs">Outbox approvals</span>
 			{pending > 0 && (
 				<span
 					data-testid="outbox-pending-badge"
@@ -146,7 +152,7 @@ function OutboxRow({ onOpen }: { onOpen: () => void }) {
 					{pending}
 				</span>
 			)}
-			<span className="shrink-0 truncate text-[10px] text-muted-foreground/70">Approvals</span>
+			<span className="shrink-0 truncate text-[10px] text-muted-foreground/70">Shell</span>
 		</ListRow>
 	);
 }

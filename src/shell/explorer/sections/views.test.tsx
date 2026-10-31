@@ -54,16 +54,16 @@ afterEach(() => {
 });
 
 describe('ViewsSection Outbox entry', () => {
-	it('shows Outbox even when no pkg contributes a view', () => {
+	it('shows Outbox approvals even when no pkg contributes a view', () => {
 		render(<ViewsSection {...ctx} />);
-		expect(screen.getByText('Outbox')).toBeTruthy();
+		expect(screen.getByText('Outbox approvals')).toBeTruthy();
 		expect(screen.queryByText('No contributed views')).toBeNull();
 	});
 
 	it('falls back to the empty state when no backend is active and no views exist', () => {
 		active = false;
 		render(<ViewsSection {...ctx} />);
-		expect(screen.queryByText('Outbox')).toBeNull();
+		expect(screen.queryByText('Outbox approvals')).toBeNull();
 		expect(screen.getByText('No contributed views')).toBeTruthy();
 	});
 
@@ -82,7 +82,7 @@ describe('ViewsSection Outbox entry', () => {
 		];
 		render(<ViewsSection {...ctx} />);
 		const text = document.body.textContent ?? '';
-		expect(text.indexOf('Outbox')).toBeLessThan(text.indexOf('Alpha view'));
+		expect(text.indexOf('Outbox approvals')).toBeLessThan(text.indexOf('Alpha view'));
 	});
 
 	it('hides the entry (but keeps pkg views) when the backend is inactive', () => {
@@ -100,7 +100,7 @@ describe('ViewsSection Outbox entry', () => {
 			},
 		];
 		render(<ViewsSection {...ctx} />);
-		expect(screen.queryByText('Outbox')).toBeNull();
+		expect(screen.queryByText('Outbox approvals')).toBeNull();
 		expect(screen.getByText('Alpha view')).toBeTruthy();
 	});
 
@@ -115,8 +115,11 @@ describe('ViewsSection Outbox entry', () => {
 
 	it('click opens /outbox/approvals in the focused pane', () => {
 		render(<ViewsSection {...ctx} />);
-		fireEvent.click(screen.getByText('Outbox'));
-		expect(addTab).toHaveBeenCalledWith('p1', { kind: 'route', path: '/outbox/approvals' });
+		fireEvent.click(screen.getByText('Outbox approvals'));
+		expect(addTab).toHaveBeenCalledWith('p1', {
+			kind: 'route',
+			path: '/outbox/approvals',
+		});
 	});
 
 	it('context menu: open-to-side splits, pin-rail pins, no open-in-ngwa', () => {
@@ -131,7 +134,40 @@ describe('ViewsSection Outbox entry', () => {
 		);
 		h['pin-rail']!();
 		expect(addPin).toHaveBeenCalledWith(
-			expect.objectContaining({ kind: 'route', target: '/outbox/approvals', label: 'Outbox' })
+			expect.objectContaining({
+				kind: 'route',
+				target: '/outbox/approvals',
+				label: 'Outbox approvals',
+			})
 		);
+	});
+
+	it('with the outbound pkg present: one pkg "Outbox" and one shell "Outbox approvals", distinct targets', () => {
+		views = [
+			{
+				pkg_id: 'com.ikenga.outbound',
+				pkg_name: 'Outbound',
+				qualified_id: 'com.ikenga.outbound:outbound.index',
+				id: 'outbound.index',
+				title: 'Outbox',
+				route: '/',
+				pane_route: '/pkg/com.ikenga.outbound/',
+				pin_on_install: false,
+			},
+		];
+		render(<ViewsSection {...ctx} />);
+		expect(screen.getAllByText('Outbox')).toHaveLength(1);
+		expect(screen.getAllByText('Outbox approvals')).toHaveLength(1);
+		expect(screen.getByLabelText('Outbox approvals')).toBeTruthy();
+		fireEvent.click(screen.getByText('Outbox'));
+		expect(addTab).toHaveBeenLastCalledWith('p1', {
+			kind: 'route',
+			path: '/pkg/com.ikenga.outbound/',
+		});
+		fireEvent.click(screen.getByText('Outbox approvals'));
+		expect(addTab).toHaveBeenLastCalledWith('p1', {
+			kind: 'route',
+			path: '/outbox/approvals',
+		});
 	});
 });
