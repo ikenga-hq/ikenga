@@ -164,6 +164,7 @@ export const RPC_REQUIREMENTS: Readonly<Record<string, ArmRequirement>> = {
 	oba_unlink_one: { caps: ['install'], class: 'owner' },
 	oba_update: { caps: ['install'], class: 'owner' },
 	os_username: { caps: [], class: 'owner' },
+	outbox_approvals_status: { caps: [], class: 'access' },
 	pa_actions_commit: { caps: ['approve'], class: 'shared' },
 	pa_actions_list: { caps: ['sessions'], class: 'shared' },
 	pa_actions_pause: { caps: ['approve'], class: 'owner' },

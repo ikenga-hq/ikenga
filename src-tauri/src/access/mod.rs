@@ -566,7 +566,7 @@ pub fn authorize(ctx: &AccessCtx, cmd: &str) -> Result<(), AccessError> {
 /// describes the whole box and is only meaningful where the whole box is
 /// visible.
 pub fn is_broker_arm(cmd: &str) -> bool {
-    cmd.starts_with("access_") || cmd == "server_health"
+    cmd.starts_with("access_") || cmd == "server_health" || cmd == "outbox_approvals_status"
 }
 
 /// The requirement of a non-RPC protected route (§1.6 "Non-RPC routes");

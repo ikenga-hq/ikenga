@@ -1,5 +1,7 @@
 import { useCallback } from 'react';
-import { LayoutGrid } from 'lucide-react';
+import { LayoutGrid, Send } from 'lucide-react';
+import { useOutboxApprovalsActive } from '@/lib/queries/outbox-approvals-active';
+import { APPROVALS_ROUTE, usePendingApprovalsCount } from '@/shell/status-bar';
 import { ListRow } from '@/components/ui/list-row';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { usePkgActivityBarEntries, type PkgViewEntry } from '@/lib/pkg/use-activity-bar-entries';
@@ -17,6 +19,7 @@ import type { ExplorerSectionContext } from '../section-registry';
 export function ViewsSection(_ctx: ExplorerSectionContext) {
 	const { views, loaded } = usePkgActivityBarEntries();
 	const addPin = usePinsStore((s) => s.addPin);
+	const outboxActive = useOutboxApprovalsActive();
 
 	const openView = useCallback((route: string) => {
 		const { focusedId, addTab } = usePaneStore.getState();
@@ -50,7 +53,16 @@ export function ViewsSection(_ctx: ExplorerSectionContext) {
 		addTab(focusedId, { kind: 'route', path: '/ngwa/installed' });
 	}, []);
 
-	if (loaded && views.length === 0) {
+	const pinOutbox = useCallback(() => {
+		void addPin({
+			kind: 'route',
+			target: APPROVALS_ROUTE,
+			label: 'Outbox',
+			iconLucide: 'send',
+		}).catch(() => {});
+	}, [addPin]);
+
+	if (loaded && views.length === 0 && !outboxActive) {
 		return (
 			<div className="p-4 text-center">
 				<h3 className="text-sm font-semibold">No contributed views</h3>
@@ -70,6 +82,18 @@ export function ViewsSection(_ctx: ExplorerSectionContext) {
 
 	return (
 		<div className="py-1">
+			{outboxActive && (
+				<EffectiveContextMenu
+					menuId="views"
+					handlers={{
+						open: () => openView(APPROVALS_ROUTE),
+						'open-to-side': () => openViewSplit(APPROVALS_ROUTE),
+						'pin-rail': pinOutbox,
+					}}
+				>
+					<OutboxRow onOpen={() => openView(APPROVALS_ROUTE)} />
+				</EffectiveContextMenu>
+			)}
 			{views.map((view: PkgViewEntry) => (
 				<EffectiveContextMenu
 					key={view.qualified_id}
@@ -102,5 +126,27 @@ export function ViewsSection(_ctx: ExplorerSectionContext) {
 				</EffectiveContextMenu>
 			))}
 		</div>
+	);
+}
+
+/** The shell-core Outbox entry: opens the approvals queue, with the pending
+ *  count as a badge. Separate component so the count's polling query mounts
+ *  only while the entry is visible. */
+function OutboxRow({ onOpen }: { onOpen: () => void }) {
+	const pending = usePendingApprovalsCount();
+	return (
+		<ListRow size="sm" onActivate={onOpen} title="Outbox" className="w-full gap-1.5 px-2">
+			<Send className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+			<span className="flex-1 truncate text-xs">Outbox</span>
+			{pending > 0 && (
+				<span
+					data-testid="outbox-pending-badge"
+					className="shrink-0 rounded-full bg-primary/15 px-1.5 text-[10px] font-medium tabular-nums text-primary"
+				>
+					{pending}
+				</span>
+			)}
+			<span className="shrink-0 truncate text-[10px] text-muted-foreground/70">Approvals</span>
+		</ListRow>
 	);
 }
