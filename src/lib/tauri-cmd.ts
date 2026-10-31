@@ -4718,6 +4718,19 @@ export async function projectListenActiveChanged(
 	return listen<{ id: string }>('projects:active-changed', (e) => callback(e.payload));
 }
 
+/** What changed in the project list. Frozen as gate G-EVENT. */
+export type ProjectListChange = { id: string; kind: 'created' | 'updated' | 'archived' };
+
+/** Subscribe to project-list changes: `projects:list-changed`, emitted by Rust after
+ *  `project_create` / `project_update` / `project_archive` succeed on any surface (Tauri
+ *  command, daemon RPC, iyke bridge). Not a switch: do NOT invalidate `project-scoped`
+ *  queries from this; re-read the list (`refreshProjects`) and nothing more. */
+export async function projectListenListChanged(
+	callback: (payload: ProjectListChange) => void
+): Promise<UnlistenFn> {
+	return listen<ProjectListChange>('projects:list-changed', (e) => callback(e.payload));
+}
+
 // ─── Atelier skill files (WP-16b / WP-10) ─────────────────────────────────────
 //
 // Generic reader for per-project Atelier skill config living under

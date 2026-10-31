@@ -17,6 +17,15 @@ use super::db::PaDb;
 
 pub use crate::server::shared::projects::*;
 
+/// The desktop's half of `projects:list-changed`: broadcast on Tauri's event
+/// bus. Every Tauri command and iyke bridge route that creates, updates or
+/// archives a project passes its `AppHandle` to the `*_announcing` helpers.
+impl ListChangedSink for AppHandle {
+    fn list_changed(&self, id: &str, kind: ListChangeKind) {
+        let _ = self.emit(LIST_CHANGED_EVENT, ListChanged { id, kind });
+    }
+}
+
 // ─── One-time migration: claudeProjectRoots → projects ────────────────────
 //
 // Pre-Phase-0-of-projects-first-class, the /claude config browser tracked a
@@ -194,6 +203,7 @@ fn slugify(input: &str) -> String {
 
 #[tauri::command]
 pub async fn project_create(
+    app: AppHandle,
     db: State<'_, Arc<PaDb>>,
     id: String,
     display_name: String,
@@ -203,7 +213,7 @@ pub async fn project_create(
     description: Option<String>,
 ) -> Result<Project, String> {
     let pool = db.ensure_pool().await?;
-    create_project(
+    create_project_announcing(
         &pool,
         CreateArgs {
             id,
@@ -213,18 +223,20 @@ pub async fn project_create(
             color,
             description,
         },
+        &app,
     )
     .await
 }
 
 #[tauri::command]
 pub async fn project_update(
+    app: AppHandle,
     db: State<'_, Arc<PaDb>>,
     id: String,
     patch: ProjectPatch,
 ) -> Result<Project, String> {
     let pool = db.ensure_pool().await?;
-    update_project(&pool, &id, patch).await
+    update_project_announcing(&pool, &id, patch, &app).await
 }
 
 #[tauri::command]
@@ -237,9 +249,13 @@ pub async fn project_list(
 }
 
 #[tauri::command]
-pub async fn project_archive(db: State<'_, Arc<PaDb>>, id: String) -> Result<(), String> {
+pub async fn project_archive(
+    app: AppHandle,
+    db: State<'_, Arc<PaDb>>,
+    id: String,
+) -> Result<(), String> {
     let pool = db.ensure_pool().await?;
-    archive_project(&pool, &id).await
+    archive_project_announcing(&pool, &id, &app).await
 }
 
 #[tauri::command]

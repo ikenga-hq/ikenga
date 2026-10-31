@@ -94,6 +94,7 @@ export function useWorkspaceEffects(
 	// command invocations (resolves "focused pane" client-side).
 	useScreenshotListener();
 	// Phase 0 (projects-first-class): subscribe to `projects:active-changed`
+	// (and `projects:list-changed`, which only refreshes the list)
 	// Tauri events and invalidate any `'project-scoped'` TanStack Query so
 	// later phases' per-project data swaps automatically on switch.
 	useProjectsSync();

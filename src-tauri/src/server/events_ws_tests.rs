@@ -220,6 +220,7 @@ async fn ready_names_every_live_topic_and_never_an_unproduced_one() {
     for name in [
         "settings://changed",
         "projects:active-changed",
+        "projects:list-changed",
         "actions://changed",
         "notifications://changed",
         "pa-action-paused",
@@ -236,6 +237,58 @@ async fn ready_names_every_live_topic_and_never_an_unproduced_one() {
     for name in ["runtime://bun", "pkg-installed"] {
         assert!(!events.contains(&name), "{name} has no daemon producer");
     }
+}
+
+/// `projects:list-changed` (G-EVENT): each of the three RPC arms publishes it
+/// exactly once on success, nothing on failure, and a create is not a switch
+/// (`projects:active-changed` stays silent).
+#[tokio::test]
+async fn project_mutations_publish_list_changed_exactly_once_each() {
+    let d = daemon().await;
+    let r = &d.router;
+    let mut ws = connect(d.addr).await;
+    ready_and_subscribe(&mut ws, &["projects:list-changed", "projects:active-changed"]).await;
+
+    rpc(r, "project_create", json!({ "id": "p1", "displayName": "P1" })).await;
+    rpc(
+        r,
+        "project_update",
+        json!({ "id": "p1", "patch": { "display_name": "P1!" } }),
+    )
+    .await;
+    rpc(r, "project_archive", json!({ "id": "p1" })).await;
+    // A refused mutation must not announce.
+    let refused = r
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/rpc")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::from(
+                    json!({ "cmd": "project_archive", "args": { "id": "nope" } }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::OK);
+
+    let mut seen = Vec::new();
+    while let Some(frame) = next_json(&mut ws, Duration::from_millis(500)).await {
+        if frame["type"] == "event" {
+            seen.push((frame["event"].clone(), frame["payload"].clone()));
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![
+            (json!("projects:list-changed"), json!({ "id": "p1", "kind": "created" })),
+            (json!("projects:list-changed"), json!({ "id": "p1", "kind": "updated" })),
+            (json!("projects:list-changed"), json!({ "id": "p1", "kind": "archived" })),
+        ]
+    );
 }
 
 /// Each producer the daemon has publishes the desktop's event name and
