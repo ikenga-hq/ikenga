@@ -54,7 +54,10 @@ pub struct ListChanged<'a> {
 /// Where a project mutation announces itself: the desktop's `AppHandle`
 /// (Tauri event bus) or the daemon's `EventBus`. A trait so the
 /// `*_announcing` helpers below are testable without a webview runtime.
-pub trait ListChangedSink {
+///
+/// `Send + Sync` because the helpers hold a `&dyn ListChangedSink` across
+/// `.await`, and the axum handlers / RPC arms that call them must stay `Send`.
+pub trait ListChangedSink: Send + Sync {
     fn list_changed(&self, id: &str, kind: ListChangeKind);
 }
 
