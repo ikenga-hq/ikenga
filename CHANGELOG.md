@@ -1,5 +1,15 @@
 # ikenga-desktop
 
+## 0.29.0
+
+### Minor Changes
+
+- e638e1d: Settings → Integrations has a "Sender (box)" section, shown only when the app is open against the box (never on the desktop), to set the box sender's credentials without a terminal loader. Every member gets a "My outreach mailbox" card (SMTP and IMAP, ports defaulting to 465 and 993); admins also get cards for Ruby's mailbox, Buffer, Listmonk, the help-centre CMS draft key and the Tasks token, and can clear anyone's mailbox. The values go to the sender's own vault, never to an account vault a pkg or Chi can read, and are never returned: status shows set or not set, value lengths, who changed it and when, and what a mailbox still needs from whoever runs the box. Password and key inputs are write-only and cleared on save. Save runs the sender's login test first and saves only if it passes (a key with no live check says "format checked only"); clearing asks in-app first. The server relays `vault.status|set|test|clear` to the sender socket as the signed-in account (identity and role come from the session, never the request), applies the same member/admin rule before the sender does, and writes a `sender.vault_changed` audit row (key names only) that carries the sender's event and a ready-to-post note line for the founder. The Mattermost note itself is not posted by the server yet. New route: `POST /api/sender/vault/:op`; it needs a password session or a full-access device and is refused inside a share.
+
+### Patch Changes
+
+- 3b96ce1: Explorer Views now shows an Outbox entry (with the pending-approvals count) automatically when an approvals backend is active: the `com.ikenga.outbound` pkg installed and enabled (or drafts present) on desktop, the sender approvals socket live on a remote box, and operators only inside a share. Adds the read-only `outbox_approvals_status` RPC arm.
+
 ## 0.28.1
 
 ### Patch Changes
