@@ -103,6 +103,10 @@ export interface PkgActivityBarState {
 	 *  `null` until the first snapshot, or when the snapshot failed: unknown,
 	 *  so nothing is hidden. */
 	availablePkgIds: ReadonlySet<string> | null;
+	/** Pkg ids that are installed AND enabled (`installed[].enabled !== false`).
+	 *  The rail's automatic app icons are limited to these. `null` until the
+	 *  first snapshot, or when it failed: unknown. */
+	enabledPkgIds: ReadonlySet<string> | null;
 }
 
 interface SidecarStatus {
@@ -185,6 +189,13 @@ export function availablePkgIdsOf(status: {
 	return ids;
 }
 
+/** Pkg ids that are installed and not disabled. */
+export function enabledPkgIdsOf(status: {
+	installed?: ReadonlyArray<{ id: string; enabled?: boolean }>;
+}): Set<string> {
+	return new Set((status.installed ?? []).filter((i) => i.enabled !== false).map((i) => i.id));
+}
+
 /** Pkg ids whose every `ui_routes` entry is `kind: "webview"`. A native
  *  webview is a desktop-only surface that a browser session can never mount
  *  (2026-10-06 gap audit, rank 20), so the rail and the Views list drop these
@@ -208,6 +219,7 @@ export function usePkgActivityBarEntries(): PkgActivityBarState {
 	const [views, setViews] = useState<PkgViewEntry[]>([]);
 	const [loaded, setLoaded] = useState(false);
 	const [availablePkgIds, setAvailablePkgIds] = useState<ReadonlySet<string> | null>(null);
+	const [enabledPkgIds, setEnabledPkgIds] = useState<ReadonlySet<string> | null>(null);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -240,12 +252,14 @@ export function usePkgActivityBarEntries(): PkgActivityBarState {
 					setViews(viewEntries);
 					setEntries(merged);
 					setAvailablePkgIds(availablePkgIdsOf(status));
+						setEnabledPkgIds(enabledPkgIdsOf(status));
 				}
 			} catch {
 				if (!cancelled) {
 					setViews([]);
 					setEntries([]);
 					setAvailablePkgIds(null);
+						setEnabledPkgIds(null);
 				}
 			} finally {
 				if (!cancelled) setLoaded(true);
@@ -276,5 +290,5 @@ export function usePkgActivityBarEntries(): PkgActivityBarState {
 		};
 	}, []);
 
-	return { entries, views, loaded, availablePkgIds };
+	return { entries, views, loaded, availablePkgIds, enabledPkgIds };
 }
