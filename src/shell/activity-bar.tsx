@@ -83,6 +83,7 @@ import {
 	subscribePinPruneOnUninstall,
 } from '@/lib/shell/pins-store';
 import { autoRailEntries, useRailAutoStore } from '@/lib/shell/rail-auto-icons';
+import { isBrowserSession } from '@/lib/transport';
 import { type CoreMode, useShellStore } from '@/lib/shell/shell-store';
 import { focusCompanion } from './companion-focus';
 import { PinIcon } from './pin-icon';
@@ -247,7 +248,9 @@ export function ActivityBar() {
 	// Hold the auto icons back until pins and the hidden list have loaded, so
 	// a pinned or hidden pkg never flashes in a second time.
 	const hiddenHydrated = useRailAutoStore((s) => s.hydrated);
-	const autoReady = hydrated && hiddenHydrated;
+	// R-4: pkgs never run on the box, so a browser tab gets no auto app icons
+	// even if the server's pkg index lists some.
+	const autoReady = !isBrowserSession() && hydrated && hiddenHydrated;
 	const autoEntries = useMemo(
 		() =>
 			autoReady
@@ -263,7 +266,7 @@ export function ActivityBar() {
 	// re-runs and concurrent hydrate calls.
 	useEffect(() => {
 		void hydratePins();
-		void hydrateAuto();
+		if (!isBrowserSession()) void hydrateAuto();
 	}, [hydratePins, hydrateAuto]);
 
 	// An uninstalled pkg's pins would open a view that no longer exists: the

@@ -13,6 +13,7 @@ import type { ActivityPin } from '@/lib/tauri-cmd';
 
 const h = vi.hoisted(() => ({
 	share: null as { role: string } | null,
+	browser: false,
 	installed: [] as Array<{ id: string; enabled: boolean }>,
 	drafts: [] as unknown[],
 	pending: 0,
@@ -35,7 +36,7 @@ vi.mock('@/lib/queries/pa-actions', () => ({
 }));
 vi.mock('@/lib/transport', async (orig) => ({
 	...(await orig<typeof import('@/lib/transport')>()),
-	isBrowserSession: () => false,
+	isBrowserSession: () => h.browser,
 }));
 vi.mock('@/lib/tauri-cmd', async (orig) => ({
 	...(await orig<typeof import('@/lib/tauri-cmd')>()),
@@ -123,6 +124,7 @@ beforeEach(() => {
 	localStorage.setItem('ikenga.gloss.seen', JSON.stringify(['ngwa', 'chi']));
 	vi.spyOn(console, 'warn').mockImplementation(() => {});
 	h.share = null;
+	h.browser = false;
 	h.installed = [];
 	h.drafts = [];
 	h.pending = 0;
@@ -228,6 +230,16 @@ describe('automatic app pkg icons (R-3)', () => {
 		mount();
 		await screen.findByLabelText('ALPHA');
 		expect(items()).toEqual(['project', 'chi', 'ngwa', 'app:alpha', 'app:beta', 'settings']);
+	});
+
+	it('a browser tab on the box gets no pkg icons (R-4), even if the index lists some', async () => {
+		h.browser = true;
+		setPkgs([{ id: 'alpha' }]);
+		mount();
+		await waitFor(() => expect(items()).toContain('settings'));
+		await new Promise((r) => setTimeout(r, 50));
+		expect(items()).not.toContain('app:alpha');
+		expect(h.kv.size).toBe(0);
 	});
 
 	it('a disabled pkg gets no icon', async () => {
