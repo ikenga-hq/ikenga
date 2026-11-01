@@ -38,11 +38,14 @@ test.describe('frame smoke (current frame)', () => {
 		for (const label of ['Project', 'Chi', 'Ngwa', 'Settings']) {
 			await expect(rail.getByRole('button', { name: label, exact: true })).toBeVisible();
 		}
-		// The pre-v16 modes and per-package rail buttons are gone: a package's
-		// rail presence is a pin now (WP-22 seeds one per former rail icon).
-		for (const label of ['App', 'Files', 'Sessions', 'Artifact grid', 'Packages', 'Demo Pkg']) {
+		// The pre-v16 modes are gone.
+		for (const label of ['App', 'Files', 'Sessions', 'Artifact grid', 'Packages']) {
 			await expect(rail.getByRole('button', { name: label, exact: true })).toHaveCount(0);
 		}
+		// An installed + enabled app pkg with a view gets exactly one automatic
+		// rail icon (rail-app-icons R-3); it isn't pinned here, so no pin either.
+		await expect(rail.locator('[data-rail-item="app:com.e2e.demo"]')).toHaveCount(1);
+		await expect(rail.getByRole('button', { name: 'Demo Pkg', exact: true })).toHaveCount(1);
 
 		// User pin from activity_pins_list, grouped under its section.
 		const pin = MOCK_PINS[0]!;
@@ -77,7 +80,9 @@ test.describe('frame smoke (current frame)', () => {
 		await expect(page.getByRole('navigation', { name: 'Explorer sidebar' })).toBeVisible();
 		// Listed once across every nav landmark (the tab and the page heading
 		// also say "Appearance"; those aren't navigation).
-		await expect(page.getByRole('navigation').getByText('Appearance', { exact: true })).toHaveCount(1);
+		await expect(page.getByRole('navigation').getByText('Appearance', { exact: true })).toHaveCount(
+			1
+		);
 
 		// Record (not assert) which host commands had no canned answer, so a
 		// spec author can see what to add to the fixture when the frame grows.
@@ -439,7 +444,9 @@ test.describe('explorer (WP-04)', () => {
 
 		// Explorer top header controls
 		await expect(explorer.getByTestId('explorer-project-chip')).toBeVisible();
-		await expect(explorer.getByRole('button', { name: /Collapse all sections|Restore sections/ })).toBeVisible();
+		await expect(
+			explorer.getByRole('button', { name: /Collapse all sections|Restore sections/ })
+		).toBeVisible();
 
 		// Clicking a section header toggles its open state
 		const filesHeader = explorer.locator('[data-section-id="files"]');
@@ -490,7 +497,9 @@ test.describe('companion (WP-06)', () => {
 
 		// Panels rendered
 		for (const panelName of ['Permissions', 'Cost', 'Tool feed', 'Runs']) {
-			await expect(companion.getByRole('button', { name: new RegExp(`^${panelName}`) })).toBeVisible();
+			await expect(
+				companion.getByRole('button', { name: new RegExp(`^${panelName}`) })
+			).toBeVisible();
 		}
 
 		// Collapse Companion via header collapse button
@@ -515,7 +524,10 @@ test.describe('three-noun routes (WP-10)', () => {
 		// producer output from WP-14a - so the page renders true-shaped data rather
 		// than the mock's default `null`.
 		const ngwaGolden = JSON.parse(
-			readFileSync(new URL('../src/lib/ngwa/__fixtures__/ngwa-snapshot.golden.json', import.meta.url), 'utf8')
+			readFileSync(
+				new URL('../src/lib/ngwa/__fixtures__/ngwa-snapshot.golden.json', import.meta.url),
+				'utf8'
+			)
 		);
 		await installTauriMock(page, { responses: { ngwa_snapshot: ngwaGolden } });
 		await page.goto('/', { waitUntil: 'domcontentloaded' });
@@ -621,7 +633,9 @@ test.describe('D-01 conformance (WP-12)', () => {
 					'[data-pane-id] > .flex.shrink-0 button, [data-pane-id] > .flex.shrink-0 [role="tab"]'
 				)
 			) as HTMLElement[];
-			return nodes.filter((el) => el.checkVisibility?.({ checkOpacity: true, checkVisibilityCSS: true })).length;
+			return nodes.filter((el) =>
+				el.checkVisibility?.({ checkOpacity: true, checkVisibilityCSS: true })
+			).length;
 		});
 		const companion = await countRegion('aside[aria-label="Chi companion"]');
 		const statusBar = await countRegion('footer[aria-label="Status bar"]');
@@ -668,6 +682,3 @@ test.describe('D-01 conformance (WP-12)', () => {
 		expect(outline).toBe(true);
 	});
 });
-
-
-
