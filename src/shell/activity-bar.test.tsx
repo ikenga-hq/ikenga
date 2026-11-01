@@ -9,6 +9,13 @@ import type { ActivityPin } from '@/lib/tauri-cmd';
 // Host-backed hooks the rail reads. Their own behaviour is tested elsewhere;
 // here they are inert so the rail renders the same with or without Tauri.
 vi.mock('@/lib/registry/use-updates-available', () => ({ useUpdatesAvailable: () => 0 }));
+// The Outbox key (R-1) and app icons (R-3) have their own file
+// (activity-bar.app-icons.test.tsx); here the Outbox backend is inactive.
+vi.mock('@/lib/queries/outbox-approvals-active', () => ({ useOutboxApprovalsActive: () => false }));
+vi.mock('@/shell/status-bar', () => ({
+	APPROVALS_ROUTE: '/outbox/approvals',
+	usePendingApprovalsCount: () => 0,
+}));
 vi.mock('@/lib/pkg/use-activity-bar-entries', () => ({
 	usePkgActivityBarEntries: () => ({ entries: [], views: [], loaded: true }),
 }));
@@ -235,7 +242,9 @@ describe('keyboard (R2)', () => {
 
 		press({ key: '3', ...MOD });
 		expect(shell.useShellStore.getState().activeMode).toBe('ngwa');
-		expect(panes.usePaneStore.getState().navigateFocused).toHaveBeenLastCalledWith('/ngwa/installed');
+		expect(panes.usePaneStore.getState().navigateFocused).toHaveBeenLastCalledWith(
+			'/ngwa/installed'
+		);
 
 		press({ key: ',', ...MOD });
 		expect(shell.useShellStore.getState().activeMode).toBe('settings');

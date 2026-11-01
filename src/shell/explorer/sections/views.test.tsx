@@ -1,23 +1,15 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { useRailAutoStore } from '@/lib/shell/rail-auto-icons';
 import { ViewsSection } from './views';
 
 const addTab = vi.fn();
 const placeView = vi.fn();
 const addPin = vi.fn(async () => {});
-let active = true;
-let pending = 0;
 let views: unknown[] = [];
 let handlersSeen: Array<Record<string, () => void>> = [];
 
-vi.mock('@/lib/queries/outbox-approvals-active', () => ({
-	useOutboxApprovalsActive: () => active,
-}));
-vi.mock('@/shell/status-bar', () => ({
-	APPROVALS_ROUTE: '/outbox/approvals',
-	usePendingApprovalsCount: () => pending,
-}));
 vi.mock('@/lib/pkg/use-activity-bar-entries', () => ({
 	usePkgActivityBarEntries: () => ({ views, loaded: true }),
 }));
@@ -26,6 +18,10 @@ vi.mock('@/lib/panes/pane-store', () => ({
 }));
 vi.mock('@/lib/shell/pins-store', () => ({
 	usePinsStore: (sel: (s: { addPin: typeof addPin }) => unknown) => sel({ addPin }),
+}));
+vi.mock('@/lib/tauri-cmd', () => ({
+	settingsGet: async () => null,
+	settingsSet: async () => {},
 }));
 vi.mock('@/shell/menu/effective-context-menu', () => ({
 	EffectiveContextMenu: ({
@@ -41,133 +37,63 @@ vi.mock('@/shell/menu/effective-context-menu', () => ({
 }));
 
 const ctx = { projectId: 'p' };
+const alpha = {
+	pkg_id: 'a',
+	pkg_name: 'Alpha',
+	qualified_id: 'a:v',
+	id: 'v',
+	title: 'Alpha view',
+	route: '/v',
+	pane_route: '/pkg/a/v',
+	pin_on_install: false,
+};
 
 beforeEach(() => {
-	active = true;
-	pending = 0;
 	views = [];
 	handlersSeen = [];
+	useRailAutoStore.setState({ hidden: new Set(), hydrated: true });
 });
 afterEach(() => {
 	cleanup();
 	vi.clearAllMocks();
 });
 
-describe('ViewsSection Outbox entry', () => {
-	it('shows Outbox approvals even when no pkg contributes a view', () => {
-		render(<ViewsSection {...ctx} />);
-		expect(screen.getByText('Outbox approvals')).toBeTruthy();
-		expect(screen.queryByText('No contributed views')).toBeNull();
-	});
-
-	it('falls back to the empty state when no backend is active and no views exist', () => {
-		active = false;
+describe('ViewsSection', () => {
+	it('no longer lists Outbox approvals (it is a rail icon now)', () => {
+		views = [alpha];
 		render(<ViewsSection {...ctx} />);
 		expect(screen.queryByText('Outbox approvals')).toBeNull();
-		expect(screen.getByText('No contributed views')).toBeTruthy();
-	});
-
-	it('is listed first, above pkg views', () => {
-		views = [
-			{
-				pkg_id: 'a',
-				pkg_name: 'Alpha',
-				qualified_id: 'a:v',
-				id: 'v',
-				title: 'Alpha view',
-				route: '/v',
-				pane_route: '/pkg/a/v',
-				pin_on_install: false,
-			},
-		];
-		render(<ViewsSection {...ctx} />);
-		const text = document.body.textContent ?? '';
-		expect(text.indexOf('Outbox approvals')).toBeLessThan(text.indexOf('Alpha view'));
-	});
-
-	it('hides the entry (but keeps pkg views) when the backend is inactive', () => {
-		active = false;
-		views = [
-			{
-				pkg_id: 'a',
-				pkg_name: 'Alpha',
-				qualified_id: 'a:v',
-				id: 'v',
-				title: 'Alpha view',
-				route: '/v',
-				pane_route: '/pkg/a/v',
-				pin_on_install: false,
-			},
-		];
-		render(<ViewsSection {...ctx} />);
-		expect(screen.queryByText('Outbox approvals')).toBeNull();
+		expect(screen.queryByTestId('outbox-pending-badge')).toBeNull();
 		expect(screen.getByText('Alpha view')).toBeTruthy();
 	});
 
-	it('shows the pending count only when above zero', () => {
-		const { unmount } = render(<ViewsSection {...ctx} />);
-		expect(screen.queryByTestId('outbox-pending-badge')).toBeNull();
-		unmount();
-		pending = 3;
+	it('shows the empty state when no pkg contributes a view', () => {
 		render(<ViewsSection {...ctx} />);
-		expect(screen.getByTestId('outbox-pending-badge').textContent).toBe('3');
+		expect(screen.getByText('No contributed views')).toBeTruthy();
 	});
 
-	it('click opens /outbox/approvals in the focused pane', () => {
+	it('pkg rows open their pane route and keep their context menu', () => {
+		views = [alpha];
 		render(<ViewsSection {...ctx} />);
-		fireEvent.click(screen.getByText('Outbox approvals'));
-		expect(addTab).toHaveBeenCalledWith('p1', {
-			kind: 'route',
-			path: '/outbox/approvals',
-		});
+		fireEvent.click(screen.getByText('Alpha view'));
+		expect(addTab).toHaveBeenCalledWith('p1', { kind: 'route', path: '/pkg/a/v' });
+		expect(Object.keys(handlersSeen[0]!).sort()).toEqual([
+			'open',
+			'open-in-ngwa',
+			'open-to-side',
+			'pin-rail',
+		]);
 	});
 
-	it('context menu: open-to-side splits, pin-rail pins, no open-in-ngwa', () => {
+	it('offers "Show in rail" only for a pkg whose rail icon is hidden', () => {
+		views = [alpha];
+		const first = render(<ViewsSection {...ctx} />);
+		expect(screen.queryByLabelText('Show Alpha in rail')).toBeNull();
+		first.unmount();
+		useRailAutoStore.setState({ hidden: new Set(['a']) });
 		render(<ViewsSection {...ctx} />);
-		const h = handlersSeen[0]!;
-		expect(Object.keys(h).sort()).toEqual(['open', 'open-to-side', 'pin-rail']);
-		h['open-to-side']!();
-		expect(placeView).toHaveBeenCalledWith(
-			'p1',
-			{ kind: 'route', path: '/outbox/approvals' },
-			'right'
-		);
-		h['pin-rail']!();
-		expect(addPin).toHaveBeenCalledWith(
-			expect.objectContaining({
-				kind: 'route',
-				target: '/outbox/approvals',
-				label: 'Outbox approvals',
-			})
-		);
-	});
-
-	it('with the outbound pkg present: one pkg "Outbox" and one shell "Outbox approvals", distinct targets', () => {
-		views = [
-			{
-				pkg_id: 'com.ikenga.outbound',
-				pkg_name: 'Outbound',
-				qualified_id: 'com.ikenga.outbound:outbound.index',
-				id: 'outbound.index',
-				title: 'Outbox',
-				route: '/',
-				pane_route: '/pkg/com.ikenga.outbound/',
-				pin_on_install: false,
-			},
-		];
-		render(<ViewsSection {...ctx} />);
-		expect(screen.getAllByText('Outbox')).toHaveLength(1);
-		expect(screen.getAllByText('Outbox approvals')).toHaveLength(1);
-		expect(screen.getByLabelText('Outbox approvals')).toBeTruthy();
-		fireEvent.click(screen.getByText('Outbox'));
-		expect(addTab).toHaveBeenLastCalledWith('p1', {
-			kind: 'route',
-			path: '/pkg/com.ikenga.outbound/',
-		});
-		fireEvent.click(screen.getByText('Outbox approvals'));
-		expect(addTab).toHaveBeenLastCalledWith('p1', {
-			kind: 'route',
-			path: '/outbox/approvals',
-		});
+		fireEvent.click(screen.getByLabelText('Show Alpha in rail'));
+		expect(useRailAutoStore.getState().hidden.has('a')).toBe(false);
+		expect(addTab).not.toHaveBeenCalled();
 	});
 });

@@ -1,10 +1,13 @@
-// The rail (WP-03): Project · Chi · Ngwa · pins · Settings.
+// The rail (WP-03): Project · Chi · Ngwa · [Outbox approvals] · pins · app
+// icons · Settings.
 //
 // Three nouns, one surface each (DEC-1): Project (⌘1) owns the workbench,
 // Chi (⌘2) brings the Companion forward, Ngwa (⌘3) is the equipment
-// catalogue that absorbed Packages. Below them sit the user's pins (a
-// package's rail presence is a pin since WP-22 seeded one per former rail
-// icon), then Settings (⌘,) at the foot. ⌘4–⌘6 are retired and unbound.
+// catalogue that absorbed Packages. Right after Ngwa sits the shell-owned
+// Outbox approvals icon (only while an approvals backend is active), then the
+// user's pins (a package's rail presence is a pin since WP-22 seeded one per
+// former rail icon), then one automatic icon per installed + enabled app pkg
+// the user has not pinned or hidden, then Settings (⌘,) at the foot. ⌘4–⌘6 are retired and unbound.
 //
 // Keyboard: the rail is one tab stop (roving tabindex, spec §1.4); ↑/↓ move
 // between items, Home/End jump, Enter/Space activate. Every item has a
@@ -21,13 +24,16 @@
 import {
 	ArrowDown,
 	ArrowUp,
+	EyeOff,
 	Folder,
+	LayoutGrid,
 	HeartPulse,
 	type LucideIcon,
 	Package,
 	Pencil,
 	Pin as PinGlyph,
 	PinOff,
+	Send,
 	Settings,
 	Settings2,
 	SquareDashed,
@@ -55,9 +61,12 @@ import {
 	DialogTitle,
 } from '@/components/ui/dialog';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import { useOutboxApprovalsActive } from '@/lib/queries/outbox-approvals-active';
+import { APPROVALS_ROUTE, usePendingApprovalsCount } from '@/shell/status-bar';
 import { useIkengaStore } from '@/lib/ikenga/theme-store';
 import { useCommands } from '@/lib/keymap/dispatcher';
 import { labelFor } from '@/lib/keymap/registry';
+import { findLeaf } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import {
 	type PkgActivityBarEntry,
@@ -73,6 +82,8 @@ import {
 	usePinsStore,
 	subscribePinPruneOnUninstall,
 } from '@/lib/shell/pins-store';
+import { autoRailEntries, useRailAutoStore } from '@/lib/shell/rail-auto-icons';
+import { isBrowserSession } from '@/lib/transport';
 import { type CoreMode, useShellStore } from '@/lib/shell/shell-store';
 import { focusCompanion } from './companion-focus';
 import { PinIcon } from './pin-icon';
@@ -134,6 +145,18 @@ const TOP_KEYS: readonly RailKeyDef[] = [
 	{ mode: 'chi', label: 'Chi', command: 'rail.chi', Icon: ChiGlyph },
 	{ mode: 'ngwa', label: 'Ngwa', command: 'rail.ngwa', Icon: NgwaGlyph },
 ];
+
+/** Route path of the focused pane's active tab, or null when it is not a route
+ *  view. Drives the Outbox icon's active state. */
+function useFocusedRoutePath(): string | null {
+	return usePaneStore((s) => {
+		const leaf = findLeaf(s.root, s.focusedId);
+		const view = leaf?.tabs[leaf.activeTabIdx];
+		return view && view.kind === 'route' ? view.path : null;
+	});
+}
+
+const OUTBOX_ITEM_ID = 'outbox-approvals';
 
 const SETTINGS_KEY: RailKeyDef = {
 	mode: 'settings',
@@ -217,6 +240,24 @@ export function ActivityBar() {
 	);
 	const updatesAvailable = useUpdatesAvailable();
 	const pinStatus = usePinPkgStatus(pkgBar.entries);
+	const outboxActive = useOutboxApprovalsActive();
+	const focusedPath = useFocusedRoutePath();
+	const allPins = usePinsStore((s) => s.pins);
+	const hiddenAuto = useRailAutoStore((s) => s.hidden);
+	const hydrateAuto = useRailAutoStore((s) => s.hydrate);
+	// Hold the auto icons back until pins and the hidden list have loaded, so
+	// a pinned or hidden pkg never flashes in a second time.
+	const hiddenHydrated = useRailAutoStore((s) => s.hydrated);
+	// R-4: pkgs never run on the box, so a browser tab gets no auto app icons
+	// even if the server's pkg index lists some.
+	const autoReady = !isBrowserSession() && hydrated && hiddenHydrated;
+	const autoEntries = useMemo(
+		() =>
+			autoReady
+				? autoRailEntries(pkgBar.entries, pkgBar.enabledPkgIds, allPins, hiddenAuto)
+				: [],
+		[autoReady, pkgBar.entries, pkgBar.enabledPkgIds, allPins, hiddenAuto]
+	);
 	const railRef = useRef<HTMLElement>(null);
 	const [rovingId, setRovingId] = useState<string | null>(null);
 	const terms = useMemo(glossTerms, []);
@@ -225,7 +266,8 @@ export function ActivityBar() {
 	// re-runs and concurrent hydrate calls.
 	useEffect(() => {
 		void hydratePins();
-	}, [hydratePins]);
+		if (!isBrowserSession()) void hydrateAuto();
+	}, [hydratePins, hydrateAuto]);
 
 	// An uninstalled pkg's pins would open a view that no longer exists: the
 	// kernel emits `pkg-uninstalled`, and the pins pointing into it go.
@@ -284,6 +326,12 @@ export function ActivityBar() {
 		usePaneStore.getState().navigateFocused(to);
 	}
 
+	function openRoute(path: string) {
+		const { sidebarCollapsed, setSidebarCollapsed } = useShellStore.getState();
+		if (sidebarCollapsed) setSidebarCollapsed(false);
+		usePaneStore.getState().navigateFocused(path);
+	}
+
 	function handleSelectPin(pin: Pin) {
 		dispatchPinSelection(pin, usePaneStore.getState());
 	}
@@ -309,12 +357,14 @@ export function ActivityBar() {
 	// item that had focus while it still exists, else the active mode's key.
 	const itemIds: string[] = [
 		...TOP_KEYS.map((k) => k.mode),
+		...(outboxActive ? [OUTBOX_ITEM_ID] : []),
 		...(hasAnyPins
 			? [
 					...sections.flatMap((s) => (pinsBySection.get(s.id) ?? []).map((p) => `pin:${p.id}`)),
 					...sectionLessPins.map((p) => `pin:${p.id}`),
 				]
 			: []),
+		...autoEntries.map((e) => `app:${e.pkg_id}`),
 		SETTINGS_KEY.mode,
 	];
 	const tabStop = rovingId && itemIds.includes(rovingId) ? rovingId : activeMode;
@@ -364,7 +414,11 @@ export function ActivityBar() {
 						)
 					)}
 
-					{hasAnyPins && (
+					{outboxActive && (
+						<OutboxRailKey isActive={isOutboxPath(focusedPath)} onOpen={openRoute} />
+					)}
+
+					{(hasAnyPins || autoEntries.length > 0) && (
 						<>
 							<div className="ikenga-rail-rule" aria-hidden="true" />
 							<div className="ikenga-rail-pins">
@@ -415,6 +469,19 @@ export function ActivityBar() {
 													onSelect={handleSelectPin}
 												/>
 											</PinContextWrap>
+										))}
+									</div>
+								)}
+								{autoEntries.length > 0 && (
+									<div className="ikenga-rail-section" data-section="__apps" title="Apps">
+										{autoEntries.map((entry) => (
+											<AutoAppContextWrap
+												key={entry.pkg_id}
+												entry={entry}
+												onOpen={() => openRoute(entry.route)}
+											>
+												<AutoAppButton entry={entry} onOpen={() => openRoute(entry.route)} />
+											</AutoAppContextWrap>
 										))}
 									</div>
 								)}
@@ -497,6 +564,128 @@ function RailKey({ def, isActive, onSelect, badgeCount, ...rest }: RailKeyProps)
 				)}
 			</button>
 		</RailTooltip>
+	);
+}
+
+/** `/outbox/approvals`, or anything else under `/outbox/`. */
+function isOutboxPath(path: string | null): boolean {
+	return !!path && (path === '/outbox' || path.startsWith('/outbox/'));
+}
+
+/** The shell-owned Outbox approvals key (R-1): fixed right after Ngwa, not
+ *  unpinnable or reorderable. A separate component so the pending-count poll
+ *  mounts only while the key is visible. */
+function OutboxRailKey({
+	isActive,
+	onOpen,
+}: {
+	isActive: boolean;
+	onOpen: (path: string) => void;
+}) {
+	const { tabIndexFor, onItemFocus } = useContext(RovingContext);
+	const pending = usePendingApprovalsCount();
+	const label = 'Outbox approvals';
+	const detail = pending > 0 ? `${pending} pending` : null;
+	return (
+		<RailTooltip label={detail ? `${label} · ${detail}` : label}>
+			<button
+				type="button"
+				onClick={() => onOpen(APPROVALS_ROUTE)}
+				onFocus={() => onItemFocus(OUTBOX_ITEM_ID)}
+				tabIndex={tabIndexFor(OUTBOX_ITEM_ID)}
+				aria-label={detail ? `${label} (${detail})` : label}
+				aria-current={isActive ? 'page' : undefined}
+				data-rail-item={OUTBOX_ITEM_ID}
+				className="ikenga-rail-item"
+			>
+				<Send className="h-[18px] w-[18px]" />
+				{pending > 0 && (
+					<span
+						aria-hidden="true"
+						data-testid="outbox-pending-badge"
+						className="ikenga-rail-badge"
+					>
+						{pending > 9 ? '9+' : pending}
+					</span>
+				)}
+			</button>
+		</RailTooltip>
+	);
+}
+
+/** An automatic app icon (R-3): one per installed + enabled pkg that has a
+ *  view and no pin. Same look and keys as a pin, minus reorder / unpin. */
+function AutoAppButton({
+	entry,
+	onOpen,
+	...rest
+}: { entry: PkgActivityBarEntry; onOpen: () => void } & React.ComponentPropsWithoutRef<'button'>) {
+	const { tabIndexFor, onItemFocus } = useContext(RovingContext);
+	const id = `app:${entry.pkg_id}`;
+	const badge = entry.badge;
+	const count = typeof badge?.count === 'number' && badge.count > 0 ? badge.count : 0;
+	const detail = [
+		entry.parked ? `Parked: ${entry.parked_reason ?? 'sidecar stopped'}` : null,
+		badge?.tooltip,
+	]
+		.filter(Boolean)
+		.join(' · ');
+	const label = entry.pkg_name;
+	return (
+		<RailTooltip label={detail ? `${label} · ${detail}` : label}>
+			<button
+				type="button"
+				{...rest}
+				onClick={onOpen}
+				onFocus={() => onItemFocus(id)}
+				tabIndex={tabIndexFor(id)}
+				aria-label={detail ? `${label} (${detail})` : label}
+				data-rail-item={id}
+				data-app-pkg-id={entry.pkg_id}
+				className="ikenga-rail-item ikenga-rail-pin"
+			>
+				<PinIcon iconLucide={entry.icon ?? null} iconEmoji={null} Fallback={LayoutGrid} />
+				{entry.parked ? (
+					<span aria-hidden="true" className="ikenga-rail-dot" data-tone="danger" />
+				) : count > 0 ? (
+					<span aria-hidden="true" className="ikenga-rail-badge">
+						{count > 9 ? '9+' : count}
+					</span>
+				) : badge?.dot ? (
+					<span aria-hidden="true" className="ikenga-rail-dot" />
+				) : null}
+			</button>
+		</RailTooltip>
+	);
+}
+
+/** Right-click menu for an automatic app icon: Open, Hide from rail. Showing
+ *  it again is on the pkg's row in the Explorer Views section. */
+function AutoAppContextWrap({
+	entry,
+	onOpen,
+	children,
+}: {
+	entry: PkgActivityBarEntry;
+	onOpen: () => void;
+	children: React.ReactNode;
+}) {
+	const hide = useRailAutoStore((s) => s.hide);
+	return (
+		<ContextMenu>
+			<ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
+			<ContextMenuContent>
+				<ContextMenuItem data-action="rail.app-open" onSelect={onOpen}>
+					<PinGlyph className="h-3.5 w-3.5" />
+					Open {entry.pkg_name}
+				</ContextMenuItem>
+				<ContextMenuSeparator />
+				<ContextMenuItem data-action="rail.app-hide" onSelect={() => void hide(entry.pkg_id)}>
+					<EyeOff className="h-3.5 w-3.5" />
+					Hide from rail
+				</ContextMenuItem>
+			</ContextMenuContent>
+		</ContextMenu>
 	);
 }
 

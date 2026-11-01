@@ -1,11 +1,10 @@
 import { useCallback } from 'react';
-import { LayoutGrid, Send } from 'lucide-react';
-import { useOutboxApprovalsActive } from '@/lib/queries/outbox-approvals-active';
-import { APPROVALS_ROUTE, usePendingApprovalsCount } from '@/shell/status-bar';
+import { LayoutGrid, PanelLeft } from 'lucide-react';
 import { ListRow } from '@/components/ui/list-row';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { usePkgActivityBarEntries, type PkgViewEntry } from '@/lib/pkg/use-activity-bar-entries';
 import { usePinsStore } from '@/lib/shell/pins-store';
+import { useRailAutoStore } from '@/lib/shell/rail-auto-icons';
 import { PinIcon } from '@/shell/pin-icon';
 import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import type { ExplorerSectionContext } from '../section-registry';
@@ -19,7 +18,8 @@ import type { ExplorerSectionContext } from '../section-registry';
 export function ViewsSection(_ctx: ExplorerSectionContext) {
 	const { views, loaded } = usePkgActivityBarEntries();
 	const addPin = usePinsStore((s) => s.addPin);
-	const outboxActive = useOutboxApprovalsActive();
+	const hiddenFromRail = useRailAutoStore((s) => s.hidden);
+	const showInRail = useRailAutoStore((s) => s.show);
 
 	const openView = useCallback((route: string) => {
 		const { focusedId, addTab } = usePaneStore.getState();
@@ -53,16 +53,7 @@ export function ViewsSection(_ctx: ExplorerSectionContext) {
 		addTab(focusedId, { kind: 'route', path: '/ngwa/installed' });
 	}, []);
 
-	const pinOutbox = useCallback(() => {
-		void addPin({
-			kind: 'route',
-			target: APPROVALS_ROUTE,
-			label: 'Outbox approvals',
-			iconLucide: 'send',
-		}).catch(() => {});
-	}, [addPin]);
-
-	if (loaded && views.length === 0 && !outboxActive) {
+	if (loaded && views.length === 0) {
 		return (
 			<div className="p-4 text-center">
 				<h3 className="text-sm font-semibold">No contributed views</h3>
@@ -80,20 +71,12 @@ export function ViewsSection(_ctx: ExplorerSectionContext) {
 		);
 	}
 
+	const firstViewOfPkg = new Map<string, string>();
+	for (const v of views)
+		if (!firstViewOfPkg.has(v.pkg_id)) firstViewOfPkg.set(v.pkg_id, v.qualified_id);
+
 	return (
 		<div className="py-1">
-			{outboxActive && (
-				<EffectiveContextMenu
-					menuId="views"
-					handlers={{
-						open: () => openView(APPROVALS_ROUTE),
-						'open-to-side': () => openViewSplit(APPROVALS_ROUTE),
-						'pin-rail': pinOutbox,
-					}}
-				>
-					<OutboxRow onOpen={() => openView(APPROVALS_ROUTE)} />
-				</EffectiveContextMenu>
-			)}
 			{views.map((view: PkgViewEntry) => (
 				<EffectiveContextMenu
 					key={view.qualified_id}
@@ -122,37 +105,24 @@ export function ViewsSection(_ctx: ExplorerSectionContext) {
 						<span className="shrink-0 truncate text-[10px] text-muted-foreground/70">
 							{view.pkg_name}
 						</span>
+						{hiddenFromRail.has(view.pkg_id) &&
+							view.qualified_id === firstViewOfPkg.get(view.pkg_id) && (
+								<button
+									type="button"
+									aria-label={`Show ${view.pkg_name} in rail`}
+									title="Show in rail"
+									onClick={(e) => {
+										e.stopPropagation();
+										void showInRail(view.pkg_id);
+									}}
+									className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
+								>
+									<PanelLeft className="h-3.5 w-3.5" />
+								</button>
+							)}
 					</ListRow>
 				</EffectiveContextMenu>
 			))}
 		</div>
-	);
-}
-
-/** The shell-core Outbox entry: opens the approvals queue, with the pending
- *  count as a badge. Separate component so the count's polling query mounts
- *  only while the entry is visible. */
-function OutboxRow({ onOpen }: { onOpen: () => void }) {
-	const pending = usePendingApprovalsCount();
-	return (
-		<ListRow
-			size="sm"
-			onActivate={onOpen}
-			title="Outbox approvals"
-			aria-label="Outbox approvals"
-			className="w-full gap-1.5 px-2"
-		>
-			<Send className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-			<span className="flex-1 truncate text-xs">Outbox approvals</span>
-			{pending > 0 && (
-				<span
-					data-testid="outbox-pending-badge"
-					className="shrink-0 rounded-full bg-primary/15 px-1.5 text-[10px] font-medium tabular-nums text-primary"
-				>
-					{pending}
-				</span>
-			)}
-			<span className="shrink-0 truncate text-[10px] text-muted-foreground/70">Shell</span>
-		</ListRow>
 	);
 }
