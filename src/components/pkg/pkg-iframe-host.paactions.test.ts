@@ -158,6 +158,7 @@ describe('host.paActions.* (pkg-iframe approve-gate write verbs)', () => {
 			hashtags: ['#a'],
 			media: { kind: 'single', imageUrls: ['https://x/1.png'] },
 			scheduledIso: null,
+			attachments: [{ url: 'https://cdn.x/a.pdf', name: 'a.pdf' }],
 		};
 		const res = await dispatchHostCall(PKG, 'host.paActions.update', {
 			draftId: DRAFT,
@@ -336,6 +337,26 @@ describe('host.paActions.* inside a share (moved from the /outbox/approvals pane
 			error: raw,
 			message:
 				"Nothing was approved: you are not on the box's list of people who may approve sends.",
+		});
+	});
+
+	it('a refused social_queue post edit reaches the pkg raw (with its codes) and as a sentence', async () => {
+		withScope(true);
+		const raw =
+			'social_refused: x_no_first_comment: X posts have no first comment: remove the ---firstcomment---/---hashtags--- marker';
+		update.mockRejectedValue(new Error(raw) as never);
+
+		const res = await dispatchHostCall(PKG, 'host.paActions.update', {
+			draftId: DRAFT,
+			patch: { firstComment: 'nope' },
+		});
+
+		expect(res.isError).toBe(true);
+		expect(res.structuredContent).toEqual({
+			ok: false,
+			error: raw,
+			message:
+				"This post can't be saved: X posts have no first comment: remove the ---firstcomment---/---hashtags--- marker. Nothing was changed.",
 		});
 	});
 

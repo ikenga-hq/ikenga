@@ -6,7 +6,10 @@
 // checked (a wrong type is an error, not a silent drop, so a pkg never shows
 // "saved" for an edit that was not), and every other key is dropped.
 
-import type { PaActionDraftPatch, PaDraftSeen } from '@/lib/tauri-cmd';
+import type { PaActionDraftAttachment, PaActionDraftPatch, PaDraftSeen } from '@/lib/tauri-cmd';
+
+/** Most attachments one edit may carry (G-CONTRACT r2; the Rust store refuses more). */
+export const PA_ACTION_MAX_ATTACHMENTS = 20;
 
 type Parsed<T> = { ok: true; value: T } | { ok: false; error: string };
 
@@ -66,10 +69,44 @@ export function paActionPatchFromArgs(raw: unknown): Parsed<PaActionDraftPatch> 
 		}
 		patch.scheduledIso = v as string | null;
 	}
+	if ('attachments' in src) {
+		const list = attachmentsFrom(src.attachments);
+		if (!list) {
+			return {
+				ok: false,
+				error: `\`patch.attachments\` must be an array of at most ${PA_ACTION_MAX_ATTACHMENTS} { url: string (https), name?: string }`,
+			};
+		}
+		patch.attachments = list;
+	}
 	if (Object.keys(patch).length === 0) {
 		return { ok: false, error: '`patch` has no editable keys' };
 	}
 	return { ok: true, value: patch };
+}
+
+function isHttpsUrl(v: unknown): v is string {
+	if (typeof v !== 'string') return false;
+	try {
+		return new URL(v).protocol === 'https:';
+	} catch {
+		return false;
+	}
+}
+
+/** `patch.attachments` (G-CONTRACT r2): each entry's `url` (https) and optional
+ *  `name`, every other entry key dropped; `null` when the list is malformed. */
+function attachmentsFrom(raw: unknown): PaActionDraftAttachment[] | null {
+	if (!Array.isArray(raw) || raw.length > PA_ACTION_MAX_ATTACHMENTS) return null;
+	const out: PaActionDraftAttachment[] = [];
+	for (const a of raw) {
+		if (a === null || typeof a !== 'object' || Array.isArray(a)) return null;
+		const { url, name } = a as { url?: unknown; name?: unknown };
+		if (!isHttpsUrl(url)) return null;
+		if (name !== undefined && typeof name !== 'string') return null;
+		out.push(name === undefined ? { url } : { url, name });
+	}
+	return out;
 }
 
 /** The `seen` row of a `host.paActions.commit` call, if any (`undefined` = none). */
@@ -130,10 +167,34 @@ export function draftActionErrorMessage(err: unknown): string {
 	if (http) {
 		return `The box did not answer properly (HTTP ${http[1]}). Try again in a moment; reload the list first if you are unsure whether it went through.`;
 	}
+	// A refused edit of a social_queue post (G-CONTRACT r2): `social_refused: <code>: <why>`
+	// (one `<code>: <why>` per problem, `; `-separated), behind the daemon's
+	// `pa_actions_update: ` when it came over RPC. Show the reasons.
+	const social = /^(?:pa_actions_update: )?social_refused: (.+)$/s.exec(raw);
+	if (social) {
+		const reasons = social[1]
+			.split('; ')
+			.map((p) => p.replace(/^[a-z0-9_]+: /, '').trim())
+			.filter(Boolean)
+			.map((p) => (/[.!?]$/.test(p) ? p : `${p}.`));
+		return `This post can't be saved: ${reasons.join(' ')} Nothing was changed.`;
+	}
 	const m =
 		/^(?:approval_unavailable|approval_refused|draft_changed|forbidden|invalid_request): (.+)$/s.exec(
 			raw
 		);
 	const text = (m ? m[1] : raw).trim();
 	return text || 'The action failed. Nothing was changed.';
+}
+
+/** The problem codes of a refused social_queue post edit (G-CONTRACT r2), in order, or
+ *  `[]` when the error is not one. */
+export function socialRefusalCodes(err: unknown): string[] {
+	const raw = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+	const m = /^(?:pa_actions_update: )?social_refused: (.+)$/s.exec(raw);
+	if (!m) return [];
+	return m[1]
+		.split('; ')
+		.map((p) => /^([a-z0-9_]+): /.exec(p)?.[1])
+		.filter((c): c is string => !!c);
 }

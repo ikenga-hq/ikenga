@@ -5135,10 +5135,28 @@ export interface PaActionDraftMediaPatch {
 	imageUrls: string[];
 }
 
-/** An operator edit (G-CONTRACT, plans/outbox-redesign). Keys are DraftItem field
+/** One email attachment of an edit (G-CONTRACT r2, D-16): fetched over https by the
+ *  sender at send time. */
+export interface PaActionDraftAttachment {
+	/** An absolute `https:` URL. */
+	url: string;
+	name?: string;
+}
+
+/** An operator edit (G-CONTRACT + r2, plans/outbox-redesign). Keys are DraftItem field
  *  names; the store shallow-merges them into `editedJson` and folds them into
  *  `payloadJson.item` on commit. `scheduledIso` also rewrites `scheduledAt`
- *  (normalised to UTC; `null` = unscheduled). */
+ *  (normalised to UTC; `null` = unscheduled). `attachments` is the list the Outbox
+ *  displayed at approve (D-16), at most 20.
+ *
+ *  A source-bound social draft (`payloadJson.item.social`) is edited at its source
+ *  instead (D-15): only `body`, `firstComment`, `media` and `scheduledIso` are
+ *  accepted, `editedJson` is not written, and `item.social`, the derived Buffer
+ *  fields and the linked `social_queue` row are rewritten together. A refusal reads
+ *  `social_refused: <code>: <message>[; <code>: <message>…]`, `<code>` being the
+ *  sender's problem code (`over_280`, `x_no_first_comment`, `bad_media_url`, …) or
+ *  the store's own (`thread_not_editable`, `not_editable_at_source`,
+ *  `social_queue_changed`, `social_queue_missing`, `stale_edited_body`, …). */
 export interface PaActionDraftPatch {
 	subject?: string;
 	body?: string;
@@ -5148,6 +5166,7 @@ export interface PaActionDraftPatch {
 	hashtags?: string[];
 	media?: PaActionDraftMediaPatch;
 	scheduledIso?: string | null;
+	attachments?: PaActionDraftAttachment[];
 }
 
 /** Persist operator edits onto a draft (shallow merge into `editedJson`). */
