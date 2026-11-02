@@ -32,6 +32,7 @@ use serde_json::Value;
 use sqlx::Row as _;
 
 use super::agent_ops;
+use super::social_draft;
 use crate::db::PaDb;
 
 /// The only agent-ops job the approve gate ever wakes: the mutation worker.
@@ -313,11 +314,43 @@ pub const PATCH_NOT_OBJECT: &str = "`patch` must be an object";
 /// that is neither an ISO-8601 string nor `null`.
 pub const PATCH_SCHEDULE_INVALID: &str = "`patch.scheduledIso` must be a string or null";
 
+/// Most attachments one edit may carry (G-CONTRACT r2, D-16).
+pub const MAX_ATTACHMENTS: usize = 20;
+
+/// What `pa_actions_update` answers (after its prefix) for a `patch.attachments`
+/// that is not the contract's list.
+pub const PATCH_ATTACHMENTS_INVALID: &str =
+    "`patch.attachments` must be an array of at most 20 { url: string (https), name?: string }";
+
+/// `patch.attachments` (D-16): `Array<{ url: string /* https */, name?: string }>`,
+/// at most [`MAX_ATTACHMENTS`]. Each entry is an object holding exactly `url`
+/// (an absolute `https:` URL) and optionally `name` (a string); nothing else.
+fn attachments_ok(v: &Value) -> bool {
+    let Some(list) = v.as_array() else {
+        return false;
+    };
+    list.len() <= MAX_ATTACHMENTS
+        && list.iter().all(|a| {
+            let Some(o) = a.as_object() else {
+                return false;
+            };
+            let url_ok = o
+                .get("url")
+                .and_then(Value::as_str)
+                .and_then(|u| url::Url::parse(u).ok())
+                .is_some_and(|u| u.scheme() == "https");
+            let name_ok = o.get("name").is_none_or(Value::is_string);
+            url_ok && name_ok && o.keys().all(|k| k == "url" || k == "name")
+        })
+}
+
 /// Everything `update` checks about the request itself, before it reads the
 /// DB: `None` when `patch` is acceptable. Public because the box broker runs the
 /// same checks, in the same place, before it looks a draft up for a share
 /// viewer (`broker::approvals::gate`), so a malformed patch reads the same for a
-/// hidden row as for a missing one.
+/// hidden row as for a missing one. Checks that depend on the row (a
+/// source-bound social draft, [`social_draft::plan_source_edit`]) run in
+/// `update`, after the lookup, on both surfaces alike.
 pub fn patch_error(patch: Option<&Value>) -> Option<&'static str> {
     let Some(patch) = patch else {
         return Some(PATCH_REQUIRED);
@@ -326,8 +359,12 @@ pub fn patch_error(patch: Option<&Value>) -> Option<&'static str> {
         return Some(PATCH_NOT_OBJECT);
     };
     match obj.get("scheduledIso") {
-        None | Some(Value::Null) | Some(Value::String(_)) => None,
-        Some(_) => Some(PATCH_SCHEDULE_INVALID),
+        None | Some(Value::Null) | Some(Value::String(_)) => {}
+        Some(_) => return Some(PATCH_SCHEDULE_INVALID),
+    }
+    match obj.get("attachments") {
+        Some(v) if !attachments_ok(v) => Some(PATCH_ATTACHMENTS_INVALID),
+        _ => None,
     }
 }
 
@@ -359,6 +396,12 @@ const RACE_RETRIES: usize = 3;
 /// `scheduled_at` (normalised to SQLite UTC like at pause time; `null` clears
 /// it). The write is guarded on the `edited_json` it merged onto, so two edits
 /// racing each other cannot drop one another's keys.
+///
+/// **A source-bound social draft (`item.social`) is edited at its source**
+/// (D-15, G-CONTRACT r2): `edited_json` is not written; the patch is applied to
+/// `item.social` and the derived Buffer fields ([`social_draft::plan_source_edit`]),
+/// and the draft and its `social_queue` row are written in one transaction
+/// ([`update_social_source`]). A refusal reads `social_refused: <code>: …`.
 pub async fn update(db: &PaDb, draft_id: &str, patch: &Value) -> Result<(), String> {
     if let Some(e) = patch_error(Some(patch)) {
         return Err(e.to_string());
@@ -370,17 +413,31 @@ pub async fn update(db: &PaDb, draft_id: &str, patch: &Value) -> Result<(), Stri
     let pool = db.ensure_pool().await?;
 
     for _ in 0..RACE_RETRIES {
-        let row: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT edited_json FROM pa_action_drafts \
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT payload_json, edited_json FROM pa_action_drafts \
              WHERE id = ? AND status IN ('awaiting', 'edited')",
         )
         .bind(draft_id)
         .fetch_optional(&pool)
         .await
         .map_err(|e| format!("read draft {draft_id}: {e}"))?;
-        let Some((stored,)) = row else {
+        let Some((payload_json, stored)) = row else {
             return Err(update_refusal(draft_id));
         };
+        if social_draft::is_source_bound(&payload_json) {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let Some(plan) =
+                social_draft::plan_source_edit(&payload_json, stored.as_deref(), obj, now_ms)?
+            else {
+                return Ok(());
+            };
+            if update_social_source(&pool, draft_id, &payload_json, stored.as_deref(), &plan)
+                .await?
+            {
+                return Ok(());
+            }
+            continue;
+        }
         let merged = serde_json::to_string(&merge_edit(stored.as_deref(), obj))
             .map_err(|e| format!("serialize patch: {e}"))?;
         let affected = sqlx::query(
@@ -410,10 +467,107 @@ pub async fn update(db: &PaDb, draft_id: &str, patch: &Value) -> Result<(), Stri
     ))
 }
 
+/// Write a planned source edit: the draft's `payload_json` (`awaiting` →
+/// `edited`, `edited_json` and `scheduled_at` untouched — Buffer holds a social
+/// post's schedule) and its `social_queue` row (`content`, `media_url`,
+/// `scheduled_for`), in ONE transaction, so the sender's link check
+/// (`social_queue` row == `item.social`) holds before and after.
+///
+/// The draft write is guarded on the `payload_json` and `edited_json` the plan
+/// was made from: `Ok(false)` (rolled back) when either changed in between, for
+/// the caller to plan again. The queue row must still equal `item.social` as it
+/// was (`social_queue_changed`) and must exist (`social_queue_missing`, the way a
+/// queued post is cancelled); either refuses the edit and writes nothing.
+async fn update_social_source(
+    pool: &sqlx::SqlitePool,
+    draft_id: &str,
+    payload_json: &str,
+    edited_json: Option<&str>,
+    plan: &social_draft::SourceEdit,
+) -> Result<bool, String> {
+    let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
+    // The draft first: its write takes the database's write lock, so the queue
+    // row read below cannot change before this transaction commits.
+    let flipped = sqlx::query(
+        "UPDATE pa_action_drafts \
+         SET payload_json = ?, \
+             status = CASE WHEN status = 'awaiting' THEN 'edited' ELSE status END \
+         WHERE id = ? AND status IN ('awaiting', 'edited') \
+           AND payload_json = ? AND edited_json IS ?",
+    )
+    .bind(&plan.payload_json)
+    .bind(draft_id)
+    .bind(payload_json)
+    .bind(edited_json)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("update draft {draft_id}: {e}"))?
+    .rows_affected();
+    if flipped != 1 {
+        tx.rollback().await.map_err(|e| format!("rollback: {e}"))?;
+        return Ok(false);
+    }
+    let queue: Option<(String, String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT platform, account, content, media_url, scheduled_for \
+         FROM social_queue WHERE id = ?",
+    )
+    .bind(&plan.queue_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| format!("read social_queue row {}: {e}", plan.queue_id))?;
+    let refuse = |code: &str, msg: String| {
+        social_draft::refusal(&[social_draft::Problem {
+            code: code.into(),
+            message: msg,
+        }])
+    };
+    let Some((platform, account, content, media_url, scheduled_for)) = queue else {
+        tx.rollback().await.map_err(|e| format!("rollback: {e}"))?;
+        return Err(refuse(
+            "social_queue_missing",
+            format!(
+                "social_queue row {} no longer exists (cancelled); nothing was changed",
+                plan.queue_id
+            ),
+        ));
+    };
+    let row_post = social_draft::SocialPost {
+        platform,
+        account,
+        content,
+        media_url,
+        scheduled_for,
+    };
+    if row_post != plan.before {
+        tx.rollback().await.map_err(|e| format!("rollback: {e}"))?;
+        return Err(refuse(
+            "social_queue_changed",
+            format!(
+                "social_queue row {} was changed after it was queued and no longer matches this draft; \
+                 nothing was changed",
+                plan.queue_id
+            ),
+        ));
+    }
+    sqlx::query(
+        "UPDATE social_queue SET content = ?, media_url = ?, scheduled_for = ? WHERE id = ?",
+    )
+    .bind(&plan.after.content)
+    .bind(&plan.after.media_url)
+    .bind(&plan.after.scheduled_for)
+    .bind(&plan.queue_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("update social_queue row {}: {e}", plan.queue_id))?;
+    tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
+    Ok(true)
+}
+
 /// The edit keys `commit` folds into the payload's `item`: the patch keys of
-/// `host.paActions.update` (G-CONTRACT), which are DraftItem field names (or
-/// the producer's extra `item` fields — `hashtags`, `preheader`, `subjectB`).
-pub const FOLD_KEYS: [&str; 8] = [
+/// `host.paActions.update` (G-CONTRACT, + `attachments` in r2), which are
+/// DraftItem field names (or the producer's extra `item` fields — `hashtags`,
+/// `preheader`, `subjectB`, `attachments`).
+pub const FOLD_KEYS: [&str; 9] = [
     "subject",
     "body",
     "subjectB",
@@ -422,6 +576,7 @@ pub const FOLD_KEYS: [&str; 8] = [
     "hashtags",
     "media",
     "scheduledIso",
+    "attachments",
 ];
 
 /// `payload_json` with the operator's edit folded into its `item` (D-08): the
@@ -443,8 +598,9 @@ pub const FOLD_KEYS: [&str; 8] = [
 /// `body`, `firstComment`, `media`, `scheduledIso`, … — re-derived from
 /// `item.social` by the sender, which refuses the row (`social_mismatch`) when
 /// they disagree. Folding an edit into them would make an approved post
-/// unsendable. The sender applies `edited_json.body` itself, so the body edit
-/// still reaches the post; other edits to such a draft are not sent.
+/// unsendable. Since G-CONTRACT r2 `update` edits such a draft at its source
+/// (`item.social` + the `social_queue` row) and writes no `edited_json`, so
+/// there is nothing to fold.
 pub fn fold_edits(payload_json: &str, edited_json: Option<&str>) -> Option<String> {
     let edited: Value = serde_json::from_str(edited_json.filter(|s| !s.is_empty())?).ok()?;
     let edited = edited.as_object()?;
@@ -861,7 +1017,8 @@ mod tests {
         let edit = r#"{"body":"B2","media":{"kind":"single","imageUrls":["https://a/2.png"]},"scheduledIso":null}"#;
         assert_eq!(fold_edits(payload, Some(edit)), None);
         // A Buffer draft without item.social is still folded.
-        let plain = r#"{"item":{"body":"B","media":{"kind":"single","imageUrls":["https://a/1.png"]}}}"#;
+        let plain =
+            r#"{"item":{"body":"B","media":{"kind":"single","imageUrls":["https://a/1.png"]}}}"#;
         let out: Value = serde_json::from_str(&fold_edits(plain, Some(edit)).unwrap()).unwrap();
         assert_eq!(out["item"]["media"]["imageUrls"][0], "https://a/2.png");
         assert_eq!(out["item"]["body"], "B2");
@@ -903,6 +1060,278 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&out).unwrap(),
             json!({"item": {"firstComment": "c", "scheduledIso": null}})
+        );
+    }
+
+    #[test]
+    fn patch_error_checks_attachments_strictly() {
+        let at = |v: Value| patch_error(Some(&json!({ "attachments": v })));
+        for ok in [
+            json!([]),
+            json!([{"url": "https://cdn.x/a.pdf"}]),
+            json!([{"url": "https://cdn.x/a.pdf", "name": "Contract.pdf"}]),
+            Value::Array(vec![json!({"url": "https://a.b/c"}); MAX_ATTACHMENTS]),
+        ] {
+            assert_eq!(at(ok.clone()), None, "{ok}");
+        }
+        for bad in [
+            json!(null),
+            json!("https://a.b/c"),
+            json!({"url": "https://a.b/c"}),
+            json!(["https://a.b/c"]),
+            json!([{"url": "http://a.b/c"}]),
+            json!([{"url": "ftp://a.b/c"}]),
+            json!([{"url": "/relative.pdf"}]),
+            json!([{"url": 5}]),
+            json!([{"name": "x"}]),
+            json!([{"url": "https://a.b/c", "name": 5}]),
+            json!([{"url": "https://a.b/c", "name": null}]),
+            json!([{"url": "https://a.b/c", "size": 1}]),
+            Value::Array(vec![json!({"url": "https://a.b/c"}); MAX_ATTACHMENTS + 1]),
+        ] {
+            assert_eq!(at(bad.clone()), Some(PATCH_ATTACHMENTS_INVALID), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn attachments_merge_into_the_edit_and_fold_into_the_item() {
+        let raw = json!({"item": {"subject": "S", "body": "B", "channel": "smtp"}});
+        let (db, _t) = db_with(&[("d1", raw)]).await;
+        let list = json!([{"url": "https://cdn.x/a.pdf", "name": "a.pdf"}, {"url": "https://cdn.x/b.png"}]);
+        update(&db, "d1", &json!({"attachments": list}))
+            .await
+            .unwrap();
+        update(&db, "d1", &json!({"body": "B2"})).await.unwrap();
+        let edited: Value =
+            serde_json::from_str(row(&db, "d1", None).await.edited_json.as_deref().unwrap())
+                .unwrap();
+        assert_eq!(edited, json!({"attachments": list, "body": "B2"}));
+        assert_eq!(
+            update(&db, "d1", &json!({"attachments": [{"url": "http://x/y"}]}))
+                .await
+                .unwrap_err(),
+            PATCH_ATTACHMENTS_INVALID
+        );
+        commit(&db, "d1").await.unwrap();
+        let p: Value =
+            serde_json::from_str(&row(&db, "d1", Some("committed")).await.payload_json).unwrap();
+        assert_eq!(p["item"]["attachments"], list);
+        // An empty list is a list: approving "no attachments" is folded too.
+        let raw = json!({"item": {"body": "B", "attachments": [{"url": "https://cdn.x/old.pdf"}]}});
+        let (db, _t) = db_with(&[("d2", raw)]).await;
+        update(&db, "d2", &json!({"attachments": []}))
+            .await
+            .unwrap();
+        commit(&db, "d2").await.unwrap();
+        let p: Value =
+            serde_json::from_str(&row(&db, "d2", Some("committed")).await.payload_json).unwrap();
+        assert_eq!(p["item"]["attachments"], json!([]));
+    }
+
+    // ── source-bound social drafts (D-15) ──────────────────────────────────
+
+    fn golden_edits() -> Vec<Value> {
+        let g: Value =
+            serde_json::from_str(include_str!("testdata/social-draft-golden.json")).unwrap();
+        g["edit"].as_array().unwrap().clone()
+    }
+
+    /// A linked social draft `id` whose item is `item`, plus its `social_queue`
+    /// row `q-<id>` holding `item.social`, as `social-queue-submit.ts` writes them.
+    async fn social_db(drafts: &[(&str, &Value)]) -> (PaDb, tempfile::TempDir) {
+        let payloads: Vec<(&str, Value)> = drafts
+            .iter()
+            .map(|(id, item)| {
+                (
+                    *id,
+                    json!({"item": item, "meta": {"actionId": "ruby/social-post"},
+                           "source": {"kind": "social_post", "queue_id": format!("q-{id}"), "slug": null}}),
+                )
+            })
+            .collect();
+        let (db, t) = db_with(&payloads).await;
+        let pool = db.ensure_pool().await.unwrap();
+        sqlx::query("UPDATE pa_action_drafts SET scheduled_at = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (id, item) in drafts {
+            let s = &item["social"];
+            sqlx::query(
+                "INSERT INTO social_queue (id, platform, account, content, media_url, status, \
+                 scheduled_for, created_at, source, slug) \
+                 VALUES (?, ?, ?, ?, ?, 'draft', ?, '2026-11-02T00:00:00.000Z', 'ruby-queue', ?)",
+            )
+            .bind(format!("q-{id}"))
+            .bind(s["platform"].as_str())
+            .bind(s["account"].as_str())
+            .bind(s["content"].as_str())
+            .bind(s["media_url"].as_str())
+            .bind(s["scheduled_for"].as_str())
+            .bind(format!("slug-{id}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        (db, t)
+    }
+
+    async fn queue_row(db: &PaDb, id: &str) -> Option<(String, Option<String>, Option<String>)> {
+        let pool = db.ensure_pool().await.unwrap();
+        sqlx::query_as("SELECT content, media_url, scheduled_for FROM social_queue WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_social_edit_rewrites_the_source_and_the_queue_row_in_one_go() {
+        for c in golden_edits() {
+            let name = c["name"].as_str().unwrap();
+            let (db, _t) = social_db(&[("d1", &c["before"])]).await;
+            update(&db, "d1", &c["patch"])
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let r = row(&db, "d1", None).await;
+            assert_eq!(r.status, "edited", "{name}");
+            assert_eq!(r.edited_json, None, "{name}: edited_json is never written");
+            assert_eq!(r.scheduled_at, None, "{name}: Buffer holds the schedule");
+            let p: Value = serde_json::from_str(&r.payload_json).unwrap();
+            assert_eq!(
+                social_draft::stable(&p["item"]),
+                c["stable"].as_str().unwrap(),
+                "{name}: the item is what the sender's buildSocialItem builds"
+            );
+            assert_eq!(p["source"]["queue_id"], "q-d1");
+            let after = &c["after"];
+            assert_eq!(
+                queue_row(&db, "q-d1").await.unwrap(),
+                (
+                    after["content"].as_str().unwrap().to_string(),
+                    after["media_url"].as_str().map(str::to_string),
+                    after["scheduled_for"].as_str().map(str::to_string),
+                ),
+                "{name}: the queue row equals item.social"
+            );
+            // Nothing to fold: approving sends exactly this payload.
+            let ev = commit(&db, "d1").await.unwrap();
+            assert_eq!(ev.payload_json, r.payload_json, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_social_edit_writes_nothing_anywhere() {
+        let c = &golden_edits()[0];
+        let (db, _t) = social_db(&[("d1", &c["before"])]).await;
+        let before = row(&db, "d1", None).await;
+        let q_before = queue_row(&db, "q-d1").await;
+
+        let e = update(&db, "d1", &json!({"subject": "x"}))
+            .await
+            .unwrap_err();
+        assert!(
+            e.starts_with("social_refused: not_editable_at_source: "),
+            "{e}"
+        );
+        let e = update(
+            &db,
+            "d1",
+            &json!({"media": {"kind": "single", "imageUrls": ["http://a/b.png"]}}),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.starts_with("social_refused: bad_media_url: "), "{e}");
+
+        // The queue row was changed elsewhere: refused, the draft untouched.
+        let pool = db.ensure_pool().await.unwrap();
+        sqlx::query("UPDATE social_queue SET content = 'changed elsewhere' WHERE id = 'q-d1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let e = update(&db, "d1", &json!({"body": "new"}))
+            .await
+            .unwrap_err();
+        assert!(
+            e.starts_with("social_refused: social_queue_changed: "),
+            "{e}"
+        );
+        let r = row(&db, "d1", None).await;
+        assert_eq!(
+            (r.status, r.payload_json),
+            (before.status.clone(), before.payload_json.clone())
+        );
+        assert_eq!(
+            queue_row(&db, "q-d1").await.unwrap().0,
+            "changed elsewhere",
+            "the rolled-back transaction left the row as it was"
+        );
+
+        // The queue row is gone (cancelled): refused, the draft untouched.
+        sqlx::query("DELETE FROM social_queue WHERE id = 'q-d1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let e = update(&db, "d1", &json!({"body": "new"}))
+            .await
+            .unwrap_err();
+        assert!(
+            e.starts_with("social_refused: social_queue_missing: "),
+            "{e}"
+        );
+        let r = row(&db, "d1", None).await;
+        assert_eq!(
+            (r.status, r.payload_json, r.edited_json),
+            (before.status, before.payload_json, None)
+        );
+        assert!(q_before.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_x_thread_takes_no_edit_and_an_x_post_no_first_comment() {
+        let g: Value =
+            serde_json::from_str(include_str!("testdata/social-draft-golden.json")).unwrap();
+        let built = |part: &str| {
+            let c = g["build"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"].as_str().unwrap().contains(part))
+                .unwrap()
+                .clone();
+            social_draft::build_social_item(
+                &social_draft::SocialPost::from_value(&c["canon"]).unwrap(),
+                c["channelId"].as_str().unwrap(),
+                c["draftId"].as_str().unwrap(),
+            )
+        };
+        let thread = built("x thread");
+        let single = built("x single post");
+        let (db, _t) = social_db(&[("t", &thread), ("x", &single)]).await;
+        let e = update(&db, "t", &json!({"scheduledIso": null}))
+            .await
+            .unwrap_err();
+        assert!(
+            e.starts_with("social_refused: thread_not_editable: "),
+            "{e}"
+        );
+        let e = update(&db, "x", &json!({"firstComment": "c"}))
+            .await
+            .unwrap_err();
+        assert!(e.starts_with("social_refused: x_no_first_comment: "), "{e}");
+        let e = update(&db, "x", &json!({"body": "z".repeat(281)}))
+            .await
+            .unwrap_err();
+        assert!(e.starts_with("social_refused: over_280: "), "{e}");
+        for id in ["t", "x"] {
+            assert_eq!(row(&db, id, None).await.status, "awaiting");
+        }
+        // Missing or terminal drafts still read as they always did.
+        assert_eq!(
+            update(&db, "nope", &json!({"body": "x"}))
+                .await
+                .unwrap_err(),
+            update_refusal("nope")
         );
     }
 

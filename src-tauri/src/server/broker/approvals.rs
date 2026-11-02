@@ -786,7 +786,10 @@ pub async fn gate(
             };
             // The patch is checked exactly as the child checks it
             // (`pa_actions::patch_error`: present, an object, a string-or-null
-            // `scheduledIso`), so no malformed patch tells the two apart. A
+            // `scheduledIso`, a well-formed `attachments` list), so no malformed
+            // patch tells the two apart. Checks that need the row (a
+            // source-bound social draft's edit, G-CONTRACT r2) run in the
+            // child's `pa_actions::update`, after the row is found. A
             // reject's `reason` needs no check here: the child reads it
             // leniently and never refuses on it.
             if cmd == CMD_UPDATE && draft_id_of(args).is_some() {
@@ -3176,6 +3179,36 @@ mod tests {
         assert_eq!(out.ok(), Some(Gated::Unchanged));
         let out = gate_with(&rows, &bob, "pa_actions_list", json!({})).await;
         assert_eq!(out.ok(), Some(Gated::AnnotateList(OutreachView::Nothing)));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_attachments_patch_reads_the_same_for_a_hidden_and_a_missing_row() {
+        // G-CONTRACT r2 `attachments` is checked by `patch_error` before the row
+        // is looked up, exactly as the owner's child checks it.
+        let p = parties();
+        let rows = two_outreach_rows();
+        let bad = json!([{"url": "http://not-https.example/a.pdf"}]);
+        let want = json!({"ok": false, "error": format!(
+            "pa_actions_update: {}",
+            crate::server::shared::pa_actions::PATCH_ATTACHMENTS_INVALID
+        )});
+        for id in [HIS, "outreach:ffffffffffffffff", MINE] {
+            let args = json!({"draftId": id, "patch": {"attachments": bad}});
+            let body = error_of(gate_with(&rows, &p.ada, "pa_actions_update", args).await).await;
+            assert_eq!(body, want, "{id}");
+        }
+        // A well-formed list, and a source-bound social edit (its row checks run
+        // in the child's `pa_actions::update`, the same code as on the desktop),
+        // are forwarded as they came.
+        for patch in [
+            json!({"attachments": [{"url": "https://cdn.example/a.pdf", "name": "a.pdf"}]}),
+            json!({"body": "x", "firstComment": "y", "media": {"kind": "single", "imageUrls": []},
+                   "scheduledIso": null}),
+        ] {
+            let args = json!({"draftId": MINE, "patch": patch});
+            let out = gate_with(&rows, &p.ada, "pa_actions_update", args).await;
+            assert_eq!(out.ok(), Some(Gated::Unchanged), "{patch}");
+        }
     }
 
     #[tokio::test]
