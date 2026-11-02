@@ -437,6 +437,14 @@ pub const FOLD_KEYS: [&str; 8] = [
 /// `None` when nothing changes: no edit, an edit with none of these keys, or a
 /// payload / edit that is not a JSON object (left for the worker to refuse,
 /// exactly as before the fold existed).
+///
+/// **Source-bound social drafts are never folded.** An item carrying `social`
+/// (a post built from a `social_queue` row) has its adapter fields —
+/// `body`, `firstComment`, `media`, `scheduledIso`, … — re-derived from
+/// `item.social` by the sender, which refuses the row (`social_mismatch`) when
+/// they disagree. Folding an edit into them would make an approved post
+/// unsendable. The sender applies `edited_json.body` itself, so the body edit
+/// still reaches the post; other edits to such a draft are not sent.
 pub fn fold_edits(payload_json: &str, edited_json: Option<&str>) -> Option<String> {
     let edited: Value = serde_json::from_str(edited_json.filter(|s| !s.is_empty())?).ok()?;
     let edited = edited.as_object()?;
@@ -447,6 +455,9 @@ pub fn fold_edits(payload_json: &str, edited_json: Option<&str>) -> Option<Strin
     } else {
         root
     };
+    if target.get("social").is_some_and(Value::is_object) {
+        return None;
+    }
     let mut changed = false;
     for key in FOLD_KEYS {
         let Some(v) = edited.get(key) else { continue };
@@ -840,6 +851,20 @@ mod tests {
         assert_eq!(ev.payload_json, before);
         assert_eq!(row(&db, "d1", Some("committed")).await.payload_json, before);
         assert!(commit(&db, "d1").await.is_err(), "not committable twice");
+    }
+
+    #[test]
+    fn fold_edits_never_touches_a_source_bound_social_draft() {
+        // The sender re-derives body/media/firstComment/scheduledIso from
+        // item.social and refuses a mismatch: folding would make it unsendable.
+        let payload = r#"{"item":{"body":"B","media":{"kind":"single","imageUrls":["https://a/1.png"]},"social":{"platform":"linkedin","account":"royalti","content":"B","media_url":"https://a/1.png","scheduled_for":null}}}"#;
+        let edit = r#"{"body":"B2","media":{"kind":"single","imageUrls":["https://a/2.png"]},"scheduledIso":null}"#;
+        assert_eq!(fold_edits(payload, Some(edit)), None);
+        // A Buffer draft without item.social is still folded.
+        let plain = r#"{"item":{"body":"B","media":{"kind":"single","imageUrls":["https://a/1.png"]}}}"#;
+        let out: Value = serde_json::from_str(&fold_edits(plain, Some(edit)).unwrap()).unwrap();
+        assert_eq!(out["item"]["media"]["imageUrls"][0], "https://a/2.png");
+        assert_eq!(out["item"]["body"], "B2");
     }
 
     #[test]
