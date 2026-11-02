@@ -54,26 +54,22 @@ describe('conflicts() — DEC-59', () => {
 	it('lists the defaults\' same-key pairs as precedence, separately (macOS)', () => {
 		// G-ACTIONS §5: ⌘K — palette open / close / hosted terminal clear;
 		// ⌘/ — Shortcuts open vs the open palette's toggle. The three DEC-64
-		// pairs (⌘N, ⌘T, Ctrl+1–3) are gone (WP-54). WP-56 adds five more,
+		// pairs (⌘N, ⌘T, Ctrl+1–3) are gone (WP-54). WP-56 adds more,
 		// each narrower-`when` vs. a broader default (§10.2 "Reserved for
-		// WP-56"): ⌘S is shared three ways (approve-gate / loupe / markdown
-		// save, one per owning widget's focus key), ⌘↵ two ways (approve-gate
-		// approve vs the pin composer), and ⌘B against `explorer.toggle`.
+		// WP-56"): ⌘S is shared by the loupe and markdown save (one per owning
+		// widget's focus key) and ⌘B is against `explorer.toggle`. (The approve
+		// gate's ⌘S / ⌘↵ pairs went with its panel — outbox redesign D-01.)
 		expect(pairCommands(conflicts({ platform: 'mac' }).precedence)).toEqual(
 			[
 				'palette.close + palette.open',
 				'palette.close + terminal.clear',
 				'palette.open + terminal.clear',
 				'palette.toggle-shortcuts + shortcuts.open',
-				'approve-gate.save + markdown.save',
-				'approve-gate.save + studio.loupe-save',
 				'markdown.save + studio.loupe-save',
 				// plans/file-editing: ⌘S in the shared text editor, a fourth
 				// owner on the same key, one focus key each.
-				'approve-gate.save + editor.save',
 				'editor.save + markdown.save',
 				'editor.save + studio.loupe-save',
-				'approve-gate.approve + studio.pin-submit',
 				'explorer.toggle + markdown.bold',
 				// WP-68 (G-SEATS §8.2): ⌘2 — `rail.chi` (`!inputFocus`) vs
 				// `chi.board` (`dispatchFocus`).
@@ -85,7 +81,7 @@ describe('conflicts() — DEC-59', () => {
 	it('lists the defaults\' same-key pairs as precedence, separately (Windows/Linux)', () => {
 		// Ctrl+K open / close; Ctrl+/ open / toggle; Ctrl+Shift+A hosted
 		// terminal select-all vs focus-dispatch. Pane focus moved to Alt+1–6
-		// (DEC-64), so Ctrl+1–3 is the rail's alone. WP-56's five pairs (see
+		// (DEC-64), so Ctrl+1–3 is the rail's alone. WP-56's pairs (see
 		// the macOS case above) are platform-agnostic `mod` keys, so they
 		// repeat here unchanged.
 		expect(pairCommands(conflicts({ platform: 'other' }).precedence)).toEqual(
@@ -93,15 +89,11 @@ describe('conflicts() — DEC-59', () => {
 				'palette.close + palette.open',
 				'palette.toggle-shortcuts + shortcuts.open',
 				'companion.focus-dispatch + terminal.select-all',
-				'approve-gate.save + markdown.save',
-				'approve-gate.save + studio.loupe-save',
 				'markdown.save + studio.loupe-save',
 				// plans/file-editing: ⌘S in the shared text editor, a fourth
 				// owner on the same key, one focus key each.
-				'approve-gate.save + editor.save',
 				'editor.save + markdown.save',
 				'editor.save + studio.loupe-save',
-				'approve-gate.approve + studio.pin-submit',
 				'explorer.toggle + markdown.bold',
 				// WP-68 (G-SEATS §8.2): ⌘2 — `rail.chi` (`!inputFocus`) vs
 				// `chi.board` (`dispatchFocus`).

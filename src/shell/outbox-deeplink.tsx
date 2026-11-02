@@ -3,8 +3,9 @@
 // /pkg/com.ikenga.outbound/<view> (the registered sub-route if present, else the
 // pkg root) and sets the pkg-menu active feature so an already-mounted iframe
 // swaps views without a remount. Falls back to a landing when the pkg isn't
-// installed. The approve gate (/outbox/approvals) is a shell-native route and
-// does NOT use this — it renders ApproveGatePanel directly.
+// installed. Since the outbox redesign (plans/outbox-redesign D-01) this covers
+// /outbox/approvals too: the one triage inbox is the pkg's (route `/approvals`,
+// view token `v:approvals`), and the shell keeps only the entry points.
 
 import { Send } from 'lucide-react';
 import type { ComponentType } from 'react';
@@ -14,6 +15,18 @@ import { usePkgMenuStore } from '@/lib/pkg/pkg-menu-store';
 import { pkgKernelStatus } from '@/lib/tauri-cmd';
 
 const OUTBOUND_PKG_ID = 'com.ikenga.outbound';
+
+/** The shell's entry route for the Outbox queue (rail, status bar, ⌘K, menu,
+ *  `pa-action-paused`): it deep-links into the outbound pkg's `/approvals`. */
+export const OUTBOX_APPROVALS_ROUTE = '/outbox/approvals';
+
+/** Is `path` a route of the outbound pkg (`/pkg/com.ikenga.outbound`, `…/<sub>`)? The
+ *  rail's Outbox key is active there, and `pa-action-paused` does not yank a pane that is
+ *  already in the pkg (the operator may be mid-edit; the pkg's own list picks the batch up). */
+export function isOutboundPkgPath(path: string | null | undefined): boolean {
+	const root = `/pkg/${OUTBOUND_PKG_ID}`;
+	return !!path && (path === root || path.startsWith(`${root}/`) || path.startsWith(`${root}?`));
+}
 
 export function OutboundDeepLink({
 	view,

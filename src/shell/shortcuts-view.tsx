@@ -30,7 +30,6 @@ export const SHORTCUT_REGIONS: ReadonlyArray<{ id: string; label: string; namesp
 		{ id: 'terminal', label: 'Terminal', namespaces: ['terminal'] },
 		{ id: 'ngwa', label: 'Ngwa', namespaces: ['ngwa'] },
 		// WP-56: leftover widget-local handlers migrated to registry commands.
-		{ id: 'approve-gate', label: 'Approve gate', namespaces: ['approve-gate'] },
 		{ id: 'studio', label: 'Artifact grid', namespaces: ['studio'] },
 		{ id: 'markdown', label: 'Markdown editor', namespaces: ['markdown'] },
 		// plans/file-editing: the shared text editor's `editor.save`.

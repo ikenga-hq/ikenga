@@ -102,9 +102,9 @@ export function useWorkspaceEffects(
 	// PDF/XLSX/code file open isn't a cold fetch.
 	usePreloadViewers();
 	// Approve-gate seam: when an approve-aware action pauses a batch
-	// (`pa-action-paused`), open /outbox/approvals in the focused pane so the
-	// operator can sign off the drafts. Workspace-level so any action's pause
-	// reliably surfaces the gate.
+	// (`pa-action-paused`), open /outbox/approvals (the outbound pkg's inbox) in
+	// the focused pane so the operator can sign off the drafts. Workspace-level
+	// so any action's pause reliably surfaces the queue.
 	usePaActionsListener();
 	// Note: the mbox sync scheduler that used to live here moved into the
 	// com.ikenga.email pkg's manifest cron when the strip-down landed.

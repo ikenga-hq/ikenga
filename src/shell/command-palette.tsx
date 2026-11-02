@@ -48,6 +48,7 @@ import {
 } from './people/use-shared-projects';
 import { ChromePickerDialog } from './chrome-picker/chrome-picker-dialog';
 import { ActionsGroup, ChiGroup, ManageGroup } from './palette-actions';
+import { OUTBOX_APPROVALS_ROUTE } from './outbox-deeplink';
 import { ShortcutsView } from './shortcuts-view';
 
 export type PaletteMode = 'all' | 'views' | 'switcher' | 'projects' | 'shortcuts';
@@ -337,7 +338,7 @@ export function CommandPalette({ open, mode, onOpenChange }: CommandPaletteProps
 													label="Go to Outbox · Sent"
 												/>
 												<PaletteItem
-													onSelect={() => go('/outbox/approvals')}
+													onSelect={() => go(OUTBOX_APPROVALS_ROUTE)}
 													Icon={CheckSquare}
 													label="Go to Outbox · Approvals"
 												/>

@@ -784,12 +784,17 @@ pub async fn gate(
             } else {
                 None
             };
-            if cmd == CMD_UPDATE && draft_id_of(args).is_some() && args.get("patch").is_none() {
-                return Err(Json(RpcResponse::error(format!(
-                    "{CMD_UPDATE}: {}",
-                    crate::server::shared::pa_actions::PATCH_REQUIRED
-                )))
-                .into_response());
+            // The patch is checked exactly as the child checks it
+            // (`pa_actions::patch_error`: present, an object, a string-or-null
+            // `scheduledIso`), so no malformed patch tells the two apart. A
+            // reject's `reason` needs no check here: the child reads it
+            // leniently and never refuses on it.
+            if cmd == CMD_UPDATE && draft_id_of(args).is_some() {
+                if let Some(e) = crate::server::shared::pa_actions::patch_error(args.get("patch")) {
+                    return Err(
+                        Json(RpcResponse::error(format!("{CMD_UPDATE}: {e}"))).into_response()
+                    );
+                }
             }
             if view != OutreachView::All {
                 let Some(draft_id) =

@@ -401,18 +401,30 @@ async fn an_operator_lists_updates_and_rejects_through_the_owners_child_without_
     let (r, log) = rig(Role::Operator, Some(OK)).await;
     insert_account(&r.pool, "ada", 20_001, false).await;
     let cookie = login_cookie(&r.app, "ada").await;
+    // The outbox redesign's whole patch (G-CONTRACT) and a reject reason reach
+    // the owner's child exactly as sent: the merge and the reason are the
+    // child's (`shared::pa_actions`), the broker adds and drops nothing.
+    let update_args = json!({"draftId": DRAFT, "patch": {
+        "body": "x", "subjectB": "B", "preheader": "p", "firstComment": "c",
+        "hashtags": ["#a"], "media": {"kind": "carousel", "imageUrls": ["https://x/1.png"]},
+        "scheduledIso": "2026-11-03T09:00:00+01:00"}});
+    let reject_args = json!({"draftId": DRAFT, "reason": "Wrong tone"});
     for (cmd, args) in [
         ("pa_actions_list", json!({"status": null})),
-        (
-            "pa_actions_update",
-            json!({"draftId": DRAFT, "patch": {"body": "x"}}),
-        ),
-        ("pa_actions_reject", json!({"draftId": DRAFT})),
+        ("pa_actions_update", update_args.clone()),
+        ("pa_actions_reject", reject_args.clone()),
     ] {
         let (_, body) = rpc(&r.app, Some(&cookie), json!({"cmd": cmd, "args": args})).await;
         assert_eq!(body["ok"], true, "{cmd}: {body}");
     }
     let got = owner_requests(&r);
+    let forwarded = |cmd: &str| {
+        got.iter()
+            .find(|(_, b)| b["cmd"] == cmd)
+            .map(|(_, b)| b["args"].clone())
+    };
+    assert_eq!(forwarded("pa_actions_update"), Some(update_args));
+    assert_eq!(forwarded("pa_actions_reject"), Some(reject_args));
     let cmds: Vec<_> = got
         .iter()
         .map(|(_, b)| b["cmd"].as_str().unwrap().to_string())

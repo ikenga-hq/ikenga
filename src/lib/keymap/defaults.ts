@@ -332,36 +332,6 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 		label: 'Deny the focused permission request',
 	},
 	{
-		command: 'approve-gate.next',
-		key: 'j',
-		when: 'approveGateFocus && !inputFocus',
-		source: 'default',
-		label: 'Next draft (approve gate)',
-	},
-	{
-		command: 'approve-gate.prev',
-		key: 'k',
-		when: 'approveGateFocus && !inputFocus',
-		source: 'default',
-		label: 'Previous draft (approve gate)',
-	},
-	{
-		command: 'approve-gate.save',
-		key: 'mod+s',
-		// Fix round 1: narrower than `approveGateFocus` — pre-WP-56 this only
-		// fired while the detail pane had focus, not the whole section.
-		when: 'approveGateDetailFocus',
-		source: 'default',
-		label: 'Save draft (approve gate)',
-	},
-	{
-		command: 'approve-gate.approve',
-		key: 'mod+enter',
-		when: 'approveGateDetailFocus',
-		source: 'default',
-		label: 'Approve & send (approve gate)',
-	},
-	{
 		command: 'studio.loupe-save',
 		key: 'mod+s',
 		when: 'loupeFocus',

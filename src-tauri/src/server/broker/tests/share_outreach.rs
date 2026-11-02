@@ -127,12 +127,14 @@ impl ChildLauncher for OutreachLauncher {
                                 Json(json!({"ok": true, "data": out}))
                             }
                             "pa_actions_update" | "pa_actions_reject" | "pa_actions_commit" => {
-                                // The real child reads `patch` before it touches the DB.
-                                if cmd == "pa_actions_update" && args.get("patch").is_none() {
-                                    return Json(json!({
-                                        "ok": false,
-                                        "error": format!("{cmd}: {}", core::PATCH_REQUIRED),
-                                    }));
+                                // The real child checks `patch` before it touches the DB.
+                                if cmd == "pa_actions_update" {
+                                    if let Some(e) = core::patch_error(args.get("patch")) {
+                                        return Json(json!({
+                                            "ok": false,
+                                            "error": format!("{cmd}: {e}"),
+                                        }));
+                                    }
                                 }
                                 let allowed: &[&str] = match cmd.as_str() {
                                     "pa_actions_update" => &["awaiting", "edited"],
@@ -738,9 +740,27 @@ async fn an_update_without_a_patch_does_not_tell_a_hidden_row_from_a_missing_one
         )
         .await;
     }
-    // A patch that is JSON null is a value, not a missing one: still the refusal for a hidden id.
-    let mk = |id: &str| json!({"cmd": "pa_actions_update", "args": {"draftId": id, "patch": null}});
-    same_answer(&r, &ada, mk(C_FIRST), mk(GHOST), C_FIRST, "null patch").await;
+    // A patch that is not an object (JSON null included), or whose `scheduledIso`
+    // is neither a string nor null, is refused before any lookup, the same for a
+    // hidden id as for a missing one.
+    for bad in [
+        json!(null),
+        json!("x"),
+        json!([1]),
+        json!({"scheduledIso": 7}),
+    ] {
+        let mk =
+            |id: &str| json!({"cmd": "pa_actions_update", "args": {"draftId": id, "patch": bad}});
+        same_answer(
+            &r,
+            &ada,
+            mk(C_FIRST),
+            mk(GHOST),
+            C_FIRST,
+            &format!("patch {bad}"),
+        )
+        .await;
+    }
     assert!(r.db.mutations.lock().unwrap().is_empty());
 }
 

@@ -62,6 +62,7 @@ import {
 } from '@/components/ui/dialog';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { useOutboxApprovalsActive } from '@/lib/queries/outbox-approvals-active';
+import { isOutboundPkgPath } from '@/shell/outbox-deeplink';
 import { APPROVALS_ROUTE, usePendingApprovalsCount } from '@/shell/status-bar';
 import { useIkengaStore } from '@/lib/ikenga/theme-store';
 import { useCommands } from '@/lib/keymap/dispatcher';
@@ -567,9 +568,12 @@ function RailKey({ def, isActive, onSelect, badgeCount, ...rest }: RailKeyProps)
 	);
 }
 
-/** `/outbox/approvals`, or anything else under `/outbox/`. */
+/** `/outbox/approvals`, anything else under `/outbox/`, or the outbound pkg those
+ *  routes deep-link into (the Outbox queue lives there — outbox redesign D-01). */
 function isOutboxPath(path: string | null): boolean {
-	return !!path && (path === '/outbox' || path.startsWith('/outbox/'));
+	return (
+		!!path && (path === '/outbox' || path.startsWith('/outbox/') || isOutboundPkgPath(path))
+	);
 }
 
 /** The shell-owned Outbox approvals key (R-1): fixed right after Ngwa, not

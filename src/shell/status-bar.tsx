@@ -57,6 +57,7 @@ import { labelFor } from '@/lib/keymap/registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { usePkgsDerived } from '@/lib/pkgs/use-derived';
 import { paActionsListQueryOptions } from '@/lib/queries/pa-actions';
+import { OUTBOX_APPROVALS_ROUTE } from '@/shell/outbox-deeplink';
 import { useSeats } from '@/lib/queries/seats';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { listen } from '@/lib/transport';
@@ -93,7 +94,8 @@ export const NGWA_LINKS = {
 	violations: '/packages?filter=review',
 } as const;
 
-export const APPROVALS_ROUTE = '/outbox/approvals';
+/** The Outbox queue's entry route — a deep-link into the com.ikenga.outbound pkg. */
+export const APPROVALS_ROUTE = OUTBOX_APPROVALS_ROUTE;
 /** Same poll the rail's approvals button ran (activity-bar.tsx). */
 export const APPROVALS_REFETCH_MS = 15_000;
 
@@ -104,8 +106,8 @@ function plural(n: number, one: string, many = `${one}s`): string {
 // ─── data hooks ────────────────────────────────────────────────────────────
 
 /** Pending approve-gate drafts. Identical options to the rail's former
- *  `ApprovalsRailButton` — same key, so the route's commit/reject
- *  invalidations refresh this count too. */
+ *  `ApprovalsRailButton` — same key, so a `pa-action-paused` invalidation refreshes
+ *  this count too (the pkg's own commits/rejects land on the next poll). */
 export function usePendingApprovalsCount(): number {
 	const { data } = useQuery({
 		...paActionsListQueryOptions(),
