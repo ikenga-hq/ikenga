@@ -291,6 +291,19 @@ set -e
 [[ ! -e /tmp/pwned ]] || fail "manifest text was executed"
 pass "TEST 7 (manifest is data, not code)"
 
+# --- TEST 7b: check-request ("Check now") checks unless one ran moments ago ---
+echo "==> [Container] TEST 7b: check-request..."
+# available.json was written seconds ago: a request inside the window does
+# not touch the network (the manifest it would read says 0.18.4).
+OUT="$(RELEASE_MANIFEST_URL="$(manifest 0.18.4)" "$PROVISION" check-request)"
+echo "$OUT" | grep -q "not checking again yet" || fail "check-request inside the window still checked: $OUT"
+[[ "$(jget "$AV" latest)" == "0.18.5" ]] || fail "check-request inside the window rewrote available.json"
+# Outside the window it is check-update.
+OUT="$(UPDATE_CHECK_MIN_INTERVAL=0 RELEASE_MANIFEST_URL="$(manifest 0.18.4)" "$PROVISION" check-request)"
+[[ "$(jget "$AV" latest)" == "0.18.4" ]] || fail "check-request did not check: $OUT"
+[[ "$(installed)" == "0.18.2" ]] || fail "check-request installed something"
+pass "TEST 7b (check-request)"
+
 # Advertise 0.18.3 again for the request tests.
 RELEASE_MANIFEST_URL="$(manifest 0.18.3)" "$PROVISION" check-update
 
@@ -436,7 +449,8 @@ pass "TEST 13 (upgrade lock)"
 # --- TEST 14: install-update-units ---
 echo "==> [Container] TEST 14: install-update-units..."
 OUT="$("$PROVISION" install-update-units --dry-run)"
-for u in ikenga-update-check.service ikenga-update-check.timer ikenga-update.path ikenga-update.service; do
+for u in ikenga-update-check.service ikenga-update-check.timer ikenga-update.path ikenga-update.service \
+         ikenga-update-check-request.path ikenga-update-check-request.service; do
   echo "$OUT" | grep -q "write $SYSTEMD_DIR/$u" || fail "dry run does not show $u"
   [[ ! -e "$SYSTEMD_DIR/$u" ]] || fail "dry run wrote $u"
 done
@@ -448,6 +462,14 @@ cmp -s /work/provision.sh "$IKENGA_PROVISION_STABLE" || fail "stable copy differ
 grep -qx "PathExists=$REQ_T1" "$SYSTEMD_DIR/ikenga-update.path" || fail "path unit watches the wrong file"
 grep -qx "ExecStart=$IKENGA_PROVISION_STABLE apply-request" "$SYSTEMD_DIR/ikenga-update.service"
 grep -qx "ExecStart=$IKENGA_PROVISION_STABLE check-update" "$SYSTEMD_DIR/ikenga-update-check.service"
+CHECK_REQ_T1="$INSTALL_DIR/data/operator/update-check-request.json"
+grep -qx "PathExists=$CHECK_REQ_T1" "$SYSTEMD_DIR/ikenga-update-check-request.path" || fail "check path unit watches the wrong file"
+grep -qx "Unit=ikenga-update-check-request.service" "$SYSTEMD_DIR/ikenga-update-check-request.path"
+grep -qx "ExecStart=$IKENGA_PROVISION_STABLE check-request" "$SYSTEMD_DIR/ikenga-update-check-request.service"
+grep -qx "ExecStopPost=/bin/rm -f -- $CHECK_REQ_T1" "$SYSTEMD_DIR/ikenga-update-check-request.service" \
+  || fail "the check service must remove its request when it stops"
+grep -qx "ReadWritePaths=$INSTALL_DIR/data/operator" "$SYSTEMD_DIR/ikenga-update-check-request.service" \
+  || fail "the check service cannot remove its request under ProtectSystem=strict"
 OUT="$("$PROVISION" install-update-units)"
 echo "$OUT" | grep -q "no changes" || fail "install-update-units is not idempotent: $OUT"
 pass "TEST 14 (update units)"

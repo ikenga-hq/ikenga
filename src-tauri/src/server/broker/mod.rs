@@ -8,7 +8,7 @@
 //!                      ├─ /access/pair/*, /access/invite/*    (extension point, R16 §14.1)
 //!                      └─ require_principal ─▶ PrincipalCtx
 //!                          ├─ /auth/{logout,me,password}
-//!                          ├─ /api/server/update{,/apply}   (answered here, admins only; never proxied)
+//!                          ├─ /api/server/update{,/apply,/check}   (answered here, admins only; never proxied)
 //!                          ├─ /api/rpc ─ R-3 authorize / access_* ─▶ 127.0.0.1:<port> /api/rpc
 //!                          ├─ /pkgs/*  ──────────────────────────▶ 127.0.0.1:<port> /pkgs/*
 //!                          └─ /ws/*    ─ ws_registry ───────────▶ 127.0.0.1:<port> /ws/*
@@ -259,6 +259,10 @@ pub fn router(
         .route(
             "/api/server/update/apply",
             post(crate::server::update::broker_apply),
+        )
+        .route(
+            "/api/server/update/check",
+            post(crate::server::update::broker_check),
         )
         // Sender credentials from Settings (WP-K): relayed to the sender's
         // socket as the session's principal; never proxied to a child.

@@ -576,7 +576,10 @@ pub fn route_requirement(path: &str) -> Option<Requirement> {
     // `/api/shutdown`. A paired device of any tier is refused.
     if matches!(
         path,
-        "/api/shutdown" | "/api/server/update" | "/api/server/update/apply"
+        "/api/shutdown"
+            | "/api/server/update"
+            | "/api/server/update/apply"
+            | "/api/server/update/check"
     ) {
         Some(Requirement::operator())
     } else if matches!(path, "/api/backup/export" | "/api/backup/import") {
@@ -942,6 +945,7 @@ mod tests {
             "/api/shutdown",
             "/api/server/update",
             "/api/server/update/apply",
+            "/api/server/update/check",
         ] {
             assert_eq!(
                 route_requirement(p).unwrap().class,

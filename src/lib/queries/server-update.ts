@@ -3,8 +3,8 @@
 // `useServerUpdate()` is the one read: the banner and the Settings › About
 // panel share it. It is enabled only where `fetchServerUpdate` could answer
 // (a browser tab; under T1 an admin). It polls every 2 s while root is
-// applying an update (or a request waits to be claimed), and every 10 min
-// otherwise, plus on window focus.
+// applying an update (or a request waits to be claimed) or a "Check now" is
+// pending, and every 10 min otherwise, plus on window focus.
 //
 // The update restarts the server, so polls fail for a few seconds mid-run.
 // `fetchServerUpdate` throws on those (rather than answering `null`), which
@@ -45,7 +45,7 @@ export function needsReload(view: ServerUpdateView | null | undefined): boolean 
 }
 
 export function serverUpdatePollInterval(view: ServerUpdateView | null | undefined): number {
-	return isServerUpdateInFlight(view) ? FAST_POLL_MS : SLOW_POLL_MS;
+	return isServerUpdateInFlight(view) || view?.check_pending === true ? FAST_POLL_MS : SLOW_POLL_MS;
 }
 
 export function useServerUpdate() {

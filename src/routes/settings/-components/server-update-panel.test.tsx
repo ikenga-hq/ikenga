@@ -6,9 +6,11 @@
 import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-
+import type {
+	ApplyServerUpdateResult,
+	CheckServerUpdateResult,
+} from '@/lib/transport/server-update';
 import { serverUpdateRun, serverUpdateView } from '@/lib/transport/server-update.fixtures';
-import type { ApplyServerUpdateResult } from '@/lib/transport/server-update';
 
 vi.mock('@/lib/actions/runner/open', () => ({ gotoRoute: vi.fn() }));
 
@@ -160,5 +162,67 @@ describe('<ServerUpdateCard />', () => {
 		);
 		expect(screen.getByRole('button', { name: 'Reload' })).toBeTruthy();
 		expect(screen.queryByRole('button', { name: /Update now/ })).toBeNull();
+	});
+
+	describe('Check now', () => {
+		function setupCheck(view = serverUpdateView(), result: CheckServerUpdateResult = { ok: true }) {
+			const check = vi.fn(async () => result);
+			const onChanged = vi.fn();
+			render(
+				<ServerUpdateCard
+					view={view}
+					reloadNeeded={false}
+					apply={vi.fn()}
+					check={check}
+					onChanged={onChanged}
+				/>
+			);
+			return { check, onChanged, user: userEvent.setup() };
+		}
+
+		it('is hidden without a check handler', () => {
+			setup();
+			expect(screen.queryByTestId('server-update-check')).toBeNull();
+		});
+
+		it('asks the server and refreshes the view, even with nothing available', async () => {
+			const { check, onChanged, user } = setupCheck(
+				serverUpdateView({
+					available: null,
+					can_apply: false,
+					apply_blocked_reason: 'none_available',
+				})
+			);
+			await user.click(screen.getByTestId('server-update-check'));
+			expect(check).toHaveBeenCalledTimes(1);
+			expect(onChanged).toHaveBeenCalled();
+			expect(screen.queryByTestId('server-update-check-error')).toBeNull();
+		});
+
+		it('shows a pending check and disables the button', () => {
+			setupCheck(serverUpdateView({ check_pending: true, can_check: false }));
+			expect(screen.getByTestId('server-update-panel').textContent).toContain(
+				'Checking for updates…'
+			);
+			expect((screen.getByTestId('server-update-check') as HTMLButtonElement).disabled).toBe(true);
+		});
+
+		it('explains a throttled check', async () => {
+			const { user } = setupCheck(serverUpdateView(), {
+				ok: false,
+				code: 'throttled',
+				message: 'the server checked for updates moments ago',
+			});
+			await user.click(screen.getByTestId('server-update-check'));
+			expect(screen.getByTestId('server-update-check-error').textContent).toContain('moments ago');
+		});
+
+		it('says how to install the units when root never picks the check up', () => {
+			setupCheck(serverUpdateView({ check_stalled: true }));
+			expect(screen.getByTestId('server-update-check-stalled').textContent).toContain(
+				'install-update-units'
+			);
+			expect((screen.getByTestId('server-update-check') as HTMLButtonElement).disabled).toBe(false);
+		});
 	});
 });

@@ -2,8 +2,8 @@
 //
 // The server never upgrades itself: root's units check for a release and
 // apply an admin's request (scripts/server/provision.sh). The server answers
-// two routes — `GET /api/server/update` and `POST /api/server/update/apply` —
-// to the T1 admins (the broker answers them itself) or the T0 operator bearer.
+// three routes — `GET /api/server/update`, `POST /api/server/update/apply`
+// and `POST /api/server/update/check` ("Check now") — to the T1 admins (the broker answers them itself) or the T0 operator bearer.
 // Everyone else gets a bare 403 and sees nothing.
 //
 // Deliberately NOT routed through `invoke()`: its 401 handler opens the
@@ -77,6 +77,12 @@ export interface ServerUpdateView {
 	open_terminals_partial: boolean;
 	can_apply: boolean;
 	apply_blocked_reason: ServerUpdateBlockedReason | null;
+	/** A "Check now" waits for root (or root is running it). */
+	check_pending: boolean;
+	/** A "Check now" was never picked up: the box's update units predate it. */
+	check_stalled: boolean;
+	/** "Check now" may be pressed. */
+	can_check: boolean;
 }
 
 export type ApplyServerUpdateResult =
@@ -201,6 +207,51 @@ export async function applyServerUpdate(input: {
 		code,
 		message: typeof body?.error === 'string' ? body.error : `Request failed (HTTP ${res.status}).`,
 		...(typeof body?.open_terminals === 'number' ? { openTerminals: body.open_terminals } : {}),
+	};
+}
+
+export type CheckServerUpdateResult =
+	| { ok: true }
+	| {
+			ok: false;
+			/** `throttled`, `forbidden`, `unsupported`, or `network`. */
+			code: string;
+			message: string;
+	  };
+
+/**
+ * `POST /api/server/update/check`: ask root to check for a release now
+ * instead of waiting for the daily timer. Idempotent while one waits.
+ */
+export async function requestServerUpdateCheck(): Promise<CheckServerUpdateResult> {
+	if (!mayAskForServerUpdates()) {
+		return {
+			ok: false,
+			code: 'forbidden',
+			message: 'Only an administrator can check for updates.',
+		};
+	}
+	let res: Response;
+	try {
+		res = await fetch('/api/server/update/check', {
+			method: 'POST',
+			headers: authHeaders(),
+			credentials: 'same-origin',
+		});
+	} catch (err) {
+		return { ok: false, code: 'network', message: `Could not reach the server: ${String(err)}` };
+	}
+	let body: { ok?: boolean; error?: string; code?: string } | null;
+	try {
+		body = (await res.json()) as typeof body;
+	} catch {
+		body = null;
+	}
+	if (res.ok && body?.ok) return { ok: true };
+	return {
+		ok: false,
+		code: typeof body?.code === 'string' ? body.code : `http_${res.status}`,
+		message: typeof body?.error === 'string' ? body.error : `Request failed (HTTP ${res.status}).`,
 	};
 }
 

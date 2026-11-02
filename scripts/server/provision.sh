@@ -57,10 +57,13 @@ UPDATE_REQUEST_MAX_AGE="${UPDATE_REQUEST_MAX_AGE:-900}"
 # for this long: a broken release must not become a restart loop that keeps
 # ending people's terminals.
 UPDATE_RETRY_COOLDOWN="${UPDATE_RETRY_COOLDOWN:-3600}"
+# An admin's "Check now" runs the release check at most this often; a request
+# inside the window is dropped without touching the network.
+UPDATE_CHECK_MIN_INTERVAL="${UPDATE_CHECK_MIN_INTERVAL:-60}"
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
 
 case "${1:-}" in
-  upgrade|check-update|apply-request|install-update-units|install-agent-cli-updates|sync-accounts|refresh-projects|backups|tunnels|swap) ACTION="$1"; shift ;;
+  upgrade|check-update|check-request|apply-request|install-update-units|install-agent-cli-updates|sync-accounts|refresh-projects|backups|tunnels|swap) ACTION="$1"; shift ;;
 esac
 
 while [[ $# -gt 0 ]]; do
@@ -92,8 +95,10 @@ while [[ $# -gt 0 ]]; do
         exit 0
       fi
       if [[ "$ACTION" != "provision" ]]; then
-        printf 'Usage: %s check-update | apply-request | install-update-units | install-agent-cli-updates | sync-accounts | refresh-projects | backups | tunnels | swap [--profile <file>] [--dry-run]\n\n' "${BASH_SOURCE[0]}"
+        printf 'Usage: %s check-update | check-request | apply-request | install-update-units | install-agent-cli-updates | sync-accounts | refresh-projects | backups | tunnels | swap [--profile <file>] [--dry-run]\n\n' "${BASH_SOURCE[0]}"
         printf '  check-update          read the release manifest and write %s/available.json (installs nothing)\n' "$STATE_DIR"
+        printf '  check-request         an admin asked to check now: check-update, unless one ran in the last %ss\n' "$UPDATE_CHECK_MIN_INTERVAL"
+        printf '                        (run by ikenga-update-check-request.service, which then removes the request)\n'
         printf '  apply-request         claim and apply an admin update request (run by ikenga-update.service)\n'
         printf '  install-update-units  install %s and the update timer, path and service units\n' "$STABLE_COPY"
         printf '  install-agent-cli-updates  install the daily npm update timer for the profile'"'"'s AGENT_CLIS\n'
@@ -1453,6 +1458,9 @@ do_upgrade() {
 # The request (ikenga-update-request/1) is written by the server:
 #   t0: $INSTALL_DIR/data/update-request.json          (owner: ikenga)
 #   t1: $INSTALL_DIR/data/operator/update-request.json (owner: root, the broker)
+# "Check now" (ikenga-update-check-request/1) sits next to it as
+# update-check-request.json. Root never reads it: its existence means "check
+# now", and ikenga-update-check-request.service removes it when it stops.
 
 update_request_path() {
   if [[ "$TIER" == t1 ]]; then
@@ -1460,6 +1468,10 @@ update_request_path() {
   else
     printf '%s/data/update-request.json' "$INSTALL_DIR"
   fi
+}
+
+update_check_request_path() {
+  printf '%s/update-check-request.json' "$(dirname -- "$(update_request_path)")"
 }
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -1569,6 +1581,25 @@ do_check_update() {
   write_state_file available.json "{\"schema\":\"ikenga-update-available/1\",\"checked_at\":$(jstr "$(now_iso)"),\"channel\":$(jstr "$channel"),\"installed\":$(jstr "$installed"),\"latest\":$(jstr "$latest"),\"min_upgrade_from\":$(jstr "$min"),\"blocked\":$blocked,\"blocked_reason\":$(jstr "$blocked_reason"),\"notes_url\":$(jstr "$notes_url"),\"published_at\":$(jstr "$published"),\"last_error\":$(jstr "$err")}"
   note "update check: installed ${installed:-unknown}, latest ${latest:-unknown}${err:+ (error: $err)}"
   return 0
+}
+
+# Run by ikenga-update-check-request.service when an admin presses "Check
+# now". The request carries nothing root reads; the only decision here is
+# whether a check ran moments ago (the server throttles too, but a t0 daemon
+# owns the request's directory and could drop the file in a loop). The unit's
+# ExecStopPost removes the request however this ends.
+do_check_request() {
+  [[ $EUID -eq 0 ]] || die "check-request must run as root"
+  local -a prev
+  if [[ -f "$STATE_DIR/available.json" ]] \
+     && fields_into prev "$STATE_DIR/available.json" checked_at 2>/dev/null; then
+    local age; age="$(age_of "${prev[0]:-}")"
+    if [[ -n "$age" ]] && (( age >= 0 && age < UPDATE_CHECK_MIN_INTERVAL )); then
+      note "update check: one ran ${age}s ago; not checking again yet"
+      return 0
+    fi
+  fi
+  do_check_update
 }
 
 # status.json. Arguments are name=value pairs; values must already be safe.
@@ -1784,12 +1815,13 @@ ensure_stable_copy() {
   fi
 }
 
-# The stable copy of this script and the four update units. Idempotent.
+# The stable copy of this script and the six update units. Idempotent.
 install_update_units() {
-  log "Update units (check timer, request path, stable provisioner copy)"
+  log "Update units (check timer, check-now and request paths, stable provisioner copy)"
   [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo); dry runs may be unprivileged"
-  local req
+  local req checkreq
   req="$(update_request_path)"
+  checkreq="$(update_check_request_path)"
   ensure_stable_copy
 
   local any=0
@@ -1821,6 +1853,40 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 " && any=1
+  # "Check now": the request is removed when the service stops, on success,
+  # failure or timeout alike, so a PathExists unit can never re-fire on a file
+  # a crashed check left behind.
+  write_unit ikenga-update-check-request.path "[Unit]
+Description=Ikenga: run the server update check an admin asked for
+
+[Path]
+PathExists=$checkreq
+Unit=ikenga-update-check-request.service
+TriggerLimitIntervalSec=60
+TriggerLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
+" && any=1
+  write_unit ikenga-update-check-request.service "[Unit]
+Description=Ikenga: check for a server update now (an admin asked; installs nothing)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$STABLE_COPY check-request
+ExecStopPost=/bin/rm -f -- $checkreq
+TimeoutStartSec=2min
+Nice=10
+StateDirectory=ikenga-update
+StateDirectoryMode=0755
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=$(dirname -- "$checkreq")
+ProtectHome=read-only
+" && any=1
   write_unit ikenga-update.path "[Unit]
 Description=Ikenga: apply an admin's server update request
 
@@ -1850,14 +1916,14 @@ ProtectHome=read-only
 " && any=1
 
   if [[ $DRY_RUN -eq 1 ]]; then
-    note "[dry-run] systemctl daemon-reload; enable --now ikenga-update-check.timer ikenga-update.path"
+    note "[dry-run] systemctl daemon-reload; enable --now ikenga-update-check.timer ikenga-update.path ikenga-update-check-request.path"
     return 0
   fi
   install -d -m 0755 -o root -g root "$STATE_DIR"
   if command -v systemctl >/dev/null 2>&1; then
     [[ $any -eq 1 ]] && systemctl daemon-reload
-    systemctl enable --now ikenga-update-check.timer ikenga-update.path >/dev/null 2>&1 \
-      || note "WARNING: could not enable the update timer/path units (see systemctl status ikenga-update.path)"
+    systemctl enable --now ikenga-update-check.timer ikenga-update.path ikenga-update-check-request.path >/dev/null 2>&1 \
+      || note "WARNING: could not enable the update timer/path units (see systemctl status ikenga-update.path ikenga-update-check-request.path)"
     # First check now, not 15 minutes after the next boot.
     [[ ! -f "$STATE_DIR/available.json" ]] && systemctl start --no-block ikenga-update-check.service >/dev/null 2>&1 || true
   fi
@@ -5194,6 +5260,7 @@ case "$ACTION" in
     do_upgrade
     exit 0 ;;
   check-update) do_check_update; exit 0 ;;
+  check-request) do_check_request; exit 0 ;;
   apply-request) do_apply_request; exit 0 ;;
   install-update-units) install_update_units; summary; exit 0 ;;
   install-agent-cli-updates)

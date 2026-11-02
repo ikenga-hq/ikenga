@@ -22,6 +22,9 @@ export function serverUpdateView(over: Partial<ServerUpdateView> = {}): ServerUp
 		open_terminals_partial: false,
 		can_apply: true,
 		apply_blocked_reason: null,
+		check_pending: false,
+		check_stalled: false,
+		can_check: true,
 		...over,
 	};
 }

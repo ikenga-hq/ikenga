@@ -430,7 +430,8 @@ pub(crate) fn app_lock_gates_path(path: &str) -> bool {
         || path.starts_with("/pkgs/")
         || path == "/api/shutdown"
         || path == "/api/server/update"
-        || path == "/api/server/update/apply";
+        || path == "/api/server/update/apply"
+        || path == "/api/server/update/check";
     !exempt
 }
 
@@ -1054,6 +1055,7 @@ fn build_router(
         // In-app updates (WP-P9): operator only (`access::route_requirement`).
         .route("/api/server/update", get(update::t0_status))
         .route("/api/server/update/apply", post(update::t0_apply))
+        .route("/api/server/update/check", post(update::t0_check))
         // Backup export/import (WP-B): streamed download / upload (100MB max)
         .route("/api/backup/export", get(rpc_backup::http_backup_export))
         .route(

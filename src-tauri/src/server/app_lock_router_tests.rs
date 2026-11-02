@@ -933,6 +933,7 @@ fn the_lock_gates_every_protected_path_but_the_named_ones() {
         "/api/shutdown",
         "/api/server/update",
         "/api/server/update/apply",
+        "/api/server/update/check",
     ] {
         assert!(!gated(path), "{path}");
     }

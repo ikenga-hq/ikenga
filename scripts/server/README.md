@@ -156,24 +156,27 @@ Everything lives under `/opt/ikenga/data`. In multi-user mode that is the operat
 
 ## Updates
 
-`provision.sh` installs a stable copy of itself at `/usr/local/sbin/ikenga-provision` and four systemd units. You can also run `sudo ikenga-provision install-update-units` on its own.
+`provision.sh` installs a stable copy of itself at `/usr/local/sbin/ikenga-provision` and six systemd units. You can also run `sudo ikenga-provision install-update-units` on its own.
+
+An upgrade replaces the server, not `provision.sh` or these units. When a release changes them, run `sudo scripts/server/provision.sh install-update-units` once from a checkout of that release; it refreshes the stable copy too.
 
 | Unit | What it does |
 |------|--------------|
 | `ikenga-update-check.timer` → `ikenga-update-check.service` | Once a day, reads the `stable` release manifest and writes `/var/lib/ikenga-update/available.json`. Installs nothing. |
+| `ikenga-update-check-request.path` → `ikenga-update-check-request.service` | When an admin presses **Check now**, runs `ikenga-provision check-request`: the same check, skipped if one ran in the last minute. The service removes the request when it stops, however the check ended. |
 | `ikenga-update.path` → `ikenga-update.service` | When an admin asks for the update in the app, runs `ikenga-provision apply-request`: the same steps as `upgrade` (checksum, keep `.prev`, restart, health check that the new version answers, automatic rollback). Writes `/var/lib/ikenga-update/status.json`. |
 
 **Who may update.** In multi-user mode, an enabled admin who is signed in with a password, or on a device at the Full tier. In single-user mode, only the bearer-token holder; a paired device cannot. Everyone else sees nothing. The app shows how many open terminals a restart will end and asks the admin to confirm.
 
 **Notify only.** Nothing installs itself. An update happens only when an admin confirms it, or when you run `upgrade` over SSH.
 
-**What root trusts.** The server writes nothing but a small request file: `/opt/ikenga/data/update-request.json` in single-user mode, `/opt/ikenga/data/operator/update-request.json` in multi-user mode. Root claims it, checks its owner, size and age (15 minutes), and applies it only when the version equals the one root's own check advertised. A request cannot name a URL, a path, a channel or a downgrade. After a rolled-back or failed attempt at a version, the same version is refused for an hour, so a broken release cannot turn into a restart loop.
+**What root trusts.** The server writes nothing but a small request file: `/opt/ikenga/data/update-request.json` in single-user mode, `/opt/ikenga/data/operator/update-request.json` in multi-user mode. Root claims it, checks its owner, size and age (15 minutes), and applies it only when the version equals the one root's own check advertised. A request cannot name a URL, a path, a channel or a downgrade. **Check now** writes `update-check-request.json` in the same directory; root never reads it, its existence is the whole request. After a rolled-back or failed attempt at a version, the same version is refused for an hour, so a broken release cannot turn into a restart loop.
 
 **Files.** `available.json` and `status.json` are world-readable and hold versions, times and the last run's progress lines. `last-run.log` is root-only. None of them holds a secret, and the update path never reads `.env` except for the `IKENGA_HOST` line used for the health check.
 
 **Exit codes of `upgrade`.** 0: upgraded, or already on that version. 3: the new version failed its health check and the previous one is back. 4: the rollback failed too; look at `journalctl -u ikenga-server*`. 5: the new version is installed and healthy, but an [add-on script](#add-ons) failed (in the app's update status this is `failed`, with a message that says the new version is running).
 
-**Turning it off.** `sudo systemctl disable --now ikenga-update.path` stops in-app updates. `sudo systemctl disable --now ikenga-update-check.timer` stops the daily check, and the app then shows no update at all.
+**Turning it off.** `sudo systemctl disable --now ikenga-update.path` stops in-app updates. `sudo systemctl disable --now ikenga-update-check.timer` stops the daily check, and the app then shows no update at all. `sudo systemctl disable --now ikenga-update-check-request.path` stops **Check now** (the app then reports that the check was never run).
 
 ## Shared projects and scoped secrets
 

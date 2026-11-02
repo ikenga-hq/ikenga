@@ -1682,6 +1682,59 @@ fn same_origin() -> String {
     format!("https://{HOST}")
 }
 
+async fn update_check(app: &Router, cookie: &str) -> (StatusCode, Value) {
+    let (s, _, j) = send(
+        app,
+        request("POST", "/api/server/update/check")
+            .header("cookie", cookie)
+            .header("origin", same_origin())
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    (s, j)
+}
+
+#[tokio::test]
+async fn check_now_is_admin_only_and_writes_one_request_root_removes() {
+    let (h, _, request_path) = update_harness().await;
+    let check_path = request_path.with_file_name(crate::server::update::CHECK_REQUEST_FILE);
+    insert_account(&h.pool, "ada", 20_001, true).await;
+    insert_account(&h.pool, "bob", 20_002, false).await;
+    let ada_cookie = login_cookie(&h.app, "ada").await;
+    let bob_cookie = login_cookie(&h.app, "bob").await;
+
+    // A member is refused and writes nothing.
+    let (s, body) = update_check(&h.app, &bob_cookie).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+    assert!(!check_path.exists());
+
+    let (s, body) = update_get(&h.app, &ada_cookie).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["data"]["can_check"], true);
+    assert_eq!(body["data"]["check_pending"], false);
+
+    let (s, body) = update_check(&h.app, &ada_cookie).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["data"]["state"], "queued");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&check_path).unwrap()).unwrap();
+    assert_eq!(doc["schema"], "ikenga-update-check-request/1");
+    assert_eq!(doc["requested_by"], "ada");
+    // It is not an apply request.
+    assert!(!request_path.exists());
+
+    // While it waits, the view says so and a second press is a no-op.
+    let (_, body) = update_get(&h.app, &ada_cookie).await;
+    assert_eq!(body["data"]["check_pending"], true);
+    assert_eq!(body["data"]["can_check"], false);
+    let (s, body) = update_check(&h.app, &ada_cookie).await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    assert_eq!(body["data"]["state"], "already_queued");
+
+    // Answered by the broker: no child was launched, so nothing was forwarded.
+    assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn update_routes_refuse_a_member_without_leaking_versions() {
     let (h, _, request_path) = update_harness().await;

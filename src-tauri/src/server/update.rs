@@ -7,9 +7,15 @@
 //!
 //! ```text
 //!  ikenga-update-check.timer ─▶ provision check-update ─▶ /var/lib/ikenga-update/available.json
-//!  admin ─▶ POST /api/server/update/apply ─▶ <request path>      (this module; the only write)
+//!  admin ─▶ POST /api/server/update/check ─▶ <check request>     (this module)
+//!  ikenga-update-check-request.path ─▶ provision check-request ─▶ available.json, then removes the check request
+//!  admin ─▶ POST /api/server/update/apply ─▶ <request path>      (this module)
 //!  ikenga-update.path (PathExists) ─▶ provision apply-request ─▶ /var/lib/ikenga-update/status.json
 //! ```
+//!
+//! "Check now" carries no input root acts on: the file's existence is the
+//! whole request, and root throttles it too. Units older than the check
+//! request never remove it; the view reports that as `check_stalled`.
 //!
 //! The server never upgrades itself: it reads root's two files, counts the
 //! terminals a restart would end, and publishes one small request file. Root
@@ -57,10 +63,14 @@ pub const REQUEST_FILE: &str = "update-request.json";
 pub const AVAILABLE_FILE: &str = "available.json";
 /// Written by `provision.sh apply-request`.
 pub const STATUS_FILE: &str = "status.json";
+/// provision.sh `update_check_request_path`: "check now", next to the apply
+/// request. Root never reads it; its unit removes it when the check stops.
+pub const CHECK_REQUEST_FILE: &str = "update-check-request.json";
 
 const AVAILABLE_SCHEMA: &str = "ikenga-update-available/1";
 const STATUS_SCHEMA: &str = "ikenga-update-status/1";
 const REQUEST_SCHEMA: &str = "ikenga-update-request/1";
+const CHECK_REQUEST_SCHEMA: &str = "ikenga-update-check-request/1";
 
 /// Root's files are small; anything bigger is not one of them.
 const MAX_STATE_FILE: u64 = 64 * 1024;
@@ -79,6 +89,12 @@ const RETRY_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 const APPLY_THROTTLE: Duration = Duration::from_secs(30);
 /// provision.sh accepts at most four digits.
 const MAX_ACK: u32 = 9999;
+/// A check request still there after this long was never picked up: the
+/// host's update units predate "Check now" (`install-update-units` adds it).
+const CHECK_STALE: Duration = Duration::from_secs(3 * 60);
+/// At most one check per this window (provision.sh
+/// `UPDATE_CHECK_MIN_INTERVAL` drops a request inside it too).
+const CHECK_THROTTLE: Duration = Duration::from_secs(60);
 
 /// The state directory: [`STATE_DIR_ENV`] when set, else
 /// [`DEFAULT_STATE_DIR`].
@@ -239,6 +255,12 @@ pub struct UpdateView {
     /// `unsupported` | `none_available` | `blocked_min_upgrade` | `running`
     /// | `pending` | `cooldown`.
     pub apply_blocked_reason: Option<&'static str>,
+    /// A "Check now" waits for root (or root is running it).
+    pub check_pending: bool,
+    /// A "Check now" was never picked up: root's units predate it.
+    pub check_stalled: bool,
+    /// "Check now" may be pressed (supported, and none pending).
+    pub can_check: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -305,6 +327,13 @@ impl ApplyError {
     }
 }
 
+/// An accepted "Check now".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckRequested {
+    /// False when one was already waiting (idempotent re-POST).
+    pub new: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applied {
     pub version: String,
@@ -321,15 +350,28 @@ struct Snapshot {
     pending: Option<PendingView>,
     /// The request file exists but is too old for root to accept.
     pending_stale: bool,
+    check: CheckState,
+}
+
+/// The "Check now" file, as the server sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckState {
+    None,
+    Pending,
+    /// There, but older than [`CHECK_STALE`]: nothing will remove it.
+    Stalled,
 }
 
 /// One per server process: the T0 daemon, or the T1 broker.
 pub struct UpdateCtl {
     state_dir: PathBuf,
     request_path: PathBuf,
+    check_path: PathBuf,
     current: String,
     /// Serializes applies, and remembers the last accepted one (throttle).
     last_apply: Mutex<Option<Instant>>,
+    /// The same for "Check now".
+    last_check: Mutex<Option<Instant>>,
 }
 
 impl std::fmt::Debug for UpdateCtl {
@@ -350,9 +392,11 @@ impl UpdateCtl {
     pub fn with_version(state_dir: PathBuf, request_path: PathBuf, current: &str) -> Self {
         Self {
             state_dir,
+            check_path: request_path.with_file_name(CHECK_REQUEST_FILE),
             request_path,
             current: current.to_string(),
             last_apply: Mutex::new(None),
+            last_check: Mutex::new(None),
         }
     }
 
@@ -377,6 +421,22 @@ impl UpdateCtl {
             status,
             pending,
             pending_stale,
+            check: self.read_check(),
+        }
+    }
+
+    fn read_check(&self) -> CheckState {
+        let Ok(meta) = std::fs::symlink_metadata(&self.check_path) else {
+            return CheckState::None;
+        };
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|m| SystemTime::now().duration_since(m).ok());
+        if age.is_some_and(|a| a > CHECK_STALE) {
+            CheckState::Stalled
+        } else {
+            CheckState::Pending
         }
     }
 
@@ -508,6 +568,9 @@ impl UpdateCtl {
                 open_terminals_partial,
                 can_apply: false,
                 apply_blocked_reason: Some("unsupported"),
+                check_pending: false,
+                check_stalled: false,
+                can_check: false,
             };
         }
         let available = snap.available.as_ref().and_then(|a| self.newer(a));
@@ -531,7 +594,68 @@ impl UpdateCtl {
             open_terminals_partial,
             can_apply: reason.is_none(),
             apply_blocked_reason: reason,
+            check_pending: snap.check == CheckState::Pending,
+            check_stalled: snap.check == CheckState::Stalled,
+            can_check: snap.check != CheckState::Pending,
         }
+    }
+
+    /// Publish an admin's "Check now". Idempotent while one waits; a stalled
+    /// one (old units never removed it) is replaced, so pressing again after
+    /// `install-update-units` works.
+    pub fn request_check(&self, requested_by: &str) -> Result<CheckRequested, ApplyError> {
+        let mut last = self.last_check.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = self.snapshot();
+        if !snap.supported {
+            return Err(ApplyError::new(
+                StatusCode::NOT_FOUND,
+                "unsupported",
+                "server updates are not managed on this host",
+            ));
+        }
+        match snap.check {
+            CheckState::Pending => return Ok(CheckRequested { new: false }),
+            CheckState::Stalled => {
+                let _ = std::fs::remove_file(&self.check_path);
+            }
+            CheckState::None => {}
+        }
+        let checked_moments_ago = snap
+            .available
+            .as_ref()
+            .and_then(|a| age_of(a.checked_at.as_deref()))
+            .is_some_and(|age| age < CHECK_THROTTLE);
+        if checked_moments_ago || last.is_some_and(|t| t.elapsed() < CHECK_THROTTLE) {
+            return Err(ApplyError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "throttled",
+                "the server checked for updates moments ago",
+            ));
+        }
+        let doc = json!({
+            "schema": CHECK_REQUEST_SCHEMA,
+            "requested_by": requested_by,
+            "requested_at": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        });
+        match publish(&self.check_path, doc.to_string().as_bytes()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Ok(CheckRequested { new: false });
+            }
+            Err(e) => {
+                tracing::error!(
+                    "update: could not write {}: {e}",
+                    self.check_path.display()
+                );
+                return Err(ApplyError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "the check request could not be written",
+                ));
+            }
+        }
+        *last = Some(Instant::now());
+        Ok(CheckRequested { new: true })
     }
 
     /// Publish an admin's request for root to apply.
@@ -686,7 +810,11 @@ fn publish(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })?;
     let mut rand = [0u8; 8];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut rand);
-    let tmp = dir.join(format!(".update-request.{}.tmp", hex::encode(rand)));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.{}.tmp", hex::encode(rand)));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -885,8 +1013,42 @@ pub(crate) async fn t0_apply(
     accepted(&applied)
 }
 
+fn check_accepted(c: &CheckRequested) -> Response {
+    ok(
+        StatusCode::ACCEPTED,
+        json!({ "state": if c.new { "queued" } else { "already_queued" } }),
+    )
+}
+
+/// T0 `POST /api/server/update/check` (operator only).
+pub(crate) async fn t0_check(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<AccessCtx>,
+) -> Response {
+    if !ctx.is_operator() {
+        return json_error(StatusCode::FORBIDDEN, "forbidden", "admin only");
+    }
+    let Some(ctl) = state.update.clone() else {
+        return unsupported();
+    };
+    match tokio::task::spawn_blocking(move || ctl.request_check("operator")).await {
+        Ok(Ok(c)) => {
+            if c.new {
+                tracing::info!("server update check requested by the operator");
+            }
+            check_accepted(&c)
+        }
+        Ok(Err(e)) => apply_error(&e),
+        Err(_) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "internal error",
+        ),
+    }
+}
+
 #[cfg(target_os = "linux")]
-pub use self::broker_routes::{broker_apply, broker_status};
+pub use self::broker_routes::{broker_apply, broker_check, broker_status};
 
 /// The T1 broker's side: it answers these routes itself, after a fresh
 /// admin check, and never forwards them to a principal's child.
@@ -901,7 +1063,10 @@ mod broker_routes {
     use axum::Extension;
     use serde_json::{json, Value};
 
-    use super::{accepted, apply_error, json_error, ok, parse_body, requested_event, unsupported};
+    use super::{
+        accepted, apply_error, check_accepted, json_error, ok, parse_body, requested_event,
+        unsupported,
+    };
     use crate::access::AccessCtx;
     use crate::server::auth::{Credential, PrincipalCtx};
     use crate::server::broker::proxy::PRINCIPAL_HEADER;
@@ -1021,6 +1186,42 @@ mod broker_routes {
         let (open, partial) = open_terminals(&state).await;
         match tokio::task::spawn_blocking(move || ctl.view(open, partial)).await {
             Ok(v) => ok(StatusCode::OK, v),
+            Err(_) => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "internal error",
+            ),
+        }
+    }
+
+    /// T1 `POST /api/server/update/check`: "Check now". Same admin check as
+    /// apply; the body is ignored.
+    pub async fn broker_check(
+        State(state): State<std::sync::Arc<BrokerState>>,
+        Extension(ctx): Extension<PrincipalCtx>,
+        req: Request,
+    ) -> Response {
+        let (parts, _) = req.into_parts();
+        let (account, _) = match admin(&state, &ctx, &parts).await {
+            Ok(a) => a,
+            Err(r) => return r,
+        };
+        let Some(ctl) = state.update.clone() else {
+            return unsupported();
+        };
+        let requested_by = account.username.clone();
+        match tokio::task::spawn_blocking(move || ctl.request_check(&requested_by)).await {
+            Ok(Ok(c)) => {
+                if c.new {
+                    tracing::info!(
+                        "server update check requested by {} ({})",
+                        account.username,
+                        ctx.principal.id
+                    );
+                }
+                check_accepted(&c)
+            }
+            Ok(Err(e)) => apply_error(&e),
             Err(_) => json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
@@ -1383,7 +1584,7 @@ mod tests {
         use serde_json::{json, Value};
         use tower::ServiceExt;
 
-        use super::{available, write, AVAILABLE_FILE, REQUEST_FILE};
+        use super::{available, write, AVAILABLE_FILE, CHECK_REQUEST_FILE, REQUEST_FILE};
         use crate::access::caps::Tier;
         use crate::access::devices::tests::pair;
         use crate::access::{AccessStore, DaemonAccess};
@@ -1553,8 +1754,47 @@ mod tests {
                 )
                 .await;
                 assert_eq!(s, StatusCode::FORBIDDEN, "{tier:?}");
+                let (s, _) = call(
+                    &d.router,
+                    "POST",
+                    "/api/server/update/check",
+                    &tok,
+                    None,
+                    None,
+                )
+                .await;
+                assert_eq!(s, StatusCode::FORBIDDEN, "{tier:?}");
             }
             assert!(!d.data.join(REQUEST_FILE).exists());
+            assert!(!d.data.join(CHECK_REQUEST_FILE).exists());
+        }
+
+        #[tokio::test]
+        async fn the_operator_can_ask_for_a_check() {
+            let d = t0(
+                DaemonAccess::with_store(AccessStore::memory_t0().await),
+                true,
+            )
+            .await;
+            write(&d.state, AVAILABLE_FILE, available("0.20.0"));
+            let (s, b) = call(
+                &d.router,
+                "POST",
+                "/api/server/update/check",
+                OP,
+                Some("http://box.test:4000"),
+                None,
+            )
+            .await;
+            assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+            assert_eq!(b["data"]["state"], "queued");
+            let doc: Value = serde_json::from_slice(
+                &std::fs::read(d.data.join(CHECK_REQUEST_FILE)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(doc["requested_by"], "operator");
+            let (_, b) = call(&d.router, "GET", "/api/server/update", OP, None, None).await;
+            assert_eq!(b["data"]["check_pending"], true);
         }
 
         #[tokio::test]
@@ -1620,6 +1860,92 @@ mod tests {
             }
             assert!(!d.data.join(REQUEST_FILE).exists());
         }
+    }
+
+    fn check_path(f: &Fixture) -> PathBuf {
+        f.data.join(CHECK_REQUEST_FILE)
+    }
+
+    fn age_file(path: &Path, secs: u64) {
+        let t = SystemTime::now() - Duration::from_secs(secs);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    #[test]
+    fn check_now_publishes_once_and_reports_pending() {
+        let f = fixture();
+        assert_eq!(
+            f.ctl.request_check("ada").unwrap_err().code,
+            "unsupported",
+            "no root units, no check"
+        );
+        write(&f.state, AVAILABLE_FILE, available("0.20.0"));
+        let v = f.ctl.view(0, false);
+        assert!(v.can_check && !v.check_pending && !v.check_stalled);
+
+        assert!(f.ctl.request_check("ada").unwrap().new);
+        let raw = std::fs::read(check_path(&f)).unwrap();
+        let doc: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(doc["schema"], CHECK_REQUEST_SCHEMA);
+        assert_eq!(doc["requested_by"], "ada");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::metadata(check_path(&f)).unwrap();
+            assert_eq!((m.mode() & 0o777, m.nlink()), (0o600, 1));
+        }
+        // No temp file left behind; the apply request is untouched.
+        let names: Vec<_> = std::fs::read_dir(&f.data)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![CHECK_REQUEST_FILE.to_string()]);
+
+        let v = f.ctl.view(0, false);
+        assert!(v.check_pending && !v.can_check);
+        // Pressing again while it waits is idempotent.
+        assert!(!f.ctl.request_check("ada").unwrap().new);
+        // Pending does not block an apply (root serializes them).
+        assert_eq!(v.apply_blocked_reason, Some("none_available"));
+    }
+
+    #[test]
+    fn check_now_is_throttled() {
+        let f = fixture();
+        write(&f.state, AVAILABLE_FILE, available("0.20.0"));
+        assert!(f.ctl.request_check("ada").unwrap().new);
+        // Root ran it and removed the request; pressing again at once is throttled.
+        std::fs::remove_file(check_path(&f)).unwrap();
+        let e = f.ctl.request_check("ada").unwrap_err();
+        assert_eq!((e.status, e.code), (StatusCode::TOO_MANY_REQUESTS, "throttled"));
+        assert!(!check_path(&f).exists());
+
+        // A check root ran moments ago (the timer, another admin) throttles too.
+        let f = fixture();
+        let mut a = available("0.20.0");
+        a["checked_at"] = json!(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        write(&f.state, AVAILABLE_FILE, a);
+        assert_eq!(f.ctl.request_check("ada").unwrap_err().code, "throttled");
+    }
+
+    #[test]
+    fn a_check_root_never_picks_up_is_stalled_and_replaced() {
+        let f = fixture();
+        write(&f.state, AVAILABLE_FILE, available("0.20.0"));
+        std::fs::write(check_path(&f), b"{}").unwrap();
+        age_file(&check_path(&f), 4 * 60);
+        let v = f.ctl.view(0, false);
+        assert!(v.check_stalled && !v.check_pending && v.can_check);
+        assert!(f.ctl.request_check("ada").unwrap().new);
+        let doc: Value =
+            serde_json::from_slice(&std::fs::read(check_path(&f)).unwrap()).unwrap();
+        assert_eq!(doc["requested_by"], "ada");
+        assert!(f.ctl.view(0, false).check_pending);
     }
 
     #[test]
