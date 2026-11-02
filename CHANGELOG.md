@@ -1,5 +1,21 @@
 # ikenga-desktop
 
+## 0.30.0
+
+### Minor Changes
+
+- 2c144d3: Outbox round 2 (plans/outbox-redesign D-15, D-16, G-CONTRACT r2).
+  
+  - **Email attachments.** `host.paActions.update` accepts `attachments`: up to 20 `{ url, name? }` entries, each URL https. The key is type-checked by the iframe host and by the Rust store (also in the box broker, before the row lookup), merged into `edited_json`, and folded into `item.attachments` on approve.
+  - **Social-queue posts are edited at the source.** An edit to a draft whose item carries `social` no longer touches `edited_json`. The patch (`body`, `firstComment`, `media`, `scheduledIso` only) is applied to `item.social`, the Buffer fields are re-derived exactly as the sender's `buildSocialItem` derives them, and the draft (`awaiting` → `edited`) and its linked `social_queue` row (`content`, `media_url`, `scheduled_for`) are written in one transaction. Edits are checked against the sender's rules and refused as `social_refused: <code>: …` using the sender's problem codes (`over_280`, `x_no_first_comment`, `bad_media_url`, `bad_scheduled_for`, …). X threads are read-only. Golden fixtures generated from the sender's own code pin the derivation.
+- 4e7a593: The Outbox is now one inbox in the outbound pkg. The shell's approve-gate panel is retired, and `/outbox/approvals` (plus the rail, status bar, ⌘K and menu entries) deep-links into the pkg.
+  
+  - **Saved edits merge.** They no longer replace earlier edits.
+  - **Reschedule** moves `scheduled_at`.
+  - **Approving folds every saved edit into the payload**, so the send worker sends what the reviewer saw.
+  - **Reject reasons are stored** in `reject_reason` (migration 0074).
+  - **New `host.paActions.list` verb**, routed through the box broker inside a share. Commit carries `seen`, and reject carries an optional reason.
+
 ## 0.29.1
 
 ### Patch Changes
