@@ -44,6 +44,12 @@ import type { HostRefusalReason } from '@ikenga/contract/rpc';
 import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/app-bridge';
 import { useEffect, useRef, useState } from 'react';
 import { hostDownloadFile, hostOpenLink } from './host-mediated';
+import {
+	draftActionErrorMessage,
+	paActionPatchFromArgs,
+	paDraftSeenFromArgs,
+	rejectReasonFromArgs,
+} from './host-pa-actions';
 import { registerIykeIframe } from '@/lib/iyke/iframe-registry';
 import { usePkgLifecycle } from '@/lib/pkgs/lifecycle';
 import {
@@ -77,6 +83,7 @@ import {
 	isRemoteWebSession,
 	osUsername,
 	paActionsCommit,
+	paActionsList,
 	paActionsReject,
 	paActionsRetry,
 	paActionsUpdate,
@@ -99,7 +106,7 @@ import {
 	type SqlValue,
 	skillRosterRead,
 } from '@/lib/tauri-cmd';
-import { isBrowserHost, isTauri, listen, type UnlistenFn } from '@/lib/transport';
+import { currentShare, isBrowserHost, isTauri, listen, type UnlistenFn } from '@/lib/transport';
 import { open as openDialog } from '@/lib/transport/dialog-shim';
 import { isUnavailableOnServer } from '@/lib/transport/unavailable';
 import {
@@ -899,29 +906,59 @@ export async function dispatchHostCall(
 		}
 	}
 
-	// ─── approve-gate write verbs (host.paActions.*) — WP-18a ───────────────────
-	// Four thin wrappers over the existing, tested `pa_actions_*` Rust commands
-	// (the same ones the /outbox/approvals route calls). The outbound pkg's
-	// bridge extension (bridge.ext.outbound.js) already calls these verb names
-	// (`host.paActions.commit|reject|retry|update`); this closes its dead-verb
-	// gap. The pkg never gets raw write access to pa_action_drafts —
-	// commit/event/wake/normalization stay Rust-owned. Gated on the same
-	// `engine:invoke` scope `host.sendToActiveSession` uses (host.* verbs bypass
-	// kernel scope enforcement, so the check happens here and fails closed). The
-	// bridge helper resolves only when `structuredContent.ok === true`, so
-	// success returns `{ ok: true }` and any failure carries `ok: false` + a
-	// human-readable `error`/`reason`. Each verb operates on a pa_action_drafts
-	// row `id` (the `draftId` argument).
-	if (
-		name === 'host.paActions.commit' ||
-		name === 'host.paActions.reject' ||
-		name === 'host.paActions.retry' ||
-		name === 'host.paActions.update'
-	) {
+	// ─── approve-gate verbs (host.paActions.*) — WP-18a + outbox redesign ───────
+	// Thin wrappers over the tested `pa_actions_*` Rust commands, for the
+	// com.ikenga.outbound pkg — the one Outbox queue since the shell approve-gate
+	// panel was retired (plans/outbox-redesign D-01, frozen shell ↔ pkg contract
+	// G-CONTRACT). The pkg never gets raw write access to pa_action_drafts —
+	// merge/fold/commit/event/wake/normalisation stay Rust-owned. Every verb is
+	// gated on the `engine:invoke` scope `host.sendToActiveSession` uses (host.*
+	// verbs bypass kernel scope enforcement, so the check happens here and fails
+	// closed). The bridge helper resolves only when `structuredContent.ok ===
+	// true`; a failure carries `ok: false`, the raw `error` (share refusals keep
+	// their `<code>: ` prefix, e.g. `draft_changed: …`) and `message`, the same
+	// text as a sentence a person can read (`draftActionErrorMessage`).
+	//
+	//   list({ status? })            → { ok, rows: PaActionDraftRow[], inShare }
+	//   update({ draftId, patch })   → { ok }   patch: contract keys only, typed
+	//   commit({ draftId, seen? })   → { ok }   seen: the row shown (share binding)
+	//   reject({ draftId, reason? }) → { ok }
+	//   retry({ draftId })           → { ok }
+	//
+	// Everything goes through the `paActions*` wrappers, so inside a share the
+	// request rides the share transport and the box broker gates it (Operator
+	// role, per-person outreach rows, the ledger approval on commit).
+	if (name.startsWith('host.paActions.')) {
 		const verb = name.slice('host.paActions.'.length);
-		const draftId = typeof args.draftId === 'string' ? args.draftId : null;
-		if (!draftId) {
+		if (!['list', 'update', 'commit', 'reject', 'retry'].includes(verb)) {
+			return errResult(`unknown host tool: ${name}`);
+		}
+		const draftId = typeof args.draftId === 'string' && args.draftId ? args.draftId : null;
+		if (verb !== 'list' && !draftId) {
 			return errResult(`${name}: missing required \`draftId\` argument`);
+		}
+		if (verb === 'list' && args.status !== undefined && args.status !== null) {
+			if (typeof args.status !== 'string') {
+				return errResult(`${name}: \`status\` must be a string`);
+			}
+		}
+		// Argument shapes are checked before the scope so a malformed call never
+		// reaches the kernel, mirroring the draftId check above.
+		let patch: Parameters<typeof paActionsUpdate>[1] | undefined;
+		let seen: Parameters<typeof paActionsCommit>[1];
+		let reason: string | undefined;
+		if (verb === 'update') {
+			const p = paActionPatchFromArgs(args.patch);
+			if (!p.ok) return errResult(`${name}: ${p.error}`);
+			patch = p.value;
+		} else if (verb === 'commit') {
+			const p = paDraftSeenFromArgs(args.seen);
+			if (!p.ok) return errResult(`${name}: ${p.error}`);
+			seen = p.value;
+		} else if (verb === 'reject') {
+			const p = rejectReasonFromArgs(args.reason);
+			if (!p.ok) return errResult(`${name}: ${p.error}`);
+			reason = p.value;
 		}
 		const engineScope = await pkgDeclaresScope(pkgId, 'engine', 'invoke');
 		if (engineScope.kind === 'unavailable') {
@@ -931,26 +968,27 @@ export async function dispatchHostCall(
 			return scopeDeniedResult(`${name}: pkg lacks the 'engine:invoke' scope`);
 		}
 		try {
+			if (verb === 'list') {
+				const status = typeof args.status === 'string' ? args.status : undefined;
+				const rows = await paActionsList(status);
+				return {
+					content: [{ type: 'text', text: `${rows.length} draft(s)` }],
+					structuredContent: { ok: true, rows, inShare: currentShare() !== null },
+				};
+			}
+			const id = draftId as string;
 			if (verb === 'commit') {
-				await paActionsCommit(draftId);
+				// Outside a share `seen` is not needed; it is passed only when given.
+				await (seen ? paActionsCommit(id, seen) : paActionsCommit(id));
 			} else if (verb === 'reject') {
-				await paActionsReject(draftId);
+				await (reason ? paActionsReject(id, reason) : paActionsReject(id));
 			} else if (verb === 'retry') {
-				await paActionsRetry(draftId);
+				await paActionsRetry(id);
 			} else {
-				// update — the Rust command validates the patch; nothing extra
-				// enforced here. Thread through subject/body when present.
-				const rawPatch =
-					args.patch && typeof args.patch === 'object'
-						? (args.patch as Record<string, unknown>)
-						: {};
-				const patch: { subject?: string; body?: string } = {};
-				if (typeof rawPatch.subject === 'string') patch.subject = rawPatch.subject;
-				if (typeof rawPatch.body === 'string') patch.body = rawPatch.body;
-				await paActionsUpdate(draftId, patch);
+				await paActionsUpdate(id, patch as NonNullable<typeof patch>);
 			}
 			return {
-				content: [{ type: 'text', text: `${verb} ${draftId}` }],
+				content: [{ type: 'text', text: `${verb} ${id}` }],
 				structuredContent: { ok: true },
 			};
 		} catch (e) {
@@ -958,7 +996,7 @@ export async function dispatchHostCall(
 			return {
 				content: [{ type: 'text', text: `${name} failed: ${msg}` }],
 				isError: true,
-				structuredContent: { ok: false, error: msg },
+				structuredContent: { ok: false, error: msg, message: draftActionErrorMessage(e) },
 			};
 		}
 	}

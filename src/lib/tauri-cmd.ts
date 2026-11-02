@@ -5014,13 +5014,16 @@ export async function commentRoute(args: {
 // ─── Approve-gate run-then-pause seam (pa_action_drafts) ──────────────────────
 //
 // Wrappers + event listeners for the approve-gate seam (WP-4). Rust side:
-// src-tauri/src/commands/pa_actions.rs (WP-3); scope:
-// plans/atelier/10-approve-gate-seam.md. The list returns opaque rows — parse
-// `payloadJson`/`editedJson` and derive the PausedDraft view-model with
-// `fromDraftItem` from @ikenga/contract.
+// src-tauri/src/commands/pa_actions.rs (WP-3) over server/shared/pa_actions.rs;
+// scope: plans/atelier/10-approve-gate-seam.md. The queue UI is the
+// com.ikenga.outbound pkg, which reaches these through the `host.paActions.*`
+// verbs (pkg-iframe-host.tsx; contract G-CONTRACT in plans/outbox-redesign).
+// The list returns opaque rows — `payloadJson` is a DraftItem + ApproveGateMeta.
 
 /** One draft row as stored in pa_action_drafts. `payloadJson` is a DraftItem +
- *  ApproveGateMeta; `editedJson` holds operator subject/body overrides.
+ *  ApproveGateMeta; `editedJson` holds the operator's edit (a shallow merge of every
+ *  `paActionsUpdate` patch — see `PaActionDraftPatch`), folded into `payloadJson.item`
+ *  when the draft is committed.
  *  The 0051 columns (claimedAt … deliveryCheckedAt) are written by the external
  *  mutation worker; the shell surfaces them for failure-surfacing (WP-12 / G-09). */
 export interface PaActionDraftRow {
@@ -5048,6 +5051,10 @@ export interface PaActionDraftRow {
 	/** null | accepted | delivered | bounced | complained | errored */
 	deliveryStatus: string | null;
 	deliveryCheckedAt: string | null;
+	// ── 0074 ──────────────────────────────────────────────────────────────────
+	/** Why the operator rejected the draft (`paActionsReject(id, reason)`); null when none
+	 *  was given or the row was never rejected. */
+	rejectReason: string | null;
 	/** Set only by the box broker, only on an `awaiting`/`edited` row seen through a share: the
 	 *  sender's approvals ledger already holds an approval for this draft's current version, so it
 	 *  is about to be sent. Display only; it never gates anything. */
@@ -5102,10 +5109,12 @@ export interface PaActionCommittedEvent {
 }
 export interface PaActionRejectedEvent {
 	draftId: string;
+	/** The stored reason; absent when the reject carried none. */
+	reason?: string;
 }
 
 /** List drafts in the gate. Defaults to the active set (awaiting/edited/
- *  committed); pass a status to filter (e.g. 'sent', 'rejected'). */
+ *  committed/failed); pass a status to filter (e.g. 'sent', 'rejected'). */
 export async function paActionsList(status?: string): Promise<PaActionDraftRow[]> {
 	return invoke<PaActionDraftRow[]>('pa_actions_list', { status: status ?? null });
 }
@@ -5120,11 +5129,29 @@ export async function paActionsPause(
 	return invoke<number>('pa_actions_pause', { batchId, actionId, drafts });
 }
 
-/** Persist operator inline edits ({ subject?, body? }) onto a draft. */
-export async function paActionsUpdate(
-	draftId: string,
-	patch: { subject?: string; body?: string }
-): Promise<void> {
+/** Social media block of an edit — the editable part of contract `SocialMedia`. */
+export interface PaActionDraftMediaPatch {
+	kind: 'single' | 'carousel' | 'thread';
+	imageUrls: string[];
+}
+
+/** An operator edit (G-CONTRACT, plans/outbox-redesign). Keys are DraftItem field
+ *  names; the store shallow-merges them into `editedJson` and folds them into
+ *  `payloadJson.item` on commit. `scheduledIso` also rewrites `scheduledAt`
+ *  (normalised to UTC; `null` = unscheduled). */
+export interface PaActionDraftPatch {
+	subject?: string;
+	body?: string;
+	subjectB?: string;
+	preheader?: string;
+	firstComment?: string;
+	hashtags?: string[];
+	media?: PaActionDraftMediaPatch;
+	scheduledIso?: string | null;
+}
+
+/** Persist operator edits onto a draft (shallow merge into `editedJson`). */
+export async function paActionsUpdate(draftId: string, patch: PaActionDraftPatch): Promise<void> {
 	return invoke('pa_actions_update', { draftId, patch });
 }
 
@@ -5149,9 +5176,10 @@ export async function paActionsCommit(draftId: string, seen?: PaDraftSeen): Prom
 	return invoke('pa_actions_commit', seen ? { draftId, seen } : { draftId });
 }
 
-/** Reject a draft. Flips it to rejected + emits `pa-action-rejected`. */
-export async function paActionsReject(draftId: string): Promise<void> {
-	return invoke('pa_actions_reject', { draftId });
+/** Reject a draft, optionally saying why (stored as `rejectReason`). Flips it to
+ *  rejected + emits `pa-action-rejected`. */
+export async function paActionsReject(draftId: string, reason?: string): Promise<void> {
+	return invoke('pa_actions_reject', reason ? { draftId, reason } : { draftId });
 }
 
 /** Re-queue a failed draft for another send attempt (WP-12 / G-09).
