@@ -734,12 +734,13 @@ pub(super) async fn pa_actions_list(state: &AppState, args: &Value) -> RpcRespon
 pub(super) async fn pa_actions_update(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let draft_id: String = targ(args, &["draftId", "draft_id"])?;
-        // Tauri's `patch: Value` takes JSON null as a value; read it raw.
-        let patch = args
-            .get("patch")
-            .cloned()
-            .ok_or_else(|| pa_actions::PATCH_REQUIRED.to_string())?;
-        pa_actions::update(pa_db(state)?, &draft_id, &patch).await
+        // Tauri's `patch: Value` takes JSON null as a value; read it raw. The
+        // shape is checked before the DB is (`patch_error`), as the broker does.
+        let patch = args.get("patch");
+        if let Some(e) = pa_actions::patch_error(patch) {
+            return Err(e.to_string());
+        }
+        pa_actions::update(pa_db(state)?, &draft_id, patch.expect("checked")).await
     }
     .await;
     respond("pa_actions_update", r)
@@ -776,10 +777,13 @@ pub(super) async fn pa_actions_retry(state: &AppState, args: &Value) -> RpcRespo
 pub(super) async fn pa_actions_reject(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let draft_id: String = targ(args, &["draftId", "draft_id"])?;
-        pa_actions::reject(pa_db(state)?, &draft_id).await?;
+        // Read leniently: a reason that is not a string is no reason, never a
+        // refusal (that would answer a hidden draft and a missing one apart).
+        let reason = args.get("reason").and_then(Value::as_str);
+        let reason = pa_actions::reject(pa_db(state)?, &draft_id, reason).await?;
         state.events.publish(
             Topic::PaActionRejected,
-            pa_actions::PaActionRejectedEvent { draft_id },
+            pa_actions::PaActionRejectedEvent { draft_id, reason },
         );
         Ok(())
     }

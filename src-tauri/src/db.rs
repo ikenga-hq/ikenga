@@ -688,6 +688,12 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0073_chi_cache_tool_policy",
         include_str!("../migrations/0073_chi_cache_tool_policy.sql"),
     ),
+    // why a pa_action_drafts row was rejected (outbox redesign D-05)
+    (
+        74,
+        "0074_pa_action_reject_reason",
+        include_str!("../migrations/0074_pa_action_reject_reason.sql"),
+    ),
 ];
 
 /// Embedded migration set, kept in lockstep with `migrations/*.sql`. Tracked

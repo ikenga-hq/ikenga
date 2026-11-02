@@ -93,8 +93,10 @@ pub async fn pa_actions_list(
     core::list(&db, status.as_deref()).await
 }
 
-/// Persist operator inline edits (`{ subject?, body? }`) into `edited_json` and
-/// move an `awaiting` row to `edited`. Only editable while in the gate.
+/// Shallow-merge operator edits (`{ subject?, body?, subjectB?, preheader?,
+/// firstComment?, hashtags?, media?, scheduledIso? }`) into `edited_json` and
+/// move an `awaiting` row to `edited`; `scheduledIso` also rewrites
+/// `scheduled_at`. Only editable while in the gate.
 #[tauri::command]
 pub async fn pa_actions_update(
     db: State<'_, Arc<PaDb>>,
@@ -104,8 +106,9 @@ pub async fn pa_actions_update(
     core::update(&db, &draft_id, &patch).await
 }
 
-/// Commit a draft (post-undo). Flips it to `committed`, stamps `committed_at`,
-/// and emits `pa-action-committed` with the channel + payload for the external
+/// Commit a draft (post-undo). Folds the operator's edit into
+/// `payload_json.item`, flips it to `committed`, stamps `committed_at`, and
+/// emits `pa-action-committed` with the channel + payload for the external
 /// mutation worker. The shell does NOT perform the send.
 #[tauri::command]
 pub async fn pa_actions_commit(
@@ -161,19 +164,22 @@ pub async fn pa_actions_retry(
     Ok(())
 }
 
-/// Reject a draft. Flips it to `rejected` and emits `pa-action-rejected` so the
-/// producing action can terminate cleanly.
+/// Reject a draft, storing the operator's optional `reason` in `reject_reason`.
+/// Flips it to `rejected` and emits `pa-action-rejected` so the producing action
+/// can terminate cleanly.
 #[tauri::command]
 pub async fn pa_actions_reject(
     app: AppHandle,
     db: State<'_, Arc<PaDb>>,
     draft_id: String,
+    reason: Option<String>,
 ) -> Result<(), String> {
-    core::reject(&db, &draft_id).await?;
+    let reason = core::reject(&db, &draft_id, reason.as_deref()).await?;
     let _ = app.emit(
         "pa-action-rejected",
         PaActionRejectedEvent {
             draft_id: draft_id.clone(),
+            reason,
         },
     );
     Ok(())
