@@ -30,6 +30,7 @@ import { isMacPlatform, toAccelerator } from '@/lib/keymap/platform';
 import { modeForRoute } from '@/lib/shell/mode-routes';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { usePaneStore } from '@/lib/panes/pane-store';
+import { OUTBOX_APPROVALS_ROUTE } from '@/shell/outbox-deeplink';
 import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
 
 /** OS-predefined items — macOS renders these via Tauri's `PredefinedMenuItem`
@@ -142,7 +143,7 @@ const NATIVE_ONLY_ACTIONS: Readonly<Record<string, () => void>> = {
 	'menu.new-terminal': () => newSessionTab('terminal'),
 	'session.switch-adapter': () => emit(EVT.switchAdapter),
 	'project.project-settings': () => goto('/settings/projects'),
-	'chi.permission-inbox': () => goto('/outbox/approvals'),
+	'chi.permission-inbox': () => goto(OUTBOX_APPROVALS_ROUTE),
 	'chi.runs': () => goto('/automations?view=runs'),
 	'ngwa.installed': () => goto('/ngwa/installed'),
 	'ngwa.store': () => goto('/ngwa/store'),
