@@ -11,6 +11,11 @@
 // `terminals_open` with the new count and the dialog re-opens with it. Root
 // does the update (scripts/server/provision.sh apply-request); this panel
 // polls its status file through the server and shows the outcome.
+//
+// [Check now] asks root to run the release check at once instead of waiting
+// for the daily timer (provision.sh check-request). The server throttles it to
+// once a minute; a request root never picks up (units older than the button)
+// shows how to install them.
 
 import { useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Download, ExternalLink, Loader2, RefreshCw } from 'lucide-react';
@@ -25,11 +30,13 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from '@/components/ui/dialog';
-import { queryKeys } from '@/lib/query-keys';
 import { needsReload, useServerUpdate } from '@/lib/queries/server-update';
+import { queryKeys } from '@/lib/query-keys';
 import {
 	type ApplyServerUpdateResult,
 	applyServerUpdate,
+	type CheckServerUpdateResult,
+	requestServerUpdateCheck,
 	type ServerUpdateBlockedReason,
 	type ServerUpdateRun,
 	type ServerUpdateView,
@@ -59,6 +66,12 @@ const APPLY_ERROR_COPY: Record<string, string> = {
 	unsupported: BLOCKED_REASON_COPY.unsupported,
 };
 
+const CHECK_ERROR_COPY: Record<string, string> = {
+	throttled: 'The server checked moments ago. Try again in a minute.',
+	forbidden: 'Only an administrator can check for updates.',
+	unsupported: BLOCKED_REASON_COPY.unsupported,
+};
+
 const RUN_STATE_COPY: Record<ServerUpdateRun['state'], string> = {
 	running: 'Running',
 	succeeded: 'Updated',
@@ -85,6 +98,7 @@ export function ServerUpdatePanel() {
 			view={view}
 			reloadNeeded={needsReload(view)}
 			apply={applyServerUpdate}
+			check={requestServerUpdateCheck}
 			onChanged={() => void queryClient.invalidateQueries({ queryKey: queryKeys.serverUpdate.all })}
 		/>
 	);
@@ -94,6 +108,7 @@ export function ServerUpdateCard({
 	view,
 	reloadNeeded,
 	apply,
+	check,
 	onChanged,
 }: {
 	view: ServerUpdateView;
@@ -102,17 +117,32 @@ export function ServerUpdateCard({
 		version: string;
 		acknowledgedOpenTerminals: number;
 	}) => Promise<ApplyServerUpdateResult>;
+	/** "Check now"; the button is hidden without it. */
+	check?: () => Promise<CheckServerUpdateResult>;
 	onChanged: () => void;
 }) {
 	/** The terminal count the open confirm shows (and will acknowledge). */
 	const [confirmCount, setConfirmCount] = useState<number | null>(null);
 	const [sending, setSending] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+	const [checking, setChecking] = useState(false);
+	const [checkError, setCheckError] = useState<string | null>(null);
 
 	const available = view.available;
 	const run = view.last_run;
 	const running = run?.state === 'running' || view.pending_request !== null;
 	const blockedReason = view.apply_blocked_reason;
+
+	async function checkNow() {
+		if (!check) return;
+		setChecking(true);
+		setCheckError(null);
+		const result = await check();
+		setChecking(false);
+		if (!result.ok) setCheckError(CHECK_ERROR_COPY[result.code] ?? result.message);
+		onChanged();
+	}
+	const checkPending = checking || view.check_pending;
 
 	async function confirm() {
 		if (!available || confirmCount === null) return;
@@ -171,12 +201,62 @@ export function ServerUpdateCard({
 						)}
 					</div>
 
-					<div className="font-mono text-[11px] text-muted-foreground/80">
-						Last checked {isoRelative(view.checked_at)}
-						{view.check_error && (
-							<span className="text-[var(--danger)]"> · check failed: {view.check_error}</span>
+					<div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+						<span className="font-mono text-[11px] text-muted-foreground/80">
+							{checkPending ? (
+								'Checking for updates…'
+							) : (
+								<>Last checked {isoRelative(view.checked_at)}</>
+							)}
+							{!checkPending && view.check_error && (
+								<span className="text-[var(--danger)]"> · check failed: {view.check_error}</span>
+							)}
+						</span>
+						{check && (
+							<Button
+								size="sm"
+								variant="ghost"
+								className="h-6 px-2 text-xs"
+								data-testid="server-update-check"
+								disabled={checkPending || !view.can_check}
+								onClick={() => void checkNow()}
+							>
+								{checkPending ? (
+									<Loader2 className="mr-1 size-3 animate-spin" />
+								) : (
+									<RefreshCw className="mr-1 size-3" />
+								)}
+								Check now
+							</Button>
 						)}
 					</div>
+
+					{checkError && (
+						<p
+							role="alert"
+							className="text-xs text-[var(--danger)]"
+							data-testid="server-update-check-error"
+						>
+							{checkError}
+						</p>
+					)}
+
+					{view.check_stalled && !checkPending && (
+						<p
+							className="flex items-start gap-2 text-xs text-muted-foreground"
+							data-testid="server-update-check-stalled"
+						>
+							<AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+							<span>
+								The server never ran the last check: its update units are older than this button.
+								Someone with root installs them once with{' '}
+								<code className="font-mono">
+									sudo scripts/server/provision.sh install-update-units
+								</code>{' '}
+								from a current checkout.
+							</span>
+						</p>
+					)}
 
 					{available?.blocked && (
 						<p

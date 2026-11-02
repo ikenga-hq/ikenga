@@ -8,6 +8,7 @@ import {
 	applyServerUpdate,
 	fetchServerUpdate,
 	isServerUpdateInFlight,
+	requestServerUpdateCheck,
 	ServerUnreachableError,
 } from './server-update';
 import { serverUpdateRun, serverUpdateView } from './server-update.fixtures';
@@ -115,6 +116,38 @@ describe('applyServerUpdate', () => {
 		__setT1SessionForTests(true, { principal_id: 'p', username: 'bob', is_admin: false });
 		const r = await applyServerUpdate({ version: '0.21.0', acknowledgedOpenTerminals: 0 });
 		expect(r.ok).toBe(false);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+});
+
+describe('requestServerUpdateCheck', () => {
+	it('POSTs with the operator bearer and reports success', async () => {
+		fetchMock.mockResolvedValueOnce(json({ ok: true, data: { state: 'queued' } }, 202));
+		expect(await requestServerUpdateCheck()).toEqual({ ok: true });
+		const [url, init] = fetchMock.mock.calls[0];
+		expect(url).toBe('/api/server/update/check');
+		expect(init?.method).toBe('POST');
+		expect((init?.headers as Record<string, string>).Authorization).toBe('Bearer op-token');
+	});
+
+	it('types a throttled refusal and a network failure', async () => {
+		fetchMock.mockResolvedValueOnce(
+			json({ ok: false, code: 'throttled', error: 'moments ago' }, 429)
+		);
+		expect(await requestServerUpdateCheck()).toEqual({
+			ok: false,
+			code: 'throttled',
+			message: 'moments ago',
+		});
+		fetchMock.mockRejectedValueOnce(new TypeError('offline'));
+		expect((await requestServerUpdateCheck()) as { code: string }).toMatchObject({
+			code: 'network',
+		});
+	});
+
+	it('never asks for a T1 member', async () => {
+		__setT1SessionForTests(true, { principal_id: 'p', username: 'bob', is_admin: false });
+		expect((await requestServerUpdateCheck()).ok).toBe(false);
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 });
