@@ -58,6 +58,7 @@ pub mod seats;
 pub mod settings;
 pub mod settings_cascade;
 pub mod shell_detect;
+pub mod social_draft;
 pub mod sidecar_call;
 pub mod studio_threads;
 pub mod supabase_config;

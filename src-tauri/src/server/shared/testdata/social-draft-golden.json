@@ -1,0 +1,632 @@
+{
+  "_generated": "tsx src-tauri/src/server/shared/testdata/gen-social-draft-golden.mts <royalti-co>/scripts/cron/lib/social-draft.ts (see the script header)",
+  "build": [
+    {
+      "name": "linkedin, comment, image, scheduled",
+      "draftId": "social-post:q-li-1",
+      "channelId": "69c034d8af47dacb6943e6d6",
+      "canon": {
+        "account": "royalti-io",
+        "media_url": "https://cdn.royalti.io/social/launch.png",
+        "scheduled_for": "2099-03-04T09:30:00.000Z",
+        "platform": "linkedin",
+        "content": "We shipped royalty splits.\n\n---firstcomment---\nhttps://royalti.io/blog #MusicBiz"
+      },
+      "stable": "{\"body\":\"We shipped royalty splits.\",\"channel\":\"buffer\",\"channelId\":\"69c034d8af47dacb6943e6d6\",\"firstComment\":\"https://royalti.io/blog #MusicBiz\",\"fromProvider\":\"Buffer\",\"id\":\"social-post:q-li-1\",\"media\":{\"imageUrls\":[\"https://cdn.royalti.io/social/launch.png\"],\"kind\":\"single\"},\"recipient\":\"linkedin:royalti-io\",\"recipientEmail\":null,\"scheduledIso\":\"2099-03-04T09:30:00.000Z\",\"scheduledLabel\":\"2099-03-04T09:30:00.000Z\",\"senderAddress\":\"linkedin:royalti-io\",\"social\":{\"account\":\"royalti-io\",\"content\":\"We shipped royalty splits.\\n\\n---firstcomment---\\nhttps://royalti.io/blog #MusicBiz\",\"media_url\":\"https://cdn.royalti.io/social/launch.png\",\"platform\":\"linkedin\",\"scheduled_for\":\"2099-03-04T09:30:00.000Z\"},\"subject\":\"\",\"threadCount\":\"\"}"
+    },
+    {
+      "name": "linkedin, no comment, no image, unscheduled",
+      "draftId": "social-post:q-li-2",
+      "channelId": "69c034d8af47dacb6943e6d6",
+      "canon": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "Plain post, nothing else."
+      },
+      "stable": "{\"body\":\"Plain post, nothing else.\",\"channel\":\"buffer\",\"channelId\":\"69c034d8af47dacb6943e6d6\",\"fromProvider\":\"Buffer\",\"id\":\"social-post:q-li-2\",\"recipient\":\"linkedin:royalti-io\",\"recipientEmail\":null,\"scheduledIso\":null,\"scheduledLabel\":\"next sender run\",\"senderAddress\":\"linkedin:royalti-io\",\"social\":{\"account\":\"royalti-io\",\"content\":\"Plain post, nothing else.\",\"media_url\":null,\"platform\":\"linkedin\",\"scheduled_for\":null},\"subject\":\"\",\"threadCount\":\"\"}"
+    },
+    {
+      "name": "linkedin personal, comment (padded, mixed-case marker), no image, unscheduled",
+      "draftId": "social-post:q-li-3",
+      "channelId": "69c23e43af47dacb694bbba5",
+      "canon": {
+        "account": "personal",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "Body line one\nBody line two   \n\n  ---FirstComment---  \n\n  the comment\n  second line  \n"
+      },
+      "stable": "{\"body\":\"Body line one\\nBody line two\",\"channel\":\"buffer\",\"channelId\":\"69c23e43af47dacb694bbba5\",\"firstComment\":\"the comment\\n  second line\",\"fromProvider\":\"Buffer\",\"id\":\"social-post:q-li-3\",\"recipient\":\"linkedin:personal\",\"recipientEmail\":null,\"scheduledIso\":null,\"scheduledLabel\":\"next sender run\",\"senderAddress\":\"linkedin:personal\",\"social\":{\"account\":\"personal\",\"content\":\"Body line one\\nBody line two   \\n\\n  ---FirstComment---  \\n\\n  the comment\\n  second line  \\n\",\"media_url\":null,\"platform\":\"linkedin\",\"scheduled_for\":null},\"subject\":\"\",\"threadCount\":\"\"}"
+    },
+    {
+      "name": "linkedin company, no comment, image, scheduled",
+      "draftId": "social-post:q-li-4",
+      "channelId": "69c034d8af47dacb6943e6d6",
+      "canon": {
+        "account": "company",
+        "media_url": "https://cdn.royalti.io/social/second.jpg",
+        "scheduled_for": "2099-05-06T17:45:00.000Z",
+        "platform": "linkedin",
+        "content": "Image-only announcement"
+      },
+      "stable": "{\"body\":\"Image-only announcement\",\"channel\":\"buffer\",\"channelId\":\"69c034d8af47dacb6943e6d6\",\"fromProvider\":\"Buffer\",\"id\":\"social-post:q-li-4\",\"media\":{\"imageUrls\":[\"https://cdn.royalti.io/social/second.jpg\"],\"kind\":\"single\"},\"recipient\":\"linkedin:company\",\"recipientEmail\":null,\"scheduledIso\":\"2099-05-06T17:45:00.000Z\",\"scheduledLabel\":\"2099-05-06T17:45:00.000Z\",\"senderAddress\":\"linkedin:company\",\"social\":{\"account\":\"company\",\"content\":\"Image-only announcement\",\"media_url\":\"https://cdn.royalti.io/social/second.jpg\",\"platform\":\"linkedin\",\"scheduled_for\":\"2099-05-06T17:45:00.000Z\"},\"subject\":\"\",\"threadCount\":\"\"}"
+    },
+    {
+      "name": "x single post (platform \"x\"), unscheduled",
+      "draftId": "social-post:q-x-1",
+      "channelId": "631318f83cc20753ba813080",
+      "canon": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "x",
+        "content": "Short and sweet on X."
+      },
+      "stable": "{\"body\":\"Short and sweet on X.\",\"channel\":\"buffer\",\"channelId\":\"631318f83cc20753ba813080\",\"fromProvider\":\"Buffer\",\"id\":\"social-post:q-x-1\",\"recipient\":\"x:royalti-io\",\"recipientEmail\":null,\"scheduledIso\":null,\"scheduledLabel\":\"next sender run\",\"senderAddress\":\"x:royalti-io\",\"social\":{\"account\":\"royalti-io\",\"content\":\"Short and sweet on X.\",\"media_url\":null,\"platform\":\"x\",\"scheduled_for\":null},\"subject\":\"\",\"threadCount\":\"\"}"
+    },
+    {
+      "name": "twitter single post with image and emoji at exactly 280 UTF-16 units",
+      "draftId": "social-post:q-x-2",
+      "channelId": "631318f83cc20753ba813080",
+      "canon": {
+        "account": "royalti-io",
+        "media_url": "https://cdn.royalti.io/social/launch.png",
+        "scheduled_for": "2099-03-04T09:30:00.000Z",
+        "platform": "twitter",
+        "content": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa😀"
+      },
+      "stable": "{\"body\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa😀\",\"channel\":\"buffer\",\"channelId\":\"631318f83cc20753ba813080\",\"fromProvider\":\"Buffer\",\"id\":\"social-post:q-x-2\",\"media\":{\"imageUrls\":[\"https://cdn.royalti.io/social/launch.png\"],\"kind\":\"single\"},\"recipient\":\"twitter:royalti-io\",\"recipientEmail\":null,\"scheduledIso\":\"2099-03-04T09:30:00.000Z\",\"scheduledLabel\":\"2099-03-04T09:30:00.000Z\",\"senderAddress\":\"twitter:royalti-io\",\"social\":{\"account\":\"royalti-io\",\"content\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa😀\",\"media_url\":\"https://cdn.royalti.io/social/launch.png\",\"platform\":\"twitter\",\"scheduled_for\":\"2099-03-04T09:30:00.000Z\"},\"subject\":\"\",\"threadCount\":\"\"}"
+    },
+    {
+      "name": "x thread with an image on the first tweet (derived, not editable)",
+      "draftId": "social-post:q-x-3",
+      "channelId": "631318f83cc20753ba813080",
+      "canon": {
+        "account": "royalti-io",
+        "media_url": "https://cdn.royalti.io/social/launch.png",
+        "scheduled_for": null,
+        "platform": "x",
+        "content": "Tweet one\n\n---\n\nTweet two\n\n---\n\nTweet three"
+      },
+      "stable": "{\"body\":\"Tweet one\\n\\n---\\n\\nTweet two\\n\\n---\\n\\nTweet three\",\"channel\":\"buffer\",\"channelId\":\"631318f83cc20753ba813080\",\"fromProvider\":\"Buffer\",\"id\":\"social-post:q-x-3\",\"media\":{\"kind\":\"thread\",\"thread\":[{\"imageUrls\":[\"https://cdn.royalti.io/social/launch.png\"],\"text\":\"Tweet one\"},{\"text\":\"Tweet two\"},{\"text\":\"Tweet three\"}]},\"recipient\":\"x:royalti-io\",\"recipientEmail\":null,\"scheduledIso\":null,\"scheduledLabel\":\"next sender run\",\"senderAddress\":\"x:royalti-io\",\"social\":{\"account\":\"royalti-io\",\"content\":\"Tweet one\\n\\n---\\n\\nTweet two\\n\\n---\\n\\nTweet three\",\"media_url\":\"https://cdn.royalti.io/social/launch.png\",\"platform\":\"x\",\"scheduled_for\":null},\"subject\":\"\",\"threadCount\":\"3\"}"
+    },
+    {
+      "name": "instagram with image and a ---hashtags--- comment",
+      "draftId": "social-post:q-ig-1",
+      "channelId": "6310c4f07ebd08090ac74e4c",
+      "canon": {
+        "account": "royalti-io",
+        "media_url": "https://cdn.royalti.io/social/launch.png",
+        "scheduled_for": "2099-03-04T09:30:00.000Z",
+        "platform": "instagram",
+        "content": "Studio day ✨\n---hashtags---\n#studio #royalti"
+      },
+      "stable": "{\"body\":\"Studio day ✨\",\"channel\":\"buffer\",\"channelId\":\"6310c4f07ebd08090ac74e4c\",\"firstComment\":\"#studio #royalti\",\"fromProvider\":\"Buffer\",\"id\":\"social-post:q-ig-1\",\"media\":{\"imageUrls\":[\"https://cdn.royalti.io/social/launch.png\"],\"kind\":\"single\"},\"recipient\":\"instagram:royalti-io\",\"recipientEmail\":null,\"scheduledIso\":\"2099-03-04T09:30:00.000Z\",\"scheduledLabel\":\"2099-03-04T09:30:00.000Z\",\"senderAddress\":\"instagram:royalti-io\",\"social\":{\"account\":\"royalti-io\",\"content\":\"Studio day ✨\\n---hashtags---\\n#studio #royalti\",\"media_url\":\"https://cdn.royalti.io/social/launch.png\",\"platform\":\"instagram\",\"scheduled_for\":\"2099-03-04T09:30:00.000Z\"},\"subject\":\"\",\"threadCount\":\"\"}"
+    },
+    {
+      "name": "instagram with image, no comment",
+      "draftId": "social-post:q-ig-2",
+      "channelId": "6310c4f07ebd08090ac74e4c",
+      "canon": {
+        "account": "royalti-io",
+        "media_url": "https://cdn.royalti.io/social/second.jpg",
+        "scheduled_for": null,
+        "platform": "instagram",
+        "content": "Just the picture."
+      },
+      "stable": "{\"body\":\"Just the picture.\",\"channel\":\"buffer\",\"channelId\":\"6310c4f07ebd08090ac74e4c\",\"fromProvider\":\"Buffer\",\"id\":\"social-post:q-ig-2\",\"media\":{\"imageUrls\":[\"https://cdn.royalti.io/social/second.jpg\"],\"kind\":\"single\"},\"recipient\":\"instagram:royalti-io\",\"recipientEmail\":null,\"scheduledIso\":null,\"scheduledLabel\":\"next sender run\",\"senderAddress\":\"instagram:royalti-io\",\"social\":{\"account\":\"royalti-io\",\"content\":\"Just the picture.\",\"media_url\":\"https://cdn.royalti.io/social/second.jpg\",\"platform\":\"instagram\",\"scheduled_for\":null},\"subject\":\"\",\"threadCount\":\"\"}"
+    }
+  ],
+  "validate": [
+    {
+      "name": "valid linkedin",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "ok"
+      },
+      "codes": []
+    },
+    {
+      "name": "x with a first comment",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "x",
+        "content": "body\n---firstcomment---\ncomment"
+      },
+      "codes": [
+        "x_no_first_comment"
+      ]
+    },
+    {
+      "name": "x over 280",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "x",
+        "content": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "codes": [
+        "over_280"
+      ]
+    },
+    {
+      "name": "x 279 + emoji is over 280",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "x",
+        "content": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb😀"
+      },
+      "codes": [
+        "over_280"
+      ]
+    },
+    {
+      "name": "x exactly 280 with emoji",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "x",
+        "content": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa😀"
+      },
+      "codes": []
+    },
+    {
+      "name": "x ---tweet--- delimiter",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "twitter",
+        "content": "one ---TWEET--- two"
+      },
+      "codes": [
+        "wrong_thread_delimiter"
+      ]
+    },
+    {
+      "name": "x thread with an empty and an over-long tweet",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "x",
+        "content": "one\n\n---\n\n   \n\n---\n\ncccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "codes": [
+        "empty_thread_segment",
+        "over_280"
+      ]
+    },
+    {
+      "name": "http media",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": "http://a.b/c.png",
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "x"
+      },
+      "codes": [
+        "bad_media_url"
+      ]
+    },
+    {
+      "name": "media with a space",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": "https://a.b/c d.png",
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "x"
+      },
+      "codes": [
+        "bad_media_url"
+      ]
+    },
+    {
+      "name": "media padded",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": " https://a.b/c.png",
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "x"
+      },
+      "codes": [
+        "bad_media_url"
+      ]
+    },
+    {
+      "name": "media blank",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": "",
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "x"
+      },
+      "codes": [
+        "bad_media_url"
+      ]
+    },
+    {
+      "name": "media not a url",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": "nota url",
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "x"
+      },
+      "codes": [
+        "bad_media_url"
+      ]
+    },
+    {
+      "name": "media not a url, no space",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": "cdn.royalti.io/x.png",
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "x"
+      },
+      "codes": [
+        "bad_media_url"
+      ]
+    },
+    {
+      "name": "media credentials",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": "https://u:p@a.b/c.png",
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "x"
+      },
+      "codes": [
+        "bad_media_url"
+      ]
+    },
+    {
+      "name": "media too long",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": "https://a.b/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "x"
+      },
+      "codes": [
+        "bad_media_url"
+      ]
+    },
+    {
+      "name": "empty content",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": " \n\t "
+      },
+      "codes": [
+        "empty_content"
+      ]
+    },
+    {
+      "name": "empty body before the marker",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "  \n---firstcomment---\nc"
+      },
+      "codes": [
+        "empty_content"
+      ]
+    },
+    {
+      "name": "marker with nothing after it",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "b\n---firstcomment---\n  \n"
+      },
+      "codes": [
+        "empty_first_comment"
+      ]
+    },
+    {
+      "name": "two markers",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "b\n---firstcomment---\nc\n---hashtags---\n#d"
+      },
+      "codes": [
+        "multiple_markers"
+      ]
+    },
+    {
+      "name": "unknown channel",
+      "channelKnown": false,
+      "canon": {
+        "account": "nobody",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "b"
+      },
+      "codes": [
+        "unknown_channel"
+      ]
+    },
+    {
+      "name": "BOM-only content is empty",
+      "channelKnown": true,
+      "canon": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "﻿"
+      },
+      "codes": [
+        "empty_content"
+      ]
+    }
+  ],
+  "edit": [
+    {
+      "name": "linkedin: new body and comment, image swapped, rescheduled with an offset",
+      "draftId": "social-post:q-e-1",
+      "before": {
+        "id": "social-post:q-e-1",
+        "recipient": "linkedin:royalti-io",
+        "recipientEmail": null,
+        "subject": "",
+        "body": "We shipped royalty splits.",
+        "channel": "buffer",
+        "channelId": "69c034d8af47dacb6943e6d6",
+        "senderAddress": "linkedin:royalti-io",
+        "fromProvider": "Buffer",
+        "scheduledIso": "2099-03-04T09:30:00.000Z",
+        "scheduledLabel": "2099-03-04T09:30:00.000Z",
+        "threadCount": "",
+        "firstComment": "https://royalti.io/blog #MusicBiz",
+        "media": {
+          "kind": "single",
+          "imageUrls": [
+            "https://cdn.royalti.io/social/launch.png"
+          ]
+        },
+        "social": {
+          "account": "royalti-io",
+          "media_url": "https://cdn.royalti.io/social/launch.png",
+          "scheduled_for": "2099-03-04T09:30:00.000Z",
+          "platform": "linkedin",
+          "content": "We shipped royalty splits.\n\n---firstcomment---\nhttps://royalti.io/blog #MusicBiz"
+        }
+      },
+      "patch": {
+        "body": "We shipped royalty splits, now with payouts.",
+        "firstComment": "Read more: https://royalti.io/blog/splits",
+        "media": {
+          "kind": "single",
+          "imageUrls": [
+            "https://cdn.royalti.io/social/second.jpg"
+          ]
+        },
+        "scheduledIso": "2099-03-05T10:00:00+01:00"
+      },
+      "after": {
+        "account": "royalti-io",
+        "media_url": "https://cdn.royalti.io/social/second.jpg",
+        "scheduled_for": "2099-03-05T09:00:00.000Z",
+        "platform": "linkedin",
+        "content": "We shipped royalty splits, now with payouts.\n---firstcomment---\nRead more: https://royalti.io/blog/splits"
+      },
+      "stable": "{\"body\":\"We shipped royalty splits, now with payouts.\",\"channel\":\"buffer\",\"channelId\":\"69c034d8af47dacb6943e6d6\",\"firstComment\":\"Read more: https://royalti.io/blog/splits\",\"fromProvider\":\"Buffer\",\"id\":\"social-post:q-e-1\",\"media\":{\"imageUrls\":[\"https://cdn.royalti.io/social/second.jpg\"],\"kind\":\"single\"},\"recipient\":\"linkedin:royalti-io\",\"recipientEmail\":null,\"scheduledIso\":\"2099-03-05T09:00:00.000Z\",\"scheduledLabel\":\"2099-03-05T09:00:00.000Z\",\"senderAddress\":\"linkedin:royalti-io\",\"social\":{\"account\":\"royalti-io\",\"content\":\"We shipped royalty splits, now with payouts.\\n---firstcomment---\\nRead more: https://royalti.io/blog/splits\",\"media_url\":\"https://cdn.royalti.io/social/second.jpg\",\"platform\":\"linkedin\",\"scheduled_for\":\"2099-03-05T09:00:00.000Z\"},\"subject\":\"\",\"threadCount\":\"\"}"
+    },
+    {
+      "name": "linkedin: comment removed, image removed, unscheduled",
+      "draftId": "social-post:q-e-2",
+      "before": {
+        "id": "social-post:q-e-2",
+        "recipient": "linkedin:royalti-io",
+        "recipientEmail": null,
+        "subject": "",
+        "body": "We shipped royalty splits.",
+        "channel": "buffer",
+        "channelId": "69c034d8af47dacb6943e6d6",
+        "senderAddress": "linkedin:royalti-io",
+        "fromProvider": "Buffer",
+        "scheduledIso": "2099-03-04T09:30:00.000Z",
+        "scheduledLabel": "2099-03-04T09:30:00.000Z",
+        "threadCount": "",
+        "firstComment": "https://royalti.io/blog #MusicBiz",
+        "media": {
+          "kind": "single",
+          "imageUrls": [
+            "https://cdn.royalti.io/social/launch.png"
+          ]
+        },
+        "social": {
+          "account": "royalti-io",
+          "media_url": "https://cdn.royalti.io/social/launch.png",
+          "scheduled_for": "2099-03-04T09:30:00.000Z",
+          "platform": "linkedin",
+          "content": "We shipped royalty splits.\n\n---firstcomment---\nhttps://royalti.io/blog #MusicBiz"
+        }
+      },
+      "patch": {
+        "firstComment": "",
+        "media": {
+          "kind": "single",
+          "imageUrls": []
+        },
+        "scheduledIso": null
+      },
+      "after": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "We shipped royalty splits."
+      },
+      "stable": "{\"body\":\"We shipped royalty splits.\",\"channel\":\"buffer\",\"channelId\":\"69c034d8af47dacb6943e6d6\",\"fromProvider\":\"Buffer\",\"id\":\"social-post:q-e-2\",\"recipient\":\"linkedin:royalti-io\",\"recipientEmail\":null,\"scheduledIso\":null,\"scheduledLabel\":\"next sender run\",\"senderAddress\":\"linkedin:royalti-io\",\"social\":{\"account\":\"royalti-io\",\"content\":\"We shipped royalty splits.\",\"media_url\":null,\"platform\":\"linkedin\",\"scheduled_for\":null},\"subject\":\"\",\"threadCount\":\"\"}"
+    },
+    {
+      "name": "linkedin: comment added to a plain post, body kept",
+      "draftId": "social-post:q-e-3",
+      "before": {
+        "id": "social-post:q-e-3",
+        "recipient": "linkedin:royalti-io",
+        "recipientEmail": null,
+        "subject": "",
+        "body": "Plain post, nothing else.",
+        "channel": "buffer",
+        "channelId": "69c034d8af47dacb6943e6d6",
+        "senderAddress": "linkedin:royalti-io",
+        "fromProvider": "Buffer",
+        "scheduledIso": null,
+        "scheduledLabel": "next sender run",
+        "threadCount": "",
+        "social": {
+          "account": "royalti-io",
+          "media_url": null,
+          "scheduled_for": null,
+          "platform": "linkedin",
+          "content": "Plain post, nothing else."
+        }
+      },
+      "patch": {
+        "firstComment": "#royalti #musicbusiness"
+      },
+      "after": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "linkedin",
+        "content": "Plain post, nothing else.\n---firstcomment---\n#royalti #musicbusiness"
+      },
+      "stable": "{\"body\":\"Plain post, nothing else.\",\"channel\":\"buffer\",\"channelId\":\"69c034d8af47dacb6943e6d6\",\"firstComment\":\"#royalti #musicbusiness\",\"fromProvider\":\"Buffer\",\"id\":\"social-post:q-e-3\",\"recipient\":\"linkedin:royalti-io\",\"recipientEmail\":null,\"scheduledIso\":null,\"scheduledLabel\":\"next sender run\",\"senderAddress\":\"linkedin:royalti-io\",\"social\":{\"account\":\"royalti-io\",\"content\":\"Plain post, nothing else.\\n---firstcomment---\\n#royalti #musicbusiness\",\"media_url\":null,\"platform\":\"linkedin\",\"scheduled_for\":null},\"subject\":\"\",\"threadCount\":\"\"}"
+    },
+    {
+      "name": "x single: body only",
+      "draftId": "social-post:q-e-4",
+      "before": {
+        "id": "social-post:q-e-4",
+        "recipient": "x:royalti-io",
+        "recipientEmail": null,
+        "subject": "",
+        "body": "Short and sweet on X.",
+        "channel": "buffer",
+        "channelId": "631318f83cc20753ba813080",
+        "senderAddress": "x:royalti-io",
+        "fromProvider": "Buffer",
+        "scheduledIso": null,
+        "scheduledLabel": "next sender run",
+        "threadCount": "",
+        "social": {
+          "account": "royalti-io",
+          "media_url": null,
+          "scheduled_for": null,
+          "platform": "x",
+          "content": "Short and sweet on X."
+        }
+      },
+      "patch": {
+        "body": "Edited on X 😀"
+      },
+      "after": {
+        "account": "royalti-io",
+        "media_url": null,
+        "scheduled_for": null,
+        "platform": "x",
+        "content": "Edited on X 😀"
+      },
+      "stable": "{\"body\":\"Edited on X 😀\",\"channel\":\"buffer\",\"channelId\":\"631318f83cc20753ba813080\",\"fromProvider\":\"Buffer\",\"id\":\"social-post:q-e-4\",\"recipient\":\"x:royalti-io\",\"recipientEmail\":null,\"scheduledIso\":null,\"scheduledLabel\":\"next sender run\",\"senderAddress\":\"x:royalti-io\",\"social\":{\"account\":\"royalti-io\",\"content\":\"Edited on X 😀\",\"media_url\":null,\"platform\":\"x\",\"scheduled_for\":null},\"subject\":\"\",\"threadCount\":\"\"}"
+    },
+    {
+      "name": "instagram: hashtags comment rewritten under the firstcomment marker, schedule only fractional",
+      "draftId": "social-post:q-e-5",
+      "before": {
+        "id": "social-post:q-e-5",
+        "recipient": "instagram:royalti-io",
+        "recipientEmail": null,
+        "subject": "",
+        "body": "Studio day ✨",
+        "channel": "buffer",
+        "channelId": "6310c4f07ebd08090ac74e4c",
+        "senderAddress": "instagram:royalti-io",
+        "fromProvider": "Buffer",
+        "scheduledIso": "2099-03-04T09:30:00.000Z",
+        "scheduledLabel": "2099-03-04T09:30:00.000Z",
+        "threadCount": "",
+        "firstComment": "#studio #royalti",
+        "media": {
+          "kind": "single",
+          "imageUrls": [
+            "https://cdn.royalti.io/social/launch.png"
+          ]
+        },
+        "social": {
+          "account": "royalti-io",
+          "media_url": "https://cdn.royalti.io/social/launch.png",
+          "scheduled_for": "2099-03-04T09:30:00.000Z",
+          "platform": "instagram",
+          "content": "Studio day ✨\n---hashtags---\n#studio #royalti"
+        }
+      },
+      "patch": {
+        "firstComment": "#studio #newmusic",
+        "scheduledIso": "2099-03-04T09:30:00.123456Z"
+      },
+      "after": {
+        "account": "royalti-io",
+        "media_url": "https://cdn.royalti.io/social/launch.png",
+        "scheduled_for": "2099-03-04T09:30:00.123Z",
+        "platform": "instagram",
+        "content": "Studio day ✨\n---firstcomment---\n#studio #newmusic"
+      },
+      "stable": "{\"body\":\"Studio day ✨\",\"channel\":\"buffer\",\"channelId\":\"6310c4f07ebd08090ac74e4c\",\"firstComment\":\"#studio #newmusic\",\"fromProvider\":\"Buffer\",\"id\":\"social-post:q-e-5\",\"media\":{\"imageUrls\":[\"https://cdn.royalti.io/social/launch.png\"],\"kind\":\"single\"},\"recipient\":\"instagram:royalti-io\",\"recipientEmail\":null,\"scheduledIso\":\"2099-03-04T09:30:00.123Z\",\"scheduledLabel\":\"2099-03-04T09:30:00.123Z\",\"senderAddress\":\"instagram:royalti-io\",\"social\":{\"account\":\"royalti-io\",\"content\":\"Studio day ✨\\n---firstcomment---\\n#studio #newmusic\",\"media_url\":\"https://cdn.royalti.io/social/launch.png\",\"platform\":\"instagram\",\"scheduled_for\":\"2099-03-04T09:30:00.123Z\"},\"subject\":\"\",\"threadCount\":\"\"}"
+    }
+  ]
+}
