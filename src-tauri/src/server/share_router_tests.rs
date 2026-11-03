@@ -31,6 +31,7 @@ struct Child {
     router: Router,
     project: PathBuf,
     outside: PathBuf,
+    pkgs: PathBuf,
 }
 
 fn write(path: &Path, text: &str) {
@@ -58,6 +59,12 @@ fn transcript(cwd: &str) -> String {
 }
 
 async fn child() -> Child {
+    child_with_pkg(None).await
+}
+
+/// `pkg_id`: the daemon is given a `--pkgs-dir` (`Child::pkgs`) already holding
+/// that pkg (the index is built once, at router construction).
+async fn child_with_pkg(pkg_id: Option<&str>) -> Child {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let data = root.join("data");
@@ -65,6 +72,13 @@ async fn child() -> Child {
     let work = root.join("work");
     let project = work.join("proj");
     let outside = work.join("not-shared.txt");
+    let pkgs = root.join("pkgs");
+    if let Some(id) = pkg_id {
+        write(
+            &pkgs.join(id).join("manifest.json"),
+            &format!(r#"{{"id":"{id}","name":"N {id}","version":"0.1.0","ikenga_api":"1"}}"#),
+        );
+    }
     std::fs::create_dir_all(&data).unwrap();
     write(&project.join("docs/brief.md"), "the brief");
     write(&outside, "the Owner's other file");
@@ -97,7 +111,7 @@ async fn child() -> Child {
         host: "127.0.0.1".into(),
         port: 0,
         static_dir: PathBuf::from("no-spa-here"),
-        pkgs_dir: None,
+        pkgs_dir: pkg_id.map(|_| pkgs.clone()),
         data_dir: Some(data),
         auth_token: Some(TOKEN.into()),
         allowed_origins: vec![],
@@ -122,6 +136,7 @@ async fn child() -> Child {
         router,
         project,
         outside,
+        pkgs,
     }
 }
 
@@ -563,4 +578,58 @@ async fn git_status_under_share_confinement() {
         .await;
         assert_eq!(no_files["ok"], false, "caps `{caps}`: {no_files}");
     }
+}
+
+/// A pkg view in a share reads its own manifest to check declared capabilities
+/// (`pkg-iframe-host` `checkPkgManifest`); that was owner-only, which broke every
+/// pkg view for an Operator in a shared project. An indexed pkg answers by exact
+/// path even though it lives outside the share; any other path stays confined to
+/// the shared project.
+#[tokio::test]
+async fn a_share_member_reads_an_indexed_pkgs_manifest_and_nothing_outside_the_share() {
+    let c = child_with_pkg(Some("com.test.outbound")).await;
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    let indexed = c.pkgs.join("com.test.outbound");
+
+    // 1. The indexed pkg (outside the shared project) previews for a viewer.
+    let res = call(
+        &c,
+        Some("viewer"),
+        "pkg_preview_manifest",
+        json!({ "installPath": s(&indexed) }),
+    )
+    .await;
+    assert_eq!(res["ok"], true, "{res}");
+    assert_eq!(res["data"]["id"], "com.test.outbound");
+
+    // 2. A manifest the index does not name, outside the share: refused.
+    let other = c.pkgs.join("not-indexed");
+    write(
+        &other.join("manifest.json"),
+        r#"{"id":"com.test.other","name":"N","version":"0.1.0","ikenga_api":"1"}"#,
+    );
+    let refused = call(
+        &c,
+        Some("viewer"),
+        "pkg_preview_manifest",
+        json!({ "installPath": s(&other) }),
+    )
+    .await;
+    assert_eq!(refused["ok"], false, "{refused}");
+
+    // 3. A manifest inside the shared project reads through the narrowed guard.
+    let inside = c.project.join("my-pkg");
+    write(
+        &inside.join("manifest.json"),
+        r#"{"id":"com.test.mine","name":"N","version":"0.1.0","ikenga_api":"1"}"#,
+    );
+    let ok = call(
+        &c,
+        Some("viewer"),
+        "pkg_preview_manifest",
+        json!({ "installPath": s(&inside) }),
+    )
+    .await;
+    assert_eq!(ok["ok"], true, "{ok}");
+    assert_eq!(ok["data"]["id"], "com.test.mine");
 }
