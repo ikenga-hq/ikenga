@@ -302,7 +302,13 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     // ── slice 8 ──
     ("pin_screenshot_write", req!(shared[Files])),
     ("scaffold_agent_config", req!(owner[Settings])),
-    ("pkg_preview_manifest", req!(owner[Files])),
+    // Shared-readable: the pkg host reads a pkg's manifest to check the
+    // capabilities it declares before it serves a `host.*` verb, and an
+    // Operator in a share hit `forbidden: class=owner` there, so every
+    // pkg view (the Outbox's `host.paActions.list`, which IS share-routed)
+    // failed. The arm answers an indexed pkg by exact path (operator-installed,
+    // non-secret) and anything else only inside the share's narrowed guard.
+    ("pkg_preview_manifest", req!(shared[Files])),
     ("pkg_discover_workspace", req!(owner[Files])),
     ("pkg_scaffold", req!(owner[Install])),
     // ── executor-routed + pkg settings (gap audit 2026-10-06 ranks 21/23/20).

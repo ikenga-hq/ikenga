@@ -188,7 +188,7 @@ export const RPC_REQUIREMENTS: Readonly<Record<string, ArmRequirement>> = {
 	pkg_mcp_call: { caps: ['dispatch'], class: 'owner' },
 	pkg_permission_violations_clear: { caps: ['settings'], class: 'owner' },
 	pkg_permission_violations_list: { caps: ['settings'], class: 'owner' },
-	pkg_preview_manifest: { caps: ['files'], class: 'owner' },
+	pkg_preview_manifest: { caps: ['files'], class: 'shared' },
 	pkg_scaffold: { caps: ['install'], class: 'owner' },
 	pkg_settings_get: { caps: ['files'], class: 'shared' },
 	pkg_settings_set: { caps: ['settings'], class: 'owner' },
