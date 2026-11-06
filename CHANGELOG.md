@@ -1,5 +1,11 @@
 # ikenga-desktop
 
+## 0.31.2
+
+### Patch Changes
+
+- 868cc17: The PDF viewer now has a **Download** button. In a browser session it saves the PDF; on desktop it opens the file in the default app. Before, a PDF could be read but not saved from a browser.
+
 ## 0.31.1
 
 ### Patch Changes
