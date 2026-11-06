@@ -3,6 +3,7 @@ import {
 	AlertCircle,
 	ChevronLeft,
 	ChevronRight,
+	Download,
 	Loader2,
 	Search,
 	ZoomIn,
@@ -17,6 +18,9 @@ import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
 import { Button } from '@/components/ui/button';
 import { fsRead } from '@/lib/tauri-cmd';
+import { toast } from '@/lib/toast';
+import { isBrowserHost, openLocalPath, saveBlobAs } from '@/lib/transport';
+import { basename } from '../lib/path';
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -124,6 +128,34 @@ export function PdfView({ path }: PdfViewProps) {
 					placeholder="Find in page…"
 					className="h-7 w-40 rounded border border-border bg-background px-2 text-xs outline-none focus:ring-1 focus:ring-primary"
 				/>
+				<div className="flex-1" />
+				<Button
+					variant="ghost"
+					size="sm"
+					className="h-7 gap-1.5 px-2"
+					title={isBrowserHost() ? 'Download' : 'Open in default app'}
+					onClick={() => {
+						if (state.kind !== 'ready') return;
+						// Browser: the bytes are already loaded, hand them straight to the
+						// browser. Desktop: let the OS open the file.
+						if (isBrowserHost()) {
+							saveBlobAs(
+								new Blob([state.data as BlobPart], { type: 'application/pdf' }),
+								basename(path)
+							);
+							return;
+						}
+						openLocalPath(path, { kind: 'file' }).catch((e) =>
+							toast({
+								label: `Could not open ${basename(path)}: ${e instanceof Error ? e.message : String(e)}`,
+								variant: 'error',
+							})
+						);
+					}}
+				>
+					<Download className="h-3.5 w-3.5" />
+					{isBrowserHost() ? 'Download' : 'Open'}
+				</Button>
 			</div>
 			<div className="flex-1 overflow-auto bg-muted/40 px-4 py-4">
 				<div className="mx-auto flex flex-col items-center gap-4">
