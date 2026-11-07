@@ -5,7 +5,7 @@
 // them. Not run in this session (DEC-50 — see the WP-44 report).
 
 import { describe, expect, it } from 'vitest';
-import { CodeView, PdfView, pickRenderer, XlsxView } from './auto-router';
+import { CodeView, isAbsoluteViewerPath, PdfView, pickRenderer, XlsxView } from './auto-router';
 import { AudioView } from './renderers/audio-view';
 import { CsvView } from './renderers/csv-view';
 import { HtmlFrame } from './renderers/html-frame';
@@ -53,5 +53,20 @@ describe('pickRenderer — pre-existing branches unaffected', () => {
 		['application/octet-stream', 'dist/Ikenga.AppImage', UnknownView],
 	])('%s / %s → the expected renderer', (mime, path, expected) => {
 		expect(pickRenderer(mime, path)).toBe(expected);
+	});
+});
+
+describe('isAbsoluteViewerPath', () => {
+	it('treats POSIX, home and drive paths as absolute', () => {
+		expect(isAbsoluteViewerPath('/opt/ikenga/data/x.pdf')).toBe(true);
+		expect(isAbsoluteViewerPath('~/deliverables/x.pdf')).toBe(true);
+		expect(isAbsoluteViewerPath('C:\\Users\\a\\x.pdf')).toBe(true);
+		expect(isAbsoluteViewerPath('D:/x.pdf')).toBe(true);
+	});
+
+	it('treats everything else as relative', () => {
+		expect(isAbsoluteViewerPath('deliverables/x.pdf')).toBe(false);
+		expect(isAbsoluteViewerPath('./x.pdf')).toBe(false);
+		expect(isAbsoluteViewerPath('x.pdf')).toBe(false);
 	});
 });
