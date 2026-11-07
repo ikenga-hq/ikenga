@@ -166,7 +166,9 @@ pub struct ShellInfo {
 /// - `5`: Chi seats — `GET /iyke/seats/list`, `GET /iyke/seats/get`,
 ///   `POST /iyke/seats/{create,resume,fill,clear,send,release}` (WP-70,
 ///   G-SEATS §7.2 — `seat_routes.rs`).
-pub const BRIDGE_API: u32 = 5;
+/// - `6`: `GET /iyke/fs-roots`, `POST /iyke/fs-roots/add` (the fs allowlist;
+///   an add the list doesn't cover asks the user — `fs_roots_routes.rs`).
+pub const BRIDGE_API: u32 = 6;
 
 /// WP-21: mirror of the FE `ActiveProject` (`src/lib/shell/shell-store.ts`).
 /// Field names are the FE's own snake_case, so the push needs no mapping.
@@ -2311,7 +2313,7 @@ mod tests {
         };
         let v = serde_json::to_value(&info).unwrap();
         assert_eq!(v["bridge_api"], serde_json::json!(super::BRIDGE_API));
-        assert_eq!(super::BRIDGE_API, 5, "bump the FE `BRIDGE_API` mirror when this changes");
+        assert_eq!(super::BRIDGE_API, 6, "bump the FE `BRIDGE_API` mirror when this changes");
         assert_eq!(
             v["active_project"],
             serde_json::json!({

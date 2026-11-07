@@ -381,7 +381,13 @@ pub fn run() {
             // User-configurable FS allowlist. Must be installed before the
             // first call to `commands::resolve_allowlisted` (which fs_*,
             // viewer_serve, and a handful of other commands depend on).
-            match fs_roots::FsRoots::load(data_dir.join("fs_roots.json")) {
+            // A list nobody has set up yet starts with the user's home folder,
+            // as a T1 principal's does; `reset` goes back to it. A list the
+            // user edited, even to empty, is left as it is.
+            let home_seed = platform::home_dir()
+                .map(|h| vec![h.to_string_lossy().into_owned()])
+                .unwrap_or_default();
+            match fs_roots::FsRoots::load_seeded(data_dir.join("fs_roots.json"), home_seed) {
                 Ok(roots) => {
                     let arc = Arc::new(roots);
                     if let Err(e) = fs_roots::install(arc) {
@@ -418,6 +424,18 @@ pub fn run() {
             let db_path = data_dir.join(main_db_name);
             let pa_db = Arc::new(PaDb::new(db_path));
             app.manage(pa_db.clone());
+
+            // On the boot that first seeds the fs allowlist, project folders
+            // outside home are added too (the WP-05 gap, `commands::projects`).
+            {
+                let db = pa_db.clone();
+                tauri::async_runtime::spawn(async move {
+                    match db.ensure_pool().await {
+                        Ok(pool) => commands::projects::allow_project_folders_once(&pool).await,
+                        Err(e) => log::warn!("[fs_roots] project backfill: no db: {e}"),
+                    }
+                });
+            }
 
             let settings_manager = Arc::new(settings::SettingsManager::new(
                 app.handle().clone(),

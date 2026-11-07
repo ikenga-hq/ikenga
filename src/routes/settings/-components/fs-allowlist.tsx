@@ -15,10 +15,14 @@ import { type AccessStatus, accessStatus } from '@/lib/access/client';
 import {
 	askForFoldersCopy,
 	cannotEditRootsReason,
-	isAbsoluteServerPath,
+	folderPathExample,
+	isAddableFolderPath,
 	isPermissionError,
 } from '@/lib/fs-allowlist';
+import { isWindows } from '@/lib/platform';
 import { fsRootsAdd, fsRootsList, fsRootsRemove, fsRootsReset } from '@/lib/tauri-cmd';
+import { isTauri } from '@/lib/transport';
+import { open as openDialog } from '@/lib/transport/dialog-shim';
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
@@ -29,10 +33,19 @@ interface RootsEditorProps {
 	readOnlyReason?: string | null;
 	askCopy: string;
 	resetHint: string;
+	/** The desktop app: a native folder picker, `~` paths, this OS's path form. */
+	desktop?: boolean;
 }
 
 /** One folder list: rows with remove, an add-by-path field, reset. */
-export function RootsEditor({ principal, readOnlyReason, askCopy, resetHint }: RootsEditorProps) {
+export function RootsEditor({
+	principal,
+	readOnlyReason,
+	askCopy,
+	resetHint,
+	desktop = false,
+}: RootsEditorProps) {
+	const example = folderPathExample(desktop, isWindows);
 	const [roots, setRoots] = useState<string[] | null>(null);
 	const [loadError, setLoadError] = useState<string | null>(null);
 	const [draft, setDraft] = useState('');
@@ -74,11 +87,27 @@ export function RootsEditor({ principal, readOnlyReason, askCopy, resetHint }: R
 
 	async function add() {
 		const path = draft.trim();
-		if (!isAbsoluteServerPath(path)) {
-			setActionError("Give the folder's full path, starting with /.");
+		if (!isAddableFolderPath(path, desktop)) {
+			setActionError(
+				desktop
+					? `Give the folder's full path, like ${example}, or start it with ~.`
+					: "Give the folder's full path, starting with /."
+			);
 			return;
 		}
 		if (await run(() => fsRootsAdd(path, principal))) setDraft('');
+	}
+
+	async function choose() {
+		setActionError(null);
+		let picked: string | string[] | null;
+		try {
+			picked = await openDialog({ directory: true, multiple: false });
+		} catch (err) {
+			setActionError(message(err));
+			return;
+		}
+		if (typeof picked === 'string' && picked) await run(() => fsRootsAdd(picked, principal));
 	}
 
 	if (loadError) {
@@ -141,11 +170,17 @@ export function RootsEditor({ principal, readOnlyReason, askCopy, resetHint }: R
 							onKeyDown={(e) => {
 								if (e.key === 'Enter') void add();
 							}}
-							placeholder="/home/you/projects"
+							placeholder={example}
 							aria-label="Folder to add"
 							spellCheck={false}
-							className="flex-1 rounded-md border border-border bg-transparent px-2 py-1 font-mono text-xs outline-none"
+							className="min-w-0 flex-1 rounded-md border border-border bg-transparent px-2 py-1 font-mono text-xs outline-none"
 						/>
+						{desktop && (
+							<Button variant="outline" size="sm" disabled={busy} onClick={() => void choose()}>
+								<FolderOpen className="mr-1 h-3.5 w-3.5" />
+								Choose folder…
+							</Button>
+						)}
 						<Button
 							variant="outline"
 							size="sm"
@@ -247,16 +282,20 @@ export function FsAllowlistSectionBody() {
 	}
 	const multiUser = status?.tier === 't1';
 	const isAdmin = multiUser && status.principal.isAdmin && status.adminStrength;
+	const desktop = isTauri();
 	return (
 		<div className="space-y-3 px-4 py-3">
 			<p className="text-xs text-muted-foreground">
-				The folders you can open here — in the file browser, the folder picker and as projects.
-				{multiUser ? ' Your list started with your home folder.' : ''}
+				{desktop
+					? 'The folders Ikenga can open — in the file browser, artifact panes, the folder picker and for agents driving it. A project’s folders are added when you create the project or add a root to it; anything else outside these folders is refused.'
+					: 'The folders you can open here — in the file browser, the folder picker and as projects.'}
+				{multiUser || desktop ? ' Your list started with your home folder.' : ''}
 			</p>
 			<RootsEditor
 				readOnlyReason={cannotEditRootsReason(status)}
 				askCopy={askForFoldersCopy(status)}
-				resetHint={multiUser ? 'Back to your home folder' : 'Back to no folders'}
+				resetHint={multiUser || desktop ? 'Back to your home folder' : 'Back to no folders'}
+				desktop={desktop}
 			/>
 			{isAdmin && status && <OtherPersonRoots status={status} />}
 		</div>

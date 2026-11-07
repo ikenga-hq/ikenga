@@ -283,6 +283,8 @@ pub(crate) fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         // callback (`src-tauri/src/iyke/actions_routes.rs`).
         crate::iyke::actions_routes::iyke_set_actions_frame,
         crate::iyke::actions_routes::iyke_actions_request_done,
+        // The user's Allow / Deny on a `POST /iyke/fs-roots/add` prompt.
+        crate::iyke::fs_roots_routes::iyke_fs_roots_request_done,
         iyke::iyke_log_push,
         iyke::iyke_network_push,
         iyke::iyke_dom_done,
