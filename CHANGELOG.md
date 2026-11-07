@@ -1,5 +1,12 @@
 # ikenga-desktop
 
+## 0.31.3
+
+### Patch Changes
+
+- b7b1cf7: In a remote web session, the Default project's Files panel now shows the signed-in person's home folder as its root when the project has no root path configured, allowing files written in their own workspace to be browsed and opened.
+- 0fd5762: In a browser session, the viewer now says why it can't open a relative path, instead of showing a raw "path does not exist" error. A relative path is resolved on the server against its own working directory, which in a shared project is the owner's home, so the file was never where the reader expected.
+
 ## 0.31.2
 
 ### Patch Changes
