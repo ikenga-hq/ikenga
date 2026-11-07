@@ -225,7 +225,7 @@ jobs:
       - name: Set up Node (for pnpm)
         uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 22
 
       # Linux runner needs WebKit + GTK headers. macOS / Windows runners
       # ship the platform SDKs by default.
