@@ -11,6 +11,7 @@ import { PkgIframeLayer } from '@/components/pkg/pkg-iframe-layer';
 import { IFRAME_POOL_ENABLED } from '@/lib/panes/iframe-pool';
 import { TerminalHandoffPrompt } from '../artifact-wizard/terminal-handoff-prompt';
 import { WizardPopRecoveryChip } from '../artifact-wizard/wizard-pop-recovery-chip';
+import { FsRootRequestPrompt } from '../fs-root-request-prompt';
 import { RuntimeBunChip } from '../runtime-bun-chip';
 
 export function IframePoolOverlay() {
@@ -33,6 +34,8 @@ export function RestOverlays() {
 
 			<WizardPopRecoveryChip />
 			<RuntimeBunChip />
+			{/* Allow / Deny for a folder a bridge caller asks to open. */}
+			<FsRootRequestPrompt />
 		</>
 	);
 }

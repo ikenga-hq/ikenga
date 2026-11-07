@@ -188,6 +188,10 @@ describe('FsAllowlistSectionBody', () => {
 			render(<FsAllowlistSectionBody />);
 			await screen.findByTestId('fs-allowlist-empty');
 			expect(screen.getByText(/A project’s folders are added/)).toBeTruthy();
+			expect(screen.getByText(/started with your home folder/)).toBeTruthy();
+			expect(screen.getByRole('button', { name: /Reset/ }).getAttribute('title')).toBe(
+				'Back to your home folder'
+			);
 
 			await userEvent.click(screen.getByRole('button', { name: /Choose folder/ }));
 			await waitFor(() => expect(roots()).toEqual(['C:\\Users\\ada\\Documents\\artifacts']));

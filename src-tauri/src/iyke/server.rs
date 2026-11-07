@@ -22,6 +22,7 @@ use super::actions_routes::{
     post_keys_set,
 };
 use super::auth::{require_token, AuthState};
+use super::fs_roots_routes::{get_fs_roots, post_fs_roots_add};
 use super::browser_handlers::{
     get_browser_list, get_browser_profiles, get_browser_targets, post_browser_back,
     post_browser_click, post_browser_close, post_browser_eval, post_browser_fill,
@@ -260,6 +261,11 @@ pub async fn serve(
         // `iyke_set_frame` (503 until the first push), same envelope and
         // error shape as `/iyke/keys`.
         .route("/iyke/explorer/sections", get(get_explorer_sections))
+        // The fs allowlist (`fs_roots_routes.rs`): list, and ask for a folder.
+        // An add the list doesn't already cover is an Allow / Deny prompt
+        // in the shell; there is no bridge remove.
+        .route("/iyke/fs-roots", get(get_fs_roots))
+        .route("/iyke/fs-roots/add", post(post_fs_roots_add))
         // Chi-first agent surface (WP-03).
         .route("/iyke/chi/run", post(post_chi_run))
         .route("/iyke/chi/resume", post(post_chi_resume))

@@ -289,12 +289,12 @@ export function FsAllowlistSectionBody() {
 				{desktop
 					? 'The folders Ikenga can open — in the file browser, artifact panes, the folder picker and for agents driving it. A project’s folders are added when you create the project or add a root to it; anything else outside these folders is refused.'
 					: 'The folders you can open here — in the file browser, the folder picker and as projects.'}
-				{multiUser ? ' Your list started with your home folder.' : ''}
+				{multiUser || desktop ? ' Your list started with your home folder.' : ''}
 			</p>
 			<RootsEditor
 				readOnlyReason={cannotEditRootsReason(status)}
 				askCopy={askForFoldersCopy(status)}
-				resetHint={multiUser ? 'Back to your home folder' : 'Back to no folders'}
+				resetHint={multiUser || desktop ? 'Back to your home folder' : 'Back to no folders'}
 				desktop={desktop}
 			/>
 			{isAdmin && status && <OtherPersonRoots status={status} />}

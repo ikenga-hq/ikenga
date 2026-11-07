@@ -3087,6 +3087,22 @@ export async function iykeActionsRequestDone(requestId: string, result: unknown)
 	return invoke('iyke_actions_request_done', { requestId, result });
 }
 
+/** Payload of `iyke://fs-roots-add-request`: a bridge caller (`POST
+ *  /iyke/fs-roots/add`) asks to open a folder the allowlist doesn't cover.
+ *  `resolved` is the canonical folder the request names; `path` is how the
+ *  caller spelled it. Rust: `src-tauri/src/iyke/fs_roots_routes.rs`. */
+export interface FsRootAddRequest {
+	request_id: string;
+	path: string;
+	resolved: string;
+	reason: string | null;
+}
+
+/** The user's Allow / Deny on one `iyke://fs-roots-add-request` prompt. */
+export async function iykeFsRootsRequestDone(requestId: string, allow: boolean): Promise<void> {
+	return invoke('iyke_fs_roots_request_done', { requestId, allow });
+}
+
 // ─── Screenshots ──────────────────────────────────────────────────────────────
 
 export interface ScreenshotResult {

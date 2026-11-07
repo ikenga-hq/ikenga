@@ -171,6 +171,7 @@ commands.allow = [
   "iyke_dom_done",
   "iyke_dom_query",
   "iyke_endpoint",
+  "iyke_fs_roots_request_done",
   "iyke_log_push",
   "iyke_mcp_info",
   "iyke_network_push",
