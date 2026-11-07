@@ -202,6 +202,43 @@ impl FsRoots {
         })
     }
 
+    /// Fill a list nobody has set up yet with `seed`, the same rule
+    /// [`FsRoots::load_seeded`] applies at load time: only when the list is
+    /// empty **and** was never seeded or edited, so a list its owner emptied
+    /// on purpose stays empty. For a seed that is only known after load —
+    /// the desktop's project folders, which need the database. Blank and
+    /// duplicate entries are dropped. Returns whether anything was seeded.
+    /// Does not change what [`FsRoots::reset`] restores.
+    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+    pub fn seed_if_unset(&self, seed: &[String]) -> Result<bool> {
+        let mut guard = self.state.write().expect("fs_roots state poisoned");
+        if guard.initialized || !guard.entries.is_empty() {
+            return Ok(false);
+        }
+        // Blank entries go before resolving: "" would resolve to the cwd.
+        let wanted: Vec<&str> = seed
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut entries: Vec<Entry> = Vec::new();
+        for entry in entries_of(&wanted) {
+            if !entries.iter().any(|e| e.resolved == entry.resolved) {
+                entries.push(entry);
+            }
+        }
+        if entries.is_empty() {
+            return Ok(false);
+        }
+        let next = State {
+            entries,
+            initialized: true,
+        };
+        self.persist(&next)?;
+        *guard = next;
+        Ok(true)
+    }
+
     /// Remove a root by its user-input string (the same string the UI shows).
     /// Returns the updated input list.
     pub fn remove(&self, input: &str) -> Result<Vec<String>> {
@@ -419,6 +456,60 @@ mod tests {
         assert!(roots.add(&extra.to_string_lossy()).is_err());
         assert!(roots.list_inputs().is_empty());
         assert!(!roots.is_allowed(&extra.canonicalize().unwrap()));
+    }
+
+    /// The desktop's backfill: a never-configured empty list (the
+    /// `{"roots": []}` every desktop install wrote) takes the project
+    /// folders, once, dropping blanks and duplicates.
+    #[test]
+    fn seed_if_unset_fills_a_never_configured_list_once() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("fs_roots.json");
+        std::fs::write(&file, r#"{"roots": []}"#).unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let proj_s = proj.to_string_lossy().to_string();
+
+        let roots = FsRoots::load(file.clone()).unwrap();
+        let seeded = roots
+            .seed_if_unset(&[" ".into(), proj_s.clone(), format!(" {proj_s} ")])
+            .unwrap();
+        assert!(seeded);
+        assert_eq!(roots.list_inputs(), vec![proj_s.clone()]);
+        assert!(roots.is_allowed(&proj.canonicalize().unwrap().join("a.html")));
+        assert!(initialized_flag(&file));
+
+        // Persisted, and a second backfill (next boot) is a no-op.
+        let reloaded = FsRoots::load(file).unwrap();
+        assert_eq!(reloaded.list_inputs(), vec![proj_s]);
+        let other = dir.path().join("other").to_string_lossy().to_string();
+        assert!(!reloaded.seed_if_unset(&[other]).unwrap());
+    }
+
+    /// The backfill never overrides the owner: an emptied list stays empty,
+    /// a configured list is left as it is, and reset still means "no folders".
+    #[test]
+    fn seed_if_unset_respects_edited_lists() {
+        let dir = TempDir::new().unwrap();
+        let proj = dir.path().join("proj").to_string_lossy().to_string();
+
+        let emptied = dir.path().join("emptied.json");
+        std::fs::write(&emptied, r#"{"roots": [], "initialized": true}"#).unwrap();
+        let roots = FsRoots::load(emptied).unwrap();
+        assert!(!roots.seed_if_unset(std::slice::from_ref(&proj)).unwrap());
+        assert!(roots.list_inputs().is_empty());
+
+        let configured = dir.path().join("configured.json");
+        std::fs::write(&configured, r#"{"roots": ["/work"]}"#).unwrap();
+        let roots = FsRoots::load(configured).unwrap();
+        assert!(!roots.seed_if_unset(std::slice::from_ref(&proj)).unwrap());
+        assert_eq!(roots.list_inputs(), vec!["/work".to_string()]);
+
+        let fresh = dir.path().join("fresh.json");
+        let roots = FsRoots::load(fresh).unwrap();
+        assert!(!roots.seed_if_unset(&[" ".into()]).unwrap(), "nothing to seed");
+        assert!(roots.seed_if_unset(std::slice::from_ref(&proj)).unwrap());
+        assert_eq!(roots.reset().unwrap().len(), DEFAULT_ROOTS.len());
     }
 
     #[test]

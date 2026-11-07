@@ -1,8 +1,9 @@
-// File-roots editor — surfaces the user-configurable FS allowlist (Rust
-// side: `fs_roots`, persisted to `app_data_dir/fs_roots.json`). Imported by
-// Settings → Storage. Inline-edit a path with Enter to commit / Esc to
-// revert; commit calls `fsList` to verify the path is reachable and inside
-// the allowlist before persisting.
+// Project extra-roots editor — the active project's `extra_roots` (settings
+// `projects.extraRoots`). Imported by Settings → Projects. Not the fs
+// allowlist itself (Settings → Storage, `fs-allowlist.tsx`), though on the
+// desktop app `setProjectExtraRoots` also allows each newly added root.
+// Inline-edit a path with Enter to commit / Esc to revert; commit calls
+// `fsList` to check the path is reachable before persisting.
 
 import { useEffect, useState } from 'react';
 import { open as openDialog } from '@/lib/transport/dialog-shim';
@@ -126,9 +127,10 @@ export function FileRootsSectionBody() {
 	return (
 		<div className="space-y-3 px-4 py-3">
 			<p className="text-xs text-muted-foreground">
-				Directories the file browser and editor are allowed to open. Changes take effect immediately
-				— the Rust resolver reads from the same list. Click any path to edit it; press{' '}
-				<kbd>Enter</kbd> to commit, <kbd>Esc</kbd> to revert.
+				Extra folders this project shows in the file browser. In the desktop app, adding one also
+				adds it to Settings → Storage → Folders you can open; removing one here leaves that list as
+				it is. Click any path to edit it; press <kbd>Enter</kbd> to commit, <kbd>Esc</kbd> to
+				revert.
 			</p>
 			<ul className="space-y-1 rounded-md border border-border bg-background">
 				{roots.map((root) => (

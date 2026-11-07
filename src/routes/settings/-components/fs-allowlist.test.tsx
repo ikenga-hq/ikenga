@@ -13,9 +13,15 @@ const cmd = vi.hoisted(() => ({
 	fsRootsReset: vi.fn(),
 }));
 const access = vi.hoisted(() => ({ accessStatus: vi.fn() }));
+const env = vi.hoisted(() => ({ tauri: false, pick: vi.fn() }));
 
 vi.mock('@/lib/tauri-cmd', () => cmd);
 vi.mock('@/lib/access/client', () => access);
+vi.mock('@/lib/transport', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/lib/transport')>()),
+	isTauri: () => env.tauri,
+}));
+vi.mock('@/lib/transport/dialog-shim', () => ({ open: env.pick }));
 
 import { FsAllowlistSectionBody } from './fs-allowlist';
 
@@ -61,6 +67,8 @@ describe('FsAllowlistSectionBody', () => {
 	beforeEach(() => {
 		for (const f of Object.values(cmd)) f.mockReset();
 		access.accessStatus.mockReset();
+		env.tauri = false;
+		env.pick.mockReset();
 	});
 
 	it("edits the caller's own list", async () => {
@@ -153,5 +161,73 @@ describe('FsAllowlistSectionBody', () => {
 		await waitFor(() => expect(roots()).toEqual(['/srv/ada', '/srv/bob', '/srv/team']));
 		expect(cmd.fsRootsAdd).toHaveBeenCalledWith('/srv/team', 'bob');
 		expect(admin).toBeTruthy();
+	});
+
+	it('a browser session gets no folder picker and no ~ paths', async () => {
+		server({ self: [] });
+		access.accessStatus.mockResolvedValue(status());
+		render(<FsAllowlistSectionBody />);
+		await screen.findByTestId('fs-allowlist-empty');
+		expect(screen.queryByRole('button', { name: /Choose folder/ })).toBeNull();
+		await userEvent.type(screen.getByLabelText('Folder to add'), '~/work');
+		await userEvent.click(screen.getByRole('button', { name: /Add folder/ }));
+		expect((await screen.findByRole('alert')).textContent).toContain('starting with /');
+		expect(cmd.fsRootsAdd).not.toHaveBeenCalled();
+	});
+
+	describe('in the desktop app', () => {
+		beforeEach(() => {
+			env.tauri = true;
+			// The desktop has no access status: the probe fails.
+			access.accessStatus.mockRejectedValue(new Error('not served'));
+		});
+
+		it('adds a folder chosen with the native picker', async () => {
+			server({ self: [] });
+			env.pick.mockResolvedValue('C:\\Users\\ada\\Documents\\artifacts');
+			render(<FsAllowlistSectionBody />);
+			await screen.findByTestId('fs-allowlist-empty');
+			expect(screen.getByText(/A project’s folders are added/)).toBeTruthy();
+
+			await userEvent.click(screen.getByRole('button', { name: /Choose folder/ }));
+			await waitFor(() => expect(roots()).toEqual(['C:\\Users\\ada\\Documents\\artifacts']));
+			expect(env.pick).toHaveBeenCalledWith({ directory: true, multiple: false });
+			expect(cmd.fsRootsAdd).toHaveBeenCalledWith(
+				'C:\\Users\\ada\\Documents\\artifacts',
+				undefined
+			);
+		});
+
+		it('does nothing when the picker is cancelled', async () => {
+			server({ self: ['/work'] });
+			env.pick.mockResolvedValue(null);
+			render(<FsAllowlistSectionBody />);
+			await waitFor(() => expect(roots()).toEqual(['/work']));
+			await userEvent.click(screen.getByRole('button', { name: /Choose folder/ }));
+			await waitFor(() => expect(env.pick).toHaveBeenCalled());
+			expect(cmd.fsRootsAdd).not.toHaveBeenCalled();
+			expect(screen.queryByRole('alert')).toBeNull();
+		});
+
+		it('takes typed Windows and ~ paths, and explains a relative one', async () => {
+			server({ self: [] });
+			render(<FsAllowlistSectionBody />);
+			await screen.findByTestId('fs-allowlist-empty');
+			const field = () => screen.getByLabelText('Folder to add');
+
+			await userEvent.type(field(), 'work');
+			await userEvent.click(screen.getByRole('button', { name: /Add folder/ }));
+			expect((await screen.findByRole('alert')).textContent).toContain('start it with ~');
+			expect(cmd.fsRootsAdd).not.toHaveBeenCalled();
+
+			await userEvent.clear(field());
+			await userEvent.type(field(), '~/work');
+			await userEvent.click(screen.getByRole('button', { name: /Add folder/ }));
+			await waitFor(() => expect(roots()).toEqual(['~/work']));
+
+			await userEvent.type(field(), 'D:\\media');
+			await userEvent.click(screen.getByRole('button', { name: /Add folder/ }));
+			await waitFor(() => expect(roots()).toEqual(['~/work', 'D:\\media']));
+		});
 	});
 });

@@ -419,6 +419,18 @@ pub fn run() {
             let pa_db = Arc::new(PaDb::new(db_path));
             app.manage(pa_db.clone());
 
+            // Installs that never set up their fs allowlist get their project
+            // folders allowed, once (the WP-05 gap — `commands::projects`).
+            {
+                let db = pa_db.clone();
+                tauri::async_runtime::spawn(async move {
+                    match db.ensure_pool().await {
+                        Ok(pool) => commands::projects::allow_project_folders_once(&pool).await,
+                        Err(e) => log::warn!("[fs_roots] project backfill: no db: {e}"),
+                    }
+                });
+            }
+
             let settings_manager = Arc::new(settings::SettingsManager::new(
                 app.handle().clone(),
                 pa_db.clone(),
