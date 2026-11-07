@@ -1,5 +1,6 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import { FileText, Loader2 } from 'lucide-react';
+import { isRemoteWebSession } from '@/lib/transport';
 import { basename } from './lib/path';
 import { mimeFromExt, resolveMime } from './lib/mime';
 import { recordViewerOpen, type ViewerRecentSource } from './lib/recents';
@@ -90,6 +91,12 @@ export function ViewerRouter({
 	line,
 	col,
 }: ViewerRouterProps) {
+	// A relative path in a browser session would be resolved by the daemon
+	// against its own working directory, which is not the reader's: in a shared
+	// project that is the project owner's home. Say so, instead of surfacing a
+	// raw "path does not exist" for a file that lives somewhere else.
+	const relativeInRemote = isRemoteWebSession() && !isAbsoluteViewerPath(path);
+
 	// Synchronous first-pass — known extensions render immediately.
 	const initialMime = useMemo(() => mimeFromExt(path), [path]);
 	const [mime, setMime] = useState<string | null>(initialMime ?? null);
@@ -117,6 +124,10 @@ export function ViewerRouter({
 		if (mime === null) return;
 		void recordViewerOpen(path, mime, source);
 	}, [path, mime, source]);
+
+	if (relativeInRemote) {
+		return <RelativePathNotice path={path} />;
+	}
 
 	if (mime === null) {
 		return (
@@ -167,6 +178,25 @@ export function ViewerRouter({
 				<span className="ml-auto font-mono text-[10px] text-muted-foreground">{mime}</span>
 			</div>
 			<div className="min-h-0 flex-1">{body}</div>
+		</div>
+	);
+}
+
+/** POSIX or Windows-drive absolute, or `~/`. Anything else is relative. */
+export function isAbsoluteViewerPath(p: string): boolean {
+	return p.startsWith('/') || p.startsWith('~') || /^[a-zA-Z]:[\\/]/.test(p);
+}
+
+function RelativePathNotice({ path }: { path: string }) {
+	return (
+		<div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center text-xs text-muted-foreground">
+			<div className="font-medium text-foreground">Can't open a relative path here</div>
+			<div className="break-all font-mono">{path}</div>
+			<div className="max-w-sm">
+				This server can't tell which folder that path is relative to. Open the file from the Files
+				panel, or use its full path. If it is in a folder that isn't listed, add that folder under
+				Settings › Projects › Extra roots.
+			</div>
 		</div>
 	);
 }
