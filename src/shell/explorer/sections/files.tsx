@@ -19,7 +19,12 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { useFilesStore } from '@/lib/shell/files-store';
 import { usePaneStore } from '@/lib/panes/pane-store';
-import { fsList, fsSearch, type FileEntry } from '@/lib/tauri-cmd';
+import { fsList, fsRootsList, fsSearch, type FileEntry } from '@/lib/tauri-cmd';
+import { isRemoteWebSession } from '@/lib/transport';
+import { homeDir } from '@/lib/transport/path-shim';
+import { isDefaultProject } from '@/lib/ngwa/use-store-install';
+import { accessStatus } from '@/lib/access/client';
+import { askForFoldersCopy, isAbsoluteServerPath } from '@/lib/fs-allowlist';
 import {
 	type CreateKind,
 	SAVE_OR_DISCARD_FIRST,
@@ -1114,14 +1119,65 @@ function FilesViewMenuItems({
 
 export function FilesSection(_ctx: { projectId: string }) {
 	const activeProject = useShellStore((s) => s.activeProject);
+	const isRemote = isRemoteWebSession();
+	const isDefault = isDefaultProject(activeProject?.id);
+	const hasNoRoot = !activeProject?.root_path;
+	const shouldFallbackToHome = isRemote && isDefault && hasNoRoot;
+
+	const { data: homePath, isLoading: homeLoading } = useQuery({
+		queryKey: ['fs', 'home'],
+		queryFn: homeDir,
+		enabled: shouldFallbackToHome,
+		staleTime: Number.POSITIVE_INFINITY,
+	});
+
+	const { data: allowlist, isLoading: allowlistLoading } = useQuery({
+		queryKey: ['fs', 'roots-list'],
+		queryFn: () => fsRootsList(),
+		enabled: shouldFallbackToHome,
+		staleTime: 30_000,
+	});
+
+	const { data: status } = useQuery({
+		queryKey: ['access', 'status'],
+		queryFn: accessStatus,
+		enabled: shouldFallbackToHome,
+		staleTime: 60_000,
+	});
+
+	const effectiveHome = useMemo(() => {
+		if (!shouldFallbackToHome) return null;
+		if (homePath && homePath !== '~' && isAbsoluteServerPath(homePath)) {
+			return homePath;
+		}
+		if (allowlist && allowlist.length > 0 && isAbsoluteServerPath(allowlist[0])) {
+			return allowlist[0];
+		}
+		return null;
+	}, [shouldFallbackToHome, homePath, allowlist]);
+
+	const isAllowed = useMemo(() => {
+		if (!shouldFallbackToHome || !effectiveHome) return false;
+		if (!allowlist || allowlist.length === 0) return false;
+		const target = stripTrailingSlash(effectiveHome);
+		return allowlist.some((root) => {
+			const r = stripTrailingSlash(root);
+			return target === r || target.startsWith(`${r}/`);
+		});
+	}, [shouldFallbackToHome, effectiveHome, allowlist]);
+
 	const roots = useMemo(() => {
 		const list: string[] = [];
-		if (activeProject?.root_path) list.push(activeProject.root_path);
+		if (activeProject?.root_path) {
+			list.push(activeProject.root_path);
+		} else if (shouldFallbackToHome && effectiveHome && isAllowed) {
+			list.push(effectiveHome);
+		}
 		for (const r of activeProject?.extra_roots ?? []) {
 			if (!list.includes(r)) list.push(r);
 		}
 		return list;
-	}, [activeProject?.root_path, activeProject?.extra_roots]);
+	}, [activeProject?.root_path, activeProject?.extra_roots, shouldFallbackToHome, effectiveHome, isAllowed]);
 
 	const hydrated = useFilesStore((s) => s.hydrated);
 	const hydrate = useFilesStore((s) => s.hydrate);
@@ -1243,18 +1299,44 @@ export function FilesSection(_ctx: { projectId: string }) {
 				</DropdownMenu>
 			</div>
 			<div ref={scrollerRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-auto">
-				{roots.length === 0 && (
-					<EmptyState
-						data-state="explorer-files-empty"
-						icon={Folder}
-						heading="No project open"
-						body="Files, artifacts and sessions are all scoped to a project. Open one and every section fills."
-						action={{
-							label: 'Open a folder…',
-							onClick: () => usePaneStore.getState().navigateFocused('/settings/projects'),
-						}}
-					/>
-				)}
+				{shouldFallbackToHome && (homeLoading || allowlistLoading) ? (
+					<div className="px-3 py-2 text-xs text-muted-foreground italic">Loading files…</div>
+				) : roots.length === 0 ? (
+					shouldFallbackToHome && !effectiveHome ? (
+						<EmptyState
+							data-state="explorer-files-home-unknown"
+							icon={Folder}
+							heading="Home folder unavailable"
+							body="Your home directory could not be determined for this session."
+							action={{
+								label: 'Open a folder…',
+								onClick: () => usePaneStore.getState().navigateFocused('/settings/projects'),
+							}}
+						/>
+					) : shouldFallbackToHome && !isAllowed ? (
+						<EmptyState
+							data-state="explorer-files-not-allowed"
+							icon={Folder}
+							heading="Not available for your access level"
+							body={askForFoldersCopy(status ?? null)}
+							action={{
+								label: 'Open settings…',
+								onClick: () => usePaneStore.getState().navigateFocused('/settings/storage'),
+							}}
+						/>
+					) : (
+						<EmptyState
+							data-state="explorer-files-empty"
+							icon={Folder}
+							heading="No project open"
+							body="Files, artifacts and sessions are all scoped to a project. Open one and every section fills."
+							action={{
+								label: 'Open a folder…',
+								onClick: () => usePaneStore.getState().navigateFocused('/settings/projects'),
+							}}
+						/>
+					)
+				) : null}
 				{roots.map((root, i) => (
 					<RootSection
 						key={root}
