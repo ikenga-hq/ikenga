@@ -4,7 +4,7 @@
 [![Version](https://img.shields.io/github/v/release/ikenga-hq/ikenga?label=version&color=blue)](https://github.com/ikenga-hq/ikenga/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Discussions](https://img.shields.io/badge/community-discussions-5865F2.svg)](https://github.com/ikenga-hq/ikenga/discussions)
-[![Newsletter](https://img.shields.io/badge/newsletter-Building%20in%20the%20Loop-e8590c.svg)](https://buildingintheloop.substack.com/subscribe)
+[![Newsletter](https://img.shields.io/badge/newsletter-nedjamez.com-e8590c.svg)](https://nedjamez.com/subscribe/)
 
 > An open-source desktop workspace for the multi-agent way of working — your agents,
 > skills, commands, scheduled jobs, and memory in one window, all aware of each other.
@@ -350,7 +350,7 @@ in v0.14.0. Revisit signing / notarization if Ikenga ever needs to be installed 
 - [`ikenga-pkgs`](https://github.com/ikenga-hq/ikenga-pkgs) — first-party pkg monorepo (working examples per archetype)
 - [`ikenga-contract`](https://github.com/ikenga-hq/ikenga-contract) — manifest schema, RPC types, capability scopes
 - [`CLAUDE.md`](CLAUDE.md) — detailed architecture for contributors
-- [Building in the Loop](https://buildingintheloop.substack.com/subscribe) — biweekly letters on running a real multi-agent Claude Code system
+- [Newsletter at nedjamez.com](https://nedjamez.com/subscribe/) — one post a month on running a real multi-agent Claude Code system
 
 ## License
 
@@ -362,4 +362,4 @@ Issues and PRs welcome — see [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.
 thread in [Discussions](https://github.com/ikenga-hq/ikenga/discussions); report security
 issues per [`.github/SECURITY.md`](.github/SECURITY.md). For workflow deep-dives and
 build-in-public notes from the founder, subscribe to
-[Building in the Loop](https://buildingintheloop.substack.com/subscribe) — biweekly.
+the [newsletter at nedjamez.com](https://nedjamez.com/subscribe/) — monthly.
