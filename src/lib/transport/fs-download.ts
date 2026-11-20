@@ -1,6 +1,6 @@
 import { isDeviceSession } from './device-session';
-import { currentShare, isBrowserHost } from './index';
-import { downloadServerFile, openLocalPath } from './shims';
+import { currentShare, isBrowserHost, transportToken } from './index';
+import { downloadServerFile, openLocalPath, saveBlobAs } from './shims';
 import { isT1Session } from './t1-session';
 
 /**
@@ -46,8 +46,9 @@ export function canDownloadByNavigation(): boolean {
  *   browser's own save dialog does the rest. Inside a share the share is
  *   selected with `?share=`.
  * - Browser with a single-user bearer token: a navigation cannot attach the
- *   header, so fall back to the blob path (`fs_read`), which refuses files
- *   over the preview cap.
+ *   header, so the same streamed route is fetched with it and the bytes are
+ *   saved from a Blob. (Not `fs_read`: that is the preview read, capped at
+ *   25 MiB and sent as JSON.) The file is held in memory for the save.
  *
  * Rejects only on the fallback paths; a navigation reports its own failure in
  * the browser's download UI.
@@ -57,15 +58,30 @@ export async function downloadFile(path: string): Promise<void> {
 		await openLocalPath(path, { kind: 'file' });
 		return;
 	}
+	const name = path.split(/[\\/]/).filter(Boolean).pop() ?? 'download';
 	if (!canDownloadByNavigation()) {
-		await downloadServerFile(path);
+		const token = transportToken();
+		if (!token) {
+			await downloadServerFile(path);
+			return;
+		}
+		const res = await fetch(fsDownloadUrl(path), {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		if (!res.ok) {
+			const body = (await res.json().catch(() => null)) as { error?: unknown } | null;
+			throw new Error(
+				typeof body?.error === 'string' ? body.error : `${res.status} ${res.statusText}`
+			);
+		}
+		saveBlobAs(await res.blob(), name);
 		return;
 	}
 	const url = fsDownloadUrl(path, { share: currentShare()?.projectKey });
 	const a = document.createElement('a');
 	a.href = url;
 	// `download` keeps the SPA in place even if the server answers an error.
-	a.download = path.split(/[\\/]/).filter(Boolean).pop() ?? 'download';
+	a.download = name;
 	a.rel = 'noopener';
 	document.body.appendChild(a);
 	a.click();

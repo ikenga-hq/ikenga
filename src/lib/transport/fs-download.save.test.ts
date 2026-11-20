@@ -6,17 +6,21 @@ const h = vi.hoisted(() => ({
 	share: null as { projectKey: string } | null,
 	openLocalPath: vi.fn(async (_p: string, _o?: unknown) => {}),
 	downloadServerFile: vi.fn(async (_p: string) => {}),
+	saveBlobAs: vi.fn((_b: Blob, _n: string) => {}),
+	token: null as string | null,
 }));
 
 vi.mock('./index', () => ({
 	isBrowserHost: () => h.browser,
 	currentShare: () => h.share,
+	transportToken: () => h.token,
 }));
 vi.mock('./t1-session', () => ({ isT1Session: () => h.cookie }));
 vi.mock('./device-session', () => ({ isDeviceSession: () => false }));
 vi.mock('./shims', () => ({
 	openLocalPath: h.openLocalPath,
 	downloadServerFile: h.downloadServerFile,
+	saveBlobAs: h.saveBlobAs,
 }));
 
 import { downloadFile, fsDownloadUrl } from './fs-download';
@@ -27,6 +31,8 @@ beforeEach(() => {
 	h.browser = true;
 	h.cookie = true;
 	h.share = null;
+	h.token = null;
+	h.saveBlobAs.mockClear();
 	h.openLocalPath.mockClear();
 	h.downloadServerFile.mockClear();
 	clicked = [];
@@ -36,7 +42,10 @@ beforeEach(() => {
 		clicked.push(this);
 	});
 });
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+	vi.restoreAllMocks();
+	vi.unstubAllGlobals();
+});
 
 describe('fsDownloadUrl share', () => {
 	it('adds ?share= only when given', () => {
@@ -71,10 +80,37 @@ describe('downloadFile', () => {
 		expect(u.searchParams.get('share')).toBe('00000000-0000-0000-0000-000000000000/proj');
 	});
 
-	it('bearer-token tab cannot navigate: falls back to the blob path', async () => {
+	it('bearer-token tab: fetches the streamed route with the header and saves the bytes', async () => {
+		h.cookie = false;
+		h.token = 'tok';
+		const fetchMock = vi.fn(async (_u: string, _i?: RequestInit) => new Response('hello'));
+		vi.stubGlobal('fetch', fetchMock);
+		await downloadFile('/srv/big file.bin');
+		const [url, init] = fetchMock.mock.calls[0];
+		expect(new URL(url, 'http://x').pathname).toBe('/api/fs/download');
+		expect((init?.headers as Record<string, string>).Authorization).toBe('Bearer tok');
+		expect(h.saveBlobAs).toHaveBeenCalledTimes(1);
+		expect(h.saveBlobAs.mock.calls[0][0].size).toBe(5);
+		expect(h.saveBlobAs.mock.calls[0][1]).toBe('big file.bin');
+		// Never the capped preview read.
+		expect(h.downloadServerFile).not.toHaveBeenCalled();
+		expect(clicked).toHaveLength(0);
+	});
+
+	it('bearer-token tab: a refusal rejects with the server sentence', async () => {
+		h.cookie = false;
+		h.token = 'tok';
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async () => new Response(JSON.stringify({ error: 'no such file' }), { status: 404 }))
+		);
+		await expect(downloadFile('/srv/gone.bin')).rejects.toThrow('no such file');
+		expect(h.saveBlobAs).not.toHaveBeenCalled();
+	});
+
+	it('no credential at all: the old blob path', async () => {
 		h.cookie = false;
 		await downloadFile('/srv/a.png');
 		expect(h.downloadServerFile).toHaveBeenCalledWith('/srv/a.png');
-		expect(clicked).toHaveLength(0);
 	});
 });
