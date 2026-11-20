@@ -322,7 +322,7 @@ impl PathGuard {
     /// told from the other by the answer.
     fn resolve_as(&self, input: &str, access: Access) -> Result<PathBuf, String> {
         let r = self.resolve_inner(input, access).and_then(|p| {
-            if self.narrow.is_some() && !p.exists() {
+            if self.narrow.is_some() && access == Access::Read && !p.exists() {
                 Err(format!("does not exist: {}", p.display()))
             } else {
                 Ok(p)
@@ -1245,7 +1245,7 @@ mod tests {
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
-    use super::PathGuard;
+    use super::{PathGuard, SHARE_REFUSAL};
     use crate::db::PaDb;
     use crate::engines::EngineRegistry;
     use crate::executor::ExecutorTier;
@@ -2735,6 +2735,12 @@ mod tests {
             assert!(!e.contains('/') || e == SHARE_REFUSAL);
             assert!(!e.contains(project.to_str().unwrap()), "{e}");
         }
+        // A write target that does not exist yet (rename / move destination)
+        // still resolves for a member; only reads need the file to exist.
+        assert_eq!(
+            tree.resolve(&project.join("docs/new-name.md").to_string_lossy()).unwrap(),
+            project.join("docs/new-name.md")
+        );
         // The Owner's own guard keeps its detailed text.
         let own = guard.resolve(&other.join("nope.md").to_string_lossy());
         assert!(own.is_ok(), "owner may name a missing leaf in an allowlisted dir");

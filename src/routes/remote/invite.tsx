@@ -1,6 +1,7 @@
 import { createFileRoute } from '@tanstack/react-router';
 import { type FormEvent, useEffect, useId, useState } from 'react';
 
+import { markShareLanding } from '@/shell/people/share-landing';
 import { type ShareSelection, setShareMode } from '@/lib/transport';
 import { type AuthMe, fetchAuthMe, signInWithPassword } from '@/lib/transport/t1-session';
 
@@ -122,7 +123,12 @@ export function selectionFromAccept(share: AcceptedShare): ShareSelection {
 }
 
 function enter(share: AcceptedShare | undefined) {
-	if (share) setShareMode(selectionFromAccept(share));
+	if (share) {
+		const sel = selectionFromAccept(share);
+		setShareMode(sel);
+		// An artifact Guest cannot list files: land on the shared one.
+		markShareLanding(sel.projectKey, sel.scope);
+	}
 	window.location.assign('/');
 }
 

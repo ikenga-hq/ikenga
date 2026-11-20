@@ -411,7 +411,7 @@ fn view_window_opens(key: String, now_ms: i64) -> bool {
 }
 
 /// The file-content reads a share audits as a view (`{path}` args).
-const VIEW_ARMS: &[&str] = &["fs_read"];
+const VIEW_ARMS: &[&str] = &["fs_read", "viewer_serve"];
 
 /// `path` with `.` segments dropped and separators collapsed; `None` when
 /// it climbs (`..`) — such a read is refused by the child anyway.
@@ -446,20 +446,30 @@ fn artifact_read_matches(path: &str, requested: &str, artifact: &str) -> bool {
 
 /// What a share read views (§6.5 `share.artifact_viewed`, "Guest and
 /// artifact-scope reads"), or `None` when it is not one: another command,
-/// an own-workspace or project-scope non-Guest request, or — on an artifact
-/// share — a path that is not the shared artifact (the child refuses it).
-/// An artifact share's view is named by the artifact's project-relative
-/// path; a project-scope Guest's by the path it read.
+/// or an own-workspace or project-scope non-Guest request. An artifact
+/// share's view of the artifact is named by its project-relative path; any
+/// other read in the folder it may read (siblings, a `viewer_serve` mount)
+/// and a project-scope Guest's reads are named by the path read.
 pub fn viewed_target(share: &super::ShareCtx, cmd: &str, args: &Value) -> Option<String> {
     if !VIEW_ARMS.contains(&cmd) {
         return None;
     }
-    let path = args.get("path").and_then(Value::as_str)?;
+    // `viewer_serve` names its folder as `rootDir`; reads name a `path`.
+    let key = if cmd == "viewer_serve" { "rootDir" } else { "path" };
+    let path = args.get(key).and_then(Value::as_str)?;
     let requested = lexical(path).filter(|p| !p.is_empty())?;
     match share.artifact_path.as_deref() {
         Some(artifact) => {
             let artifact = super::share::normalize_artifact_path(artifact).ok()?;
-            artifact_read_matches(path, &requested, &artifact).then_some(artifact)
+            // WP-12: the member may read the artifact's whole folder, so a
+            // sibling read is a view too, named by the path it read.
+            if cmd == "fs_read" && artifact_read_matches(path, &requested, &artifact) {
+                Some(artifact)
+            } else if path.starts_with(['/', '\\']) {
+                Some(format!("/{requested}"))
+            } else {
+                Some(requested)
+            }
         }
         // Named (and coalesced) by the normalized path, so `/p//a.md` and
         // `/p/./a.md` are the one (member, path, hour) window (review
@@ -705,16 +715,33 @@ mod tests {
         for other in ["/x/../docs/brief.md", ""] {
             assert_eq!(viewed_target(a, "fs_read", &read(other)), None, "{other}");
         }
-        assert_eq!(viewed_target(a, "fs_read", &abs(docs.join("other.md"))), None);
+        // WP-12: a sibling read is a view too, named by the path it read.
+        let sibling = viewed_target(a, "fs_read", &abs(docs.join("other.md")));
+        assert!(
+            sibling.as_deref().is_some_and(|s| s.starts_with('/') && s.ends_with("docs/other.md")),
+            "{sibling:?}"
+        );
         // No suffix match: a path that does not exist, or that only ends the
-        // same way as the artifact, is not a view of it.
+        // same way as the artifact, is not a view OF THE ARTIFACT (it is named
+        // by its own path, never as `docs/brief.md`).
         assert_eq!(
-            viewed_target(a, "fs_read", &read("/home/o/proj/docs/brief.md")),
-            None,
+            viewed_target(a, "fs_read", &read("/home/o/proj/docs/brief.md")).as_deref(),
+            Some("/home/o/proj/docs/brief.md"),
             "nonexistent"
         );
-        assert_eq!(viewed_target(a, "fs_read", &read("x/docs/brief.md")), None);
-        assert_eq!(viewed_target(a, "fs_read", &read("brief.md")), None);
+        assert_eq!(
+            viewed_target(a, "fs_read", &read("x/docs/brief.md")).as_deref(),
+            Some("x/docs/brief.md")
+        );
+        assert_eq!(
+            viewed_target(a, "fs_read", &read("brief.md")).as_deref(),
+            Some("brief.md")
+        );
+        // A folder mount (`viewer_serve`) is keyed on its `rootDir`.
+        assert_eq!(
+            viewed_target(a, "viewer_serve", &json!({ "rootDir": "/home/o/proj/docs" })).as_deref(),
+            Some("/home/o/proj/docs")
+        );
         assert_eq!(
             viewed_target(a, "fs_list", &read("/home/o/proj/docs/brief.md")),
             None
