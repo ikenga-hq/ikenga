@@ -580,9 +580,11 @@ perimeter_public() {
   log "Perimeter: public-https (Caddy + Let's Encrypt)${SSH_ACCESS:+, SSH over $SSH_ACCESS}"
   [[ "$SSH_ACCESS" == tailnet ]] && tailnet_join
   install_caddy
-  # Request body cap and security headers. The daemon has no trusted-proxy
-  # setting yet (WP-P4): it sees 127.0.0.1 for every client, so per-IP rate
-  # limits belong here, not in the daemon, until that lands.
+  # Request body cap and security headers. On this perimeter the daemon
+  # trusts Caddy's forwarded client address (IKENGA_TRUSTED_PROXIES=127.0.0.1,
+  # set in write_env), so its per-address limits (pairing, invites, the /s/
+  # outside links) see real clients. No `log` directive: an access log would
+  # record /s/<token> link URIs (box-files WP-16; a Rust test asserts this).
   local conf=""
   [[ -n "$ACME_EMAIL" ]] && conf="{
 	email $ACME_EMAIL

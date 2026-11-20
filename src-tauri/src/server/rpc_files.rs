@@ -806,69 +806,7 @@ pub(super) struct DownloadQuery {
     inline: Option<String>,
 }
 
-/// The only types served `inline`. Passive: no script runs from them on the
-/// daemon's origin. HTML and SVG are deliberately absent (and so is markdown:
-/// it is text a viewer renders, not something a browser should).
-const INLINE_MIMES: &[&str] = &[
-    "application/pdf",
-    "image/png",
-    "image/jpeg",
-    "image/gif",
-    "image/webp",
-    "text/plain",
-];
-
-/// Read chunk of the download stream.
-const DOWNLOAD_CHUNK: usize = 64 * 1024;
-
-/// RFC 5987 `attr-char`: everything outside it is percent-encoded in `filename*`.
-const ATTR_CHAR: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
-    .remove(b'!')
-    .remove(b'#')
-    .remove(b'$')
-    .remove(b'&')
-    .remove(b'+')
-    .remove(b'-')
-    .remove(b'.')
-    .remove(b'^')
-    .remove(b'_')
-    .remove(b'`')
-    .remove(b'|')
-    .remove(b'~');
-
-/// A file name safe to put in a header: no control characters (CR and LF
-/// included), no quotes, no path separators. Falls back to `download`.
-fn sanitize_filename(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .filter(|c| !c.is_control())
-        .map(|c| match c {
-            '"' | '\\' | '/' => '_',
-            c => c,
-        })
-        .collect();
-    let cleaned = cleaned.trim().to_string();
-    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
-        "download".to_string()
-    } else {
-        cleaned
-    }
-}
-
-/// `Content-Disposition` value: an ASCII `filename=` fallback plus the real
-/// name as `filename*=UTF-8''…` (RFC 5987 / 6266).
-fn content_disposition(file_name: &str, inline: bool) -> String {
-    let name = sanitize_filename(file_name);
-    let ascii: String = name
-        .chars()
-        .map(|c| if c.is_ascii() && c != '%' && c != ';' { c } else { '_' })
-        .collect();
-    let kind = if inline { "inline" } else { "attachment" };
-    format!(
-        "{kind}; filename=\"{ascii}\"; filename*=UTF-8''{}",
-        percent_encoding::utf8_percent_encode(&name, ATTR_CHAR)
-    )
-}
+use super::shared::download::{content_disposition, file_stream, INLINE_MIMES};
 
 /// The `Content-Type` and whether the response may be `inline`.
 fn download_type(path: &Path, want_inline: bool) -> (String, bool) {
@@ -925,8 +863,6 @@ pub(super) async fn http_fs_download(
 ) -> axum::response::Response {
     use axum::http::{header, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
-    use tokio::io::AsyncReadExt;
-
     let Some(path) = q.path.filter(|p| !p.is_empty()) else {
         return download_refusal(StatusCode::BAD_REQUEST, "path is required");
     };
@@ -970,18 +906,7 @@ pub(super) async fn http_fs_download(
     let disposition = HeaderValue::from_str(&content_disposition(&file_name, inline))
         .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"download\""));
 
-    let stream = futures_util::stream::unfold(Some(file.take(len)), |st| async move {
-        let mut reader = st?;
-        let mut buf = vec![0u8; DOWNLOAD_CHUNK];
-        match reader.read(&mut buf).await {
-            Ok(0) => None,
-            Ok(n) => {
-                buf.truncate(n);
-                Some((Ok(axum::body::Bytes::from(buf)), Some(reader)))
-            }
-            Err(e) => Some((Err(e), None)),
-        }
-    });
+    let stream = file_stream(file, len);
 
     let mut res = axum::body::Body::from_stream(stream).into_response();
     let h = res.headers_mut();
@@ -1006,29 +931,6 @@ pub(super) async fn http_fs_download(
 #[cfg(test)]
 mod download_tests {
     use super::*;
-
-    #[test]
-    fn disposition_strips_quotes_and_control_characters() {
-        let d = content_disposition("a\"b\r\nc\td.png", false);
-        assert!(!d.contains('\r') && !d.contains('\n') && !d.contains('\t'));
-        assert!(d.starts_with("attachment; filename=\"a_bcd.png\";"), "{d}");
-        assert_eq!(d.matches('"').count(), 2, "{d}");
-    }
-
-    #[test]
-    fn disposition_carries_an_ascii_fallback_and_an_rfc5987_name() {
-        let d = content_disposition("café 100%.txt", false);
-        assert!(d.contains("filename=\"caf_ 100_.txt\""), "{d}");
-        assert!(d.contains("filename*=UTF-8''caf%C3%A9%20100%25.txt"), "{d}");
-        assert!(d.is_ascii());
-    }
-
-    #[test]
-    fn empty_or_dot_names_fall_back() {
-        for n in ["", "..", "\r\n"] {
-            assert!(content_disposition(n, false).contains("filename=\"download\""), "{n:?}");
-        }
-    }
 
     #[test]
     fn inline_is_limited_to_passive_types() {

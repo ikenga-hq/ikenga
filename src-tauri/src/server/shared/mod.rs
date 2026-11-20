@@ -37,6 +37,9 @@ pub mod comment_route;
 pub mod comments;
 pub mod confined_fs;
 pub mod data_health;
+/// box-files WP-16: download header helpers shared by `/api/fs/download`
+/// and the outside file links.
+pub(crate) mod download;
 pub mod engine_layout;
 pub mod failure_class;
 pub mod fs;

@@ -46,6 +46,9 @@ export const NETWORK_ONLY_PREFIXES = [
 	'/internal',
 	'/__viewer',
 	'/__viewer-health',
+	// Outside file links (box-files WP-16): the broker's server-rendered page
+	// for people with no account, never the cached app shell.
+	'/s',
 ] as const;
 
 /** The worker script itself: the browser's update check must reach the server. */

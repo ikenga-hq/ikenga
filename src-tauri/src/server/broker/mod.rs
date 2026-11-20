@@ -24,6 +24,8 @@
 
 pub mod approvals;
 pub mod children;
+/// box-files WP-16: the unauthenticated outside-link routes, `/s/*`.
+pub mod file_links;
 pub mod fs_roots_admin;
 pub mod health_probe;
 pub mod proxy;
@@ -119,6 +121,10 @@ pub struct BrokerState {
     /// Where the sender's approvals socket is (`approvals`): a share's
     /// `pa_actions_commit` writes the ledger approval there, as the viewer.
     pub approvals: approvals::ApprovalsConfig,
+    /// The outside-link routes' state (box-files WP-16): the `--file-links`
+    /// setting, the row store, the unlock key, throttles and semaphores.
+    /// Off ([`file_links::LinkGate::disabled`]) until [`serve`] configures it.
+    pub file_links: Arc<file_links::LinkGate>,
 }
 
 /// How many backup uploads one account may have in flight at once, and how
@@ -189,6 +195,7 @@ impl BrokerState {
             access_t1: None,
             uploads: UploadGate::new(2, Duration::from_secs(600)),
             approvals: approvals::ApprovalsConfig::from_env(),
+            file_links: Arc::new(file_links::LinkGate::disabled()),
         })
     }
 }
@@ -301,7 +308,7 @@ pub fn router(
         .route("/__viewer/*rest", any(proxy::viewer_proxy))
         .with_state(state.clone());
 
-    Router::new()
+    let app = Router::new()
         .merge(public)
         .merge(viewer_routes)
         .merge(protected)
@@ -311,7 +318,16 @@ pub fn router(
             let spa = spa.clone();
             async move { spa.handle_with(uri, &headers).await }
         })
-        .layer(auth_layer)
+        .layer(auth_layer);
+
+    // box-files WP-16: the outside-link routes, always registered (a `/s/…`
+    // path must never fall to the SPA) and outside the session layer, so a
+    // signed-in visitor's session is never read, refreshed or rotated by one
+    // (06-file-links O-8, the conservative choice); inside the `Origin` gate
+    // (a cross-origin passcode POST is refused, LS-13).
+    Router::new()
+        .merge(file_links::routes(state.clone()))
+        .merge(app)
         .layer(middleware::from_fn_with_state(
             Arc::new(allowed_origins),
             auth_mod::origin_gate,
@@ -466,6 +482,14 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
             .join(crate::server::update::REQUEST_FILE),
     )));
     broker_state.access_t1 = Some(access_t1.clone());
+    // box-files WP-16: the `/s/*` routes read the same access store; off
+    // unless `--file-links`.
+    broker_state.file_links = Arc::new(file_links::LinkGate::new(file_links::LinkConfig {
+        enabled: access_t1.options.file_links,
+        public_url: access_t1.options.public_url.clone(),
+        insecure_cookie,
+        store: Some(access_t1.store.clone()),
+    }));
     let state = Arc::new(broker_state);
     // The admin Server card (`server_health`): the disk figures describe the
     // operator root's filesystem; per-account figures are asked of each

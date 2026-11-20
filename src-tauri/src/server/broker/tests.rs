@@ -2287,3 +2287,6 @@ mod share_approve;
 
 /// WP-D: the per-person view of outreach drafts (Ada her rows, Chinedum all).
 mod share_outreach;
+
+/// box-files WP-16: the outside-link routes, `/s/*` (06-file-links LS tests).
+mod file_links;

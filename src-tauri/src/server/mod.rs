@@ -31,6 +31,9 @@ pub mod events_ws;
 /// box-files WP-15: the child's `file_link_resolve` arm (what an outside
 /// link may carry, decided by the creator's own guard).
 pub(crate) mod file_link_resolve;
+/// box-files WP-16: the child's `/internal/file-link/read` (the bytes of
+/// one outside link, streamed to the broker only).
+pub(crate) mod file_link_read;
 pub mod fs_ws;
 pub mod health;
 /// A held hook gate's notification row and audit trail (daemon asks).
@@ -1120,7 +1123,13 @@ fn build_router(
             .route(
                 crate::access::audit::child::ACK_PATH,
                 post(crate::access::audit::child::ack_handler),
-            ),
+            )
+            // box-files WP-16: the bytes of one outside link, for the
+            // broker's `/s/<token>/{view,download}` only (`internal`
+            // class). Outside the app-lock gate (a link is revoked, not
+            // locked, 06-file-links §1.4); deliberately NOT in the
+            // not-activity list above, so a stream keeps the child up.
+            .route(file_link_read::READ_PATH, get(file_link_read::handler)),
         crate::access::DaemonMode::T0 => protected_routes,
     };
     let protected_routes = protected_routes.layer(middleware::from_fn_with_state(

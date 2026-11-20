@@ -611,8 +611,10 @@ pub fn route_requirement(path: &str) -> Option<Requirement> {
     } else if path == crate::server::push::outbox::EVENTS_PATH
         || path == audit::child::EVENTS_PATH
         || path == audit::child::ACK_PATH
+        || path == crate::server::file_link_read::READ_PATH
     {
         // plans/pwa S2 §10: the broker's push long-poll, broker → child only.
+        // box-files WP-16: an outside link's bytes, broker → child only.
         Some(Requirement::internal())
     } else {
         None
