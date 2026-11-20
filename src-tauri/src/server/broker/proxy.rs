@@ -901,6 +901,64 @@ pub async fn pkgs_proxy(
     .await
 }
 
+/// `GET|HEAD /api/fs/download?path=…` → the principal's (or, under a share, the
+/// owner's) child, streamed through unbuffered (`forward` pipes the body).
+///
+/// Authorized as the `fs_read` arm it serves: the same `authorize_rpc` call
+/// the RPC path makes, so class and caps are the same (`shared[Files]`) and a
+/// share read is audited by the same hook. The child re-checks and narrows.
+pub async fn fs_download_proxy(
+    State(state): State<Arc<BrokerState>>,
+    Extension(ctx): Extension<PrincipalCtx>,
+    req: Request,
+) -> Response {
+    let (mut parts, _body) = req.into_parts();
+    if !matches!(parts.method, Method::GET | Method::HEAD) {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let Some(pq) = path_and_query(&parts.uri) else {
+        return bad_path();
+    };
+    let path = axum::extract::Query::<std::collections::HashMap<String, String>>::try_from_uri(
+        &parts.uri,
+    )
+    .ok()
+    .and_then(|q| q.0.get("path").cloned())
+    .filter(|p| !p.is_empty());
+    let Some(path) = path else {
+        return json_error(StatusCode::BAD_REQUEST, "bad_request", "path is required");
+    };
+    let narrowing = match state.hooks.narrower.narrow(&ctx, &parts).await {
+        Ok(n) => n,
+        Err(r) => return refused(r),
+    };
+    parts.extensions.insert(narrowing.clone());
+    let args = serde_json::json!({ "path": path });
+    match state
+        .hooks
+        .authorizer
+        .authorize_rpc(&ctx, &parts, "fs_read", &args)
+        .await
+    {
+        Decision::Allow => {}
+        Decision::Deny {
+            status,
+            code,
+            message,
+        } => return json_error(status, code, &message),
+    }
+    forward(
+        &state,
+        &narrowing,
+        &ctx,
+        parts.method.clone(),
+        &pq,
+        &parts.headers,
+        Bytes::new(),
+    )
+    .await
+}
+
 /// `GET /api/backup/export` → the principal's child.
 pub async fn backup_export_proxy(
     State(state): State<Arc<BrokerState>>,

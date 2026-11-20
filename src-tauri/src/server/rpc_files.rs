@@ -759,6 +759,279 @@ pub(super) async fn pkg_scaffold(state: &AppState, args: &Value) -> RpcResponse 
     respond("pkg_scaffold", r)
 }
 
+// ─── streamed download ───────────────────────────────────────────────────────
+
+/// Query of `GET /api/fs/download`.
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct DownloadQuery {
+    path: Option<String>,
+    /// `1` asks for `Content-Disposition: inline`; honoured only for
+    /// [`INLINE_MIMES`].
+    inline: Option<String>,
+}
+
+/// The only types served `inline`. Passive: no script runs from them on the
+/// daemon's origin. HTML and SVG are deliberately absent (and so is markdown:
+/// it is text a viewer renders, not something a browser should).
+const INLINE_MIMES: &[&str] = &[
+    "application/pdf",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "text/plain",
+];
+
+/// Read chunk of the download stream.
+const DOWNLOAD_CHUNK: usize = 64 * 1024;
+
+/// RFC 5987 `attr-char`: everything outside it is percent-encoded in `filename*`.
+const ATTR_CHAR: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'!')
+    .remove(b'#')
+    .remove(b'$')
+    .remove(b'&')
+    .remove(b'+')
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'^')
+    .remove(b'_')
+    .remove(b'`')
+    .remove(b'|')
+    .remove(b'~');
+
+/// A file name safe to put in a header: no control characters (CR and LF
+/// included), no quotes, no path separators. Falls back to `download`.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| match c {
+            '"' | '\\' | '/' => '_',
+            c => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim().to_string();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        "download".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// `Content-Disposition` value: an ASCII `filename=` fallback plus the real
+/// name as `filename*=UTF-8''…` (RFC 5987 / 6266).
+fn content_disposition(file_name: &str, inline: bool) -> String {
+    let name = sanitize_filename(file_name);
+    let ascii: String = name
+        .chars()
+        .map(|c| if c.is_ascii() && c != '%' && c != ';' { c } else { '_' })
+        .collect();
+    let kind = if inline { "inline" } else { "attachment" };
+    format!(
+        "{kind}; filename=\"{ascii}\"; filename*=UTF-8''{}",
+        percent_encoding::utf8_percent_encode(&name, ATTR_CHAR)
+    )
+}
+
+/// The `Content-Type` and whether the response may be `inline`.
+fn download_type(path: &Path, want_inline: bool) -> (String, bool) {
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    let essence = mime.essence_str();
+    if want_inline && INLINE_MIMES.contains(&essence) {
+        let ct = if essence == "text/plain" {
+            "text/plain; charset=utf-8".to_string()
+        } else {
+            essence.to_string()
+        };
+        (ct, true)
+    } else {
+        ("application/octet-stream".to_string(), false)
+    }
+}
+
+fn download_refusal(status: axum::http::StatusCode, error: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        status,
+        axum::Json(serde_json::json!({ "ok": false, "error": error })),
+    )
+        .into_response()
+}
+
+/// The HTTP status of an access refusal (`<code>: <message>`, the shape
+/// `access::AccessError` displays as).
+fn refusal_status(error: &str) -> axum::http::StatusCode {
+    use axum::http::StatusCode;
+    match error.split(':').next().unwrap_or("") {
+        "unauthenticated" | "expired" => StatusCode::UNAUTHORIZED,
+        "not_found" => StatusCode::NOT_FOUND,
+        "invalid_request" => StatusCode::BAD_REQUEST,
+        "throttled" => StatusCode::TOO_MANY_REQUESTS,
+        "internal" => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::FORBIDDEN,
+    }
+}
+
+/// `GET /api/fs/download?path=…[&inline=1]`: stream one file from disk.
+///
+/// Authorized and narrowed exactly like the `fs_read` arm: the access
+/// pre-hook runs *as* `fs_read` (class `shared`, cap `Files`), and under a
+/// share it hands back the state whose `PathGuard` is narrowed to the shared
+/// target, so a member reaches the shared files and nothing else. The path is
+/// then resolved by that same guard (allowlist, symlink escapes, reserved
+/// daemon state). A directory is refused. The file is streamed in chunks, never
+/// read whole, so a large file costs a buffer, not its size.
+pub(super) async fn http_fs_download(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    ctx: Option<axum::Extension<crate::access::AccessCtx>>,
+    axum::extract::Query(q): axum::extract::Query<DownloadQuery>,
+) -> axum::response::Response {
+    use axum::http::{header, HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use tokio::io::AsyncReadExt;
+
+    let Some(path) = q.path.filter(|p| !p.is_empty()) else {
+        return download_refusal(StatusCode::BAD_REQUEST, "path is required");
+    };
+    let ctx = ctx.map(|axum::Extension(c)| c);
+    let args = serde_json::json!({ "path": path });
+    let state = match crate::access::rpc_prehook(&state, ctx.as_ref(), "fs_read", &args).await {
+        crate::access::PreHook::Proceed => state,
+        crate::access::PreHook::Narrowed(narrowed) => narrowed,
+        crate::access::PreHook::Answered(res) => {
+            let error = res.error.unwrap_or_else(|| "forbidden".to_string());
+            return download_refusal(refusal_status(&error), &error);
+        }
+    };
+    if let Err(e) = state.path_guard.ready() {
+        return download_refusal(StatusCode::SERVICE_UNAVAILABLE, &e);
+    }
+    // Every resolve failure answers the same 404: no oracle for what exists
+    // outside the allowlist or the share, and no absolute path in the body.
+    let Ok(resolved) = state.path_guard.resolve(&path) else {
+        return download_refusal(StatusCode::NOT_FOUND, "no such file");
+    };
+    let Ok(file) = tokio::fs::File::open(&resolved).await else {
+        return download_refusal(StatusCode::NOT_FOUND, "no such file");
+    };
+    // Metadata of the open handle, not of the path: no gap between the check
+    // and the read.
+    let Ok(meta) = file.metadata().await else {
+        return download_refusal(StatusCode::NOT_FOUND, "no such file");
+    };
+    if !meta.is_file() {
+        return download_refusal(StatusCode::BAD_REQUEST, "not a file: a folder cannot be downloaded");
+    }
+    let len = meta.len();
+
+    let want_inline = q.inline.as_deref() == Some("1");
+    let (content_type, inline) = download_type(&resolved, want_inline);
+    let file_name = resolved
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let disposition = HeaderValue::from_str(&content_disposition(&file_name, inline))
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"download\""));
+
+    let stream = futures_util::stream::unfold(Some(file.take(len)), |st| async move {
+        let mut reader = st?;
+        let mut buf = vec![0u8; DOWNLOAD_CHUNK];
+        match reader.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(axum::body::Bytes::from(buf)), Some(reader)))
+            }
+            Err(e) => Some((Err(e), None)),
+        }
+    });
+
+    let mut res = axum::body::Body::from_stream(stream).into_response();
+    let h = res.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(&content_type) {
+        h.insert(header::CONTENT_TYPE, v);
+    }
+    h.insert(header::CONTENT_DISPOSITION, disposition);
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    // Defence in depth for the inline types: no script, no framing escape.
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox; default-src 'none'"),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    res
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+
+    #[test]
+    fn disposition_strips_quotes_and_control_characters() {
+        let d = content_disposition("a\"b\r\nc\td.png", false);
+        assert!(!d.contains('\r') && !d.contains('\n') && !d.contains('\t'));
+        assert!(d.starts_with("attachment; filename=\"a_bcd.png\";"), "{d}");
+        assert_eq!(d.matches('"').count(), 2, "{d}");
+    }
+
+    #[test]
+    fn disposition_carries_an_ascii_fallback_and_an_rfc5987_name() {
+        let d = content_disposition("café 100%.txt", false);
+        assert!(d.contains("filename=\"caf_ 100_.txt\""), "{d}");
+        assert!(d.contains("filename*=UTF-8''caf%C3%A9%20100%25.txt"), "{d}");
+        assert!(d.is_ascii());
+    }
+
+    #[test]
+    fn empty_or_dot_names_fall_back() {
+        for n in ["", "..", "\r\n"] {
+            assert!(content_disposition(n, false).contains("filename=\"download\""), "{n:?}");
+        }
+    }
+
+    #[test]
+    fn inline_is_limited_to_passive_types() {
+        for (name, ok) in [
+            ("a.pdf", true),
+            ("a.png", true),
+            ("a.jpg", true),
+            ("a.gif", true),
+            ("a.webp", true),
+            ("a.txt", true),
+            ("a.html", false),
+            ("a.htm", false),
+            ("a.svg", false),
+            ("a.xml", false),
+            ("a.js", false),
+            ("a.md", false),
+            ("a.bin", false),
+        ] {
+            let (ct, inline) = download_type(Path::new(name), true);
+            assert_eq!(inline, ok, "{name} → {ct}");
+            if !ok {
+                assert_eq!(ct, "application/octet-stream", "{name}");
+            }
+        }
+        // Without the flag nothing is inline, whatever the type.
+        assert!(!download_type(Path::new("a.pdf"), false).1);
+        assert!(content_disposition("a.pdf", true).starts_with("inline;"));
+    }
+
+    #[test]
+    fn refusal_codes_map_to_statuses() {
+        use axum::http::StatusCode as S;
+        assert_eq!(refusal_status("forbidden: missing=files"), S::FORBIDDEN);
+        assert_eq!(refusal_status("not_found: nope"), S::NOT_FOUND);
+        assert_eq!(refusal_status("unauthenticated: x"), S::UNAUTHORIZED);
+        assert_eq!(refusal_status("something odd"), S::FORBIDDEN);
+    }
+}
+
 /// Router tests for every slice-8 arm (these three, and `rpc_shell`'s
 /// `pin_screenshot_write` / `scaffold_agent_config`), a file of their own.
 #[cfg(test)]
@@ -3675,5 +3948,118 @@ mod tests {
                 .iter()
                 .any(|f| f["path"] == "untracked.txt"));
         }
+    }
+
+    // ── GET /api/fs/download ──────────────────────────────────────
+
+    async fn download(
+        router: &Router,
+        path: &str,
+        inline: bool,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let q = percent_encoding::utf8_percent_encode(path, percent_encoding::NON_ALPHANUMERIC);
+        let uri = format!("/api/fs/download?path={q}{}", if inline { "&inline=1" } else { "" });
+        let res = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header("authorization", "Bearer tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, headers) = (res.status(), res.headers().clone());
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, headers, body)
+    }
+
+    #[tokio::test]
+    async fn download_streams_an_allowed_file_with_safe_headers() {
+        let d = daemon();
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(d.allowed.join("r\u{e9}sum\u{e9}.pdf"), &bytes).unwrap();
+        let p = s(&d.allowed.join("r\u{e9}sum\u{e9}.pdf"));
+
+        let (status, h, body) = download(&d.router, &p, false).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, bytes);
+        assert_eq!(h["content-length"], "200000");
+        assert_eq!(h["x-content-type-options"], "nosniff");
+        assert_eq!(h["content-type"], "application/octet-stream");
+        let cd = h["content-disposition"].to_str().unwrap();
+        assert!(cd.starts_with("attachment;"), "{cd}");
+        assert!(cd.contains("filename*=UTF-8''r%C3%A9sum%C3%A9.pdf"), "{cd}");
+
+        let (_, h, _) = download(&d.router, &p, true).await;
+        assert_eq!(h["content-type"], "application/pdf");
+        assert!(h["content-disposition"].to_str().unwrap().starts_with("inline;"));
+    }
+
+    #[tokio::test]
+    async fn download_never_serves_html_or_svg_inline() {
+        let d = daemon();
+        for name in ["x.html", "x.svg"] {
+            std::fs::write(d.allowed.join(name), b"<script>1</script>").unwrap();
+            let (status, h, _) = download(&d.router, &s(&d.allowed.join(name)), true).await;
+            assert_eq!(status, StatusCode::OK, "{name}");
+            assert!(
+                h["content-disposition"].to_str().unwrap().starts_with("attachment;"),
+                "{name}"
+            );
+            assert_eq!(h["content-type"], "application/octet-stream", "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn download_refuses_outside_allowlist_symlink_escape_and_directories() {
+        let d = daemon();
+        std::fs::write(d.outside.join("secret.txt"), b"s").unwrap();
+        let (status, _, body) = download(&d.router, &s(&d.outside.join("secret.txt")), false).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!String::from_utf8_lossy(&body).contains("secret.txt"));
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(d.outside.join("secret.txt"), d.allowed.join("link.txt"))
+                .unwrap();
+            let (status, _, _) = download(&d.router, &s(&d.allowed.join("link.txt")), false).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+
+        std::fs::create_dir_all(d.allowed.join("folder")).unwrap();
+        let (status, _, _) = download(&d.router, &s(&d.allowed.join("folder")), false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _, _) = download(&d.router, "", false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn download_needs_the_bearer() {
+        let d = daemon();
+        std::fs::write(d.allowed.join("a.txt"), b"hi").unwrap();
+        let q = percent_encoding::utf8_percent_encode(
+            &s(&d.allowed.join("a.txt")),
+            percent_encoding::NON_ALPHANUMERIC,
+        )
+        .to_string();
+        let res = d
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/fs/download?path={q}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 }

@@ -1058,6 +1058,9 @@ fn build_router(
         .route("/api/server/update/check", post(update::t0_check))
         // Backup export/import (WP-B): streamed download / upload (100MB max)
         .route("/api/backup/export", get(rpc_backup::http_backup_export))
+        // Streamed file download (box-files WP-04): authorized and share-narrowed
+        // as the `fs_read` arm (`rpc_files::http_fs_download`).
+        .route("/api/fs/download", get(rpc_files::http_fs_download))
         .route(
             "/api/backup/import",
             post(rpc_backup::http_backup_import).layer(axum::extract::DefaultBodyLimit::max(

@@ -584,6 +584,9 @@ pub fn route_requirement(path: &str) -> Option<Requirement> {
         Some(Requirement::operator())
     } else if matches!(path, "/api/backup/export" | "/api/backup/import") {
         Some(Requirement::owner(&[Cap::Settings]))
+    } else if path == "/api/fs/download" {
+        // Same requirement as the `fs_read` arm it serves (`rpc_requirements`).
+        Some(Requirement::shared(&[Cap::Files]))
     } else if path.starts_with("/ws/pty/") {
         Some(Requirement::owner(&[Cap::Sessions]))
     } else if path.starts_with("/ws/chat/") {
@@ -958,6 +961,10 @@ mod tests {
             assert_eq!(req.class, ArmClass::Owner, "{p}");
             assert_eq!(req.caps, CapSet::of(&[Cap::Settings]), "{p}");
         }
+        let dl = route_requirement("/api/fs/download").unwrap();
+        assert_eq!(dl.class, ArmClass::Shared);
+        assert_eq!(dl.caps, CapSet::of(&[Cap::Files]));
+        assert_eq!(dl, rpc_requirements::requirement("fs_read"));
         assert_eq!(
             route_requirement("/ws/pty/abc").unwrap().caps,
             CapSet::of(&[Cap::Sessions])

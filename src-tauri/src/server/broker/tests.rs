@@ -163,6 +163,10 @@ impl ChildLauncher for FakeLauncher {
                     post(move |req: Request<Body>| echo_http(r5.clone(), req)),
                 )
                 .route(
+                    "/api/fs/download",
+                    get(move |req: Request<Body>| echo_http(r4.clone(), req)),
+                )
+                .route(
                     "/__viewer/*rest",
                     any(move |req: Request<Body>| echo_http(r3.clone(), req)),
                 )
@@ -2081,6 +2085,49 @@ async fn viewer_token_routes_to_the_running_child_without_a_cookie_and_never_lau
     let (status, _, _) = send(
         &h.app,
         request("POST", &format!("/__viewer/{ada_tok}/x"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn t1_broker_proxies_fs_download_for_a_signed_in_user_only() {
+    let h = harness().await;
+    let _id = insert_account(&h.pool, "ada", 20_002, false).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+    let uri = "/api/fs/download?path=%2Ftmp%2Fa.txt";
+
+    let (status, _, _) = send(&h.app, request("GET", uri).body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _, body) = send(
+        &h.app,
+        request("GET", uri)
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "download route was proxied");
+    assert_eq!(body["data"]["path"], "/api/fs/download");
+
+    // No `path`: refused at the broker, nothing proxied.
+    let (status, _, _) = send(
+        &h.app,
+        request("GET", "/api/fs/download")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _, _) = send(
+        &h.app,
+        request("POST", uri)
+            .header("cookie", &cookie)
             .body(Body::empty())
             .unwrap(),
     )
