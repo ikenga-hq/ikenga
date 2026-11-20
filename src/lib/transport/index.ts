@@ -227,6 +227,26 @@ export class TauriTransport implements RpcTransport {
 	}
 }
 
+/** The `error` sentence (and typed `error_data`) of a non-200 RPC reply, or
+ *  `null` when the body is not the daemon's JSON envelope. */
+async function readRefusal(
+	res: Response
+): Promise<{ error: string; errorData?: Record<string, unknown> } | null> {
+	try {
+		const body: unknown = await res.json();
+		if (!body || typeof body !== 'object') return null;
+		const b = body as { error?: unknown; error_data?: unknown };
+		if (typeof b.error !== 'string' || !b.error.trim()) return null;
+		const errorData =
+			b.error_data && typeof b.error_data === 'object'
+				? (b.error_data as Record<string, unknown>)
+				: undefined;
+		return { error: b.error, errorData };
+	} catch {
+		return null;
+	}
+}
+
 export class WebRemoteTransport implements RpcTransport {
 	/** The daemon's `/ws/events` channel — one socket for every listener on
 	 *  the page (see `transport/events-socket.ts`). */
@@ -272,6 +292,16 @@ export class WebRemoteTransport implements RpcTransport {
 				} catch {
 					// Fall through
 				}
+			}
+			// The daemon and broker refuse with a JSON body whose `error` is the
+			// reason (`{ok:false,error:"expired: …"}`). Show that sentence; fall
+			// back to the bare status line only when there is no such body (an
+			// HTML 502 from a proxy, a plain-text 413, a bodiless reply).
+			const refusal = await readRefusal(res);
+			if (refusal) {
+				const err = new Error(refusal.error);
+				if (refusal.errorData) Object.assign(err, refusal.errorData);
+				throw err;
 			}
 			throw new Error(`HTTP RPC error: ${res.status} ${res.statusText}`);
 		}
