@@ -1359,8 +1359,15 @@ async fn is_rootless(state: &crate::server::AppState, project_id: &str) -> bool 
     }
 }
 
-/// `notifications_record_access {kind:'invite', title, body}` → `{id}`: the
-/// first `invite` producer (§7.3).
+/// Where a first-open notification goes: the Links panel (WP-17), which sits
+/// in the Profile tab of Settings → People.
+pub const LINKS_PANEL_ROUTE: &str = "/settings/profile";
+
+/// `notifications_record_access {kind:'invite'|'link', title, body}` → `{id}`:
+/// the first `invite` producer (§7.3). `kind: "link"` (box-files WP-18, §8.3)
+/// is the first-open notice of an outside link: it records the same
+/// `invite` notification kind (O-5: no new kind, so no mute or FE change)
+/// and its action opens the Links panel.
 async fn internal_record_access(
     state: &crate::server::AppState,
     _ctx: &AccessCtx,
@@ -1369,12 +1376,16 @@ async fn internal_record_access(
     use crate::server::shared::notifications::{
         record, Coalesce, NewNotification, NotificationKind,
     };
-    if str_arg(args, &["kind"]) != Some("invite") {
-        return Err(AccessError::new(
-            Code::InvalidRequest,
-            "kind must be `invite`",
-        ));
-    }
+    let route = match str_arg(args, &["kind"]) {
+        Some("invite") => "/settings/members",
+        Some("link") => LINKS_PANEL_ROUTE,
+        _ => {
+            return Err(AccessError::new(
+                Code::InvalidRequest,
+                "kind must be `invite` or `link`",
+            ))
+        }
+    };
     let title = str_arg(args, &["title"])
         .filter(|t| !t.trim().is_empty())
         .ok_or_else(|| AccessError::new(Code::InvalidRequest, "`title` is required"))?;
@@ -1390,7 +1401,7 @@ async fn internal_record_access(
             kind: NotificationKind::Invite,
             title: clamp(title),
             body: str_arg(args, &["body"]).map(clamp),
-            action: Some(json!({ "type": "route", "to": "/settings/members" })),
+            action: Some(json!({ "type": "route", "to": route })),
             source: "access".into(),
             dedupe_key: None,
             coalesce: Coalesce::Never,

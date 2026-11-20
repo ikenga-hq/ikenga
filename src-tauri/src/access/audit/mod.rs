@@ -419,6 +419,30 @@ fn view_window_opens(key: String, now_ms: i64) -> bool {
     true
 }
 
+/// §8.1 (box-files WP-18): outside-link opens are coalesced to one row per
+/// (link, visitor, mode, hour), the same window as share views. Its own map,
+/// so link keys and share keys can never collide.
+fn link_seen() -> &'static Mutex<HashMap<String, i64>> {
+    static SEEN: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+/// `true` when `key` (link, visitor key, mode) has no row in the current
+/// window, and opens one.
+pub fn link_window_opens(key: String, now_ms: i64) -> bool {
+    let mut seen = link_seen().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = seen.get(&key) {
+        if now_ms - at < VIEW_WINDOW_MS {
+            return false;
+        }
+    }
+    if seen.len() >= 4096 {
+        seen.retain(|_, at| now_ms - *at < VIEW_WINDOW_MS);
+    }
+    seen.insert(key, now_ms);
+    true
+}
+
 /// The file-content reads a share audits as a view (`{path}` args).
 const VIEW_ARMS: &[&str] = &["fs_read", "viewer_serve"];
 
@@ -847,6 +871,10 @@ mod tests {
         assert_eq!(category, "access");
         // The window is per hour.
         let key = "k".to_string();
+        assert!(link_window_opens("l\u{0}k\u{0}view".into(), 5_000));
+        assert!(!link_window_opens("l\u{0}k\u{0}view".into(), 5_000 + VIEW_WINDOW_MS - 1));
+        assert!(link_window_opens("l\u{0}k\u{0}download".into(), 5_001));
+        assert!(link_window_opens("l\u{0}k\u{0}view".into(), 5_000 + VIEW_WINDOW_MS));
         assert!(view_window_opens(key.clone(), 1_000));
         assert!(!view_window_opens(key.clone(), 1_000 + VIEW_WINDOW_MS - 1));
         assert!(view_window_opens(key, 1_000 + VIEW_WINDOW_MS));

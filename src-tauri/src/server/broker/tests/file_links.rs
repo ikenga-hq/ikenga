@@ -30,7 +30,9 @@ use crate::access::AccessStore;
 use crate::executor::{Principal, PrincipalId};
 use crate::server::auth::BoxFuture;
 use crate::server::broker::children::{tests::FakeProcess, ChildLauncher, LaunchedChild};
-use crate::server::broker::file_links::{LinkConfig, LinkGate, PasscodeVerifier, COOKIE_NAME};
+use crate::server::broker::file_links::{
+    LinkConfig, LinkGate, PasscodeVerifier, COOKIE_NAME, PASS_LINK_MAX,
+};
 use crate::server::broker::{router, BrokerExtensions, BrokerState};
 use crate::server::file_link_read::{read_with, ReadQuery, READ_PATH};
 use crate::server::operator::password::LoginVerifier;
@@ -157,6 +159,13 @@ fn fake_verifier() -> PasscodeVerifier {
 }
 
 async fn harness(enabled: bool) -> H {
+    harness_with(enabled, None).await
+}
+
+async fn harness_with(
+    enabled: bool,
+    calls: Option<Arc<dyn crate::access::share::OwnerCalls>>,
+) -> H {
     let (tmp, root) = test_support::temp_root();
     let pool = open_accounts(&root, Opener::Broker).await.unwrap();
     let store = AccessStore::attach_t1(pool.clone()).await.unwrap();
@@ -171,15 +180,17 @@ async fn harness(enabled: bool) -> H {
             .unwrap(),
     );
     let mut state = BrokerState::new(pool.clone(), verifier, launcher.clone()).unwrap();
-    state.file_links = Arc::new(
-        LinkGate::new(LinkConfig {
-            enabled,
-            public_url: Some("https://box.example".into()),
-            insecure_cookie: false,
-            store: Some(store),
-        })
-        .with_verifier(fake_verifier()),
-    );
+    let mut gate = LinkGate::new(LinkConfig {
+        enabled,
+        public_url: Some("https://box.example".into()),
+        insecure_cookie: false,
+        store: Some(store),
+    })
+    .with_verifier(fake_verifier());
+    if let Some(calls) = calls {
+        gate = gate.with_calls(calls);
+    }
+    state.file_links = Arc::new(gate);
     let state = Arc::new(state);
     let sessions = crate::server::auth::backend::open_session_store(&root)
         .await
@@ -1248,4 +1259,180 @@ async fn the_page_shows_the_file_and_nothing_about_its_owner() {
     assert!(!page.contains(&*h.home.to_string_lossy()));
     assert!(!page.contains("<script"));
     assert!(page.contains("noindex"));
+}
+
+
+// ─── LS-23 / LS-24: opens audit, counters, first-open notification (WP-18) ───
+
+/// Records `notifications_record_access` calls (the owner's child, faked).
+#[derive(Default)]
+struct RecordingCalls {
+    calls: Mutex<Vec<(PrincipalId, String, serde_json::Value)>>,
+}
+
+impl crate::access::share::OwnerCalls for RecordingCalls {
+    fn call<'a>(
+        &'a self,
+        owner: PrincipalId,
+        cmd: &'a str,
+        args: serde_json::Value,
+    ) -> crate::access::share::BoxFuture<'a, Result<serde_json::Value, crate::access::AccessError>>
+    {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((owner, cmd.to_string(), args));
+            Ok(serde_json::json!({ "id": 7 }))
+        })
+    }
+
+    fn close_principal(&self, _principal: PrincipalId) -> usize {
+        0
+    }
+}
+
+/// `(kind, subject, target, remote_addr, user_agent, detail)` of every link row.
+async fn link_audit_rows(
+    h: &H,
+) -> Vec<(String, Option<String>, Option<String>, Option<String>, Option<String>, String)> {
+    sqlx::query_as(
+        "SELECT kind, subject_principal_id, target, remote_addr, user_agent, detail \
+         FROM audit_events WHERE kind LIKE 'link.%' AND kind NOT IN ('link.created','link.revoked') \
+         ORDER BY seq",
+    )
+    .fetch_all(&h.pool)
+    .await
+    .unwrap()
+}
+
+/// Wait (bounded) until the spawned note work has produced `n` rows.
+async fn wait_rows(h: &H, n: usize) -> Vec<(String, Option<String>, Option<String>, Option<String>, Option<String>, String)> {
+    for _ in 0..200 {
+        let rows = link_audit_rows(h).await;
+        if rows.len() >= n {
+            return rows;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    link_audit_rows(h).await
+}
+
+async fn counters(h: &H, link_id: &str) -> (i64, i64, Option<i64>, Option<i64>) {
+    sqlx::query_as(
+        "SELECT open_count, download_count, first_opened_at, last_opened_at \
+         FROM file_links WHERE link_id = ?",
+    )
+    .bind(link_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap()
+}
+
+/// LS-23: a view and a download write exactly the listed kinds, the owner is
+/// the subject, the address and agent are kept, the token is nowhere, repeats
+/// in the hour coalesce, and the counters follow the written rows.
+#[tokio::test]
+async fn ls23_opens_are_audited_coalesced_and_counted() {
+    let calls = Arc::new(RecordingCalls::default());
+    let h = harness_with(true, Some(calls.clone())).await;
+    let (t, link_id) = pdf_link(&h).await;
+    let from = ip(41);
+    let get = |suffix: &str| {
+        let b = req("GET", &format!("/s/{t}{suffix}"), from).header("user-agent", "TestAgent/1");
+        send(&h.app, b.body(Body::empty()).unwrap())
+    };
+    assert_eq!(get("/view").await.0, StatusCode::OK);
+    assert_eq!(get("/view").await.0, StatusCode::OK);
+    assert_eq!(get("/download").await.0, StatusCode::OK);
+    assert_eq!(get("/download").await.0, StatusCode::OK);
+    let rows = wait_rows(&h, 2).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let rows2 = link_audit_rows(&h).await;
+    assert_eq!(rows2.len(), rows.len(), "no more rows after settling");
+    let mut kinds: Vec<&str> = rows2.iter().map(|r| r.0.as_str()).collect();
+    kinds.sort_unstable();
+    assert_eq!(kinds, ["link.downloaded", "link.opened"], "{kinds:?}");
+    let rows2: Vec<_> = {
+        let mut v = rows2;
+        v.sort_by(|a, b| b.0.cmp(&a.0)); // opened first
+        v
+    };
+    for r in &rows2 {
+        assert_eq!(r.1.as_deref(), Some(h.owner.to_string().as_str()));
+        assert_eq!(r.2.as_deref(), Some(link_id.as_str()));
+        assert_eq!(r.3.as_deref(), Some("10.0.0.41"));
+        assert_eq!(r.4.as_deref(), Some("TestAgent/1"));
+        assert!(!r.5.contains(&t), "the token is never in a row");
+    }
+    assert!(rows2[0].5.contains("\"mode\":\"view\""));
+    let (opens, downloads, first, last) = counters(&h, &link_id).await;
+    assert_eq!((opens, downloads), (1, 1));
+    assert!(first.is_some() && last.is_some());
+}
+
+/// LS-23: a page view is audited as mode "page", and a lock as link.locked.
+#[tokio::test]
+async fn ls23_a_page_view_and_a_lock_are_audited() {
+    let h = harness_with(true, Some(Arc::new(RecordingCalls::default()))).await;
+    let (t, link_id) = pdf_link(&h).await;
+    assert_eq!(get_from(&h, &format!("/s/{t}"), ip(50), None).await.0, StatusCode::OK);
+    let rows = wait_rows(&h, 1).await;
+    assert_eq!(rows[0].0, "link.opened");
+    assert!(rows[0].5.contains("\"mode\":\"page\""));
+    assert_eq!(counters(&h, &link_id).await.0, 1);
+
+    let (pt, plink) = passcode_link(&h, "p.pdf").await;
+    // 20 wrong guesses across addresses lock the link (LS-11's recipe).
+    for i in 0..(PASS_LINK_MAX as u32) {
+        post_passcode(&h, &pt, ip(1000 + i), "wrong").await;
+    }
+    let rows = wait_rows(&h, 2).await;
+    let locked: Vec<_> = rows.iter().filter(|r| r.0 == "link.locked").collect();
+    assert_eq!(locked.len(), 1, "{rows:?}");
+    assert_eq!(locked[0].2.as_deref(), Some(plink.as_str()));
+    assert!(locked[0].5.contains("\"until\""));
+}
+
+/// LS-24: 50 concurrent first downloads notify exactly once; a page-only GET
+/// (an unfurler) notifies nobody.
+#[tokio::test]
+async fn ls24_the_first_open_notifies_exactly_once() {
+    let calls = Arc::new(RecordingCalls::default());
+    let h = harness_with(true, Some(calls.clone())).await;
+    let (t, link_id) = pdf_link(&h).await;
+    assert_eq!(get_from(&h, &format!("/s/{t}"), ip(60), None).await.0, StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(calls.calls.lock().unwrap().is_empty(), "a page view is not a first open");
+    assert_eq!(counters(&h, &link_id).await.2, None);
+
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..50u32 {
+        let app = h.app.clone();
+        let uri = format!("/s/{t}/download");
+        set.spawn(async move {
+            // Distinct addresses: no per-address bucket interferes.
+            let r = req("GET", &uri, ip(100 + i)).body(Body::empty()).unwrap();
+            send(&app, r).await.0
+        });
+    }
+    while let Some(s) = set.join_next().await {
+        // 200, or 429/503 under the per-link stream cap; the claim still happens once.
+        let s = s.unwrap();
+        assert!(s == StatusCode::OK || s == StatusCode::SERVICE_UNAVAILABLE || s == StatusCode::TOO_MANY_REQUESTS);
+    }
+    for _ in 0..200 {
+        if !calls.calls.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let got = calls.calls.lock().unwrap().clone();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].0, h.owner);
+    assert_eq!(got[0].1, "notifications_record_access");
+    assert_eq!(got[0].2["kind"], "link");
+    assert_eq!(got[0].2["body"], "r.pdf");
+    assert!(counters(&h, &link_id).await.2.is_some());
 }

@@ -39,8 +39,14 @@
 //! * Logs name the `link_id` or nothing: never the URI, the token, the
 //!   cookie or the passcode (§6.3).
 //!
-//! The opens audit, the counters and the first-open notification are WP-18's;
-//! their call sites are marked `WP-18` below.
+//! Opens (WP-18, §8): a page view, a `/view` or a `/download` the child
+//! answered 200 is noted off the request path ([`note_open`]): a coalesced
+//! `link.opened` / `link.downloaded` audit row (one per link, visitor
+//! address, mode and hour) that bumps `open_count` / `download_count` and
+//! `last_opened_at`, and, for the first byte request only, a conditional
+//! `first_opened_at` UPDATE whose single winner notifies the owner. A lock
+//! is noted as `link.locked`. All of it is best effort and never delays or
+//! fails the response.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -64,9 +70,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use super::children::ChildEndpoint;
 use super::proxy::PRINCIPAL_HEADER;
 use super::BrokerState;
+use crate::access::audit::{self, AuditVia, Event};
 use crate::access::file_links::{self as links, PreviewKind, LINK_MAX_BYTES};
 use crate::access::pairing::throttle_key;
-use crate::access::share::now_ms;
+use crate::access::share::{broker_host, now_ms, OwnerCalls};
 use crate::access::AccessStore;
 use crate::executor::{Principal, PrincipalId};
 use crate::server::operator::accounts;
@@ -227,6 +234,9 @@ pub struct LinkGate {
     streams: Arc<Semaphore>,
     cold: Arc<Semaphore>,
     passcode_gate: Arc<Semaphore>,
+    /// How the broker reaches an owner's child for the first-open
+    /// notification (§8.3). `None`: the installed broker host's.
+    calls: Option<Arc<dyn OwnerCalls>>,
     /// Passcode verifications started (LS-11 counts them).
     pub(crate) verifications: AtomicUsize,
 }
@@ -267,6 +277,7 @@ impl LinkGate {
             streams: Arc::new(Semaphore::new(STREAMS_TOTAL)),
             cold: Arc::new(Semaphore::new(COLD_LAUNCHES)),
             passcode_gate: Arc::new(Semaphore::new(PASSCODE_VERIFICATIONS)),
+            calls: None,
             verifications: AtomicUsize::new(0),
         }
     }
@@ -275,6 +286,51 @@ impl LinkGate {
     pub fn with_verifier(mut self, verify: PasscodeVerifier) -> Self {
         self.verify = verify;
         self
+    }
+
+    /// Reach owner children through `calls` for notifications (tests).
+    pub fn with_calls(mut self, calls: Arc<dyn OwnerCalls>) -> Self {
+        self.calls = Some(calls);
+        self
+    }
+
+    /// Note an open of a live link, spawned and best effort (§8).
+    fn spawn_open(&self, live: &Live, mode: OpenMode, visitor: &Visitor, now: i64) {
+        let Some(store) = self.live_store().cloned() else {
+            return;
+        };
+        let calls = self
+            .calls
+            .clone()
+            .or_else(|| broker_host().map(|h| h.calls.clone()));
+        let note = OpenNote {
+            link_id: live.row.link_id.clone(),
+            owner: live.owner.id,
+            owner_text: live.row.owner.clone(),
+            name: live.row.name.clone(),
+            mode,
+            visitor: visitor.clone(),
+            now,
+        };
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(note_open(store, calls, note));
+        }
+    }
+
+    /// Note that a link just locked (§8.1 `link.locked`), spawned.
+    fn spawn_locked(&self, live: &Live, visitor: &Visitor, until: i64) {
+        let Some(store) = self.live_store().cloned() else {
+            return;
+        };
+        let ev = outsider_event("link.locked", &live.row, visitor)
+            .detail(serde_json::json!({ "name": live.row.name, "until": until }));
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                if let Err(e) = audit::record(&store, &ev).await {
+                    tracing::warn!("audit link.locked not recorded: {e}");
+                }
+            });
+        }
     }
 
     /// The store, only while the setting is on.
@@ -371,6 +427,159 @@ fn cookie_values(headers: &HeaderMap) -> impl Iterator<Item = String> + '_ {
         })
 }
 
+// ─── opens: audit, counters, first-open notification (WP-18, §8) ─────────────
+
+/// Who is asking: the throttle key (IPv4, or the IPv6 /64), the address as
+/// the trusted proxy resolved it, and the user agent.
+#[derive(Clone, Debug)]
+struct Visitor {
+    key: String,
+    addr: String,
+    agent: Option<String>,
+}
+
+/// §8.1: the user agent is kept to 256 characters.
+const AGENT_MAX_CHARS: usize = 256;
+
+fn visitor_agent(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.chars().filter(|c| !c.is_control()).take(AGENT_MAX_CHARS).collect())
+        .filter(|s: &String| !s.is_empty())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    Page,
+    View,
+    Download,
+}
+
+impl OpenMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            OpenMode::Page => "page",
+            OpenMode::View => "view",
+            OpenMode::Download => "download",
+        }
+    }
+
+    fn kind(self) -> &'static str {
+        match self {
+            OpenMode::Download => "link.downloaded",
+            _ => "link.opened",
+        }
+    }
+}
+
+struct OpenNote {
+    link_id: String,
+    owner: PrincipalId,
+    owner_text: String,
+    name: String,
+    mode: OpenMode,
+    visitor: Visitor,
+    now: i64,
+}
+
+/// An outsider's audit row: no actor (`via = system`), the owner as subject
+/// so the owner sees it, the link as target, the visitor's address and agent.
+/// Never the token, passcode, cookie or path (§8.1).
+fn outsider_event(kind: &'static str, row: &LinkRow, visitor: &Visitor) -> Event {
+    let mut ev = Event::new(kind, AuditVia::System)
+        .subject_principal(row.owner.clone())
+        .target(row.link_id.clone());
+    ev.remote_addr = Some(visitor.addr.clone());
+    ev.user_agent = visitor.agent.clone();
+    ev
+}
+
+/// `UPDATE … WHERE first_opened_at IS NULL`: `true` for the one caller whose
+/// update changed the row, however many race (§8.2).
+async fn claim_first_open(pool: &SqlitePool, link_id: &str, now: i64) -> bool {
+    match sqlx::query(
+        "UPDATE file_links SET first_opened_at = ?1 WHERE link_id = ?2 AND first_opened_at IS NULL",
+    )
+    .bind(now)
+    .bind(link_id)
+    .execute(pool)
+    .await
+    {
+        Ok(r) => r.rows_affected() == 1,
+        Err(e) => {
+            tracing::warn!("file link first-open update failed: {e}");
+            false
+        }
+    }
+}
+
+/// §8.3: a notification on the owner's child, then a push by id.
+async fn notify_first_open(calls: &dyn OwnerCalls, owner: PrincipalId, name: &str) {
+    match calls
+        .call(
+            owner,
+            "notifications_record_access",
+            serde_json::json!({
+                "kind": "link",
+                "title": "Someone opened your link",
+                "body": name,
+            }),
+        )
+        .await
+    {
+        Ok(v) => {
+            if let Some(id) = v.get("id").and_then(serde_json::Value::as_i64) {
+                crate::server::push::emit(crate::server::push::PushEvent::new(
+                    Some(owner),
+                    crate::server::push::PushKind::Invite,
+                    format!("n:{id}"),
+                ));
+            }
+        }
+        Err(e) => tracing::warn!("file link opened, but the owner's notification failed: {e}"),
+    }
+}
+
+/// Everything an open does, in order: the first-open claim and notification
+/// (byte requests only: a page view is not a first open, §8.2), then the
+/// coalesced audit row and, when it was written, the counters (§8.1).
+async fn note_open(store: AccessStore, calls: Option<Arc<dyn OwnerCalls>>, n: OpenNote) {
+    if n.mode != OpenMode::Page && claim_first_open(store.pool(), &n.link_id, n.now).await {
+        if let Some(calls) = &calls {
+            notify_first_open(calls.as_ref(), n.owner, &n.name).await;
+        }
+    }
+    let window = format!("{}\u{0}{}\u{0}{}", n.link_id, n.visitor.key, n.mode.as_str());
+    if !audit::link_window_opens(window, n.now) {
+        return;
+    }
+    let row = LinkRow::stub(&n.link_id, &n.owner_text);
+    let detail = if n.mode == OpenMode::Download {
+        serde_json::json!({ "name": n.name })
+    } else {
+        serde_json::json!({ "name": n.name, "mode": n.mode.as_str() })
+    };
+    let ev = outsider_event(n.mode.kind(), &row, &n.visitor).detail(detail);
+    if let Err(e) = audit::record(&store, &ev).await {
+        tracing::warn!("audit {} not recorded: {e}", n.mode.kind());
+        return;
+    }
+    let sql = if n.mode == OpenMode::Download {
+        "UPDATE file_links SET download_count = download_count + 1, last_opened_at = ?1 WHERE link_id = ?2"
+    } else {
+        "UPDATE file_links SET open_count = open_count + 1, last_opened_at = ?1 WHERE link_id = ?2"
+    };
+    if let Err(e) = sqlx::query(sql)
+        .bind(n.now)
+        .bind(&n.link_id)
+        .execute(store.pool())
+        .await
+    {
+        tracing::warn!("file link counter update failed: {e}");
+    }
+}
+
 // ─── the row ────────────────────────────────────────────────────────────────
 
 /// What a request needs of one `file_links` row. Never the token hash.
@@ -418,6 +627,25 @@ async fn fetch_row(pool: &SqlitePool, token: &str) -> Option<LinkRow> {
         locked_until: row.try_get("passcode_locked_until").ok()?,
         revoked_at: row.try_get("revoked_at").ok()?,
     })
+}
+
+impl LinkRow {
+    /// Just the ids an audit row needs.
+    fn stub(link_id: &str, owner: &str) -> Self {
+        Self {
+            link_id: link_id.to_string(),
+            owner: owner.to_string(),
+            path: String::new(),
+            name: String::new(),
+            preview_kind: String::new(),
+            mime: String::new(),
+            size_at_create: 0,
+            expires_at: None,
+            passcode_phc: None,
+            locked_until: None,
+            revoked_at: None,
+        }
+    }
 }
 
 /// A link that is live right now, with its owner's spawn identity.
@@ -537,7 +765,13 @@ async fn handle(
 ) -> Response {
     let gate = state.file_links.clone();
     let now = now_ms();
-    let key = throttle_key(&trusted_proxy::addr_of_conn(&conn, req.headers()));
+    let addr = trusted_proxy::addr_of_conn(&conn, req.headers());
+    let key = throttle_key(&addr);
+    let visitor = Visitor {
+        key: key.clone(),
+        addr,
+        agent: visitor_agent(req.headers()),
+    };
     // Throttled addresses get 429 for every /s/* request, valid links too,
     // so the 429 is not an oracle (§6.2).
     if !gate.requests.take(&key, now) || gate.misses.over(&key, now) {
@@ -547,13 +781,13 @@ async fn handle(
     let read = matches!(parts.method, Method::GET | Method::HEAD);
     let outcome = match parse_route(parts.uri.path()) {
         Some((token, Action::Page)) if read => {
-            page_get(&state, &gate, token, &parts.headers, now).await
+            page_get(&state, &gate, token, &parts.headers, &visitor, now).await
         }
         Some((token, Action::Page)) if parts.method == Method::POST => {
-            passcode_post(&state, &gate, token, &key, body, now).await
+            passcode_post(&state, &gate, token, &visitor, body, now).await
         }
         Some((token, action @ (Action::View | Action::Download))) if read => {
-            bytes(&state, &gate, token, &parts.headers, action == Action::View, now).await
+            bytes(&state, &gate, token, &parts.headers, &visitor, action == Action::View, now).await
         }
         _ => Outcome::NotAvailable,
     };
@@ -572,6 +806,7 @@ async fn page_get(
     gate: &LinkGate,
     token: &str,
     headers: &HeaderMap,
+    visitor: &Visitor,
     now: i64,
 ) -> Outcome {
     let Some(live) = live_link(state, gate, token, now).await else {
@@ -584,10 +819,9 @@ async fn page_get(
         }
         return Outcome::Done(passcode_form(gate, token, None, StatusCode::OK));
     }
-    // WP-18 call site: a page view is NOT a first open (§8.2: an unfurler
-    // fetches only the HTML). If WP-18 audits page views (§8.1 link.opened
-    // with mode "page", coalesced), its spawned call goes here, with
-    // live.row.link_id, live.owner.id and the throttle key.
+    // A page view is audited (link.opened, mode "page", coalesced) but is NOT
+    // a first open (§8.2: an unfurler fetches only the HTML).
+    gate.spawn_open(&live, OpenMode::Page, visitor, now);
     Outcome::Done(file_page(gate, token, row))
 }
 
@@ -596,7 +830,7 @@ async fn passcode_post(
     state: &BrokerState,
     gate: &LinkGate,
     token: &str,
-    key: &str,
+    visitor: &Visitor,
     body: Body,
     now: i64,
 ) -> Outcome {
@@ -611,7 +845,7 @@ async fn passcode_post(
         return Outcome::Done(locked());
     }
     // Before Argon2: a throttled address costs no CPU (§2.3).
-    let pair = format!("{key}|{}", row.link_id);
+    let pair = format!("{}|{}", visitor.key, row.link_id);
     if gate.pass_fails.over(&pair, now) {
         return Outcome::Done(slow_down());
     }
@@ -658,9 +892,7 @@ async fn passcode_post(
         return Outcome::NotAvailable;
     };
     if record_wrong_passcode(store.pool(), &row.link_id, now).await {
-        // WP-18 call site: emit link.locked here (§8.1: no actor, subject
-        // live.owner.id, target row.link_id, detail {name, until: now +
-        // LOCK_MS}), spawned, best effort.
+        gate.spawn_locked(&live, visitor, now + LOCK_MS);
         return Outcome::Done(locked());
     }
     Outcome::Done(passcode_form(
@@ -760,6 +992,7 @@ async fn bytes(
     gate: &LinkGate,
     token: &str,
     headers: &HeaderMap,
+    visitor: &Visitor,
     inline: bool,
     now: i64,
 ) -> Outcome {
@@ -800,11 +1033,14 @@ async fn bytes(
     let Some(len) = res.content_length().filter(|l| *l <= limit) else {
         return Outcome::NotAvailable;
     };
-    // WP-18 call site: a byte request the child answered 200 is an open
-    // (§8.2). The spawned, best-effort work goes here: link.opened (mode
-    // "view") or link.downloaded, coalesced per (link, throttle key, mode,
-    // hour); open_count / download_count / last_opened_at; and the
-    // conditional first_opened_at UPDATE that notifies the owner once.
+    // A byte request the child answered 200 is an open (§8.2): audit,
+    // counters and the once-only first-open notification, off the request path.
+    gate.spawn_open(
+        &live,
+        if inline { OpenMode::View } else { OpenMode::Download },
+        visitor,
+        now,
+    );
     let body = Body::from_stream(cap_stream(
         Box::pin(res.bytes_stream()),
         len,
