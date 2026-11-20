@@ -94,7 +94,8 @@ impl ChildLauncher for FakeLauncher {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             let requests = Arc::new(Mutex::new(Vec::new()));
-            let (r1, r2, r3, r4, r5) = (
+            let (r1, r2, r3, r4, r5, r6) = (
+                requests.clone(),
                 requests.clone(),
                 requests.clone(),
                 requests.clone(),
@@ -164,7 +165,7 @@ impl ChildLauncher for FakeLauncher {
                 )
                 .route(
                     "/api/fs/download",
-                    get(move |req: Request<Body>| echo_http(r4.clone(), req)),
+                    get(move |req: Request<Body>| echo_http(r6.clone(), req)),
                 )
                 .route(
                     "/__viewer/*rest",
