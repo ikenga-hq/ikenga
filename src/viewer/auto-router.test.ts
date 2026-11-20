@@ -9,6 +9,7 @@ import {
 	CodeView,
 	DocxView,
 	isAbsoluteViewerPath,
+	relativePathBlocked,
 	PdfView,
 	pickRenderer,
 	UnsupportedImageView,
@@ -97,5 +98,24 @@ describe('isAbsoluteViewerPath', () => {
 		expect(isAbsoluteViewerPath('deliverables/x.pdf')).toBe(false);
 		expect(isAbsoluteViewerPath('./x.pdf')).toBe(false);
 		expect(isAbsoluteViewerPath('x.pdf')).toBe(false);
+	});
+});
+
+describe('relativePathBlocked (WP-13)', () => {
+	it('never blocks outside a browser session or for an absolute path', () => {
+		expect(relativePathBlocked('docs/a.md', false, null)).toBe(false);
+		expect(relativePathBlocked('/srv/a.md', true, null)).toBe(false);
+	});
+
+	it('blocks a relative path in an own remote session', () => {
+		expect(relativePathBlocked('docs/a.md', true, null)).toBe(true);
+	});
+
+	it('lets a project-scope share through (the daemon joins the shared root)', () => {
+		expect(relativePathBlocked('docs/a.md', true, { scope: 'project' })).toBe(false);
+	});
+
+	it('still blocks in an artifact-scope share (one file, no root to join)', () => {
+		expect(relativePathBlocked('docs/a.md', true, { scope: 'artifact' })).toBe(true);
 	});
 });

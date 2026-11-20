@@ -28,14 +28,34 @@ pub fn resolve_allowlisted(input: &str) -> Result<PathBuf> {
 /// the daemon's `PathGuard` resolves a caller's path exactly as the desktop
 /// does and only swaps the root set it checks against.
 pub(crate) fn expand_absolute(input: &str) -> Result<PathBuf> {
-    let expanded = shellexpand::full(input)
-        .map(|c| c.into_owned())
-        .map_err(|e| anyhow!("shellexpand failed: {e}"))?;
+    expand_against(input, None)
+}
+
+/// [`expand_absolute`] with the base a RELATIVE path is joined to: `Some(root)`
+/// for a share member (a relative path means "inside what was shared", never
+/// the daemon's cwd, which is the Owner's), `None` for the process cwd.
+/// `~` is not expanded when a base is given: a member has no home of their
+/// own on this host, and the Owner's must not be reachable by spelling.
+pub(crate) fn expand_against(input: &str, base: Option<&Path>) -> Result<PathBuf> {
+    if base.is_some() && (input == "~" || input.starts_with("~/") || input.starts_with("~\\")) {
+        return Err(anyhow!("home expansion is not available here"));
+    }
+    let expanded = if base.is_some() {
+        // Variables still expand (and are then confined by the guard); a bare
+        // `~` was refused above, so `shellexpand::env` is enough.
+        shellexpand::env(input).map(|c| c.into_owned())
+    } else {
+        shellexpand::full(input).map(|c| c.into_owned())
+    }
+    .map_err(|e| anyhow!("shellexpand failed: {e}"))?;
     let path = PathBuf::from(&expanded);
     Ok(if path.is_absolute() {
         path
     } else {
-        std::env::current_dir()?.join(path)
+        match base {
+            Some(b) => b.join(path),
+            None => std::env::current_dir()?.join(path),
+        }
     })
 }
 
@@ -147,6 +167,30 @@ mod tests {
         let canon = canonical_for_check(&gone).unwrap();
         assert_eq!(canon.file_name().unwrap(), "gone.txt");
         assert!(canon.starts_with(tmp.path().canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn a_relative_path_joins_the_given_base_not_the_cwd() {
+        let base = Path::new("/srv/shared");
+        assert_eq!(
+            expand_against("docs/a.md", Some(base)).unwrap(),
+            PathBuf::from("/srv/shared/docs/a.md")
+        );
+        assert_eq!(
+            expand_against("/abs/b.md", Some(base)).unwrap(),
+            PathBuf::from("/abs/b.md")
+        );
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(expand_against("x.md", None).unwrap(), cwd.join("x.md"));
+    }
+
+    #[test]
+    fn home_is_refused_when_a_base_is_given() {
+        let base = Path::new("/srv/shared");
+        for p in ["~", "~/notes.md", "~/.ssh/id_rsa"] {
+            assert!(expand_against(p, Some(base)).is_err(), "{p}");
+        }
+        assert!(expand_against("~", None).is_ok());
     }
 
     #[test]

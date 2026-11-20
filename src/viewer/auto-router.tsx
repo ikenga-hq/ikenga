@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import { FileText, Loader2 } from 'lucide-react';
-import { isRemoteWebSession } from '@/lib/transport';
+import { currentShare, isRemoteWebSession, type ShareSelection } from '@/lib/transport';
 import { CannotPreviewPlate } from './chrome/cannot-preview-plate';
 import { basename } from './lib/path';
 import { mimeFromExt, resolveMime } from './lib/mime';
@@ -128,10 +128,11 @@ export function ViewerRouter({
 	col,
 }: ViewerRouterProps) {
 	// A relative path in a browser session would be resolved by the daemon
-	// against its own working directory, which is not the reader's: in a shared
-	// project that is the project owner's home. Say so, instead of surfacing a
-	// raw "path does not exist" for a file that lives somewhere else.
-	const relativeInRemote = isRemoteWebSession() && !isAbsoluteViewerPath(path);
+	// against its own working directory, which is not the reader's. Say so,
+	// instead of surfacing a raw "path does not exist" for a file that lives
+	// somewhere else. Inside a project-scope share the daemon joins a relative
+	// path to the shared root, so the notice stays out of the way there.
+	const relativeInRemote = relativePathBlocked(path, isRemoteWebSession(), currentShare());
 
 	// Synchronous first-pass — known extensions render immediately.
 	const initialMime = useMemo(() => mimeFromExt(path), [path]);
@@ -216,6 +217,23 @@ export function ViewerRouter({
 			<div className="min-h-0 flex-1">{body}</div>
 		</div>
 	);
+}
+
+/**
+ * Whether a relative `path` cannot be opened in this session (the notice
+ * shows). True in a browser session whose daemon would resolve it against its
+ * own working directory: an own session, or an artifact-scope share (one
+ * file; the daemon has no root to join to). False in a project-scope share,
+ * where the daemon resolves a relative path inside the shared project.
+ */
+export function relativePathBlocked(
+	path: string,
+	remote: boolean,
+	share: Pick<ShareSelection, 'scope'> | null
+): boolean {
+	if (!remote || isAbsoluteViewerPath(path)) return false;
+	if (share && share.scope === 'project') return false;
+	return true;
 }
 
 /** POSIX or Windows-drive absolute, or `~/`. Anything else is relative. */

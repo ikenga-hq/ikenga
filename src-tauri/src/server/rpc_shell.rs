@@ -93,6 +93,25 @@ pub(crate) struct PathGuard {
     /// project's root, or the one artifact for artifact scope. `None` for
     /// every own-workspace guard. Set only by [`PathGuard::narrowed_to`].
     narrow: Option<std::sync::Arc<Narrow>>,
+    /// WP-12: for an artifact-scope share (`Narrow::File`), the canonical
+    /// directory that holds the shared file. READS of anything under it are
+    /// admitted ([`PathGuard::resolve_read`] and friends), so a shared page's
+    /// sibling css / images load. Writes, listings and every other
+    /// resolver stay exact-file. Set only by [`PathGuard::with_sibling_reads`].
+    siblings: Option<PathBuf>,
+}
+
+/// What a share member sees for every refused path, missing or forbidden
+/// alike (WP-13): one text, one status (`not_found` is a 404), no path.
+/// The detail goes to the tracing log.
+pub(crate) const SHARE_REFUSAL: &str = "not_found: no such file or folder in this share";
+
+/// Whether a resolution is for a read (which a file share's sibling
+/// directory admits) or anything else.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Any,
+    Read,
 }
 
 /// What [`PathGuard::narrowed_to`] confines a guard to (canonical).
@@ -127,6 +146,7 @@ impl PathGuard {
             roots: GuardRoots::Allowlist,
             reserved: Default::default(),
             narrow: None,
+            siblings: None,
         }
     }
 
@@ -137,6 +157,7 @@ impl PathGuard {
             roots: GuardRoots::Local(roots),
             reserved: Default::default(),
             narrow: None,
+            siblings: None,
         }
     }
 
@@ -173,8 +194,78 @@ impl PathGuard {
         }
         Ok(Self {
             narrow: Some(std::sync::Arc::new(narrow)),
+            siblings: None,
             ..self.clone()
         })
+    }
+
+    /// WP-12: for a guard narrowed to one file, additionally admit READS
+    /// under the directory that holds it — never writes, never anything
+    /// above. Refused (the guard is returned unchanged, exact-file) when that
+    /// directory is a project root, or is too broad to serve a tree from (a
+    /// home directory, an ancestor of it, a top-level directory): the same
+    /// rules `viewer_serve` applies ([`crate::viewer_guard::resolve_mount`]).
+    /// A guard that is not file-narrowed is returned unchanged.
+    pub(crate) fn with_sibling_reads(
+        &self,
+        project_roots: &[PathBuf],
+        home: Option<&Path>,
+    ) -> Self {
+        let mut g = self.clone();
+        g.siblings = None;
+        let Some(Narrow::File(file)) = self.narrow.as_deref() else {
+            return g;
+        };
+        let Some(dir) = file.parent() else {
+            return g;
+        };
+        if crate::viewer_guard::project_root_of(file, project_roots, home)
+            .is_some_and(|r| r == dir)
+        {
+            return g;
+        }
+        if matches!(
+            crate::viewer_guard::resolve_mount(dir, file, project_roots, home),
+            Ok(crate::viewer_guard::MountScope::Tree)
+        ) {
+            g.siblings = Some(dir.to_path_buf());
+        }
+        g
+    }
+
+    /// Where a RELATIVE path of a share member is joined: the shared root of
+    /// a tree share (never the daemon's cwd, which is the Owner's). `None`
+    /// for every other guard.
+    fn relative_base(&self) -> Option<&Path> {
+        match self.narrow.as_deref() {
+            Some(Narrow::Tree(root)) => Some(root.as_path()),
+            _ => None,
+        }
+    }
+
+    /// The input half of every resolver: `~` / env expansion, then absolute.
+    /// A share member's `~` is refused (the Owner's home is not theirs) and
+    /// a relative path joins the shared root.
+    fn expand(&self, input: &str) -> Result<PathBuf, String> {
+        if self.narrow.is_some()
+            && (input == "~" || input.starts_with("~/") || input.starts_with("~\\"))
+        {
+            return Err("home expansion is not available in a share".to_string());
+        }
+        crate::path_allow::expand_against(input, self.relative_base()).map_err(|e| e.to_string())
+    }
+
+    /// For a share member, every refusal is the one [`SHARE_REFUSAL`]: the
+    /// real reason (which may carry absolute paths) is logged, not returned.
+    /// An own-workspace guard passes its error through unchanged.
+    fn quiet<T>(&self, input: &str, r: Result<T, String>) -> Result<T, String> {
+        match (&self.narrow, r) {
+            (Some(_), Err(detail)) => {
+                tracing::info!(path = %input, %detail, "share path refused");
+                Err(SHARE_REFUSAL.to_string())
+            }
+            (_, r) => r,
+        }
     }
 
     /// This guard, refusing `reserved` on every check as well.
@@ -217,7 +308,31 @@ impl PathGuard {
     /// then checked against this guard's roots. Canonicalizing first is what
     /// makes `..` and symlinks unable to leave the allowlist.
     pub(crate) fn resolve(&self, input: &str) -> Result<PathBuf, String> {
-        let abs = crate::path_allow::expand_absolute(input).map_err(|e| e.to_string())?;
+        self.resolve_as(input, Access::Any)
+    }
+
+    /// [`Self::resolve`] for a READ: a file share's sibling directory
+    /// (WP-12) is admitted as well. Used by the read-only arms only.
+    pub(crate) fn resolve_read(&self, input: &str) -> Result<PathBuf, String> {
+        self.resolve_as(input, Access::Read)
+    }
+
+    /// For a share member the path must also exist, so a missing path and a
+    /// forbidden one both end in the one [`SHARE_REFUSAL`] and neither can be
+    /// told from the other by the answer.
+    fn resolve_as(&self, input: &str, access: Access) -> Result<PathBuf, String> {
+        let r = self.resolve_inner(input, access).and_then(|p| {
+            if self.narrow.is_some() && !p.exists() {
+                Err(format!("does not exist: {}", p.display()))
+            } else {
+                Ok(p)
+            }
+        });
+        self.quiet(input, r)
+    }
+
+    fn resolve_inner(&self, input: &str, access: Access) -> Result<PathBuf, String> {
+        let abs = self.expand(input)?;
         let canonical = match crate::path_allow::canonical_for_check(&abs) {
             Ok(c) => c,
             // A missing parent. Inside the daemon's own state that must read
@@ -231,7 +346,7 @@ impl PathGuard {
                 return Err(e.to_string());
             }
         };
-        self.check(&canonical)?;
+        self.check_as(&canonical, access)?;
         Ok(canonical)
     }
 
@@ -244,15 +359,26 @@ impl PathGuard {
     /// (its leaf or parent exists) and is refused stays refused — the walk
     /// is only for a missing parent.
     pub(crate) fn resolve_deep(&self, input: &str) -> Result<PathBuf, String> {
+        let r = self.resolve_deep_inner(input, Access::Any);
+        self.quiet(input, r)
+    }
+
+    /// [`Self::resolve_deep`] for a READ (WP-12: admits a file share's
+    /// sibling directory). Used by `viewer_serve` only.
+    pub(crate) fn resolve_deep_read(&self, input: &str) -> Result<PathBuf, String> {
+        let r = self.resolve_deep_inner(input, Access::Read);
+        self.quiet(input, r)
+    }
+
+    fn resolve_deep_inner(&self, input: &str, access: Access) -> Result<PathBuf, String> {
         use std::path::Component;
 
         if input.is_empty() {
             return Err("path is required".to_string());
         }
-        let abs =
-            crate::path_allow::expand_absolute(input).map_err(|e| format!("expand path: {e}"))?;
+        let abs = self.expand(input).map_err(|e| format!("expand path: {e}"))?;
         if let Ok(canonical) = crate::path_allow::canonical_for_check(&abs) {
-            self.check(&canonical)?;
+            self.check_as(&canonical, access)?;
             return Ok(canonical);
         }
         if abs.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -275,7 +401,7 @@ impl PathGuard {
             .strip_prefix(existing)
             .map_err(|_| "failed to resolve path".to_string())?;
         let resolved = canonical_existing.join(tail);
-        self.check(&resolved)?;
+        self.check_as(&resolved, access)?;
         Ok(resolved)
     }
 
@@ -295,6 +421,11 @@ impl PathGuard {
     /// A body that then creates under it works on that form, so no symlink in
     /// the existing part of the caller's spelling is left to follow later.
     pub(crate) fn resolve_maybe_missing(&self, path: &Path) -> Result<PathBuf, String> {
+        let r = self.resolve_maybe_missing_inner(path);
+        self.quiet(&path.to_string_lossy(), r)
+    }
+
+    fn resolve_maybe_missing_inner(&self, path: &Path) -> Result<PathBuf, String> {
         use std::path::Component;
         if !path.is_absolute() {
             return Err(format!("path is not absolute: {}", path.display()));
@@ -325,6 +456,10 @@ impl PathGuard {
     /// The allowlist, then [`Self::check_reserved`]. `canonical` is a
     /// canonical path, or a canonical ancestor plus a missing tail.
     pub(super) fn check(&self, canonical: &Path) -> Result<(), String> {
+        self.check_as(canonical, Access::Any)
+    }
+
+    fn check_as(&self, canonical: &Path, access: Access) -> Result<(), String> {
         let allowed = match &self.roots {
             GuardRoots::Allowlist => crate::fs_roots::current()
                 .ok_or(NO_ALLOWLIST)?
@@ -336,7 +471,15 @@ impl PathGuard {
             return Err(format!("path outside allowlist: {}", canonical.display()));
         }
         if let Some(narrow) = &self.narrow {
-            if !narrow.admits(canonical) {
+            let sibling = access == Access::Read
+                && self.siblings.as_ref().is_some_and(|d| {
+                    canonical.starts_with(d)
+                        && crate::viewer_guard::may_serve(
+                            &crate::viewer_guard::MountScope::Tree,
+                            canonical,
+                        )
+                });
+            if !narrow.admits(canonical) && !sibling {
                 return Err(format!(
                     "forbidden: outside the shared project: {}",
                     canonical.display()
@@ -2540,5 +2683,102 @@ mod tests {
         assert!(file.resolve(&s(&project.join("notes.md"))).is_err());
         assert!(tree.narrowed_to(&other).is_err(), "narrowing only shrinks");
         assert!(guard.narrowed_to(&project.join("missing")).is_err());
+    }
+
+    fn share_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathGuard) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let allowed = root.join("allowed");
+        let project = allowed.join("proj");
+        let other = allowed.join("other");
+        std::fs::create_dir_all(project.join("docs/img")).unwrap();
+        std::fs::create_dir_all(project.join("cousin")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(project.join("docs/brief.html"), "x").unwrap();
+        std::fs::write(project.join("docs/style.css"), "c").unwrap();
+        std::fs::write(project.join("docs/img/a.png"), "p").unwrap();
+        std::fs::write(project.join("top.md"), "t").unwrap();
+        std::fs::write(project.join("cousin/c.md"), "c").unwrap();
+        std::fs::write(other.join("secret.md"), "z").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&other, project.join("docs/escape")).unwrap();
+        let roots_file = root.join("fs_roots.json");
+        std::fs::write(
+            &roots_file,
+            json!({ "roots": [allowed.to_string_lossy()] }).to_string(),
+        )
+        .unwrap();
+        let guard = PathGuard::roots(Arc::new(
+            crate::fs_roots::FsRoots::load(roots_file).unwrap(),
+        ));
+        (tmp, project, other, guard)
+    }
+
+    /// WP-13: a relative path of a tree-share member joins the shared root, `~`
+    /// is refused, and a missing and a forbidden path refuse identically with
+    /// no absolute path in the text.
+    #[test]
+    fn a_share_member_resolves_relative_inside_the_share_and_refuses_quietly() {
+        let (_tmp, project, other, guard) = share_fixture();
+        let tree = guard.narrowed_to(&project).unwrap();
+        assert_eq!(
+            tree.resolve("docs/brief.html").unwrap(),
+            project.join("docs/brief.html")
+        );
+        assert_eq!(tree.resolve_deep("new/x.md").unwrap(), project.join("new/x.md"));
+        let forbidden = tree.resolve(&other.join("secret.md").to_string_lossy()).unwrap_err();
+        let missing = tree.resolve("nope/missing.md").unwrap_err();
+        let home = tree.resolve("~/notes.md").unwrap_err();
+        let up = tree.resolve("../other/secret.md").unwrap_err();
+        for e in [&forbidden, &missing, &home, &up] {
+            assert_eq!(e, SHARE_REFUSAL);
+            assert!(!e.contains('/') || e == SHARE_REFUSAL);
+            assert!(!e.contains(project.to_str().unwrap()), "{e}");
+        }
+        // The Owner's own guard keeps its detailed text.
+        let own = guard.resolve(&other.join("nope.md").to_string_lossy());
+        assert!(own.is_ok(), "owner may name a missing leaf in an allowlisted dir");
+    }
+
+    /// WP-12: a file share admits READS in the shared file's folder and below,
+    /// refuses the parent, a cousin, writes, and a symlink out of the folder.
+    #[test]
+    fn a_file_share_reads_its_folder_and_nothing_else() {
+        let (_tmp, project, _other, guard) = share_fixture();
+        let file = guard.narrowed_to(&project.join("docs/brief.html")).unwrap();
+        // Without the sibling grant: exact file only.
+        assert!(file.resolve_read(&project.join("docs/style.css").to_string_lossy()).is_err());
+        let g = file.with_sibling_reads(&[], None);
+        let s = |p: PathBuf| p.to_string_lossy().into_owned();
+        assert!(g.resolve_read(&s(project.join("docs/style.css"))).is_ok());
+        assert!(g.resolve_read(&s(project.join("docs/img/a.png"))).is_ok());
+        assert!(g.resolve_deep_read(&s(project.join("docs"))).is_ok());
+        assert!(g.resolve_read(&s(project.join("top.md"))).is_err(), "parent refused");
+        assert!(g.resolve_read(&s(project.join("cousin/c.md"))).is_err(), "cousin refused");
+        assert!(g.resolve_read(&s(project.join("docs/../top.md"))).is_err());
+        #[cfg(unix)]
+        assert!(
+            g.resolve_read(&s(project.join("docs/escape/secret.md"))).is_err(),
+            "a symlink out of the folder is refused"
+        );
+        // Not a read: every other resolver stays exact-file.
+        assert!(g.resolve(&s(project.join("docs/style.css"))).is_err());
+        assert!(g.resolve_deep(&s(project.join("docs/style.css"))).is_err());
+        assert!(g.resolve_deep(&s(project.join("docs/new.css"))).is_err());
+    }
+
+    /// WP-12: the grant is withheld when the folder is a project root or the
+    /// home directory.
+    #[test]
+    fn a_file_share_in_a_project_root_or_home_gets_no_sibling_reads() {
+        let (_tmp, project, _other, guard) = share_fixture();
+        let file = guard.narrowed_to(&project.join("top.md")).unwrap();
+        let g = file.with_sibling_reads(&[project.clone()], None);
+        assert!(g.resolve_read(&project.join("cousin/c.md").to_string_lossy()).is_err());
+        let g = file.with_sibling_reads(&[], Some(&project));
+        assert!(g.resolve_read(&project.join("cousin/c.md").to_string_lossy()).is_err());
+        // A tree share never takes the grant.
+        let tree = guard.narrowed_to(&project).unwrap().with_sibling_reads(&[], None);
+        assert!(tree.siblings.is_none());
     }
 }

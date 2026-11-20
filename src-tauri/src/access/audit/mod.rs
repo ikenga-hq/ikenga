@@ -427,6 +427,23 @@ fn lexical(path: &str) -> Option<String> {
     Some(out.join("/"))
 }
 
+/// Whether a read of `path` (`requested`: its lexical form) is a read of the
+/// shared artifact (project-relative `artifact`). WP-13 (F-14): never on a
+/// bare suffix — an absolute path is judged by its CANONICAL form on disk
+/// (symlinks resolved), which must exist and end in the artifact's
+/// components; a path that cannot be canonicalized is not logged (the read it
+/// precedes is refused or answers not-found anyway). The audit hook has no
+/// project root, so a different project's identically named file still
+/// matches; the rest of the check is the child's own, on the read itself.
+fn artifact_read_matches(path: &str, requested: &str, artifact: &str) -> bool {
+    if !path.starts_with(['/', '\\']) {
+        return requested == artifact;
+    }
+    std::fs::canonicalize(path)
+        .map(|c| c.is_file() && c.ends_with(std::path::Path::new(artifact)))
+        .unwrap_or(false)
+}
+
 /// What a share read views (§6.5 `share.artifact_viewed`, "Guest and
 /// artifact-scope reads"), or `None` when it is not one: another command,
 /// an own-workspace or project-scope non-Guest request, or — on an artifact
@@ -442,8 +459,7 @@ pub fn viewed_target(share: &super::ShareCtx, cmd: &str, args: &Value) -> Option
     match share.artifact_path.as_deref() {
         Some(artifact) => {
             let artifact = super::share::normalize_artifact_path(artifact).ok()?;
-            (requested == artifact || requested.ends_with(&format!("/{artifact}")))
-                .then_some(artifact)
+            artifact_read_matches(path, &requested, &artifact).then_some(artifact)
         }
         // Named (and coalesced) by the normalized path, so `/p//a.md` and
         // `/p/./a.md` are the one (member, path, hour) window (review
@@ -671,17 +687,34 @@ mod tests {
         let read = |p: &str| json!({ "path": p });
         let art = share_ctx(Role::Reviewer, Some("./docs//brief.md"));
         let a = art.share.as_ref().unwrap();
+        // WP-13: an absolute path counts by its canonical form on disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let docs = tmp.path().join("proj/docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("brief.md"), "x").unwrap();
+        std::fs::write(docs.join("other.md"), "x").unwrap();
+        let abs = |p: std::path::PathBuf| read(&p.to_string_lossy());
         assert_eq!(
-            viewed_target(a, "fs_read", &read("/home/o/proj/docs/brief.md")).as_deref(),
+            viewed_target(a, "fs_read", &abs(docs.join("brief.md"))).as_deref(),
             Some("docs/brief.md")
         );
         assert_eq!(
             viewed_target(a, "fs_read", &read("docs/./brief.md")).as_deref(),
             Some("docs/brief.md")
         );
-        for other in ["/home/o/proj/docs/other.md", "/x/../docs/brief.md", ""] {
+        for other in ["/x/../docs/brief.md", ""] {
             assert_eq!(viewed_target(a, "fs_read", &read(other)), None, "{other}");
         }
+        assert_eq!(viewed_target(a, "fs_read", &abs(docs.join("other.md"))), None);
+        // No suffix match: a path that does not exist, or that only ends the
+        // same way as the artifact, is not a view of it.
+        assert_eq!(
+            viewed_target(a, "fs_read", &read("/home/o/proj/docs/brief.md")),
+            None,
+            "nonexistent"
+        );
+        assert_eq!(viewed_target(a, "fs_read", &read("x/docs/brief.md")), None);
+        assert_eq!(viewed_target(a, "fs_read", &read("brief.md")), None);
         assert_eq!(
             viewed_target(a, "fs_list", &read("/home/o/proj/docs/brief.md")),
             None
@@ -724,7 +757,11 @@ mod tests {
         use serde_json::json;
         let store = AccessStore::memory_t0().await;
         let ctx = share_ctx(Role::Guest, Some("docs/brief.md"));
-        let read = json!({ "path": "/proj/docs/brief.md" });
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("proj/docs")).unwrap();
+        let file = tmp.path().join("proj/docs/brief.md");
+        std::fs::write(&file, "x").unwrap();
+        let read = json!({ "path": file.to_string_lossy() });
         for _ in 0..3 {
             on_share_read(Some(&store), &ctx, "fs_read", &read);
         }
