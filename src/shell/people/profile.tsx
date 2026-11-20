@@ -19,6 +19,7 @@ import { isT1Session } from '@/lib/transport/t1-session';
 import { AccountBlock } from './account';
 import { AppLockBlock } from './app-lock-settings';
 import { startAppLockSync, useAppLockStore } from './app-lock-store';
+import { FileLinksBlock } from './file-links-block';
 import { D05_FOCUS } from './focus';
 import { Kv, PeopleBlock, PeopleHeader, PeopleRow } from './frame';
 
@@ -34,6 +35,7 @@ export function ProfileTab() {
 			<div className="max-w-[720px] space-y-4">
 				<LocalProfileBlock />
 				{isT1Session() && <AccountBlock />}
+				{isT1Session() && <FileLinksBlock />}
 				<AppLockBlock />
 			</div>
 		</div>

@@ -29,9 +29,16 @@ import {
 import { FloatingToastChip } from '@/components/ui/floating-toast-chip';
 import { cn } from '@/components/ui/utils';
 import { type Cap, ROLE_DEFAULT_CAPS } from '@/lib/access/caps.gen';
-import { accessInviteIssue, accessPolicyGet, parseAccessError } from '@/lib/access/client';
+import {
+	accessInviteIssue,
+	accessPolicyGet,
+	accessStatus,
+	parseAccessError,
+} from '@/lib/access/client';
 
 import { NewChip } from './devices-pair-confirm';
+import { linksOffered } from './file-link-model';
+import { OutsideLinkForm } from './file-link-form';
 import { D05_FOCUS } from './focus';
 import type { MemberRole } from './members';
 import { copyText } from '@/lib/clipboard';
@@ -176,6 +183,7 @@ export function ShareKolaSheet({
 	onIssued,
 	initialScope,
 	initialArtifactPath,
+	absolutePath,
 }: {
 	open: boolean;
 	onOpenChange: (o: boolean) => void;
@@ -186,6 +194,12 @@ export function ShareKolaSheet({
 	initialScope?: InviteScope;
 	/** Prefill the artifact path (project-relative) when the sheet opens. */
 	initialArtifactPath?: string;
+	/**
+	 * The file's absolute path on the server. With it (and the server's file
+	 * links setting on) the sheet offers "Get a link": an outside link to this
+	 * one file, for someone with no account.
+	 */
+	absolutePath?: string;
 }) {
 	const [mode, setMode] = useState<InviteMode>('email');
 	const [who, setWho] = useState('');
@@ -197,6 +211,8 @@ export function ShareKolaSheet({
 	const [error, setError] = useState<string | null>(null);
 	const [issued, setIssued] = useState<{ url: string; allowNewAccount: boolean } | null>(null);
 	const [copied, setCopied] = useState(false);
+	const [outside, setOutside] = useState(false);
+	const [offerLinks, setOfferLinks] = useState(false);
 	const [toast, setToast] = useState<string | null>(null);
 	const rowOf = useRoleRows(projectId, open);
 	const ids = { who: useId(), role: useId(), scope: useId(), expires: useId(), path: useId() };
@@ -206,10 +222,26 @@ export function ShareKolaSheet({
 		setIssued(null);
 		setError(null);
 		setCopied(false);
+		setOutside(false);
 		if (initialScope) setScope(initialScope);
 		if (initialArtifactPath !== undefined) setArtifactPath(initialArtifactPath);
 		// biome-ignore lint/correctness/useExhaustiveDependencies: only the open transition seeds the form
 	}, [open]);
+	// "Get a link" shows only when the server says file links are on.
+	useEffect(() => {
+		if (!open || !absolutePath) {
+			setOfferLinks(false);
+			return;
+		}
+		let live = true;
+		accessStatus()
+			.then((s) => live && setOfferLinks(linksOffered(s)))
+			.catch(() => live && setOfferLinks(false));
+		return () => {
+			live = false;
+		};
+	}, [open, absolutePath]);
+	const showOutside = outside && offerLinks && Boolean(absolutePath);
 	// §4.2: a Guest is one artifact with an expiry; leaving Guest keeps the scope.
 	useEffect(() => {
 		if (role === 'guest') {
@@ -280,7 +312,7 @@ export function ShareKolaSheet({
 							An invite is single-use and expires. Role and scope are fixed when you create it.
 						</DialogDescription>
 					</DialogHeader>
-					<div className="grid gap-5 md:grid-cols-[1fr_260px]">
+					<div className={cn('grid gap-5', !showOutside && 'md:grid-cols-[1fr_260px]')}>
 						<div className="space-y-3">
 							<Row label="How">
 								<div className="inline-flex rounded-[var(--radius-sm)] border border-[var(--border)]">
@@ -288,11 +320,14 @@ export function ShareKolaSheet({
 										<button
 											key={m}
 											type="button"
-											aria-pressed={mode === m}
-											onClick={() => setMode(m)}
+											aria-pressed={!showOutside && mode === m}
+											onClick={() => {
+												setOutside(false);
+												setMode(m);
+											}}
 											className={cn(
 												'px-3 py-1 text-[length:var(--text-caption,12px)]',
-												mode === m
+												!showOutside && mode === m
 													? 'bg-[var(--primary-soft)] font-semibold text-[var(--fg)]'
 													: 'text-[var(--fg-muted)]'
 											)}
@@ -300,9 +335,28 @@ export function ShareKolaSheet({
 											{m === 'email' ? 'Email' : 'Link'}
 										</button>
 									))}
+									{offerLinks && absolutePath && (
+										<button
+											type="button"
+											data-get-a-link
+											aria-pressed={showOutside}
+											onClick={() => setOutside(true)}
+											className={cn(
+												'px-3 py-1 text-[length:var(--text-caption,12px)]',
+												showOutside
+													? 'bg-[var(--primary-soft)] font-semibold text-[var(--fg)]'
+													: 'text-[var(--fg-muted)]'
+											)}
+										>
+											Get a link
+										</button>
+									)}
 								</div>
 							</Row>
-							<Row label="Who" htmlFor={ids.who}>
+							{showOutside && absolutePath && <OutsideLinkForm path={absolutePath} />}
+							{!showOutside && (
+								<>
+									<Row label="Who" htmlFor={ids.who}>
 								<input
 									id={ids.who}
 									type={mode === 'email' ? 'email' : 'text'}
@@ -368,7 +422,10 @@ export function ShareKolaSheet({
 									))}
 								</select>
 							</Row>
+								</>
+							)}
 						</div>
+						{!showOutside && (
 						<div>
 							<h4 className="m-0 mb-2 text-[length:var(--text-micro)] font-semibold uppercase tracking-[0.1em] text-[var(--fg-muted)]">
 								What they will be able to see
@@ -404,8 +461,9 @@ export function ShareKolaSheet({
 								))}
 							</ul>
 						</div>
+						)}
 					</div>
-					{issued && (
+					{!showOutside && issued && (
 						<div
 							data-state="share-kola-created"
 							className="space-y-2 rounded-[var(--radius-md,6px)] border border-[var(--border)] bg-[var(--bg-sunken)] p-3"
@@ -438,9 +496,9 @@ export function ShareKolaSheet({
 					)}
 					<DialogFooter>
 						<Button type="button" variant="outline" size="sm" onClick={() => onOpenChange(false)}>
-							{issued ? 'Done' : 'Cancel'}
+							{issued || showOutside ? 'Done' : 'Cancel'}
 						</Button>
-						{!issued && (
+						{!issued && !showOutside && (
 							<span title={blocker ?? undefined}>
 								<Button
 									type="button"
