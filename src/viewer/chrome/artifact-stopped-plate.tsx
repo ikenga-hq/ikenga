@@ -9,8 +9,8 @@
 
 import { CloudOff } from 'lucide-react';
 import { OfflineState } from '@/components/states';
-import { toast } from '@/lib/toast';
-import { isBrowserHost, openLocalPath } from '@/lib/transport';
+import { isBrowserHost } from '@/lib/transport';
+import { downloadWithFeedback } from './download-file';
 
 interface ArtifactStoppedPlateProps {
 	path: string;
@@ -32,14 +32,7 @@ export function ArtifactStoppedPlate({ path, onRestart }: ArtifactStoppedPlatePr
 				className="text-xs text-muted-foreground underline-offset-2 hover:underline"
 				// Matches `unknown-view.tsx`'s own "Open in default app". The OS
 				// opens the path on desktop; a browser session downloads the file.
-				onClick={() =>
-					void openLocalPath(path, { kind: 'file' }).catch((e) =>
-						toast({
-							label: `Could not open the file: ${e instanceof Error ? e.message : String(e)}`,
-							variant: 'error',
-						})
-					)
-				}
+				onClick={() => void downloadWithFeedback(path)}
 			>
 				{isBrowserHost() ? 'Download file' : 'Open in default app'}
 			</button>

@@ -123,6 +123,9 @@ const BUILTIN_NAMES: ReadonlyArray<readonly [string, string, boolean?]> = [
 	['files.toggle-ignored', 'Show ignored'],
 	['files.open-as-artifact-grid', 'Open as Artifact Grid'],
 	['files.move', 'Move…'],
+	// One Download for every file surface (Files row, viewer chrome). Browser:
+	// saves the file; desktop: relabelled "Open in default app" by the menu.
+	['files.download', 'Download'],
 	['viewer.add-pin', 'Add pin / comment here…'],
 	['viewer.open-in-studio', 'Open in Studio'],
 	['viewer.reload', 'Reload'],

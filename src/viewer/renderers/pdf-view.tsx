@@ -18,9 +18,8 @@ import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
 import { Button } from '@/components/ui/button';
 import { fsRead } from '@/lib/tauri-cmd';
-import { toast } from '@/lib/toast';
-import { isBrowserHost, openLocalPath, saveBlobAs } from '@/lib/transport';
-import { basename } from '../lib/path';
+import { isBrowserHost } from '@/lib/transport';
+import { downloadLabel, useDownloadFile } from '../chrome/download-file';
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -36,6 +35,7 @@ export function PdfView({ path }: PdfViewProps) {
 	const [numPages, setNumPages] = useState(0);
 	const [scale, setScale] = useState(1.0);
 	const [search, setSearch] = useState('');
+	const download = useDownloadFile(path);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -139,27 +139,15 @@ export function PdfView({ path }: PdfViewProps) {
 					variant="ghost"
 					size="sm"
 					className="h-7 gap-1.5 px-2"
-					title={isBrowserHost() ? 'Download' : 'Open in default app'}
-					onClick={() => {
-						if (state.kind !== 'ready') return;
-						// Browser: the bytes are already loaded, hand them straight to the
-						// browser. Desktop: let the OS open the file.
-						if (isBrowserHost()) {
-							saveBlobAs(
-								new Blob([state.data as BlobPart], { type: 'application/pdf' }),
-								basename(path)
-							);
-							return;
-						}
-						openLocalPath(path, { kind: 'file' }).catch((e) =>
-							toast({
-								label: `Could not open ${basename(path)}: ${e instanceof Error ? e.message : String(e)}`,
-								variant: 'error',
-							})
-						);
-					}}
+					title={downloadLabel()}
+					disabled={download.busy}
+					onClick={() => void download.run()}
 				>
-					<Download className="h-3.5 w-3.5" />
+					{download.busy ? (
+						<Loader2 className="h-3.5 w-3.5 animate-spin" />
+					) : (
+						<Download className="h-3.5 w-3.5" />
+					)}
 					{isBrowserHost() ? 'Download' : 'Open'}
 				</Button>
 			</div>

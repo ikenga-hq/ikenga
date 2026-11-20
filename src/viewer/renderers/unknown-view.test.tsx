@@ -4,12 +4,15 @@ import { dismissToast, useToastStore } from '@/lib/toast';
 
 const host = vi.hoisted(() => ({
 	browser: false,
-	openLocalPath: vi.fn(async () => {}),
+	openLocalPath: vi.fn(async (_path: string, _opts?: unknown) => {}),
 }));
 
 vi.mock('@/lib/transport', () => ({
 	isBrowserHost: () => host.browser,
-	openLocalPath: host.openLocalPath,
+}));
+// The shared download: desktop hands the path to the OS opener, a browser downloads.
+vi.mock('@/lib/transport/fs-download', () => ({
+	downloadFile: (path: string) => host.openLocalPath(path, { kind: 'file' }),
 }));
 vi.mock('@/lib/tauri-cmd', () => ({
 	fsRead: vi.fn(async () => ({ bytes: [1, 2, 3], mime: 'application/zip' })),

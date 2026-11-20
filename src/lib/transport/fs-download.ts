@@ -1,5 +1,6 @@
 import { isDeviceSession } from './device-session';
-import { isBrowserHost } from './index';
+import { currentShare, isBrowserHost } from './index';
+import { downloadServerFile, openLocalPath } from './shims';
 import { isT1Session } from './t1-session';
 
 /**
@@ -13,9 +14,15 @@ import { isT1Session } from './t1-session';
  * passive types (pdf, png, jpeg, gif, webp, plain text). HTML and SVG are
  * always served as attachments.
  */
-export function fsDownloadUrl(path: string, opts: { inline?: boolean } = {}): string {
+export function fsDownloadUrl(
+	path: string,
+	opts: { inline?: boolean; share?: string } = {}
+): string {
 	const q = new URLSearchParams({ path });
 	if (opts.inline) q.set('inline', '1');
+	// A navigation cannot send the `X-Ikenga-Share` header, so a share member
+	// selects the share through `?share=` (the broker reads either).
+	if (opts.share) q.set('share', opts.share);
 	return `/api/fs/download?${q.toString()}`;
 }
 
@@ -27,4 +34,40 @@ export function fsDownloadUrl(path: string, opts: { inline?: boolean } = {}): st
  */
 export function canDownloadByNavigation(): boolean {
 	return isBrowserHost() && (isT1Session() || isDeviceSession());
+}
+
+/**
+ * Save the file at `path` — the one download path every control uses.
+ *
+ * - Desktop: unchanged, the OS opens the file in its default app.
+ * - Browser with a cookie credential (T1 session or paired device): a
+ *   navigation to {@link fsDownloadUrl}. The daemon streams it with
+ *   `Content-Disposition: attachment`, so nothing is buffered in JS and the
+ *   browser's own save dialog does the rest. Inside a share the share is
+ *   selected with `?share=`.
+ * - Browser with a single-user bearer token: a navigation cannot attach the
+ *   header, so fall back to the blob path (`fs_read`), which refuses files
+ *   over the preview cap.
+ *
+ * Rejects only on the fallback paths; a navigation reports its own failure in
+ * the browser's download UI.
+ */
+export async function downloadFile(path: string): Promise<void> {
+	if (!isBrowserHost()) {
+		await openLocalPath(path, { kind: 'file' });
+		return;
+	}
+	if (!canDownloadByNavigation()) {
+		await downloadServerFile(path);
+		return;
+	}
+	const url = fsDownloadUrl(path, { share: currentShare()?.projectKey });
+	const a = document.createElement('a');
+	a.href = url;
+	// `download` keeps the SPA in place even if the server answers an error.
+	a.download = path.split(/[\\/]/).filter(Boolean).pop() ?? 'download';
+	a.rel = 'noopener';
+	document.body.appendChild(a);
+	a.click();
+	a.remove();
 }
