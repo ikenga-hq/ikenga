@@ -60,7 +60,13 @@ export function PdfView({ path }: PdfViewProps) {
 
 	// react-pdf needs a stable reference for `file` — wrapping in useMemo
 	// avoids re-fetching the document on every parent re-render.
-	const file = useMemo(() => (state.kind === 'ready' ? { data: state.data } : null), [state]);
+	// pdf.js TRANSFERS the buffer it is given to its worker, which leaves the
+	// caller's array detached (zero length). Hand it a copy so `state.data`
+	// keeps the real bytes for the Download button.
+	const file = useMemo(
+		() => (state.kind === 'ready' ? { data: state.data.slice() } : null),
+		[state]
+	);
 
 	if (state.kind === 'loading') {
 		return (
