@@ -25,6 +25,7 @@ import { UnknownView } from './renderers/unknown-view';
 // have no externally-visible identity to compare against.
 export const CodeView = lazy(() => import('./renderers/code-view').then((m) => ({ default: m.CodeView })));
 export const PdfView = lazy(() => import('./renderers/pdf-view').then((m) => ({ default: m.PdfView })));
+export const DocxView = lazy(() => import('./renderers/docx-view').then((m) => ({ default: m.DocxView })));
 export const XlsxView = lazy(() => import('./renderers/xlsx-view').then((m) => ({ default: m.XlsxView })));
 
 interface ViewerRouterProps {
@@ -62,6 +63,21 @@ export function UnsupportedImageView({ path }: { path: string }) {
 	);
 }
 
+const UNSUPPORTED_OFFICE_EXT = /\.(doc|pptx?|odt)$/i;
+
+export function isUnsupportedOffice(path: string): boolean {
+	return UNSUPPORTED_OFFICE_EXT.test(path);
+}
+
+export function UnsupportedOfficeView({ path }: { path: string }) {
+	return (
+		<CannotPreviewPlate
+			path={path}
+			reason="Word 97-2003 (.doc), PowerPoint and OpenDocument text files can't be previewed here. Download the file to open it in another app."
+		/>
+	);
+}
+
 /** Exported for `auto-router.test.ts` — mime/extension → renderer is pure
  *  dispatch logic and the highest-risk part of a router change (a
  *  mis-ordered branch silently mis-routes a whole file class). */
@@ -75,6 +91,8 @@ export function pickRenderer(mime: string, path: string): Renderer {
 	if (mime.startsWith('image/')) return ImageView;
 	if (mime.startsWith('video/')) return VideoView;
 	if (mime.startsWith('audio/')) return AudioView;
+	if (lower.endsWith('.docx')) return DocxView;
+	if (isUnsupportedOffice(path)) return UnsupportedOfficeView;
 	if (lower.endsWith('.xlsx') || lower.endsWith('.xls')) return XlsxView;
 	if (lower.endsWith('.pen')) return PenView;
 	if (mime === 'text/markdown' || lower.endsWith('.md') || lower.endsWith('.mdx'))

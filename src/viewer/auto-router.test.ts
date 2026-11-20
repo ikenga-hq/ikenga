@@ -7,10 +7,12 @@
 import { describe, expect, it } from 'vitest';
 import {
 	CodeView,
+	DocxView,
 	isAbsoluteViewerPath,
 	PdfView,
 	pickRenderer,
 	UnsupportedImageView,
+	UnsupportedOfficeView,
 	XlsxView,
 } from './auto-router';
 import { AudioView } from './renderers/audio-view';
@@ -70,6 +72,16 @@ describe('pickRenderer — pre-existing branches unaffected', () => {
 		['application/octet-stream', 'dist/Ikenga.AppImage', UnknownView],
 	])('%s / %s → the expected renderer', (mime, path, expected) => {
 		expect(pickRenderer(mime, path)).toBe(expected);
+	});
+});
+
+describe('pickRenderer — office documents (WP-07)', () => {
+	it('routes .docx to the docx view whatever the mime says', () => {
+		expect(pickRenderer('application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'a.docx')).toBe(DocxView);
+		expect(pickRenderer('application/octet-stream', 'B.DOCX')).toBe(DocxView);
+	});
+	it.each(['a.doc', 'deck.pptx', 'old.ppt', 'note.odt'])('routes %s to the cannot-preview plate', (p) => {
+		expect(pickRenderer('application/octet-stream', p)).toBe(UnsupportedOfficeView);
 	});
 });
 
