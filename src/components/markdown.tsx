@@ -51,6 +51,12 @@ interface MarkdownProps {
 	 * editor. Off by default — most consumers don't pay for it.
 	 */
 	sourceLines?: boolean;
+	/**
+	 * Rewrites each `<img>` source (see viewer/lib/markdown-assets). Returns the
+	 * final src, `null` to refuse it, `undefined` while still pending. Omit to
+	 * leave images as written.
+	 */
+	resolveImageSrc?: (src: string) => string | null | undefined;
 }
 
 /** Minimal hast shape — nodes carry `position` from remark-rehype, but
@@ -85,9 +91,10 @@ export function Markdown({
 	allowHtml = false,
 	density = 'comfortable',
 	sourceLines = false,
+	resolveImageSrc,
 }: MarkdownProps) {
 	const isCompact = density === 'compact';
-	const components = useMemo(() => buildComponents(cwd), [cwd]);
+	const components = useMemo(() => buildComponents(cwd, resolveImageSrc), [cwd, resolveImageSrc]);
 	const autolinkOpts = {
 		behavior: 'append' as const,
 		properties: { className: 'heading-anchor', ariaHidden: 'true', tabIndex: -1 },
@@ -172,8 +179,21 @@ export function Markdown({
 
 // ─── Components ─────────────────────────────────────────────────────────────
 
-function buildComponents(cwd?: string) {
+function buildComponents(cwd?: string, resolveImageSrc?: MarkdownProps['resolveImageSrc']) {
 	return {
+		img(props: React.ImgHTMLAttributes<HTMLImageElement>) {
+			const { src, alt, node: _node, ...rest } = props as typeof props & { node?: unknown };
+			if (!resolveImageSrc || typeof src !== 'string') return <img src={src} alt={alt} {...rest} />;
+			const resolved = resolveImageSrc(src);
+			if (resolved === null) {
+				return (
+					<span data-state="image-blocked" className="text-xs text-muted-foreground">
+						[image outside this folder: {alt || src}]
+					</span>
+				);
+			}
+			return <img src={resolved} alt={alt} {...rest} />;
+		},
 		code(
 			props: {
 				className?: string;
