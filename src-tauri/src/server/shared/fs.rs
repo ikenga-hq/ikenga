@@ -41,11 +41,46 @@ pub struct FsReadResult {
     pub mime: String,
 }
 
+/// The largest file `fs_read` will return (25 MiB). Over it the read is refused with
+/// [`preview_too_large_error`] before a byte is read: `fs_read` hands the whole file back as
+/// a JSON number array, so a big file would cost the daemon many times its size. A viewer that
+/// hits the refusal offers Download instead (the streamed `/api/fs/download` route).
+/// Mirrored in `src/lib/tauri-cmd.ts` as `FS_PREVIEW_MAX_BYTES`.
+pub const FS_PREVIEW_MAX_BYTES: u64 = 25 * 1024 * 1024;
+
+/// The stable code of the too-large refusal; the frontend matches on it.
+pub const PREVIEW_TOO_LARGE: &str = "preview_too_large";
+
+/// The refusal text for a file of `size` bytes: `preview_too_large: <size> > <limit>`.
+pub fn preview_too_large_error(size: u64) -> String {
+    format!("{PREVIEW_TOO_LARGE}: {size} > {FS_PREVIEW_MAX_BYTES}")
+}
+
+/// Ok when a file of `size` bytes may be read whole, else the too-large refusal.
+pub fn check_preview_size(size: u64) -> Result<(), String> {
+    if size > FS_PREVIEW_MAX_BYTES {
+        Err(preview_too_large_error(size))
+    } else {
+        Ok(())
+    }
+}
+
+/// The size inside a [`preview_too_large_error`] text (also when a caller prefixed it, as
+/// `respond` does with the command name), or `None` when `msg` is some other error.
+pub fn preview_too_large_size(msg: &str) -> Option<u64> {
+    let rest = &msg[msg.find(PREVIEW_TOO_LARGE)? + PREVIEW_TOO_LARGE.len()..];
+    rest.strip_prefix(": ")?.split(' ').next()?.parse().ok()
+}
+
 /// Read a whole file as bytes. Mirrors the desktop `fs_read`, so a binary file reads too
 /// (the daemon's original arm used `read_to_string` and returned a bare string, which no
 /// viewer could use and which failed outright on anything that was not UTF-8).
 pub async fn read(resolve: Resolve<'_>, path: &str) -> Result<FsReadResult, String> {
     let resolved = resolve(path)?;
+    let meta = tokio::fs::metadata(&resolved)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    check_preview_size(meta.len())?;
     let bytes = tokio::fs::read(&resolved)
         .await
         .map_err(|e| format!("read failed: {e}"))?;
@@ -54,6 +89,41 @@ pub async fn read(resolve: Resolve<'_>, path: &str) -> Result<FsReadResult, Stri
         .essence_str()
         .to_string();
     Ok(FsReadResult { bytes, mime })
+}
+
+/// What `fs_stat` answers: size, kind, mtime and extension-based MIME, without reading the
+/// file. The viewers use it where they only need to know how big a file is.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsStat {
+    pub size: u64,
+    pub is_dir: bool,
+    pub modified_ms: i64,
+    pub mime: String,
+}
+
+/// Stat `path` (followed through symlinks the resolver has already canonicalized).
+pub async fn stat(resolve: Resolve<'_>, path: &str) -> Result<FsStat, String> {
+    let resolved = resolve(path)?;
+    let meta = tokio::fs::metadata(&resolved)
+        .await
+        .map_err(|e| format!("stat failed: {e}"))?;
+    let modified_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let mime = mime_guess::from_path(&resolved)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_string();
+    Ok(FsStat {
+        size: meta.len(),
+        is_dir: meta.is_dir(),
+        modified_ms,
+        mime,
+    })
 }
 
 /// Write `bytes` to `path`, creating missing parent folders. Mirrors the desktop `fs_write`.
@@ -815,5 +885,38 @@ mod trash_tests {
             std::fs::read_link(dst.join("ln")).unwrap(),
             Path::new("d/x.sh")
         );
+    }
+
+    #[test]
+    fn preview_cap_refuses_over_the_limit_only() {
+        assert!(check_preview_size(FS_PREVIEW_MAX_BYTES).is_ok());
+        let e = check_preview_size(FS_PREVIEW_MAX_BYTES + 1).unwrap_err();
+        assert!(e.starts_with(PREVIEW_TOO_LARGE));
+        assert_eq!(preview_too_large_size(&e), Some(FS_PREVIEW_MAX_BYTES + 1));
+        // `respond` prefixes the command name; the size still parses.
+        assert_eq!(
+            preview_too_large_size(&format!("fs_read: {e}")),
+            Some(FS_PREVIEW_MAX_BYTES + 1)
+        );
+        assert_eq!(preview_too_large_size("read failed: nope"), None);
+    }
+
+    #[tokio::test]
+    async fn read_refuses_a_big_file_and_stat_reports_its_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let big = tmp.path().join("big.bin");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(FS_PREVIEW_MAX_BYTES + 1).unwrap(); // sparse, costs no disk
+        let small = tmp.path().join("small.txt");
+        std::fs::write(&small, b"hi").unwrap();
+        let resolve = |p: &str| -> Result<PathBuf, String> { Ok(PathBuf::from(p)) };
+        let e = read(&resolve, big.to_str().unwrap()).await.unwrap_err();
+        assert_eq!(preview_too_large_size(&e), Some(FS_PREVIEW_MAX_BYTES + 1));
+        let ok = read(&resolve, small.to_str().unwrap()).await.unwrap();
+        assert_eq!(ok.bytes, b"hi");
+        let st = stat(&resolve, big.to_str().unwrap()).await.unwrap();
+        assert_eq!(st.size, FS_PREVIEW_MAX_BYTES + 1);
+        assert!(!st.is_dir);
+        assert!(stat(&resolve, tmp.path().to_str().unwrap()).await.unwrap().is_dir);
     }
 }

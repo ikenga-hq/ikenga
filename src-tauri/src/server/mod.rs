@@ -28,6 +28,12 @@ pub mod discovery;
 /// …) and its `/ws/events` delivery to browsers (gap audit rank 10).
 pub mod events;
 pub mod events_ws;
+/// box-files WP-15: the child's `file_link_resolve` arm (what an outside
+/// link may carry, decided by the creator's own guard).
+pub(crate) mod file_link_resolve;
+/// box-files WP-16: the child's `/internal/file-link/read` (the bytes of
+/// one outside link, streamed to the broker only).
+pub(crate) mod file_link_read;
 pub mod fs_ws;
 pub mod health;
 /// A held hook gate's notification row and audit trail (daemon asks).
@@ -202,6 +208,9 @@ pub struct T1ServeOptions {
     /// `--member-invites-create-accounts` (G-ACCESS §4.4, N-11; T1). Off by
     /// default.
     pub member_invites_create_accounts: bool,
+    /// `--file-links` / `IKENGA_FILE_LINKS` (box-files WP-15): outside
+    /// links to one file. Off by default; read by the T1 broker.
+    pub file_links: bool,
     /// Web Push flags (plans/pwa S2): `--no-push`, `--push-contact`,
     /// `--push-endpoint-host`, `--push-allow-endpoint`. Read by the T0
     /// daemon and the T1 broker (the store owners).
@@ -221,6 +230,7 @@ impl T1ServeOptions {
                 .unwrap_or(crate::access::DEFAULT_INVITE_TTL_DAYS)
                 .clamp(1, crate::access::MAX_INVITE_TTL_DAYS),
             member_invites_create_accounts: self.member_invites_create_accounts,
+            file_links: self.file_links,
         }
     }
 }
@@ -1058,6 +1068,9 @@ fn build_router(
         .route("/api/server/update/check", post(update::t0_check))
         // Backup export/import (WP-B): streamed download / upload (100MB max)
         .route("/api/backup/export", get(rpc_backup::http_backup_export))
+        // Streamed file download (box-files WP-04): authorized and share-narrowed
+        // as the `fs_read` arm (`rpc_files::http_fs_download`).
+        .route("/api/fs/download", get(rpc_files::http_fs_download))
         .route(
             "/api/backup/import",
             post(rpc_backup::http_backup_import).layer(axum::extract::DefaultBodyLimit::max(
@@ -1110,7 +1123,13 @@ fn build_router(
             .route(
                 crate::access::audit::child::ACK_PATH,
                 post(crate::access::audit::child::ack_handler),
-            ),
+            )
+            // box-files WP-16: the bytes of one outside link, for the
+            // broker's `/s/<token>/{view,download}` only (`internal`
+            // class). Outside the app-lock gate (a link is revoked, not
+            // locked, 06-file-links §1.4); deliberately NOT in the
+            // not-activity list above, so a stream keeps the child up.
+            .route(file_link_read::READ_PATH, get(file_link_read::handler)),
         crate::access::DaemonMode::T0 => protected_routes,
     };
     let protected_routes = protected_routes.layer(middleware::from_fn_with_state(

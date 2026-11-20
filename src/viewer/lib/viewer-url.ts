@@ -13,6 +13,7 @@
 // `viewerServe` caller that doesn't pair it with `viewerStop`).
 
 import { fsRead, isRemoteWebSession, viewerPort } from '@/lib/tauri-cmd';
+import { encodeUrlPath } from './path';
 import { mountViewerRoot } from './viewer-root';
 
 /** Default bound port, matched to `html-frame.tsx`'s own fallback — only hit
@@ -34,5 +35,5 @@ export async function resolveHtmlViewerUrl(path: string): Promise<string> {
 	const res = await fsRead(path);
 	const html = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(res.bytes));
 	const [{ handle, file }, port] = await Promise.all([mountViewerRoot(path, html), viewerPort()]);
-	return `http://localhost:${port ?? FALLBACK_PORT}${handle.url}${file}`;
+	return `http://localhost:${port ?? FALLBACK_PORT}${handle.url}${encodeUrlPath(file)}`;
 }

@@ -123,6 +123,11 @@ const BUILTIN_NAMES: ReadonlyArray<readonly [string, string, boolean?]> = [
 	['files.toggle-ignored', 'Show ignored'],
 	['files.open-as-artifact-grid', 'Open as Artifact Grid'],
 	['files.move', 'Move…'],
+	// One Download for every file surface (Files row, viewer chrome). Browser:
+	// saves the file; desktop: relabelled "Open in default app" by the menu.
+	['files.download', 'Download'],
+	// Opens the invite sheet with this file as a one-artifact share (WP-11).
+	['files.share', 'Share…'],
 	['viewer.add-pin', 'Add pin / comment here…'],
 	['viewer.open-in-studio', 'Open in Studio'],
 	['viewer.reload', 'Reload'],
@@ -454,7 +459,9 @@ export type MenuItemCondition =
 	| 'artifact-tab'
 	| 'artifact-or-route-tab'
 	| 'html-in-pane'
-	| 'sectioned-pin';
+	| 'sectioned-pin'
+	/** The account may create shares and the file is inside the project folder. */
+	| 'shareable';
 
 /** A placement as the merge reads it: a file `Placement`, or a derived
  *  package placement that may carry an applicability `condition`. */

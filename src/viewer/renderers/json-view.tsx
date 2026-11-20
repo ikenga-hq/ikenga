@@ -10,6 +10,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import { ErrorState, LoadingState } from '@/components/states';
 import { fsRead } from '@/lib/tauri-cmd';
+import { CannotPreviewPlate } from '../chrome/cannot-preview-plate';
+import { isPreviewTooLarge } from '../lib/preview-cap';
 import { EditableTextFrame } from '../editing/editable-text-frame';
 
 interface JsonViewProps {
@@ -67,7 +69,12 @@ function JsonReadOnly({ path }: { path: string }) {
 	if (state.kind === 'loading') {
 		return <LoadingState data-state="loading" fill heading="Loading…" />;
 	}
-	if (state.kind === 'error') return <JsonParseError message={state.message} />;
+	if (state.kind === 'error') {
+		if (isPreviewTooLarge(state.message)) {
+			return <CannotPreviewPlate path={path} message={state.message} />;
+		}
+		return <JsonParseError message={state.message} />;
+	}
 	return <JsonTree text={state.text} />;
 }
 

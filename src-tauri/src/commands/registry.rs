@@ -117,6 +117,7 @@ pub(crate) fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         fs::fs_write,
         fs::fs_mkdir,
         fs::fs_exists,
+        fs::fs_stat,
         fs::fs_kind,
         fs::fs_list,
         fs::fs_mime,

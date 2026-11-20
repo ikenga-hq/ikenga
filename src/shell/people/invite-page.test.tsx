@@ -6,6 +6,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { __resetShareModeForTests, currentShare } from '@/lib/transport';
+import { LAND_KEY } from '@/shell/people/share-landing';
 import {
 	__resetInviteTokenForTests,
 	InvitePage,
@@ -125,6 +126,41 @@ describe('InvitePage', () => {
 			username: 'tomi',
 			password: 'correct horse battery',
 		});
+		// A project-scope accept marks no landing.
+		expect(sessionStorage.getItem(LAND_KEY)).toBeNull();
+		err.mockRestore();
+	});
+
+	it('an artifact accept marks the landing so the Guest opens the shared file', async () => {
+		const key = '01890a5d-ac96-774b-bcce-b302099a8057/royalti-co';
+		fetchMock.mockImplementation(async (url) => {
+			if (url === '/access/invite/inspect') return json({ ...INFO, scope: 'artifact' });
+			if (url === '/auth/me') return json({}, 401);
+			if (url === '/access/invite/accept')
+				return json({
+					ok: true,
+					share: {
+						projectKey: key,
+						ownerPrincipalId: '01890a5d-ac96-774b-bcce-b302099a8057',
+						projectId: 'royalti-co',
+						projectName: 'royalti-co',
+						role: 'guest',
+						scope: 'artifact',
+						artifactPath: 'docs/brief.html',
+					},
+				});
+			return json({}, 404);
+		});
+		const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+		render(<InvitePage />);
+		await screen.findByRole('form', { name: 'Accept invite' });
+		fireEvent.change(screen.getByLabelText('Username'), { target: { value: 'tomi' } });
+		fireEvent.change(screen.getByLabelText(/Password/), {
+			target: { value: 'correct horse battery' },
+		});
+		fireEvent.click(screen.getByRole('button', { name: 'Create account and join' }));
+		await waitFor(() => expect(currentShare()?.scope).toBe('artifact'));
+		expect(sessionStorage.getItem(LAND_KEY)).toBe(key);
 		err.mockRestore();
 	});
 

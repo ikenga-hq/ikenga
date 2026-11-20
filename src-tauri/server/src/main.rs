@@ -402,6 +402,12 @@ pub struct ServeArgs {
     #[arg(long, env = "IKENGA_MEMBER_INVITES_CREATE_ACCOUNTS")]
     pub member_invites_create_accounts: bool,
 
+    /// T1 only: let accounts share one of their files with people who have
+    /// no account, by an outside link served under `/s/`. Off by default;
+    /// changing it needs a restart.
+    #[arg(long, env = "IKENGA_FILE_LINKS")]
+    pub file_links: bool,
+
     /// Turn Web Push off: no VAPID key is used and nothing is sent to any
     /// push service (plans/pwa). `IKENGA_PUSH=off` does the same.
     #[arg(long)]
@@ -602,6 +608,7 @@ async fn async_main(cli: CliArgs) -> anyhow::Result<()> {
         max_accounts: args.max_accounts,
         invite_ttl_days: args.invite_ttl,
         member_invites_create_accounts: args.member_invites_create_accounts,
+        file_links: args.file_links,
         push: ikenga_desktop_lib::server::push::PushOptions {
             disabled: args.no_push
                 || std::env::var("IKENGA_PUSH").is_ok_and(|v| {
@@ -1342,6 +1349,7 @@ mod tests {
         assert_eq!(args.serve.max_accounts, None);
         assert_eq!(args.serve.invite_ttl, None);
         assert!(!args.serve.member_invites_create_accounts);
+        assert!(!args.serve.file_links, "outside file links default off");
         assert!(!args.serve.no_push);
         assert!(args.serve.push_endpoint_hosts.is_empty());
         let args = CliArgs::try_parse_from([
@@ -1376,6 +1384,12 @@ mod tests {
         assert_eq!(args.serve.max_accounts, Some(25));
         assert_eq!(args.serve.invite_ttl, Some(30));
         assert!(args.serve.member_invites_create_accounts);
+        assert!(
+            CliArgs::try_parse_from(["ikenga-server", "--file-links"])
+                .unwrap()
+                .serve
+                .file_links
+        );
         // P-15: the invite TTL tops out at 30 days.
         assert!(CliArgs::try_parse_from(["ikenga-server", "--invite-ttl", "31"]).is_err());
         assert!(CliArgs::try_parse_from(["ikenga-server", "--invite-ttl", "0"]).is_err());

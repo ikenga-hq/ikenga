@@ -329,10 +329,16 @@ mod tests {
                 .fetch_all(&mut conn)
                 .await
                 .unwrap();
-        // plans/pwa added `0003_push` after the absorb.
+        // plans/pwa added `0003_push` after the absorb; box-files WP-15
+        // added `0004_file_links`.
         assert_eq!(
             applied,
-            ["0001_core", "0002_absorb_auth_events", "0003_push"]
+            [
+                "0001_core",
+                "0002_absorb_auth_events",
+                "0003_push",
+                "0004_file_links"
+            ]
         );
 
         let (mut conn, ada) = accounts_db().await;

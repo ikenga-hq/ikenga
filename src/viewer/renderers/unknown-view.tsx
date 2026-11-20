@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
-import { File } from 'lucide-react';
+import { File, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { toast } from '@/lib/toast';
-import { isBrowserHost, openLocalPath } from '@/lib/transport';
-import { fsRead } from '@/lib/tauri-cmd';
+import { fsStat } from '@/lib/tauri-cmd';
 import { basename } from '../lib/path';
+import { formatBytes } from '../lib/preview-cap';
+import { downloadLabel, useDownloadFile } from '../chrome/download-file';
 
 interface UnknownViewProps {
 	path: string;
@@ -14,16 +14,21 @@ interface UnknownViewProps {
 export function UnknownView({ path, mime }: UnknownViewProps) {
 	const [size, setSize] = useState<number | null>(null);
 	const [resolvedMime, setResolvedMime] = useState<string>(mime ?? 'application/octet-stream');
+	const download = useDownloadFile(path);
 
+	// A stat, not a read: learning the size must not pull the whole file over
+	// the wire (a .docx or .pptx can be hundreds of MB).
 	useEffect(() => {
 		let cancelled = false;
-		fsRead(path)
+		fsStat(path)
 			.then((res) => {
 				if (cancelled) return;
-				setSize(res.bytes.length);
+				setSize(res.size);
 				if (!mime) setResolvedMime(res.mime);
 			})
-			.catch(() => {});
+			.catch(() => {
+				// Size and MIME are decoration; the Download button still works.
+			});
 		return () => {
 			cancelled = true;
 		};
@@ -38,29 +43,10 @@ export function UnknownView({ path, mime }: UnknownViewProps) {
 				{size !== null && ` · ${formatBytes(size)}`}
 			</div>
 			<div className="break-all font-mono text-[10px]">{path}</div>
-			<Button
-				variant="outline"
-				size="sm"
-				onClick={() => {
-					// Desktop: the OS picks the default handler. Browser: the path
-					// is on the server, so this downloads the file instead.
-					openLocalPath(path, { kind: 'file' }).catch((e) =>
-						toast({
-							label: `Could not open ${basename(path)}: ${e instanceof Error ? e.message : String(e)}`,
-							variant: 'error',
-						})
-					);
-				}}
-			>
-				{isBrowserHost() ? 'Download' : 'Open in default app'}
+			<Button variant="outline" size="sm" disabled={download.busy} onClick={() => void download.run()}>
+				{download.busy && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />}
+				{downloadLabel()}
 			</Button>
 		</div>
 	);
-}
-
-function formatBytes(n: number): string {
-	if (n < 1024) return `${n} B`;
-	if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-	if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
-	return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }

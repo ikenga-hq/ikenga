@@ -2,6 +2,9 @@ import { useEffect, useMemo, useState } from 'react';
 import { AlertCircle, Loader2 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { fsRead } from '@/lib/tauri-cmd';
+import { CannotPreviewPlate } from '../chrome/cannot-preview-plate';
+import { isPreviewTooLarge } from '../lib/preview-cap';
+import { CSV_ROW_CAP, renderedRowCount } from './csv-view';
 
 interface XlsxViewProps {
 	path: string;
@@ -10,6 +13,27 @@ interface XlsxViewProps {
 interface ParsedWorkbook {
 	sheetNames: string[];
 	sheets: Record<string, Array<Array<string | number | boolean | null>>>;
+}
+
+/** Read options: real dates (not serial numbers), and the number formats the
+ *  workbook was saved with. Exported for the test. */
+export const XLSX_READ_OPTS = { type: 'array', cellDates: true } as const;
+
+/** Sheet → rows as the *formatted* text Excel shows (`raw: false` uses each
+ *  cell's `w` field), so dates and currency read as they do in a spreadsheet. */
+export function sheetRows(sheet: XLSX.WorkSheet): Array<Array<string | number | boolean | null>> {
+	return XLSX.utils.sheet_to_json(sheet, {
+		header: 1,
+		raw: false,
+		defval: null,
+	}) as Array<Array<string | number | boolean | null>>;
+}
+
+/** The "showing first N of M rows" note, or null when everything is shown. */
+export function rowCapNote(total: number, shown: number): string | null {
+	const n = renderedRowCount(total, shown);
+	if (n >= total) return null;
+	return `Showing first ${n.toLocaleString()} of ${total.toLocaleString()} rows`;
 }
 
 // Renders the active sheet as a raw HTML table. Critical for CFO workflows
@@ -28,18 +52,14 @@ export function XlsxView({ path }: XlsxViewProps) {
 			.then((res) => {
 				if (cancelled) return;
 				try {
-					const wb = XLSX.read(new Uint8Array(res.bytes), { type: 'array' });
+					const wb = XLSX.read(new Uint8Array(res.bytes), XLSX_READ_OPTS);
 					const parsed: ParsedWorkbook = {
 						sheetNames: wb.SheetNames,
 						sheets: {},
 					};
 					for (const name of wb.SheetNames) {
 						const sheet = wb.Sheets[name]!;
-						parsed.sheets[name] = XLSX.utils.sheet_to_json(sheet, {
-							header: 1,
-							raw: true,
-							defval: null,
-						}) as Array<Array<string | number | boolean | null>>;
+						parsed.sheets[name] = sheetRows(sheet);
 					}
 					setState({ kind: 'ready', wb: parsed });
 					setActiveSheet(parsed.sheetNames[0] ?? '');
@@ -66,6 +86,11 @@ export function XlsxView({ path }: XlsxViewProps) {
 		if (state.kind !== 'ready' || !activeSheet) return [];
 		return state.wb.sheets[activeSheet] ?? [];
 	}, [state, activeSheet]);
+	const visibleRows = useMemo(
+		() => rows.slice(0, renderedRowCount(rows.length, CSV_ROW_CAP)),
+		[rows]
+	);
+	const capNote = rowCapNote(rows.length, CSV_ROW_CAP);
 
 	if (state.kind === 'loading') {
 		return (
@@ -75,6 +100,9 @@ export function XlsxView({ path }: XlsxViewProps) {
 		);
 	}
 	if (state.kind === 'error') {
+		if (isPreviewTooLarge(state.message)) {
+			return <CannotPreviewPlate path={path} message={state.message} />;
+		}
 		return (
 			<div className="flex h-full items-start justify-center p-6 text-xs text-destructive">
 				<AlertCircle className="mr-2 mt-0.5 h-4 w-4 shrink-0" />
@@ -103,7 +131,7 @@ export function XlsxView({ path }: XlsxViewProps) {
 			<div className="flex-1 overflow-auto">
 				<table className="border-collapse font-mono text-[11px]">
 					<tbody>
-						{rows.map((row, ri) => (
+						{visibleRows.map((row, ri) => (
 							<tr key={ri} className={ri === 0 ? 'bg-muted/40 font-semibold' : ''}>
 								<td className="sticky left-0 border border-border bg-muted/30 px-2 py-1 text-right text-muted-foreground tabular-nums">
 									{ri + 1}
@@ -118,6 +146,14 @@ export function XlsxView({ path }: XlsxViewProps) {
 					</tbody>
 				</table>
 			</div>
+			{capNote && (
+				<div
+					data-state="xlsx-row-cap"
+					className="shrink-0 border-t border-border bg-muted/20 px-3 py-1.5 text-[11px] text-muted-foreground"
+				>
+					{capNote}
+				</div>
+			)}
 		</div>
 	);
 }

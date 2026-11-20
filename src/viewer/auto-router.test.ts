@@ -5,7 +5,17 @@
 // them. Not run in this session (DEC-50 — see the WP-44 report).
 
 import { describe, expect, it } from 'vitest';
-import { CodeView, isAbsoluteViewerPath, PdfView, pickRenderer, XlsxView } from './auto-router';
+import {
+	CodeView,
+	DocxView,
+	isAbsoluteViewerPath,
+	relativePathBlocked,
+	PdfView,
+	pickRenderer,
+	UnsupportedImageView,
+	UnsupportedOfficeView,
+	XlsxView,
+} from './auto-router';
 import { AudioView } from './renderers/audio-view';
 import { CsvView } from './renderers/csv-view';
 import { HtmlFrame } from './renderers/html-frame';
@@ -15,6 +25,16 @@ import { MarkdownView } from './renderers/markdown-view';
 import { PenView } from './renderers/pen-view';
 import { UnknownView } from './renderers/unknown-view';
 import { VideoView } from './renderers/video-view';
+
+describe('pickRenderer — unsupported images (WP-09)', () => {
+	it('routes HEIC/HEIF/TIFF to the cannot-preview plate whatever the mime says', () => {
+		expect(pickRenderer('image/heic', 'photos/a.HEIC')).toBe(UnsupportedImageView);
+		expect(pickRenderer('application/octet-stream', 'a.heif')).toBe(UnsupportedImageView);
+		expect(pickRenderer('image/tiff', 'scan.tif')).toBe(UnsupportedImageView);
+		expect(pickRenderer('image/tiff', 'scan.tiff')).toBe(UnsupportedImageView);
+		expect(pickRenderer('image/png', 'a.png')).toBe(ImageView);
+	});
+});
 
 describe('pickRenderer — new in WP-44', () => {
 	it('routes .csv (and a resolved text/csv mime) to CsvView, not CodeView', () => {
@@ -56,6 +76,16 @@ describe('pickRenderer — pre-existing branches unaffected', () => {
 	});
 });
 
+describe('pickRenderer — office documents (WP-07)', () => {
+	it('routes .docx to the docx view whatever the mime says', () => {
+		expect(pickRenderer('application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'a.docx')).toBe(DocxView);
+		expect(pickRenderer('application/octet-stream', 'B.DOCX')).toBe(DocxView);
+	});
+	it.each(['a.doc', 'deck.pptx', 'old.ppt', 'note.odt'])('routes %s to the cannot-preview plate', (p) => {
+		expect(pickRenderer('application/octet-stream', p)).toBe(UnsupportedOfficeView);
+	});
+});
+
 describe('isAbsoluteViewerPath', () => {
 	it('treats POSIX, home and drive paths as absolute', () => {
 		expect(isAbsoluteViewerPath('/opt/ikenga/data/x.pdf')).toBe(true);
@@ -68,5 +98,24 @@ describe('isAbsoluteViewerPath', () => {
 		expect(isAbsoluteViewerPath('deliverables/x.pdf')).toBe(false);
 		expect(isAbsoluteViewerPath('./x.pdf')).toBe(false);
 		expect(isAbsoluteViewerPath('x.pdf')).toBe(false);
+	});
+});
+
+describe('relativePathBlocked (WP-13)', () => {
+	it('never blocks outside a browser session or for an absolute path', () => {
+		expect(relativePathBlocked('docs/a.md', false, null)).toBe(false);
+		expect(relativePathBlocked('/srv/a.md', true, null)).toBe(false);
+	});
+
+	it('blocks a relative path in an own remote session', () => {
+		expect(relativePathBlocked('docs/a.md', true, null)).toBe(true);
+	});
+
+	it('lets a project-scope share through (the daemon joins the shared root)', () => {
+		expect(relativePathBlocked('docs/a.md', true, { scope: 'project' })).toBe(false);
+	});
+
+	it('still blocks in an artifact-scope share (one file, no root to join)', () => {
+		expect(relativePathBlocked('docs/a.md', true, { scope: 'artifact' })).toBe(true);
 	});
 });

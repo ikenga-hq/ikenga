@@ -94,7 +94,8 @@ impl ChildLauncher for FakeLauncher {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             let requests = Arc::new(Mutex::new(Vec::new()));
-            let (r1, r2, r3, r4, r5) = (
+            let (r1, r2, r3, r4, r5, r6) = (
+                requests.clone(),
                 requests.clone(),
                 requests.clone(),
                 requests.clone(),
@@ -161,6 +162,10 @@ impl ChildLauncher for FakeLauncher {
                 .route(
                     "/api/backup/import",
                     post(move |req: Request<Body>| echo_http(r5.clone(), req)),
+                )
+                .route(
+                    "/api/fs/download",
+                    get(move |req: Request<Body>| echo_http(r6.clone(), req)),
                 )
                 .route(
                     "/__viewer/*rest",
@@ -2089,6 +2094,49 @@ async fn viewer_token_routes_to_the_running_child_without_a_cookie_and_never_lau
 }
 
 #[tokio::test]
+async fn t1_broker_proxies_fs_download_for_a_signed_in_user_only() {
+    let h = harness().await;
+    let _id = insert_account(&h.pool, "ada", 20_002, false).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+    let uri = "/api/fs/download?path=%2Ftmp%2Fa.txt";
+
+    let (status, _, _) = send(&h.app, request("GET", uri).body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _, body) = send(
+        &h.app,
+        request("GET", uri)
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "download route was proxied");
+    assert_eq!(body["data"]["path"], "/api/fs/download");
+
+    // No `path`: refused at the broker, nothing proxied.
+    let (status, _, _) = send(
+        &h.app,
+        request("GET", "/api/fs/download")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _, _) = send(
+        &h.app,
+        request("POST", uri)
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
 async fn arm_level_t1_broker_proxies_backup_export_and_import() {
     let h = harness().await;
     let _id = insert_account(&h.pool, "ada", 20_001, false).await;
@@ -2239,3 +2287,6 @@ mod share_approve;
 
 /// WP-D: the per-person view of outreach drafts (Ada her rows, Chinedum all).
 mod share_outreach;
+
+/// box-files WP-16: the outside-link routes, `/s/*` (06-file-links LS tests).
+mod file_links;

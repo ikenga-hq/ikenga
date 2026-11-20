@@ -3,6 +3,7 @@ import {
 	ArrowRight,
 	Camera,
 	Code2,
+	Download,
 	ExternalLink,
 	FolderOpen,
 	History,
@@ -59,6 +60,8 @@ import { usePinsStore } from '@/lib/shell/pins-store';
 import { isHtmlArtifactPath, resolveHtmlViewerUrl } from '@/viewer/lib/viewer-url';
 import { type DeviceWidth, useViewerPaneState } from '@/viewer/viewer-pane-state';
 import { copyText } from '@/lib/clipboard';
+import { downloadLabel, downloadWithFeedback } from '@/viewer/chrome/download-file';
+import { requestShareFile, useCanShareFile } from '@/shell/people/share-file';
 
 // No shortcut on the viewer-zoom rows: the shipped `⌘+` / `⌘−` / `⌘0` labels
 // belonged to the window-level `zoom.*` keys, not to these items (G-ACTIONS
@@ -73,6 +76,7 @@ const PANE_MENU_ICONS: Readonly<Record<string, ReactNode>> = {
 	'viewer.open-in-browser': <ExternalLink className="h-3.5 w-3.5" />,
 	'viewer.toggle-source': <Code2 className="h-3.5 w-3.5" />,
 	'reveal-files': <FolderOpen className="h-3.5 w-3.5" />,
+	'files.download': <Download className="h-3.5 w-3.5" />,
 	'viewer.copy-url': <LinkIcon className="h-3.5 w-3.5" />,
 	'viewer.zoom-in': <ZoomIn className="h-3.5 w-3.5" />,
 	'viewer.zoom-out': <ZoomOut className="h-3.5 w-3.5" />,
@@ -263,12 +267,14 @@ function PaneMenuBody({
 		artifactPath ? (s.pins.some((p) => p.target === artifactPath) ?? false) : false
 	);
 
+	const canShare = useCanShareFile(artifactPath);
 	const paneMenu = useEffectiveMenu('pane');
 	const resolvedRows = resolveMenuItems(paneMenu, {
 		target: { resource: tabPath, paneKind: activeTab?.kind },
 		conditions: {
 			history: Boolean(history),
 			'artifact-tab': isArtifact,
+			shareable: isArtifact && canShare,
 			'artifact-or-route-tab': canCopyPath && tabPath !== undefined,
 			...pkg.conditions,
 		},
@@ -303,6 +309,8 @@ function PaneMenuBody({
 			'pane.split-right': 'Split right',
 			'pane.split-down': 'Split down',
 			'copy-path': 'Copy path',
+			'files.download': downloadLabel(),
+			'files.share': 'Share…',
 			'viewer.toggle-source': viewerState.variant === 'source' ? 'Close source' : 'Open source',
 			'viewer.zoom-in': 'Zoom in',
 			'viewer.zoom-out': 'Zoom out',
@@ -337,6 +345,12 @@ function PaneMenuBody({
 					void resolveHtmlViewerUrl(artifactPath)
 						.then((url) => copyText(url))
 						.catch(() => {});
+			},
+			'files.download': () => {
+				if (artifactPath) void downloadWithFeedback(artifactPath);
+			},
+			'files.share': () => {
+				if (artifactPath) requestShareFile(artifactPath);
 			},
 			'viewer.zoom-in': () => zoomBy(paneId, 10),
 			'viewer.zoom-out': () => zoomBy(paneId, -10),

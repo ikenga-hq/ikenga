@@ -26,6 +26,8 @@ export interface AccessStatus {
 	publicUrl: string | null;
 	/** `=== (tier === 't1')` (§4.5.5, Round 16). */
 	sharingEnabled: boolean;
+	/** Outside file links are on (T1 and the server's `--file-links`; box-files WP-15). Absent on older servers. */
+	fileLinksEnabled?: boolean;
 	share: null | {
 		projectKey: string;
 		projectName: string;
@@ -237,6 +239,66 @@ export const accessInviteIssue = (args: {
 export const accessInviteRevoke = (inviteId: string) =>
 	invoke<Record<string, never>>('access_invite_revoke', { inviteId });
 export const accessSharesList = () => invoke<unknown[]>('access_shares_list', {});
+
+// ── outside file links (box-files WP-15 / WP-17) ─────────────────────────────
+
+export type FileLinkPreviewKind = 'pdf' | 'image' | 'text' | 'none';
+export type FileLinkState = 'live' | 'expired' | 'revoked' | 'locked';
+
+export interface FileLinkView {
+	linkId: string;
+	name: string;
+	path: string;
+	previewKind: FileLinkPreviewKind;
+	createdAt: number;
+	/** Unix ms; `null` = never. */
+	expiresAt: number | null;
+	revokedAt: number | null;
+	revokedReason: 'owner' | 'admin' | null;
+	hasPasscode: boolean;
+	lockedUntil: number | null;
+	openCount: number;
+	downloadCount: number;
+	firstOpenedAt: number | null;
+	lastOpenedAt: number | null;
+	state: FileLinkState;
+}
+
+/** The admin list adds whose link it is. */
+export interface AdminFileLinkView extends FileLinkView {
+	ownerPrincipalId: string;
+	ownerUsername: string | null;
+}
+
+export interface FileLinkCreated {
+	linkId: string;
+	/** The only copy of the token: shown once, never again. */
+	url: string;
+	name: string;
+	size: number;
+	previewKind: FileLinkPreviewKind;
+	expiresAt: number | null;
+	hasPasscode: boolean;
+}
+
+export const accessFileLinkCreate = (args: {
+	/** Absolute path of the file on the server. */
+	path: string;
+	/** 1..=365; omit with `never` for the 7-day default. */
+	expiresInDays?: number;
+	never?: true;
+	passcode?: string;
+}) => invoke<FileLinkCreated>('access_file_link_create', args);
+export const accessFileLinksList = () =>
+	invoke<{ links: FileLinkView[] }>('access_file_links_list', {});
+export const accessFileLinkRevoke = (linkId: string) =>
+	invoke<{ revoked: true }>('access_file_link_revoke', { linkId });
+export const accessFileLinksAdminList = (args: {
+	ownerPrincipalId?: string;
+	includeEnded?: boolean;
+} = {}) => invoke<{ links: AdminFileLinkView[] }>('access_file_links_admin_list', args);
+export const accessFileLinkAdminRevoke = (target: { linkId: string } | { ownerPrincipalId: string }) =>
+	invoke<{ revoked: number }>('access_file_link_admin_revoke', target);
 
 // ── audit (WP-77) ────────────────────────────────────────────────────────────
 

@@ -633,3 +633,76 @@ async fn a_share_member_reads_an_indexed_pkgs_manifest_and_nothing_outside_the_s
     assert_eq!(ok["ok"], true, "{ok}");
     assert_eq!(ok["data"]["id"], "com.test.mine");
 }
+
+/// A member's `GET /api/fs/download`, as the broker relays it into the Owner's
+/// child: per-child token, caps header and (for a member) the share set.
+async fn download(c: &Child, role: Option<&str>, caps: &str, path: &str) -> (u16, Vec<u8>, String) {
+    let mut req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/fs/download?path={path}"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("x-ikenga-principal", PrincipalId::new_v7().to_string())
+        .header("x-ikenga-caps", caps);
+    if let Some(role) = role {
+        req = req
+            .header("x-ikenga-share-project", PROJECT)
+            .header(
+                "x-ikenga-share-principal",
+                PrincipalId::new_v7().to_string(),
+            )
+            .header("x-ikenga-share-device", "-")
+            .header("x-ikenga-share-role", role);
+    }
+    let res = c
+        .router
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    let disposition = res
+        .headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, body.to_vec(), disposition)
+}
+
+/// WP-04: `GET /api/fs/download` serves on the share-narrowed guard. A member
+/// gets the shared project's file and nothing the Owner's allowlist admits
+/// beyond it; the Owner's own request still reads the wider allowlist.
+#[tokio::test]
+async fn a_share_member_download_is_narrowed_to_the_shared_project() {
+    let c = child().await;
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    let inside = s(&c.project.join("docs/brief.md"));
+
+    // 1. Inside the project: exact bytes, as an attachment.
+    let (status, body, disposition) = download(&c, Some("operator"), "files,sessions", &inside).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, b"the brief");
+    assert!(disposition.starts_with("attachment"), "{disposition}");
+
+    // 2. A file the router's own guard admits but the share does not: 404.
+    let (status, body, _) = download(&c, Some("operator"), "files,sessions", &s(&c.outside)).await;
+    assert_eq!(status, 404);
+    assert!(!String::from_utf8_lossy(&body).contains("Owner's other file"));
+
+    // 3. A `..` climb out of the project: 404.
+    let climb = format!("{}/../not-shared.txt", s(&c.project));
+    let (status, _, _) = download(&c, Some("operator"), "files,sessions", &climb).await;
+    assert_eq!(status, 404, "`..` never climbs out");
+
+    // 4. No Files capability: refused before any read.
+    let (status, _, _) = download(&c, Some("operator"), "sessions", &inside).await;
+    assert!(status == 403 || status == 401, "no files cap: {status}");
+
+    // 5. The Owner's own request (no share headers) still reads the wider root.
+    let (status, body, _) = download(&c, None, "files,sessions", &s(&c.outside)).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, b"the Owner's other file");
+}

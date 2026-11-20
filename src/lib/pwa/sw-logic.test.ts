@@ -53,6 +53,18 @@ describe('classify', () => {
 		}
 	});
 
+	it('never answers an outside file link, as a page or its bytes (LS-20)', () => {
+		const t = 'A'.repeat(43);
+		for (const path of ['/s', `/s/${t}`, `/s/${t}/view`, `/s/${t}/download`, '/s/abc']) {
+			expect(classify(req(path, { mode: 'navigate' }), ORIGIN, PRECACHE), path).toBe('passthrough');
+			expect(classify(req(path), ORIGIN, PRECACHE), path).toBe('passthrough');
+		}
+		// Whole segments only: an app route that merely starts with "s" is not one.
+		expect(isNetworkOnlyPath('/sessions/abc')).toBe(false);
+		expect(isNetworkOnlyPath('/settings')).toBe(false);
+		expect(classify(req('/sessions/abc', { mode: 'navigate' }), ORIGIN, PRECACHE)).toBe('navigation');
+	});
+
 	it('matches network-only prefixes as whole segments only', () => {
 		expect(isNetworkOnlyPath('/api')).toBe(true);
 		expect(isNetworkOnlyPath('/api/')).toBe(true);

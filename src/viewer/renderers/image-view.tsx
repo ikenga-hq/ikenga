@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { AlertCircle, Loader2, RotateCcw, ZoomIn, ZoomOut } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { fsRead } from '@/lib/tauri-cmd';
+import { CannotPreviewPlate } from '../chrome/cannot-preview-plate';
+import { isPreviewTooLarge } from '../lib/preview-cap';
 
 interface ImageViewProps {
 	path: string;
@@ -14,12 +16,14 @@ export function ImageView({ path }: ImageViewProps) {
 		| { kind: 'error'; message: string }
 	>({ kind: 'loading' });
 	const [scale, setScale] = useState(1);
+	const [failed, setFailed] = useState(false);
 
 	useEffect(() => {
 		let cancelled = false;
 		let blobUrl: string | null = null;
 		setState({ kind: 'loading' });
 		setScale(1);
+		setFailed(false);
 
 		fsRead(path)
 			.then((res) => {
@@ -52,11 +56,23 @@ export function ImageView({ path }: ImageViewProps) {
 		);
 	}
 	if (state.kind === 'error') {
+		if (isPreviewTooLarge(state.message)) {
+			return <CannotPreviewPlate path={path} message={state.message} />;
+		}
 		return (
 			<div className="flex h-full items-start justify-center p-6 text-xs text-destructive">
 				<AlertCircle className="mr-2 mt-0.5 h-4 w-4 shrink-0" />
 				<span className="break-all">{state.message}</span>
 			</div>
+		);
+	}
+
+	if (failed) {
+		return (
+			<CannotPreviewPlate
+				path={path}
+				reason="This image couldn't be displayed. The file may be damaged, or use a format this viewer can't draw."
+			/>
 		);
 	}
 
@@ -96,6 +112,7 @@ export function ImageView({ path }: ImageViewProps) {
 					<img
 						src={state.url}
 						alt={path}
+						onError={() => setFailed(true)}
 						style={{ transform: `scale(${scale})`, transformOrigin: 'center' }}
 						className="max-w-none transition-transform duration-100"
 					/>

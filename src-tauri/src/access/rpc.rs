@@ -155,6 +155,12 @@ pub async fn dispatch(
         "access_invite_issue" | "access_invite_revoke" => {
             super::invites::dispatch(env, ctx, cmd, args).await
         }
+        // Outside file links (box-files WP-15).
+        "access_file_link_create"
+        | "access_file_links_list"
+        | "access_file_link_revoke"
+        | "access_file_links_admin_list"
+        | "access_file_link_admin_revoke" => super::file_links::dispatch(env, ctx, cmd, args).await,
         "notifications_record_access" => super::share::record_access(ctx, args),
         "share_project_info" => super::share::project_info(ctx, args),
         // Audit — WP-77.
@@ -205,6 +211,8 @@ pub fn status(env: &Env<'_>, ctx: &AccessCtx) -> Value {
         "publicUrl": env.public_url,
         // §4.5.5 / Round 16: sharing is on exactly under T1.
         "sharingEnabled": env.tier == StoreTier::T1,
+        // box-files WP-15: outside file links are on (T1 + `--file-links`).
+        "fileLinksEnabled": super::file_links::enabled(env.tier),
         "share": ctx.share.as_ref().map(|s| json!({
             "projectKey": s.project_key,
             "projectName": s.project_id,
@@ -312,6 +320,7 @@ mod tests {
         assert_eq!(v["credential"]["tier"], "full");
         assert_eq!(v["caps"].as_array().unwrap().len(), 7);
         assert_eq!(v["sharingEnabled"], false);
+        assert_eq!(v["fileLinksEnabled"], false);
         assert_eq!(v["share"], Value::Null);
         assert_eq!(
             v["principal"]["principalId"],

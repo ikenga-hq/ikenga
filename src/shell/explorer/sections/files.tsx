@@ -63,6 +63,8 @@ import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { resolveMenuItems } from '@/shell/menu/resolve';
 import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import { copyText } from '@/lib/clipboard';
+import { downloadLabel, downloadWithFeedback } from '@/viewer/chrome/download-file';
+import { requestShareFile, useCanShareFile } from '@/shell/people/share-file';
 
 // Folders we never auto-list by default. The dot-file filter already catches
 // `.git`, `.next`, `.cache`, `.turbo`, etc.; this catches the un-prefixed ones
@@ -543,6 +545,7 @@ function TreeNode({ entry, depth, rootPath, filter }: TreeNodeProps) {
 	// is open (`EffectiveContextMenu`). The target is this row: a placement
 	// `when` (a package's `file` glob) reads its path, and a user action run
 	// from here gets it as `file.path`.
+	const canShare = useCanShareFile(entry.isDir ? undefined : entry.path);
 	const menuHandlers = {
 		'new-file': () => {
 			keepFocusOnMenuClose.current = true;
@@ -563,6 +566,8 @@ function TreeNode({ entry, depth, rootPath, filter }: TreeNodeProps) {
 		'hand-to-chi': () => handToChi(entry.path),
 		'copy-path': copyPath,
 		'copy-name': () => void copyText(entry.name),
+		'files.download': () => void downloadWithFeedback(entry.path),
+		'files.share': () => void requestShareFile(entry.path),
 		rename: () => {
 			keepFocusOnMenuClose.current = true;
 			startRename();
@@ -579,11 +584,11 @@ function TreeNode({ entry, depth, rootPath, filter }: TreeNodeProps) {
 			<EffectiveContextMenu
 				menuId="files"
 				target={{ resource: entry.path }}
-				conditions={entry.isDir ? DIR_ROW : FILE_ROW}
+				conditions={entry.isDir ? DIR_ROW : { ...FILE_ROW, shareable: canShare }}
 				handlers={menuHandlers}
 				disabled={filesMenuDisabled}
 				onCloseAutoFocus={onMenuCloseAutoFocus}
-				labels={FILES_MENU_LABELS}
+				labels={{ ...FILES_MENU_LABELS, 'files.download': downloadLabel() }}
 				icons={FILES_MENU_ICONS}
 			>
 					<ListRow

@@ -65,6 +65,12 @@ pub const STEPS: &[Step] = &[
         name: "0003_push",
         body: Body::Sql(include_str!("0003_push.sql")),
     },
+    // box-files WP-15 (06-file-links-security §3): outside file links.
+    Step {
+        version: 4,
+        name: "0004_file_links",
+        body: Body::Sql(include_str!("0004_file_links.sql")),
+    },
 ];
 
 pub fn latest() -> i64 {
@@ -283,7 +289,7 @@ mod tests {
     #[tokio::test]
     async fn t0_migrates_once_and_seeds_owner_host_and_genesis() {
         let mut conn = mem().await;
-        assert_eq!(migrate(&mut conn, &t0()).await.unwrap(), 3);
+        assert_eq!(migrate(&mut conn, &t0()).await.unwrap(), 4);
         assert_eq!(migrate(&mut conn, &t0()).await.unwrap(), 0);
         assert_eq!(state(&mut conn).await.unwrap(), SetState::Current);
         let tier: String = sqlx::query_scalar("SELECT v FROM store_meta WHERE k = 'tier'")
@@ -350,11 +356,11 @@ mod tests {
     async fn a_newer_set_is_refused_untouched() {
         let mut conn = mem().await;
         migrate(&mut conn, &t0()).await.unwrap();
-        sqlx::query("INSERT INTO _operator_migrations VALUES ('access', 4, '0004_future', 0)")
+        sqlx::query("INSERT INTO _operator_migrations VALUES ('access', 5, '0005_future', 0)")
             .execute(&mut conn)
             .await
             .unwrap();
-        assert_eq!(state(&mut conn).await.unwrap(), SetState::Ahead(4));
+        assert_eq!(state(&mut conn).await.unwrap(), SetState::Ahead(5));
         assert!(migrate(&mut conn, &t0()).await.is_err());
     }
 
@@ -395,5 +401,119 @@ mod tests {
         .execute(&mut conn)
         .await;
         assert!(revoked_with_secret.is_err());
+    }
+
+    /// box-files WP-15: a v3 store (before `0004_file_links`) reaches v4,
+    /// and a fresh one is born with the table.
+    #[tokio::test]
+    async fn a_v3_store_reaches_v4_with_file_links() {
+        let mut conn = mem().await;
+        migrate(&mut conn, &t0()).await.unwrap();
+        // Roll the store back to how a v3 binary left it.
+        sqlx::raw_sql(
+            "DROP TABLE file_links; \
+             DELETE FROM _operator_migrations WHERE \"set\" = 'access' AND version = 4",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(state(&mut conn).await.unwrap(), SetState::Behind(3));
+        assert_eq!(migrate(&mut conn, &t0()).await.unwrap(), 1);
+        assert_eq!(state(&mut conn).await.unwrap(), SetState::Current);
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'file_links'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(latest(), 4);
+    }
+
+    /// 06-file-links-security §3: the CHECKs refuse `text/html`, a relative
+    /// path, and a revoked row without a reason; a well-formed row inserts.
+    #[tokio::test]
+    async fn file_links_checks_hold() {
+        let mut conn = mem().await;
+        migrate(&mut conn, &t0()).await.unwrap();
+        async fn insert(
+            conn: &mut SqliteConnection,
+            path: &str,
+            mime: &str,
+            revoked_at: Option<i64>,
+            revoked_reason: Option<&str>,
+        ) -> Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error> {
+            let mut hash = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut hash);
+            sqlx::query(
+                "INSERT INTO file_links (link_id, token_sha256, owner_principal_id, path, name, \
+                   preview_kind, mime, size_at_create, created_at, created_via, expires_at, \
+                   revoked_at, revoked_reason) \
+                 VALUES (?, ?, ?, ?, 'r.pdf', 'pdf', ?, 1, 10, 'session', 20, ?, ?)",
+            )
+            .bind(PrincipalId::new_v7().to_string())
+            .bind(hash.as_slice())
+            .bind(PrincipalId::new_v7().to_string())
+            .bind(path)
+            .bind(mime)
+            .bind(revoked_at)
+            .bind(revoked_reason)
+            .execute(&mut *conn)
+            .await
+        }
+        insert(&mut conn, "/home/a/r.pdf", "application/pdf", None, None)
+            .await
+            .expect("a well-formed row");
+        assert!(
+            insert(&mut conn, "/home/a/x.html", "text/html", None, None)
+                .await
+                .is_err(),
+            "mime text/html"
+        );
+        assert!(
+            insert(&mut conn, "/home/a/x.svg", "image/svg+xml", None, None)
+                .await
+                .is_err(),
+            "mime image/svg+xml"
+        );
+        assert!(
+            insert(&mut conn, "home/a/r.pdf", "application/pdf", None, None)
+                .await
+                .is_err(),
+            "a relative path"
+        );
+        assert!(
+            insert(
+                &mut conn,
+                "/home/a/r.pdf",
+                "application/pdf",
+                Some(15),
+                None
+            )
+            .await
+            .is_err(),
+            "revoked without a reason"
+        );
+        assert!(
+            insert(
+                &mut conn,
+                "/home/a/r.pdf",
+                "application/pdf",
+                None,
+                Some("owner")
+            )
+            .await
+            .is_err(),
+            "a reason without revoked_at"
+        );
+        insert(
+            &mut conn,
+            "/home/a/r.pdf",
+            "application/pdf",
+            Some(15),
+            Some("admin"),
+        )
+        .await
+        .expect("revoked with a reason");
     }
 }

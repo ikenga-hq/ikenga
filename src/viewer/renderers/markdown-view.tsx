@@ -3,6 +3,10 @@ import { AlertCircle, Info, Loader2 } from 'lucide-react';
 import type { CodeEditorHandle } from '@ikenga/ui-lib';
 import { Markdown } from '@/components/markdown';
 import { fsRead } from '@/lib/tauri-cmd';
+import { CannotPreviewPlate } from '../chrome/cannot-preview-plate';
+import { isPreviewTooLarge } from '../lib/preview-cap';
+import { hasImageRefs } from '../lib/markdown-assets';
+import { useDocAssetResolver } from '../lib/use-doc-asset-base';
 import { TextDocumentFrame } from '../editing/editable-text-frame';
 import { useTextDocument } from '../editing/use-text-document';
 import { MarkdownFormatControls } from './markdown-toolbar';
@@ -56,6 +60,11 @@ function MarkdownReadOnly({ path }: { path: string }) {
 		};
 	}, [path]);
 
+	const resolveImageSrc = useDocAssetResolver(
+		path,
+		state.kind === 'ready' && hasImageRefs(state.body)
+	);
+
 	if (state.kind === 'loading') {
 		return (
 			<div className="flex h-full items-center justify-center text-xs text-muted-foreground">
@@ -64,6 +73,9 @@ function MarkdownReadOnly({ path }: { path: string }) {
 		);
 	}
 	if (state.kind === 'error') {
+		if (isPreviewTooLarge(state.message)) {
+			return <CannotPreviewPlate path={path} message={state.message} />;
+		}
 		return (
 			<div className="flex h-full items-start justify-center p-6 text-xs text-destructive">
 				<AlertCircle className="mr-2 mt-0.5 h-4 w-4 shrink-0" />
@@ -74,7 +86,12 @@ function MarkdownReadOnly({ path }: { path: string }) {
 	return (
 		<div className="h-full overflow-auto">
 			<div className="mx-auto w-full max-w-[72ch] px-8 py-8">
-				<Markdown content={state.body} cwd={cwdOf(path)} allowHtml />
+				<Markdown
+					content={state.body}
+					cwd={cwdOf(path)}
+					allowHtml
+					resolveImageSrc={resolveImageSrc}
+				/>
 			</div>
 		</div>
 	);
@@ -99,6 +116,7 @@ function EditableMarkdown({
 	const editorRef = useRef<CodeEditorHandle>(null);
 	const previewRef = useRef<HTMLDivElement>(null);
 	const cwd = cwdOf(path);
+	const resolveImageSrc = useDocAssetResolver(path, hasImageRefs(doc.base));
 
 	// ── Editor actions (operate on the live CodeMirror view) ─────────────────
 	const withView = useCallback(
@@ -200,14 +218,20 @@ function EditableMarkdown({
 			renderView={(text) => (
 				<div className="h-full overflow-auto">
 					<div className="mx-auto w-full max-w-[72ch] px-8 py-8">
-						<Markdown content={text} cwd={cwd} allowHtml />
+						<Markdown content={text} cwd={cwd} allowHtml resolveImageSrc={resolveImageSrc} />
 					</div>
 				</div>
 			)}
 			renderPreview={(text) => (
 				<div ref={previewRef} className="h-full overflow-auto" onScroll={onPreviewScroll}>
 					<div className="mx-auto w-full max-w-[72ch] px-8 py-8">
-						<Markdown content={text} cwd={cwd} allowHtml sourceLines />
+						<Markdown
+							content={text}
+							cwd={cwd}
+							allowHtml
+							sourceLines
+							resolveImageSrc={resolveImageSrc}
+						/>
 					</div>
 				</div>
 			)}

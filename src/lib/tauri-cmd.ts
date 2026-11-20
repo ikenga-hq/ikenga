@@ -323,6 +323,20 @@ export async function fsRead(path: string): Promise<FileReadResult> {
 	return invoke('fs_read', { path });
 }
 
+/** Size, kind, mtime and MIME of an allowlisted path, without reading it. */
+export interface FileStat {
+	size: number;
+	isDir: boolean;
+	modifiedMs: number;
+	mime: string;
+}
+
+/** Stat without reading — use this, not `fsRead`, to learn how big a file is. `fsRead` refuses
+ *  files over the 25 MiB preview cap (see `viewer/lib/preview-cap.ts`). */
+export async function fsStat(path: string): Promise<FileStat> {
+	return invoke('fs_stat', { path });
+}
+
 /** Cheap MIME lookup that doesn't read file contents. Used by the artifact
  * viewer's auto-router as a fallback when JS extension lookup misses. */
 export async function fsMime(path: string): Promise<string> {

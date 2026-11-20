@@ -116,6 +116,10 @@ const KINDS: &[(&str, Category, bool)] = &[
     ("policy.owner_approval_changed", Category::People, true),
     ("ownership.offered", Category::People, true),
     ("ownership.accepted", Category::People, true),
+    // box-files WP-15 (06-file-links §8.1): outside file links. Creating one
+    // is a new grant (gated); revoking must work while degraded (P-35).
+    ("link.created", Category::People, true),
+    ("link.revoked", Category::People, false),
     // permission
     ("permission.decided", Category::Permission, false),
     ("permission.refused", Category::Permission, false),
@@ -149,6 +153,11 @@ const KINDS: &[(&str, Category, bool)] = &[
     // WP-K: a credential group of the box sender's vault was set, replaced or
     // cleared from Settings (key names only, never values).
     ("sender.vault_changed", Category::Access, false),
+    // box-files (06-file-links §8.1): an outsider opened, downloaded, or
+    // locked a link by guessing its passcode. Written by WP-16 / WP-18.
+    ("link.opened", Category::Access, false),
+    ("link.downloaded", Category::Access, false),
+    ("link.locked", Category::Access, false),
 ];
 
 /// `kind` as the list's `'static` spelling, or `None` outside §6.5.
@@ -410,8 +419,32 @@ fn view_window_opens(key: String, now_ms: i64) -> bool {
     true
 }
 
+/// §8.1 (box-files WP-18): outside-link opens are coalesced to one row per
+/// (link, visitor, mode, hour), the same window as share views. Its own map,
+/// so link keys and share keys can never collide.
+fn link_seen() -> &'static Mutex<HashMap<String, i64>> {
+    static SEEN: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+/// `true` when `key` (link, visitor key, mode) has no row in the current
+/// window, and opens one.
+pub fn link_window_opens(key: String, now_ms: i64) -> bool {
+    let mut seen = link_seen().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = seen.get(&key) {
+        if now_ms - at < VIEW_WINDOW_MS {
+            return false;
+        }
+    }
+    if seen.len() >= 4096 {
+        seen.retain(|_, at| now_ms - *at < VIEW_WINDOW_MS);
+    }
+    seen.insert(key, now_ms);
+    true
+}
+
 /// The file-content reads a share audits as a view (`{path}` args).
-const VIEW_ARMS: &[&str] = &["fs_read"];
+const VIEW_ARMS: &[&str] = &["fs_read", "viewer_serve"];
 
 /// `path` with `.` segments dropped and separators collapsed; `None` when
 /// it climbs (`..`) — such a read is refused by the child anyway.
@@ -427,23 +460,49 @@ fn lexical(path: &str) -> Option<String> {
     Some(out.join("/"))
 }
 
+/// Whether a read of `path` (`requested`: its lexical form) is a read of the
+/// shared artifact (project-relative `artifact`). WP-13 (F-14): never on a
+/// bare suffix — an absolute path is judged by its CANONICAL form on disk
+/// (symlinks resolved), which must exist and end in the artifact's
+/// components; a path that cannot be canonicalized is not logged (the read it
+/// precedes is refused or answers not-found anyway). The audit hook has no
+/// project root, so a different project's identically named file still
+/// matches; the rest of the check is the child's own, on the read itself.
+fn artifact_read_matches(path: &str, requested: &str, artifact: &str) -> bool {
+    if !path.starts_with(['/', '\\']) {
+        return requested == artifact;
+    }
+    std::fs::canonicalize(path)
+        .map(|c| c.is_file() && c.ends_with(std::path::Path::new(artifact)))
+        .unwrap_or(false)
+}
+
 /// What a share read views (§6.5 `share.artifact_viewed`, "Guest and
 /// artifact-scope reads"), or `None` when it is not one: another command,
-/// an own-workspace or project-scope non-Guest request, or — on an artifact
-/// share — a path that is not the shared artifact (the child refuses it).
-/// An artifact share's view is named by the artifact's project-relative
-/// path; a project-scope Guest's by the path it read.
+/// or an own-workspace or project-scope non-Guest request. An artifact
+/// share's view of the artifact is named by its project-relative path; any
+/// other read in the folder it may read (siblings, a `viewer_serve` mount)
+/// and a project-scope Guest's reads are named by the path read.
 pub fn viewed_target(share: &super::ShareCtx, cmd: &str, args: &Value) -> Option<String> {
     if !VIEW_ARMS.contains(&cmd) {
         return None;
     }
-    let path = args.get("path").and_then(Value::as_str)?;
+    // `viewer_serve` names its folder as `rootDir`; reads name a `path`.
+    let key = if cmd == "viewer_serve" { "rootDir" } else { "path" };
+    let path = args.get(key).and_then(Value::as_str)?;
     let requested = lexical(path).filter(|p| !p.is_empty())?;
     match share.artifact_path.as_deref() {
         Some(artifact) => {
             let artifact = super::share::normalize_artifact_path(artifact).ok()?;
-            (requested == artifact || requested.ends_with(&format!("/{artifact}")))
-                .then_some(artifact)
+            // WP-12: the member may read the artifact's whole folder, so a
+            // sibling read is a view too, named by the path it read.
+            if cmd == "fs_read" && artifact_read_matches(path, &requested, &artifact) {
+                Some(artifact)
+            } else if path.starts_with(['/', '\\']) {
+                Some(format!("/{requested}"))
+            } else {
+                Some(requested)
+            }
         }
         // Named (and coalesced) by the normalized path, so `/p//a.md` and
         // `/p/./a.md` are the one (member, path, hour) window (review
@@ -518,6 +577,19 @@ mod tests {
             Some(Category::Access)
         );
         assert!(!is_access_change("server.update_requested"));
+        // box-files WP-15: a new link is a grant; nothing else about a link is.
+        assert!(is_access_change("link.created"));
+        for k in [
+            "link.revoked",
+            "link.opened",
+            "link.downloaded",
+            "link.locked",
+        ] {
+            assert!(category_of(k).is_some(), "{k}");
+            assert!(!is_access_change(k), "{k}");
+        }
+        assert_eq!(category_of("link.created"), Some(Category::People));
+        assert_eq!(category_of("link.opened"), Some(Category::Access));
     }
 
     #[test]
@@ -671,17 +743,51 @@ mod tests {
         let read = |p: &str| json!({ "path": p });
         let art = share_ctx(Role::Reviewer, Some("./docs//brief.md"));
         let a = art.share.as_ref().unwrap();
+        // WP-13: an absolute path counts by its canonical form on disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let docs = tmp.path().join("proj/docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("brief.md"), "x").unwrap();
+        std::fs::write(docs.join("other.md"), "x").unwrap();
+        let abs = |p: std::path::PathBuf| read(&p.to_string_lossy());
         assert_eq!(
-            viewed_target(a, "fs_read", &read("/home/o/proj/docs/brief.md")).as_deref(),
+            viewed_target(a, "fs_read", &abs(docs.join("brief.md"))).as_deref(),
             Some("docs/brief.md")
         );
         assert_eq!(
             viewed_target(a, "fs_read", &read("docs/./brief.md")).as_deref(),
             Some("docs/brief.md")
         );
-        for other in ["/home/o/proj/docs/other.md", "/x/../docs/brief.md", ""] {
+        for other in ["/x/../docs/brief.md", ""] {
             assert_eq!(viewed_target(a, "fs_read", &read(other)), None, "{other}");
         }
+        // WP-12: a sibling read is a view too, named by the path it read.
+        let sibling = viewed_target(a, "fs_read", &abs(docs.join("other.md")));
+        assert!(
+            sibling.as_deref().is_some_and(|s| s.starts_with('/') && s.ends_with("docs/other.md")),
+            "{sibling:?}"
+        );
+        // No suffix match: a path that does not exist, or that only ends the
+        // same way as the artifact, is not a view OF THE ARTIFACT (it is named
+        // by its own path, never as `docs/brief.md`).
+        assert_eq!(
+            viewed_target(a, "fs_read", &read("/home/o/proj/docs/brief.md")).as_deref(),
+            Some("/home/o/proj/docs/brief.md"),
+            "nonexistent"
+        );
+        assert_eq!(
+            viewed_target(a, "fs_read", &read("x/docs/brief.md")).as_deref(),
+            Some("x/docs/brief.md")
+        );
+        assert_eq!(
+            viewed_target(a, "fs_read", &read("brief.md")).as_deref(),
+            Some("brief.md")
+        );
+        // A folder mount (`viewer_serve`) is keyed on its `rootDir`.
+        assert_eq!(
+            viewed_target(a, "viewer_serve", &json!({ "rootDir": "/home/o/proj/docs" })).as_deref(),
+            Some("/home/o/proj/docs")
+        );
         assert_eq!(
             viewed_target(a, "fs_list", &read("/home/o/proj/docs/brief.md")),
             None
@@ -724,7 +830,11 @@ mod tests {
         use serde_json::json;
         let store = AccessStore::memory_t0().await;
         let ctx = share_ctx(Role::Guest, Some("docs/brief.md"));
-        let read = json!({ "path": "/proj/docs/brief.md" });
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("proj/docs")).unwrap();
+        let file = tmp.path().join("proj/docs/brief.md");
+        std::fs::write(&file, "x").unwrap();
+        let read = json!({ "path": file.to_string_lossy() });
         for _ in 0..3 {
             on_share_read(Some(&store), &ctx, "fs_read", &read);
         }
@@ -761,6 +871,10 @@ mod tests {
         assert_eq!(category, "access");
         // The window is per hour.
         let key = "k".to_string();
+        assert!(link_window_opens("l\u{0}k\u{0}view".into(), 5_000));
+        assert!(!link_window_opens("l\u{0}k\u{0}view".into(), 5_000 + VIEW_WINDOW_MS - 1));
+        assert!(link_window_opens("l\u{0}k\u{0}download".into(), 5_001));
+        assert!(link_window_opens("l\u{0}k\u{0}view".into(), 5_000 + VIEW_WINDOW_MS));
         assert!(view_window_opens(key.clone(), 1_000));
         assert!(!view_window_opens(key.clone(), 1_000 + VIEW_WINDOW_MS - 1));
         assert!(view_window_opens(key, 1_000 + VIEW_WINDOW_MS));

@@ -161,6 +161,7 @@ commands.allow = [
   "fs_roots_remove",
   "fs_roots_reset",
   "fs_search",
+  "fs_stat",
   "fs_trash",
   "fs_unwatch",
   "fs_watch",

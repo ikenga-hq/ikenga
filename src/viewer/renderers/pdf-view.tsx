@@ -18,9 +18,10 @@ import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
 import { Button } from '@/components/ui/button';
 import { fsRead } from '@/lib/tauri-cmd';
-import { toast } from '@/lib/toast';
-import { isBrowserHost, openLocalPath, saveBlobAs } from '@/lib/transport';
-import { basename } from '../lib/path';
+import { isBrowserHost } from '@/lib/transport';
+import { downloadLabel, useDownloadFile } from '../chrome/download-file';
+import { CannotPreviewPlate } from '../chrome/cannot-preview-plate';
+import { isPreviewTooLarge } from '../lib/preview-cap';
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -36,6 +37,7 @@ export function PdfView({ path }: PdfViewProps) {
 	const [numPages, setNumPages] = useState(0);
 	const [scale, setScale] = useState(1.0);
 	const [search, setSearch] = useState('');
+	const download = useDownloadFile(path);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -60,7 +62,13 @@ export function PdfView({ path }: PdfViewProps) {
 
 	// react-pdf needs a stable reference for `file` — wrapping in useMemo
 	// avoids re-fetching the document on every parent re-render.
-	const file = useMemo(() => (state.kind === 'ready' ? { data: state.data } : null), [state]);
+	// pdf.js TRANSFERS the buffer it is given to its worker, which leaves the
+	// caller's array detached (zero length). Hand it a copy so `state.data`
+	// keeps the real bytes for the Download button.
+	const file = useMemo(
+		() => (state.kind === 'ready' ? { data: state.data.slice() } : null),
+		[state]
+	);
 
 	if (state.kind === 'loading') {
 		return (
@@ -70,6 +78,9 @@ export function PdfView({ path }: PdfViewProps) {
 		);
 	}
 	if (state.kind === 'error') {
+		if (isPreviewTooLarge(state.message)) {
+			return <CannotPreviewPlate path={path} message={state.message} />;
+		}
 		return (
 			<div className="flex h-full items-start justify-center p-6 text-xs text-destructive">
 				<AlertCircle className="mr-2 mt-0.5 h-4 w-4 shrink-0" />
@@ -133,27 +144,15 @@ export function PdfView({ path }: PdfViewProps) {
 					variant="ghost"
 					size="sm"
 					className="h-7 gap-1.5 px-2"
-					title={isBrowserHost() ? 'Download' : 'Open in default app'}
-					onClick={() => {
-						if (state.kind !== 'ready') return;
-						// Browser: the bytes are already loaded, hand them straight to the
-						// browser. Desktop: let the OS open the file.
-						if (isBrowserHost()) {
-							saveBlobAs(
-								new Blob([state.data as BlobPart], { type: 'application/pdf' }),
-								basename(path)
-							);
-							return;
-						}
-						openLocalPath(path, { kind: 'file' }).catch((e) =>
-							toast({
-								label: `Could not open ${basename(path)}: ${e instanceof Error ? e.message : String(e)}`,
-								variant: 'error',
-							})
-						);
-					}}
+					title={downloadLabel()}
+					disabled={download.busy}
+					onClick={() => void download.run()}
 				>
-					<Download className="h-3.5 w-3.5" />
+					{download.busy ? (
+						<Loader2 className="h-3.5 w-3.5 animate-spin" />
+					) : (
+						<Download className="h-3.5 w-3.5" />
+					)}
 					{isBrowserHost() ? 'Download' : 'Open'}
 				</Button>
 			</div>

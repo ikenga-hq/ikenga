@@ -11,6 +11,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { AlertCircle } from 'lucide-react';
 import { ErrorState, LoadingState } from '@/components/states';
 import { fsRead } from '@/lib/tauri-cmd';
+import { CannotPreviewPlate } from '../chrome/cannot-preview-plate';
+import { isPreviewTooLarge } from '../lib/preview-cap';
 import { EditableTextFrame } from '../editing/editable-text-frame';
 
 interface CsvViewProps {
@@ -155,6 +157,9 @@ function CsvReadOnly({ path }: { path: string }) {
 		return <LoadingState data-state="loading" fill heading="Loading…" />;
 	}
 	if (state.kind === 'error') {
+		if (isPreviewTooLarge(state.message)) {
+			return <CannotPreviewPlate path={path} message={state.message} />;
+		}
 		return (
 			<ErrorState
 				data-state="error"

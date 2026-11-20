@@ -10,9 +10,12 @@ import {
 	viewerStop,
 	type ViewerHandle,
 } from '@/lib/tauri-cmd';
+import { CannotPreviewPlate } from '../chrome/cannot-preview-plate';
+import { isPreviewTooLarge } from '../lib/preview-cap';
 import { registerIykeIframe } from '@/lib/iyke/iframe-registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { cn } from '@/components/ui/utils';
+import { encodeUrlPath } from '../lib/path';
 import {
 	DropdownMenu,
 	DropdownMenuContent,
@@ -106,8 +109,8 @@ function LocalHtmlFrame({ path, paneId }: HtmlFrameProps) {
 				// viewer server's mount root; we prefix the bound viewer port so
 				// the child can fetch its own assets.
 				const src = isRemoteWebSession()
-					? `${window.location.origin}${h.url}${file}`
-					: `http://localhost:${port ?? 47821}${h.url}${file}`;
+					? `${window.location.origin}${h.url}${encodeUrlPath(file)}`
+					: `http://localhost:${port ?? 47821}${h.url}${encodeUrlPath(file)}`;
 				setState({ kind: 'ready', src, handle: h });
 			})
 			.catch((err) => {
@@ -303,6 +306,9 @@ function LocalHtmlFrame({ path, paneId }: HtmlFrameProps) {
 		);
 	}
 	if (state.kind === 'error') {
+		if (isPreviewTooLarge(state.message)) {
+			return <CannotPreviewPlate path={path} message={state.message} />;
+		}
 		return (
 			<div className="flex h-full items-start justify-center p-6 text-xs text-destructive">
 				<AlertCircle className="mr-2 mt-0.5 h-4 w-4 shrink-0" />
