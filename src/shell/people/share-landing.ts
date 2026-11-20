@@ -4,7 +4,6 @@
 // intent is carried across the reload in sessionStorage and consumed once by
 // `ShareModeBanner`, which runs inside the session chrome after the reload.
 
-import { usePaneStore } from '@/lib/panes/pane-store';
 import { projectGetActive } from '@/lib/tauri-cmd';
 
 export const LAND_KEY = 'ikenga_share_land';
@@ -43,6 +42,10 @@ export async function openSharedArtifact(artifactPath: string): Promise<boolean>
 	const project = await projectGetActive();
 	if (!project.root_path) return false;
 	const path = joinProjectPath(project.root_path, artifactPath);
+	// Imported here, not at module level: this file is reachable from the
+	// sign-in overlay, and the pane store's imports open the events socket at
+	// load, before the server tier (and so the right credential) is known.
+	const { usePaneStore } = await import('@/lib/panes/pane-store');
 	// The pane store may still be hydrating right after the reload.
 	for (let i = 0; i < 20; i++) {
 		const { focusedId, addTab } = usePaneStore.getState();

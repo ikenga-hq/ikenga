@@ -4,7 +4,11 @@
 import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@/lib/transport', () => ({ isBrowserHost: () => true }));
+vi.mock('@/lib/transport', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/lib/transport')>()),
+	isBrowserHost: () => true,
+	listen: vi.fn(async () => () => {}),
+}));
 vi.mock('@/lib/transport/fs-download', () => ({ downloadFile: vi.fn(async () => {}) }));
 vi.mock('@/lib/tauri-cmd', () => ({
 	fsRead: vi.fn(async () => {

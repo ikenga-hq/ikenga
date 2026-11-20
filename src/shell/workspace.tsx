@@ -10,6 +10,7 @@ import { useShellStore } from '@/lib/shell/shell-store';
 import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
 import { CommandPalette, useCommandPalette } from './command-palette';
 import { useCompanionStore } from './companion/companion-store';
+import { ShareFileHost } from './people/share-file-host';
 import { PwaUpdateBanner } from './pwa/pwa-update-banner';
 import { BannerSlot } from './slots/banner-slot';
 import { CompanionSlot } from './slots/companion-slot';
@@ -150,6 +151,8 @@ export function Workspace() {
 			</div>
 
 			<IframePoolOverlay />
+
+			<ShareFileHost />
 
 			<CommandPalette
 				open={palette.open}

@@ -67,7 +67,9 @@ export function requestShareFile(abs: string): boolean {
 let statusCache: { at: number; p: Promise<AccessStatus | null> } | null = null;
 function cachedStatus(): Promise<AccessStatus | null> {
 	if (!statusCache || Date.now() - statusCache.at > 60_000) {
-		statusCache = { at: Date.now(), p: accessStatus().catch(() => null) };
+		statusCache = { at: Date.now(), p: Promise.resolve()
+				.then(() => accessStatus())
+				.catch(() => null) };
 	}
 	return statusCache.p;
 }
