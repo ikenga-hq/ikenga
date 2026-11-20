@@ -41,7 +41,11 @@ export function createArgs(f: { path: string; days: number | null; passcode: str
 }
 
 /** Why "Create link" is disabled, or `null`. */
-export function linkBlocker(f: { path: string; days: number | null; passcode: string }): string | null {
+export function linkBlocker(f: {
+	path: string;
+	days: number | null;
+	passcode: string;
+}): string | null {
 	if (!f.path.trim()) return 'Choose a file first';
 	if (f.days !== null && !(Number.isInteger(f.days) && f.days >= 1 && f.days <= 365)) {
 		return 'Choose when the link expires';
@@ -50,12 +54,16 @@ export function linkBlocker(f: { path: string; days: number | null; passcode: st
 }
 
 /** Whether to offer "Get a link" at all: only when the server turned it on and this is not a share. */
-export function linksOffered(status: Pick<AccessStatus, 'fileLinksEnabled' | 'share'> | null | undefined): boolean {
+export function linksOffered(
+	status: Pick<AccessStatus, 'fileLinksEnabled' | 'share'> | null | undefined
+): boolean {
 	return Boolean(status?.fileLinksEnabled) && !status?.share;
 }
 
 /** Whether the caller may use the admin "All links" view (the server decides). */
-export function isLinksAdmin(status: Pick<AccessStatus, 'principal' | 'adminStrength'> | null | undefined): boolean {
+export function isLinksAdmin(
+	status: Pick<AccessStatus, 'principal' | 'adminStrength'> | null | undefined
+): boolean {
 	return Boolean(status?.principal.isAdmin && status.adminStrength);
 }
 
@@ -94,7 +102,9 @@ export function ownersOf(
 	links: readonly { ownerPrincipalId: string; ownerUsername: string | null }[]
 ): { id: string; name: string }[] {
 	const seen = new Map<string, string>();
-	for (const l of links) if (!seen.has(l.ownerPrincipalId)) seen.set(l.ownerPrincipalId, l.ownerUsername ?? l.ownerPrincipalId.slice(0, 8));
+	for (const l of links)
+		if (!seen.has(l.ownerPrincipalId))
+			seen.set(l.ownerPrincipalId, l.ownerUsername ?? l.ownerPrincipalId.slice(0, 8));
 	return [...seen].map(([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name));
 }
 

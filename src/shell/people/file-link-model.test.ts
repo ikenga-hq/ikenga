@@ -76,7 +76,13 @@ describe('visibility', () => {
 		expect(
 			linksOffered({
 				fileLinksEnabled: true,
-				share: { projectKey: 'k', projectName: 'n', ownerUsername: 'o', role: 'guest', scope: 'artifact' },
+				share: {
+					projectKey: 'k',
+					projectName: 'n',
+					ownerUsername: 'o',
+					role: 'guest',
+					scope: 'artifact',
+				},
 			})
 		).toBe(false);
 	});

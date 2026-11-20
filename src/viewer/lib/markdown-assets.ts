@@ -34,7 +34,8 @@ export function classifyImageSrc(raw: string): ImageSource {
 	const src = raw.trim();
 	if (src === '') return { kind: 'blocked' };
 	if (isExternal(src)) return { kind: 'external', src };
-	if (src.startsWith('/') || src.startsWith('\\') || src.startsWith('~')) return { kind: 'blocked' };
+	if (src.startsWith('/') || src.startsWith('\\') || src.startsWith('~'))
+		return { kind: 'blocked' };
 
 	const pathPart = src.split(/[?#]/, 1)[0] ?? '';
 	let decoded: string;

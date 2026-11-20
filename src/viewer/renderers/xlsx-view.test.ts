@@ -9,7 +9,10 @@ describe('xlsx formatting', () => {
 		ws['A2'] = { t: 'd', v: new Date(Date.UTC(2026, 10, 20)), z: 'yyyy-mm-dd' };
 		ws['B2'] = { t: 'n', v: 1234.5, z: '#,##0.00' };
 		ws['!ref'] = 'A1:B2';
-		const bytes = XLSX.write({ SheetNames: ['S'], Sheets: { S: ws } }, { type: 'array', bookType: 'xlsx', cellDates: true });
+		const bytes = XLSX.write(
+			{ SheetNames: ['S'], Sheets: { S: ws } },
+			{ type: 'array', bookType: 'xlsx', cellDates: true }
+		);
 		const wb = XLSX.read(new Uint8Array(bytes), XLSX_READ_OPTS);
 		const rows = sheetRows(wb.Sheets['S']!);
 		expect(rows[1]![0]).toContain('2026');

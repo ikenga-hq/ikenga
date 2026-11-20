@@ -101,7 +101,9 @@ describe('FileLinksBlock', () => {
 		cleanup();
 		mocks.accessStatus.mockResolvedValue(status({}, true));
 		const second = render(<FileLinksBlock />);
-		await waitFor(() => expect(second.container.querySelector('[data-panel="all-links"]')).not.toBeNull());
+		await waitFor(() =>
+			expect(second.container.querySelector('[data-panel="all-links"]')).not.toBeNull()
+		);
 		expect(mocks.accessFileLinksAdminList).toHaveBeenCalled();
 	});
 });

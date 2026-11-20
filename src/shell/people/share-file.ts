@@ -37,7 +37,15 @@ export function canShareFile(f: {
 }): boolean {
 	// Hidden inside a share for members: an artifact is shared from your own workspace.
 	if (f.inShare) return false;
-	if (shareDisabledReason({ tier: f.tier, adminStrength: f.adminStrength, shareRole: null, inShare: false, hasFolder: Boolean(f.root?.trim()) }) !== null)
+	if (
+		shareDisabledReason({
+			tier: f.tier,
+			adminStrength: f.adminStrength,
+			shareRole: null,
+			inShare: false,
+			hasFolder: Boolean(f.root?.trim()),
+		}) !== null
+	)
 		return false;
 	return projectRelativePath(f.path, f.root) !== null;
 }
@@ -67,9 +75,12 @@ export function requestShareFile(abs: string): boolean {
 let statusCache: { at: number; p: Promise<AccessStatus | null> } | null = null;
 function cachedStatus(): Promise<AccessStatus | null> {
 	if (!statusCache || Date.now() - statusCache.at > 60_000) {
-		statusCache = { at: Date.now(), p: Promise.resolve()
+		statusCache = {
+			at: Date.now(),
+			p: Promise.resolve()
 				.then(() => accessStatus())
-				.catch(() => null) };
+				.catch(() => null),
+		};
 	}
 	return statusCache.p;
 }

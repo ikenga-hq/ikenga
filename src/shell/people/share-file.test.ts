@@ -19,7 +19,13 @@ describe('projectRelativePath', () => {
 });
 
 describe('canShareFile', () => {
-	const ok = { tier: 't1' as const, adminStrength: true, inShare: false, root: '/srv/p', path: '/srv/p/a.pdf' };
+	const ok = {
+		tier: 't1' as const,
+		adminStrength: true,
+		inShare: false,
+		root: '/srv/p',
+		path: '/srv/p/a.pdf',
+	};
 
 	it('is on for an owner-strength T1 session and a file in the project', () => {
 		expect(canShareFile(ok)).toBe(true);
@@ -39,7 +45,9 @@ describe('files.share placement', () => {
 		for (const menu of ['files', 'pane'] as const) {
 			const ids = DEFAULT_MENUS[menu].map((e) => (typeof e === 'string' ? e : e.id));
 			expect(ids.indexOf('files.share')).toBe(ids.indexOf('files.download') + 1);
-			const entry = DEFAULT_MENUS[menu].find((e) => typeof e !== 'string' && e.id === 'files.share');
+			const entry = DEFAULT_MENUS[menu].find(
+				(e) => typeof e !== 'string' && e.id === 'files.share'
+			);
 			expect(entry).toMatchObject({ condition: 'shareable' });
 		}
 	});

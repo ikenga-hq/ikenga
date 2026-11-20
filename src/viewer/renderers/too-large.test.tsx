@@ -15,7 +15,11 @@ vi.mock('@/lib/tauri-cmd', () => ({
 		throw new Error('fs_read: preview_too_large: 99999999 > 26214400');
 	}),
 }));
-vi.mock('react-pdf', () => ({ pdfjs: { GlobalWorkerOptions: {} }, Document: () => null, Page: () => null }));
+vi.mock('react-pdf', () => ({
+	pdfjs: { GlobalWorkerOptions: {} },
+	Document: () => null,
+	Page: () => null,
+}));
 
 import { ImageView } from './image-view';
 import { PdfView } from './pdf-view';

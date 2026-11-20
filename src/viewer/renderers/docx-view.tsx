@@ -38,7 +38,19 @@ export function sanitizeDocxHtml(html: string): string {
 	ensureHook();
 	return DOMPurify.sanitize(html, {
 		USE_PROFILES: { html: true },
-		FORBID_TAGS: ['style', 'script', 'iframe', 'object', 'embed', 'form', 'link', 'meta', 'base', 'svg', 'math'],
+		FORBID_TAGS: [
+			'style',
+			'script',
+			'iframe',
+			'object',
+			'embed',
+			'form',
+			'link',
+			'meta',
+			'base',
+			'svg',
+			'math',
+		],
 		FORBID_ATTR: ['style'],
 		ALLOWED_URI_REGEXP: /^(?:https?:|mailto:|data:image\/|#)/i,
 		ADD_DATA_URI_TAGS: ['img'],
@@ -47,7 +59,10 @@ export function sanitizeDocxHtml(html: string): string {
 
 /** Bytes → sanitised HTML. Exported for the test. */
 export async function docxToHtml(bytes: Uint8Array): Promise<string> {
-	const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+	const buf = bytes.buffer.slice(
+		bytes.byteOffset,
+		bytes.byteOffset + bytes.byteLength
+	) as ArrayBuffer;
 	const res = await mammoth.convertToHtml({ arrayBuffer: buf });
 	return sanitizeDocxHtml(res.value);
 }

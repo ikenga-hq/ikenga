@@ -3,14 +3,20 @@ import { classifyImageSrc, hasImageRefs, makeImageResolver } from './markdown-as
 
 describe('classifyImageSrc', () => {
 	it('leaves absolute and data URLs alone', () => {
-		expect(classifyImageSrc('https://x.test/a.png')).toEqual({ kind: 'external', src: 'https://x.test/a.png' });
+		expect(classifyImageSrc('https://x.test/a.png')).toEqual({
+			kind: 'external',
+			src: 'https://x.test/a.png',
+		});
 		expect(classifyImageSrc('http://x.test/a.png').kind).toBe('external');
 		expect(classifyImageSrc('data:image/png;base64,AAAA').kind).toBe('external');
 		expect(classifyImageSrc('//cdn.test/a.png').kind).toBe('external');
 	});
 	it('resolves relative paths inside the folder, encoding segments', () => {
 		expect(classifyImageSrc('./chart.png')).toEqual({ kind: 'relative', rel: 'chart.png' });
-		expect(classifyImageSrc('img/a b.png?x=1#y')).toEqual({ kind: 'relative', rel: 'img/a%20b.png' });
+		expect(classifyImageSrc('img/a b.png?x=1#y')).toEqual({
+			kind: 'relative',
+			rel: 'img/a%20b.png',
+		});
 		expect(classifyImageSrc('a/../b.png')).toEqual({ kind: 'relative', rel: 'b.png' });
 		expect(classifyImageSrc('a%23b.png')).toEqual({ kind: 'relative', rel: 'a%23b.png' });
 	});

@@ -30,7 +30,9 @@ beforeEach(() => {
 	h.openLocalPath.mockClear();
 	h.downloadServerFile.mockClear();
 	clicked = [];
-	vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+	vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (
+		this: HTMLAnchorElement
+	) {
 		clicked.push(this);
 	});
 });

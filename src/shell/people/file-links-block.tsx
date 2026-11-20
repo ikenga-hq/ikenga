@@ -68,7 +68,11 @@ function LinkRows({
 	const [confirming, setConfirming] = useState<string | null>(null);
 	const now = Date.now();
 	if (links.length === 0) {
-		return <p className="m-0 py-3 text-[length:var(--text-caption,12px)] text-[var(--fg-muted)]">{empty}</p>;
+		return (
+			<p className="m-0 py-3 text-[length:var(--text-caption,12px)] text-[var(--fg-muted)]">
+				{empty}
+			</p>
+		);
 	}
 	return (
 		<table className="w-full border-collapse text-left text-[length:var(--text-caption,12px)]">
@@ -86,7 +90,12 @@ function LinkRows({
 			</thead>
 			<tbody>
 				{links.map((l) => (
-					<tr key={l.linkId} data-link-id={l.linkId} data-link-state={l.state} className="border-t border-[var(--border-soft)]">
+					<tr
+						key={l.linkId}
+						data-link-id={l.linkId}
+						data-link-state={l.state}
+						className="border-t border-[var(--border-soft)]"
+					>
 						<td className="max-w-[200px] truncate py-1.5 pr-2 text-[var(--fg)]" title={l.path}>
 							{l.name}
 							{l.hasPasscode && <Kv className="ml-1.5">passcode</Kv>}
@@ -100,7 +109,9 @@ function LinkRows({
 						<td className="py-1.5 pr-2 text-[var(--fg-muted)]">{expiryText(l.expiresAt, now)}</td>
 						<td className="py-1.5 pr-2 font-mono">{l.openCount}</td>
 						<td className="py-1.5 pr-2 font-mono">{l.downloadCount}</td>
-						<td className="py-1.5 pr-2 text-[var(--fg-muted)]">{relativeTime(l.lastOpenedAt, now)}</td>
+						<td className="py-1.5 pr-2 text-[var(--fg-muted)]">
+							{relativeTime(l.lastOpenedAt, now)}
+						</td>
 						<td className="py-1.5 text-right">
 							{canRevoke(l) &&
 								(confirming === l.linkId ? (
@@ -117,12 +128,22 @@ function LinkRows({
 										>
 											Revoke now
 										</Button>
-										<Button type="button" size="xs" variant="outline" onClick={() => setConfirming(null)}>
+										<Button
+											type="button"
+											size="xs"
+											variant="outline"
+											onClick={() => setConfirming(null)}
+										>
 											Keep
 										</Button>
 									</span>
 								) : (
-									<Button type="button" size="xs" variant="outline" onClick={() => setConfirming(l.linkId)}>
+									<Button
+										type="button"
+										size="xs"
+										variant="outline"
+										onClick={() => setConfirming(l.linkId)}
+									>
 										Revoke
 									</Button>
 								))}
@@ -160,14 +181,21 @@ function MyLinks() {
 		<PeopleBlock
 			title="Links"
 			right={
-				<Button type="button" size="xs" variant="ghost" aria-label="Refresh links" onClick={() => void load()}>
+				<Button
+					type="button"
+					size="xs"
+					variant="ghost"
+					aria-label="Refresh links"
+					onClick={() => void load()}
+				>
 					<RefreshCw />
 				</Button>
 			}
 		>
 			<div className="py-2" data-panel="my-links">
 				<p className="m-0 pb-2 text-[length:var(--text-micro)] text-[var(--fg-muted)]">
-					Outside links you made, for people with no account. Make one from a file's Share… menu. A link can't be shown again after you create it.
+					Outside links you made, for people with no account. Make one from a file's Share… menu. A
+					link can't be shown again after you create it.
 				</p>
 				{error && (
 					<p role="alert" className="m-0 pb-2 text-[12px] text-[var(--danger)]">
@@ -175,7 +203,9 @@ function MyLinks() {
 					</p>
 				)}
 				{links === null ? (
-					<p className="m-0 py-3 text-[length:var(--text-caption,12px)] text-[var(--fg-muted)]">Loading…</p>
+					<p className="m-0 py-3 text-[length:var(--text-caption,12px)] text-[var(--fg-muted)]">
+						Loading…
+					</p>
 				) : (
 					<LinkRows links={links} onRevoke={revoke} empty="You haven't made any links." />
 				)}
@@ -255,19 +285,41 @@ function AllLinks() {
 							live > 0 &&
 							(confirmAll ? (
 								<>
-									<Button type="button" size="xs" variant="outline" className={D05_DANGER} onClick={() => void revokeAll()}>
+									<Button
+										type="button"
+										size="xs"
+										variant="outline"
+										className={D05_DANGER}
+										onClick={() => void revokeAll()}
+									>
 										Revoke {live} now
 									</Button>
-									<Button type="button" size="xs" variant="outline" onClick={() => setConfirmAll(false)}>
+									<Button
+										type="button"
+										size="xs"
+										variant="outline"
+										onClick={() => setConfirmAll(false)}
+									>
 										Keep
 									</Button>
 								</>
 							) : (
-								<Button type="button" size="xs" variant="outline" onClick={() => setConfirmAll(true)}>
+								<Button
+									type="button"
+									size="xs"
+									variant="outline"
+									onClick={() => setConfirmAll(true)}
+								>
 									Revoke all
 								</Button>
 							))}
-						<Button type="button" size="xs" variant="ghost" aria-label="Refresh all links" onClick={() => void load()}>
+						<Button
+							type="button"
+							size="xs"
+							variant="ghost"
+							aria-label="Refresh all links"
+							onClick={() => void load()}
+						>
 							<RefreshCw />
 						</Button>
 					</span>
@@ -278,7 +330,9 @@ function AllLinks() {
 					</p>
 				)}
 				{links === null ? (
-					<p className="m-0 py-3 text-[length:var(--text-caption,12px)] text-[var(--fg-muted)]">Loading…</p>
+					<p className="m-0 py-3 text-[length:var(--text-caption,12px)] text-[var(--fg-muted)]">
+						Loading…
+					</p>
 				) : (
 					<LinkRows links={shown} onRevoke={revoke} owners empty="No links." />
 				)}

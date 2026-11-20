@@ -81,14 +81,17 @@ export function OutsideLinkForm({
 						<Copy /> {copied ? 'Copied' : 'Copy link'}
 					</Button>
 				</div>
-				<p className="m-0 flex items-start gap-1.5 text-[length:var(--text-micro)] text-[var(--fg)]" data-link-once>
+				<p
+					className="m-0 flex items-start gap-1.5 text-[length:var(--text-micro)] text-[var(--fg)]"
+					data-link-once
+				>
 					<ShieldAlert className="mt-0.5 h-3.5 w-3.5 flex-none text-[var(--danger)]" />
 					{LINK_ONCE_NOTE}
 				</p>
 				<p className="m-0 text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 					{created.name} · anyone with the link can open it
-					{created.hasPasscode ? ', after the passcode' : ''}. Revoke it any time under Settings, People,
-					Profile.
+					{created.hasPasscode ? ', after the passcode' : ''}. Revoke it any time under Settings,
+					People, Profile.
 				</p>
 			</div>
 		);
@@ -97,14 +100,17 @@ export function OutsideLinkForm({
 	return (
 		<div data-state="file-link-form" className="space-y-3">
 			<p className="m-0 text-[length:var(--text-caption,12px)] text-[var(--fg-muted)]">
-				Anyone with the link can open this one file, with no account. Every open is recorded and you are
-				told the first time it is opened.
+				Anyone with the link can open this one file, with no account. Every open is recorded and you
+				are told the first time it is opened.
 			</p>
 			<div className="flex min-h-8 flex-wrap items-center gap-3">
 				<span className="w-[80px] flex-none text-[length:var(--text-caption,12px)] font-medium text-[var(--fg)]">
 					File
 				</span>
-				<code className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--fg-muted)]" title={path}>
+				<code
+					className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--fg-muted)]"
+					title={path}
+				>
 					{path}
 				</code>
 			</div>
@@ -146,7 +152,10 @@ export function OutsideLinkForm({
 				/>
 			</div>
 			{shownProblem && (
-				<p className="m-0 text-[length:var(--text-micro)] text-[var(--danger)]" data-passcode-problem>
+				<p
+					className="m-0 text-[length:var(--text-micro)] text-[var(--danger)]"
+					data-passcode-problem
+				>
 					{shownProblem}
 				</p>
 			)}
