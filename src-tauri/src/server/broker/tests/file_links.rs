@@ -1017,6 +1017,13 @@ async fn ls15_no_token_is_ever_logged() {
         .with_writer(move || writer.clone())
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
+    // tracing caches each callsite's interest process-wide. While exactly one
+    // dispatcher is registered it asks the *registering thread's* default, so
+    // another test thread (no subscriber) hitting a callsite first would cache
+    // "never" and this capture would miss it. A second registered dispatcher
+    // makes tracing ask every dispatcher instead; then refresh what is cached.
+    let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    tracing::callsite::rebuild_interest_cache();
 
     let h = harness(true).await;
     let (t, _) = pdf_link(&h).await;
