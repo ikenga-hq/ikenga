@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { isRemoteWebSession, viewerPort, viewerServe, viewerStop } from '@/lib/tauri-cmd';
 import { dirname } from './path';
 import { makeImageResolver, type ImageResolver } from './markdown-assets';
@@ -39,5 +39,6 @@ export function useDocAssetResolver(path: string, enabled: boolean): ImageResolv
 		};
 	}, [path, enabled]);
 
-	return enabled ? makeImageResolver(base) : undefined;
+	// Stable identity: Markdown rebuilds its components when the resolver changes.
+	return useMemo(() => (enabled ? makeImageResolver(base) : undefined), [enabled, base]);
 }
