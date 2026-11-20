@@ -116,6 +116,10 @@ const KINDS: &[(&str, Category, bool)] = &[
     ("policy.owner_approval_changed", Category::People, true),
     ("ownership.offered", Category::People, true),
     ("ownership.accepted", Category::People, true),
+    // box-files WP-15 (06-file-links §8.1): outside file links. Creating one
+    // is a new grant (gated); revoking must work while degraded (P-35).
+    ("link.created", Category::People, true),
+    ("link.revoked", Category::People, false),
     // permission
     ("permission.decided", Category::Permission, false),
     ("permission.refused", Category::Permission, false),
@@ -149,6 +153,11 @@ const KINDS: &[(&str, Category, bool)] = &[
     // WP-K: a credential group of the box sender's vault was set, replaced or
     // cleared from Settings (key names only, never values).
     ("sender.vault_changed", Category::Access, false),
+    // box-files (06-file-links §8.1): an outsider opened, downloaded, or
+    // locked a link by guessing its passcode. Written by WP-16 / WP-18.
+    ("link.opened", Category::Access, false),
+    ("link.downloaded", Category::Access, false),
+    ("link.locked", Category::Access, false),
 ];
 
 /// `kind` as the list's `'static` spelling, or `None` outside §6.5.
@@ -544,6 +553,19 @@ mod tests {
             Some(Category::Access)
         );
         assert!(!is_access_change("server.update_requested"));
+        // box-files WP-15: a new link is a grant; nothing else about a link is.
+        assert!(is_access_change("link.created"));
+        for k in [
+            "link.revoked",
+            "link.opened",
+            "link.downloaded",
+            "link.locked",
+        ] {
+            assert!(category_of(k).is_some(), "{k}");
+            assert!(!is_access_change(k), "{k}");
+        }
+        assert_eq!(category_of("link.created"), Some(Category::People));
+        assert_eq!(category_of("link.opened"), Some(Category::Access));
     }
 
     #[test]

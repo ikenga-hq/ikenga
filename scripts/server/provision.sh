@@ -173,6 +173,7 @@ TS_AUTHKEY_FILE=""
 TS_HOSTNAME=""
 SSH_PORT="22"
 SSH_ACCESS=""          # public | tailnet (default: public for public-https)
+FILE_LINKS="0"         # 1 = outside file links under /s/ (IKENGA_FILE_LINKS); public-https + t1 only
 APPS=()
 LIBS=()
 AGENT_CLIS=()
@@ -280,6 +281,12 @@ validate_profile() {
     [[ "$SSH_ACCESS" == public || "$SSH_ACCESS" == tailnet ]] || die "SSH_ACCESS must be public or tailnet (got '$SSH_ACCESS')"
   else
     SSH_ACCESS=tailnet
+  fi
+  # Outside file links (box-files WP-15): only an outsider on the open internet
+  # can open one, so they need the public perimeter (which already needs t1).
+  [[ "$FILE_LINKS" == 0 || "$FILE_LINKS" == 1 ]] || die "FILE_LINKS must be 0 or 1 (got '$FILE_LINKS')"
+  if [[ "$FILE_LINKS" == 1 && "$PERIMETER" != public-https ]]; then
+    die "FILE_LINKS=1 requires PERIMETER=public-https (an outsider cannot reach a tailnet host)"
   fi
   # The auth key is only needed to JOIN; a host already on the tailnet
   # (re-run, or a perimeter switch) does not need one. tailnet_join enforces it.
@@ -776,6 +783,9 @@ write_env() {
   # that peer lets the daemon read Caddy's X-Forwarded-For (which Caddy
   # overwrites, so clients cannot spoof it). The tailnet perimeter has no proxy.
   if [[ "$PERIMETER" == public-https ]]; then set_var IKENGA_TRUSTED_PROXIES 127.0.0.1; else unset_var IKENGA_TRUSTED_PROXIES; fi
+  # Outside file links (box-files WP-15): off unless the profile turns them on,
+  # and only on the public perimeter (validate_profile refuses anything else).
+  if [[ "$FILE_LINKS" == 1 && "$PERIMETER" == public-https ]]; then set_var IKENGA_FILE_LINKS 1; else unset_var IKENGA_FILE_LINKS; fi
 
   # Optional secrets (agent API keys etc.) from a file the operator controls:
   # copied by name, never read into argv or the log.

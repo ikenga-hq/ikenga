@@ -62,13 +62,22 @@ const VALID_TAGS: &[&str] = &["WP-19", "WP-18b", "WP-20", "desktop-only-forever"
 ///   settings location, statusline snapshots and permission-gate answer. The
 ///   desktop reaches the same data through the iyke bridge, which a browser
 ///   has no endpoint for.
+/// * box-files WP-15: the five `access_file_link*` arms manage outside links,
+///   which exist only on a T1 server (the desktop shows nothing), and
+///   `file_link_resolve` is `internal` (broker → the creator's own child).
 const DAEMON_ONLY_VERBS: &[&str] = &[
+    "access_file_link_admin_revoke",
+    "access_file_link_create",
+    "access_file_link_revoke",
+    "access_file_links_admin_list",
+    "access_file_links_list",
     "access_push_config",
     "access_push_list",
     "access_push_subscribe",
     "access_push_test",
     "access_push_unsubscribe",
     "access_push_update",
+    "file_link_resolve",
     "fs_home",
     "git_status",
     "notifications_record_access",

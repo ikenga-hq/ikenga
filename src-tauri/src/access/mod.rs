@@ -33,6 +33,7 @@ pub mod caps;
 pub mod caps_ts;
 pub mod ctx;
 pub mod devices;
+pub mod file_links;
 pub mod fingerprint;
 pub mod http;
 pub mod invites;
@@ -206,6 +207,10 @@ pub struct AccessOptions {
     /// `--member-invites-create-accounts` (§4.4, N-11 / DEC-85): off by
     /// default.
     pub member_invites_create_accounts: bool,
+    /// `--file-links` / `IKENGA_FILE_LINKS` (box-files WP-15, 06-file-links
+    /// §7.1): outside links to one file. Off by default; it gates creating a
+    /// link and (WP-16) every `/s/*` answer. T1 only.
+    pub file_links: bool,
 }
 
 impl Default for AccessOptions {
@@ -216,6 +221,7 @@ impl Default for AccessOptions {
             max_accounts: None,
             invite_ttl_days: DEFAULT_INVITE_TTL_DAYS,
             member_invites_create_accounts: false,
+            file_links: false,
         }
     }
 }
@@ -841,6 +847,7 @@ mod tests {
         assert_eq!(plain.via, Via::ChildToken);
         assert!(authorize(&plain, "share_project_info").is_ok());
         assert!(authorize(&plain, "server_open_terminals").is_ok());
+        assert!(authorize(&plain, "file_link_resolve").is_ok());
         for name in ["x-ikenga-share-principal", "x-ikenga-share-role"] {
             let mut h = broker.clone();
             h.insert(name, "x".parse().unwrap());
@@ -849,6 +856,12 @@ mod tests {
             assert!(c.share_headers);
             assert_eq!(
                 authorize(&c, "share_project_info").unwrap_err().message,
+                "class=internal",
+                "{name}"
+            );
+            // box-files WP-15: a share header never reaches the link resolve.
+            assert_eq!(
+                authorize(&c, "file_link_resolve").unwrap_err().message,
                 "class=internal",
                 "{name}"
             );
@@ -882,6 +895,7 @@ mod tests {
                 "share_project_info",
                 "notifications_record_access",
                 "server_open_terminals",
+                "file_link_resolve",
             ] {
                 assert_eq!(
                     authorize(&c, cmd).unwrap_err().message,

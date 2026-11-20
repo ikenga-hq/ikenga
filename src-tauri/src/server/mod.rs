@@ -28,6 +28,9 @@ pub mod discovery;
 /// …) and its `/ws/events` delivery to browsers (gap audit rank 10).
 pub mod events;
 pub mod events_ws;
+/// box-files WP-15: the child's `file_link_resolve` arm (what an outside
+/// link may carry, decided by the creator's own guard).
+pub(crate) mod file_link_resolve;
 pub mod fs_ws;
 pub mod health;
 /// A held hook gate's notification row and audit trail (daemon asks).
@@ -202,6 +205,9 @@ pub struct T1ServeOptions {
     /// `--member-invites-create-accounts` (G-ACCESS §4.4, N-11; T1). Off by
     /// default.
     pub member_invites_create_accounts: bool,
+    /// `--file-links` / `IKENGA_FILE_LINKS` (box-files WP-15): outside
+    /// links to one file. Off by default; read by the T1 broker.
+    pub file_links: bool,
     /// Web Push flags (plans/pwa S2): `--no-push`, `--push-contact`,
     /// `--push-endpoint-host`, `--push-allow-endpoint`. Read by the T0
     /// daemon and the T1 broker (the store owners).
@@ -221,6 +227,7 @@ impl T1ServeOptions {
                 .unwrap_or(crate::access::DEFAULT_INVITE_TTL_DAYS)
                 .clamp(1, crate::access::MAX_INVITE_TTL_DAYS),
             member_invites_create_accounts: self.member_invites_create_accounts,
+            file_links: self.file_links,
         }
     }
 }

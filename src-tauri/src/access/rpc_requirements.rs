@@ -345,6 +345,12 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("access_policy_set_owner_approval", req!(access)),
     ("access_invite_issue", req!(access)),
     ("access_invite_revoke", req!(access)),
+    // ── outside file links (box-files WP-15) ──
+    ("access_file_link_create", req!(access)),
+    ("access_file_links_list", req!(access)),
+    ("access_file_link_revoke", req!(access)),
+    ("access_file_links_admin_list", req!(access)),
+    ("access_file_link_admin_revoke", req!(access)),
     ("access_shares_list", req!(access)),
     ("access_audit_list", req!(access)),
     ("access_audit_verify", req!(access)),
@@ -368,6 +374,9 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("outbox_approvals_status", req!(access)),
     // WP-P9: the broker's cross-principal open-terminal count.
     ("server_open_terminals", req!(internal)),
+    // box-files WP-15: the broker asks the creator's own child to resolve a
+    // path for an outside link (06-file-links §4.1).
+    ("file_link_resolve", req!(internal)),
     ("permission_relay_put", req!(operator)),
     ("permission_relay_take", req!(operator)),
     ("permission_relay_resolve", req!(operator)),

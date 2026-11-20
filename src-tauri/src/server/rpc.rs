@@ -1002,6 +1002,11 @@ pub async fn rpc_handler(
         | "access_policy_set_owner_approval"
         | "access_invite_issue"
         | "access_invite_revoke"
+        | "access_file_link_create"
+        | "access_file_links_list"
+        | "access_file_link_revoke"
+        | "access_file_links_admin_list"
+        | "access_file_link_admin_revoke"
         | "access_shares_list"
         | "access_audit_list"
         | "access_audit_verify"
@@ -1045,6 +1050,14 @@ pub async fn rpc_handler(
                 "claude_procs": claude_procs,
             }))
         }
+
+        // --- box-files WP-15: outside file links ---
+        //
+        // `internal` (only the T1 broker's own call reaches it): resolve a
+        // path this account wants to publish by an outside link, against
+        // this child's own unnarrowed guard (06-file-links §4.1). Blocking
+        // fs work, so it runs on the blocking pool.
+        "file_link_resolve" => super::file_link_resolve::arm(&state, &payload.args).await,
 
         // --- Unknown Command Fallback ---
         other => {
