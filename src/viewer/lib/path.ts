@@ -16,6 +16,15 @@ export function basename(path: string): string {
 	return idx === -1 ? norm : norm.slice(idx + 1);
 }
 
+/** Percent-encode each segment of a relative URL path, keeping the `/`
+ *  separators. A name like `Report #2 50%.html` must not reach the URL raw:
+ *  `#` starts a fragment, `?` a query, and `%` a bad escape. Both viewer
+ *  servers (desktop `viewer_server`, daemon `server/viewer.rs`) decode the
+ *  path exactly once, so this does not double-encode. */
+export function encodeUrlPath(rel: string): string {
+	return rel.split('/').map(encodeURIComponent).join('/');
+}
+
 export function extname(path: string): string {
 	const base = basename(path);
 	const dot = base.lastIndexOf('.');

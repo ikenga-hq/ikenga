@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { AlertCircle, Loader2 } from 'lucide-react';
 import { viewerServe, viewerStop, type ViewerHandle } from '@/lib/tauri-cmd';
-import { basename, dirname } from '../lib/path';
+import { basename, dirname, encodeUrlPath } from '../lib/path';
 
 interface VideoViewProps {
 	path: string;
@@ -35,7 +35,7 @@ function LocalVideoView({ path }: VideoViewProps) {
 				}
 				setState({
 					kind: 'ready',
-					src: `${h.url}${basename(path)}`,
+					src: `${h.url}${encodeUrlPath(basename(path))}`,
 					handle: h,
 				});
 			})

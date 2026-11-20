@@ -13,6 +13,7 @@ import {
 import { registerIykeIframe } from '@/lib/iyke/iframe-registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { cn } from '@/components/ui/utils';
+import { encodeUrlPath } from '../lib/path';
 import {
 	DropdownMenu,
 	DropdownMenuContent,
@@ -106,8 +107,8 @@ function LocalHtmlFrame({ path, paneId }: HtmlFrameProps) {
 				// viewer server's mount root; we prefix the bound viewer port so
 				// the child can fetch its own assets.
 				const src = isRemoteWebSession()
-					? `${window.location.origin}${h.url}${file}`
-					: `http://localhost:${port ?? 47821}${h.url}${file}`;
+					? `${window.location.origin}${h.url}${encodeUrlPath(file)}`
+					: `http://localhost:${port ?? 47821}${h.url}${encodeUrlPath(file)}`;
 				setState({ kind: 'ready', src, handle: h });
 			})
 			.catch((err) => {
