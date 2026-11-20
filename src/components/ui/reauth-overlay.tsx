@@ -2,6 +2,7 @@ import { type FormEvent, lazy, Suspense, useEffect, useState } from 'react';
 import { useReauthStore } from '@/lib/transport/reauth-store';
 import { isT1Session } from '@/lib/transport/t1-session';
 import { D05_FOCUS } from '@/shell/people/focus';
+import { ShareFileHost } from '@/shell/people/share-file-host';
 import { ShareModeBanner } from '@/shell/people/shared-with-you';
 import { T1SignInForm } from './t1-sign-in-form';
 
@@ -113,6 +114,7 @@ export function ReauthOverlay() {
 	return (
 		<>
 			<ShareModeBanner />
+			<ShareFileHost />
 			<ReauthDialog />
 		</>
 	);

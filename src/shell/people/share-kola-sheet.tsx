@@ -174,12 +174,18 @@ export function ShareKolaSheet({
 	projectId,
 	projectName,
 	onIssued,
+	initialScope,
+	initialArtifactPath,
 }: {
 	open: boolean;
 	onOpenChange: (o: boolean) => void;
 	projectId: string;
 	projectName: string;
 	onIssued: () => void;
+	/** Preselect a scope when the sheet opens (the file "Share…" action). */
+	initialScope?: InviteScope;
+	/** Prefill the artifact path (project-relative) when the sheet opens. */
+	initialArtifactPath?: string;
 }) {
 	const [mode, setMode] = useState<InviteMode>('email');
 	const [who, setWho] = useState('');
@@ -200,6 +206,9 @@ export function ShareKolaSheet({
 		setIssued(null);
 		setError(null);
 		setCopied(false);
+		if (initialScope) setScope(initialScope);
+		if (initialArtifactPath !== undefined) setArtifactPath(initialArtifactPath);
+		// biome-ignore lint/correctness/useExhaustiveDependencies: only the open transition seeds the form
 	}, [open]);
 	// §4.2: a Guest is one artifact with an expiry; leaving Guest keeps the scope.
 	useEffect(() => {

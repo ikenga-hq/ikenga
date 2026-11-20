@@ -61,6 +61,7 @@ import { isHtmlArtifactPath, resolveHtmlViewerUrl } from '@/viewer/lib/viewer-ur
 import { type DeviceWidth, useViewerPaneState } from '@/viewer/viewer-pane-state';
 import { copyText } from '@/lib/clipboard';
 import { downloadLabel, downloadWithFeedback } from '@/viewer/chrome/download-file';
+import { requestShareFile, useCanShareFile } from '@/shell/people/share-file';
 
 // No shortcut on the viewer-zoom rows: the shipped `⌘+` / `⌘−` / `⌘0` labels
 // belonged to the window-level `zoom.*` keys, not to these items (G-ACTIONS
@@ -266,12 +267,14 @@ function PaneMenuBody({
 		artifactPath ? (s.pins.some((p) => p.target === artifactPath) ?? false) : false
 	);
 
+	const canShare = useCanShareFile(artifactPath);
 	const paneMenu = useEffectiveMenu('pane');
 	const resolvedRows = resolveMenuItems(paneMenu, {
 		target: { resource: tabPath, paneKind: activeTab?.kind },
 		conditions: {
 			history: Boolean(history),
 			'artifact-tab': isArtifact,
+			shareable: isArtifact && canShare,
 			'artifact-or-route-tab': canCopyPath && tabPath !== undefined,
 			...pkg.conditions,
 		},
@@ -307,6 +310,7 @@ function PaneMenuBody({
 			'pane.split-down': 'Split down',
 			'copy-path': 'Copy path',
 			'files.download': downloadLabel(),
+			'files.share': 'Share…',
 			'viewer.toggle-source': viewerState.variant === 'source' ? 'Close source' : 'Open source',
 			'viewer.zoom-in': 'Zoom in',
 			'viewer.zoom-out': 'Zoom out',
@@ -344,6 +348,9 @@ function PaneMenuBody({
 			},
 			'files.download': () => {
 				if (artifactPath) void downloadWithFeedback(artifactPath);
+			},
+			'files.share': () => {
+				if (artifactPath) requestShareFile(artifactPath);
 			},
 			'viewer.zoom-in': () => zoomBy(paneId, 10),
 			'viewer.zoom-out': () => zoomBy(paneId, -10),
