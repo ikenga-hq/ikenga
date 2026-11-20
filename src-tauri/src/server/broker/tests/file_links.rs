@@ -882,6 +882,49 @@ async fn ls13_a_cross_origin_passcode_post_is_refused() {
     assert_eq!(failures, 0);
 }
 
+/// LS-13: `Origin: null` (what an attacker's sandboxed or no-referrer page
+/// can send) is refused too, and spends nothing.
+#[tokio::test]
+async fn ls13_an_origin_null_passcode_post_is_refused() {
+    let h = harness(true).await;
+    let (t, _) = passcode_link(&h, "r.pdf").await;
+    let (s, _, _) = send(
+        &h.app,
+        req("POST", &format!("/s/{t}"), ip(1))
+            .header("origin", "null")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!("passcode={RIGHT}")))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert_eq!(h.state.file_links.verifications.load(Ordering::SeqCst), 0);
+}
+
+/// The passcode form's page must not pin `no-referrer`: a browser would then
+/// submit the form with `Origin: null`, which the gate refuses, and the link
+/// could never be unlocked. `same-origin` keeps a real Origin on the POST and
+/// sends no Referer off the box. The plain file page keeps `no-referrer`.
+/// Live check (G-LINKSEC): submit the form in Chromium and Firefox behind
+/// Caddy, whose site block sets `Referrer-Policy no-referrer` itself.
+#[tokio::test]
+async fn the_passcode_form_keeps_a_real_origin_on_submit() {
+    let h = harness(true).await;
+    let (tp, _) = passcode_link(&h, "q.pdf").await;
+    let (_, _, b) = get_from(&h, &format!("/s/{tp}"), ip(1), None).await;
+    let page = text(&b);
+    assert!(page.contains("<form method=\"post\""), "{page}");
+    assert!(
+        page.contains(r#"<meta name="referrer" content="same-origin">"#),
+        "{page}"
+    );
+    assert!(!page.contains(r#"content="no-referrer""#), "{page}");
+
+    let (t, _) = pdf_link(&h).await;
+    let (_, _, b) = get_from(&h, &format!("/s/{t}"), ip(2), None).await;
+    assert!(text(&b).contains(r#"<meta name="referrer" content="no-referrer">"#));
+}
+
 // ─── LS-14 / LS-15 / LS-19: headers, logs, the app's cookies ────────────────
 
 fn assert_page_headers(hd: &HeaderMap, what: &str) {
@@ -978,11 +1021,28 @@ async fn ls15_no_token_is_ever_logged() {
     get_from(&h, &format!("/s/{unknown}"), ip(3), None).await;
     std::fs::remove_file(h.home.join("r.pdf")).unwrap();
     get_from(&h, &format!("/s/{t}/download"), ip(4), None).await;
+    // Refused by the Origin gate, which logs the path at warn.
+    for origin in ["https://evil.example", "null"] {
+        let (s, _, _) = send(
+            &h.app,
+            req("POST", &format!("/s/{tp}"), ip(5))
+                .header("origin", origin)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("passcode=wrong-guess"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{origin}");
+    }
 
     let logs = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
     assert!(
         logs.contains(&tp_id),
         "the capture works (the wrong guess names the link id)"
+    );
+    assert!(
+        logs.contains("cross-origin POST /s/"),
+        "the capture sees the Origin gate's refusals"
     );
     for token in [&t, &tp, &unknown] {
         assert!(!logs.contains(token.as_str()), "a token reached the logs");

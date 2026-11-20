@@ -990,7 +990,10 @@ fn passcode_form(
         t = escape(token),
         max = links::PASSCODE_MAX_CHARS,
     );
-    page_response(status, render("Passcode needed", &inner))
+    page_response(
+        status,
+        render_with_referrer("Passcode needed", &inner, "same-origin"),
+    )
 }
 
 fn shared_from(gate: &LinkGate) -> String {
@@ -1084,11 +1087,23 @@ border-radius:6px;width:100%;box-sizing:border-box;margin:.5rem 0 1rem}\
 /// The whole document around `inner` (already escaped). No script, no app
 /// asset, no manifest, no service worker (§5.3).
 fn render(title: &str, inner: &str) -> String {
+    render_with_referrer(title, inner, "no-referrer")
+}
+
+/// [`render`] with the page's own `<meta name="referrer">`. The passcode form
+/// needs `same-origin`: under `no-referrer` a browser sends `Origin: null`
+/// on the form's POST navigation (Fetch spec; Chromium and Firefox both do),
+/// even to its own origin, and the `Origin` gate rightly refuses `null`. The
+/// meta tag wins over the `Referrer-Policy` header for the document's own
+/// requests, Caddy's deferred header included. A `Referer` then only ever
+/// goes to the box itself, and the form posts to the URL it was served at, so
+/// it carries nothing the request line does not.
+fn render_with_referrer(title: &str, inner: &str, referrer: &'static str) -> String {
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
          <meta name=\"robots\" content=\"noindex,nofollow\">\
-         <meta name=\"referrer\" content=\"no-referrer\">\
+         <meta name=\"referrer\" content=\"{referrer}\">\
          <title>{}</title><style>{STYLE}</style></head><body><main>{inner}</main></body></html>",
         escape(title)
     )

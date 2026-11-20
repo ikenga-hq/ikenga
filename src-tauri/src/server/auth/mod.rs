@@ -236,7 +236,7 @@ pub async fn origin_gate(
         tracing::warn!(
             "cross-origin {} {} rejected (origin: {:?})",
             req.method(),
-            req.uri().path(),
+            log_path(req.uri().path()),
             req.headers().get("origin")
         );
         return json_error(
@@ -246,6 +246,18 @@ pub async fn origin_gate(
         );
     }
     next.run(req).await
+}
+
+/// The path as the `Origin` gate may log it: the first segment only. A
+/// refused POST to `/s/<token>` (or any route carrying a secret in its
+/// path) must not write that secret to the journal (file-links §6.3, LS-15).
+pub(crate) fn log_path(path: &str) -> String {
+    let rest = path.strip_prefix('/').unwrap_or(path);
+    match rest.split_once('/') {
+        Some((first, tail)) if !tail.is_empty() => format!("/{first}/…"),
+        Some((first, _)) => format!("/{first}/"),
+        None => format!("/{rest}"),
+    }
 }
 
 /// The unauthenticated routes beyond `/api/health`, `/auth/login` and the
@@ -319,6 +331,18 @@ mod tests {
             &allowed
         ));
         assert!(!origin_ok(&headers(Some("null"), "ik:4000"), &allowed));
+    }
+
+    #[test]
+    fn the_gate_logs_only_the_first_path_segment() {
+        let token = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCdE";
+        assert_eq!(log_path(&format!("/s/{token}")), "/s/…");
+        assert_eq!(log_path(&format!("/s/{token}/download")), "/s/…");
+        assert_eq!(log_path("/api/rpc"), "/api/…");
+        assert_eq!(log_path("/auth/"), "/auth/");
+        assert_eq!(log_path("/ws"), "/ws");
+        assert_eq!(log_path("/"), "/");
+        assert!(!log_path(&format!("/invite/{token}")).contains(token));
     }
 
     #[test]
