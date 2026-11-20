@@ -1,5 +1,30 @@
 # ikenga-desktop
 
+## 0.32.0
+
+### Minor Changes
+
+- e82a7f6: Word documents (.docx) now preview in the viewer as a readable page, with headings, lists, tables and images. Older .doc, PowerPoint and OpenDocument text files show a clear "can't preview" note with a Download button instead of a blank unknown-file view.
+- e82a7f6: When a server has outside file links turned on (`--file-links` / `IKENGA_FILE_LINKS`), a link now opens a simple page at `/s/…` on the server's own address: the file's name and size, a preview for PDFs, images and plain text, and a Download button. A link with a passcode asks for it first and remembers it for an hour. Expired, revoked or unknown links all show the same "This link isn't available" page, repeated wrong passcodes lock the link for an hour, and an installed app no longer catches `/s/` links. With the setting off, every `/s/` address shows the "not available" page. Making links from the app comes in a later release.
+- e82a7f6: Servers with accounts can now be set up to let people share one of their own files with someone who has no account, by an outside link. This release adds the groundwork only: where links are kept, the setting that turns them on (`--file-links` / `IKENGA_FILE_LINKS`, off by default, and `FILE_LINKS=1` in the provisioner for public HTTPS hosts), and the requests to create, list and revoke links, including an administrator view of every account's links. The public link page and the controls in the app come in a later release, so nothing changes for anyone until both have shipped and the setting is turned on.
+- e82a7f6: You can now make an outside link to a file from the app. When the server has file links turned on, a file's Share… menu (in Files and in the viewer) has a "Get a link" option: pick how long it lasts (1, 7 or 30 days, or never) and an optional passcode, and the link is shown once with a Copy button. It can't be shown again, so copy it then. Settings, People, Profile has a new Links panel listing the links you made, how often each was opened and downloaded, and a Revoke button. Admins also get an All links view to filter by account, revoke one link, or revoke all of an account's links. Nothing shows unless the server turned file links on.
+- e82a7f6: Download any file from the Files list or from a viewer. Right-click a file and choose Download, or use the same item in the viewer's menu. In a browser the file is saved straight from the server, so big files no longer have to load into the page first. On the desktop app the control still says "Open in default app".
+- e82a7f6: Add a streamed file download route to the server (`GET /api/fs/download`). It saves a file straight from disk to the browser without loading it into memory first, follows the same access rules as opening a file (including inside a shared project), refuses folders, and only shows PDFs, common images and plain text inline.
+- e82a7f6: When someone opens a file you shared with them, the file now opens straight away, and a shared web page or Markdown file loads its own images and stylesheets from the folder it sits in. Nothing outside that folder, and nothing in it beyond reading, is opened up.
+- e82a7f6: Share a single file from where you see it. Right-click a file in the Files list, or open the viewer's menu, and choose Share…. The invite sheet opens with "One artifact" selected and the file's path already filled in. The item only appears when you can invite people, and not while you are inside a project someone shared with you.
+
+### Patch Changes
+
+- e82a7f6: Outside file links now record who opened them. Each open or download of a link appears in the owner's audit list (once per visitor and hour, with the visitor's address and browser), the link's open and download counts and last-opened time update, and the owner gets a notification, and a push on an installed app, the first time anyone opens the file. Still off unless the server's file links setting is on.
+- e82a7f6: Images referenced by a relative path in a Markdown file (for example `![](./chart.png)`) now show up in the viewer, in the desktop app and in a browser session. Images outside the document's folder are refused, and web and inline images are unchanged.
+- e82a7f6: Images, audio and video that can't be shown no longer leave a black or empty box. The viewer now says what went wrong and offers a Download button. HEIC, HEIF and TIFF images go straight to that message instead of failing to load.
+- e82a7f6: Fix the PDF viewer's **Download** button in a browser session. It did nothing (or saved an empty file) once the PDF had rendered, because the PDF renderer had taken the loaded bytes for itself. Downloads now save the full file.
+- e82a7f6: Very large files no longer freeze the viewer. A file over 25 MB now shows a "too large to preview" message with a Download button instead of trying to load it. Other files open exactly as before, and the generic file view now reads the size without loading the file.
+- e82a7f6: In a browser session, a refused request now says why (for example "expired: this share has ended") instead of a bare "HTTP RPC error: 403 Forbidden".
+- e82a7f6: In a shared project, a file path without a leading slash now opens relative to the shared folder, and a refused path no longer reveals folder names on the host. A missing file and a file you may not see now give the same short answer.
+- e82a7f6: Audio, video and HTML previews now open files whose names contain `#`, `?`, `%` or spaces (for example `Report #2 50%.html`). Previously the name was put into the preview address unescaped and the file failed to load.
+- e82a7f6: Spreadsheets in the viewer now show dates and numbers the way Excel does (real dates and formatted amounts instead of raw serial numbers). Very long sheets show the first 2,000 rows with a "showing first N of M rows" note instead of freezing the pane.
+
 ## 0.31.4
 
 ### Patch Changes
