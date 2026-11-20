@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { AlertCircle, Loader2 } from 'lucide-react';
 import { viewerServe, viewerStop, type ViewerHandle } from '@/lib/tauri-cmd';
+import { CannotPreviewPlate } from '../chrome/cannot-preview-plate';
 import { basename, dirname, encodeUrlPath } from '../lib/path';
 
 interface VideoViewProps {
@@ -20,12 +21,14 @@ function LocalVideoView({ path }: VideoViewProps) {
 		| { kind: 'ready'; src: string; handle: ViewerHandle }
 		| { kind: 'error'; message: string }
 	>({ kind: 'loading' });
+	const [failed, setFailed] = useState(false);
 
 	useEffect(() => {
 		let cancelled = false;
 		let handle: ViewerHandle | null = null;
 
 		setState({ kind: 'loading' });
+		setFailed(false);
 		viewerServe(dirname(path), path)
 			.then((h) => {
 				handle = h;
@@ -69,11 +72,21 @@ function LocalVideoView({ path }: VideoViewProps) {
 		);
 	}
 
+	if (failed) {
+		return (
+			<CannotPreviewPlate
+				path={path}
+				reason="This video couldn't be played here. The format or codec may not be supported by this viewer."
+			/>
+		);
+	}
+
 	return (
 		<div className="flex h-full w-full items-center justify-center bg-black">
 			<video
 				src={state.src}
 				controls
+				onError={() => setFailed(true)}
 				className="max-h-full max-w-full"
 				// eslint-disable-next-line jsx-a11y/media-has-caption
 			/>

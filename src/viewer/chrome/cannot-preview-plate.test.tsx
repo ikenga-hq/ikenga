@@ -9,7 +9,7 @@ const h = vi.hoisted(() => ({
 vi.mock('@/lib/transport', () => ({ isBrowserHost: () => h.browser }));
 vi.mock('@/lib/transport/fs-download', () => ({ downloadFile: h.downloadFile }));
 
-import { PreviewTooLargePlate } from './preview-too-large-plate';
+import { CannotPreviewPlate } from './cannot-preview-plate';
 
 beforeEach(() => {
 	h.browser = true;
@@ -17,10 +17,17 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
-describe('PreviewTooLargePlate', () => {
+describe('CannotPreviewPlate', () => {
+	it('shows a custom reason with Download instead of the size line', () => {
+		render(<CannotPreviewPlate path="/srv/a.heic" reason="HEIC images can't be previewed here." />);
+		expect(screen.getByText(/HEIC images can't be previewed/)).toBeTruthy();
+		expect(screen.queryByText(/too large/)).toBeNull();
+		expect(screen.getByRole('button', { name: 'Download' })).toBeTruthy();
+	});
+
 	it('says why, with the size, and Download uses the shared function', async () => {
 		render(
-			<PreviewTooLargePlate
+			<CannotPreviewPlate
 				path="/srv/big/video.mov"
 				message={new Error('fs_read: preview_too_large: 209715200 > 26214400')}
 			/>
@@ -33,7 +40,7 @@ describe('PreviewTooLargePlate', () => {
 
 	it('desktop keeps the "Open in default app" label', () => {
 		h.browser = false;
-		render(<PreviewTooLargePlate path="/home/u/big.bin" size={30 * 1024 * 1024} />);
+		render(<CannotPreviewPlate path="/home/u/big.bin" size={30 * 1024 * 1024} />);
 		expect(screen.getByRole('button', { name: 'Open in default app' })).toBeTruthy();
 	});
 });

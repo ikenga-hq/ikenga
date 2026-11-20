@@ -5,7 +5,14 @@
 // them. Not run in this session (DEC-50 — see the WP-44 report).
 
 import { describe, expect, it } from 'vitest';
-import { CodeView, isAbsoluteViewerPath, PdfView, pickRenderer, XlsxView } from './auto-router';
+import {
+	CodeView,
+	isAbsoluteViewerPath,
+	PdfView,
+	pickRenderer,
+	UnsupportedImageView,
+	XlsxView,
+} from './auto-router';
 import { AudioView } from './renderers/audio-view';
 import { CsvView } from './renderers/csv-view';
 import { HtmlFrame } from './renderers/html-frame';
@@ -15,6 +22,16 @@ import { MarkdownView } from './renderers/markdown-view';
 import { PenView } from './renderers/pen-view';
 import { UnknownView } from './renderers/unknown-view';
 import { VideoView } from './renderers/video-view';
+
+describe('pickRenderer — unsupported images (WP-09)', () => {
+	it('routes HEIC/HEIF/TIFF to the cannot-preview plate whatever the mime says', () => {
+		expect(pickRenderer('image/heic', 'photos/a.HEIC')).toBe(UnsupportedImageView);
+		expect(pickRenderer('application/octet-stream', 'a.heif')).toBe(UnsupportedImageView);
+		expect(pickRenderer('image/tiff', 'scan.tif')).toBe(UnsupportedImageView);
+		expect(pickRenderer('image/tiff', 'scan.tiff')).toBe(UnsupportedImageView);
+		expect(pickRenderer('image/png', 'a.png')).toBe(ImageView);
+	});
+});
 
 describe('pickRenderer — new in WP-44', () => {
 	it('routes .csv (and a resolved text/csv mime) to CsvView, not CodeView', () => {

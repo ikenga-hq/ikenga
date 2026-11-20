@@ -10,7 +10,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import { ErrorState, LoadingState } from '@/components/states';
 import { fsRead } from '@/lib/tauri-cmd';
-import { PreviewTooLargePlate } from '../chrome/preview-too-large-plate';
+import { CannotPreviewPlate } from '../chrome/cannot-preview-plate';
 import { isPreviewTooLarge } from '../lib/preview-cap';
 import { EditableTextFrame } from '../editing/editable-text-frame';
 
@@ -71,7 +71,7 @@ function JsonReadOnly({ path }: { path: string }) {
 	}
 	if (state.kind === 'error') {
 		if (isPreviewTooLarge(state.message)) {
-			return <PreviewTooLargePlate path={path} message={state.message} />;
+			return <CannotPreviewPlate path={path} message={state.message} />;
 		}
 		return <JsonParseError message={state.message} />;
 	}

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { AlertCircle, Loader2, Music } from 'lucide-react';
 import { viewerServe, viewerStop, type ViewerHandle } from '@/lib/tauri-cmd';
+import { CannotPreviewPlate } from '../chrome/cannot-preview-plate';
 import { basename, dirname, encodeUrlPath } from '../lib/path';
 
 interface AudioViewProps {
@@ -22,12 +23,14 @@ function LocalAudioView({ path }: AudioViewProps) {
 		| { kind: 'ready'; src: string; handle: ViewerHandle }
 		| { kind: 'error'; message: string }
 	>({ kind: 'loading' });
+	const [failed, setFailed] = useState(false);
 	const audioRef = useRef<HTMLAudioElement>(null);
 
 	useEffect(() => {
 		let cancelled = false;
 		let handle: ViewerHandle | null = null;
 		setState({ kind: 'loading' });
+		setFailed(false);
 
 		viewerServe(dirname(path), path)
 			.then((h) => {
@@ -72,6 +75,15 @@ function LocalAudioView({ path }: AudioViewProps) {
 		);
 	}
 
+	if (failed) {
+		return (
+			<CannotPreviewPlate
+				path={path}
+				reason="This audio couldn't be played here. The format or codec may not be supported by this viewer."
+			/>
+		);
+	}
+
 	return (
 		<div className="flex h-full flex-col bg-background">
 			<div className="flex flex-1 items-center justify-center text-muted-foreground">
@@ -83,6 +95,7 @@ function LocalAudioView({ path }: AudioViewProps) {
 					ref={audioRef}
 					src={state.src}
 					controls
+					onError={() => setFailed(true)}
 					className="w-full"
 					// eslint-disable-next-line jsx-a11y/media-has-caption
 				/>

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { AlertCircle, ChevronDown, ChevronRight, Loader2 } from 'lucide-react';
 import { fsRead } from '@/lib/tauri-cmd';
-import { PreviewTooLargePlate } from '../chrome/preview-too-large-plate';
+import { CannotPreviewPlate } from '../chrome/cannot-preview-plate';
 import { isPreviewTooLarge } from '../lib/preview-cap';
 
 interface PenViewProps {
@@ -64,7 +64,7 @@ export function PenView({ path }: PenViewProps) {
 	}
 	if (state.kind === 'error') {
 		if (isPreviewTooLarge(state.message)) {
-			return <PreviewTooLargePlate path={path} message={state.message} />;
+			return <CannotPreviewPlate path={path} message={state.message} />;
 		}
 		return (
 			<div className="flex h-full items-start justify-center p-6 text-xs text-destructive">

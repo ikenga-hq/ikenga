@@ -23,7 +23,7 @@ import { CodeEditor, type CodeEditorHandle } from '@ikenga/ui-lib';
 import { ErrorState, LoadingState } from '@/components/states';
 import { focusMarkerProps } from '@/lib/keymap/context-keys';
 import { useCommands } from '@/lib/keymap/dispatcher';
-import { PreviewTooLargePlate } from '../chrome/preview-too-large-plate';
+import { CannotPreviewPlate } from '../chrome/cannot-preview-plate';
 import { isPreviewTooLarge } from '../lib/preview-cap';
 import { ConflictBanner } from './conflict-banner';
 import { EditorToolbar } from './editor-toolbar';
@@ -116,7 +116,7 @@ export function TextDocumentFrame({
 	}
 	if (doc.load.kind === 'error') {
 		if (isPreviewTooLarge(doc.load.message)) {
-			return <PreviewTooLargePlate path={path} message={doc.load.message} />;
+			return <CannotPreviewPlate path={path} message={doc.load.message} />;
 		}
 		return (
 			<ErrorState

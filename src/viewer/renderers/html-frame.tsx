@@ -10,7 +10,7 @@ import {
 	viewerStop,
 	type ViewerHandle,
 } from '@/lib/tauri-cmd';
-import { PreviewTooLargePlate } from '../chrome/preview-too-large-plate';
+import { CannotPreviewPlate } from '../chrome/cannot-preview-plate';
 import { isPreviewTooLarge } from '../lib/preview-cap';
 import { registerIykeIframe } from '@/lib/iyke/iframe-registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
@@ -307,7 +307,7 @@ function LocalHtmlFrame({ path, paneId }: HtmlFrameProps) {
 	}
 	if (state.kind === 'error') {
 		if (isPreviewTooLarge(state.message)) {
-			return <PreviewTooLargePlate path={path} message={state.message} />;
+			return <CannotPreviewPlate path={path} message={state.message} />;
 		}
 		return (
 			<div className="flex h-full items-start justify-center p-6 text-xs text-destructive">

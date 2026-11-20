@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { AlertCircle, Loader2 } from 'lucide-react';
 import { useTheme } from '@/lib/theme';
 import { fsRead } from '@/lib/tauri-cmd';
-import { PreviewTooLargePlate } from '../chrome/preview-too-large-plate';
+import { CannotPreviewPlate } from '../chrome/cannot-preview-plate';
 import { isPreviewTooLarge } from '../lib/preview-cap';
 import { EditableTextFrame } from '../editing/editable-text-frame';
 import { detectLang } from '../lib/lang';
@@ -70,7 +70,7 @@ function CodeReadOnly({ path, line, col }: { path: string; line?: number; col?: 
 	if (state.kind === 'loading') return <CodeLoading />;
 	if (state.kind === 'error') {
 		if (isPreviewTooLarge(state.message)) {
-			return <PreviewTooLargePlate path={path} message={state.message} />;
+			return <CannotPreviewPlate path={path} message={state.message} />;
 		}
 		return (
 			<div className="flex h-full items-start justify-center p-6 text-xs text-destructive">

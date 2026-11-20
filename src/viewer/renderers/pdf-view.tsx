@@ -20,7 +20,7 @@ import { Button } from '@/components/ui/button';
 import { fsRead } from '@/lib/tauri-cmd';
 import { isBrowserHost } from '@/lib/transport';
 import { downloadLabel, useDownloadFile } from '../chrome/download-file';
-import { PreviewTooLargePlate } from '../chrome/preview-too-large-plate';
+import { CannotPreviewPlate } from '../chrome/cannot-preview-plate';
 import { isPreviewTooLarge } from '../lib/preview-cap';
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -79,7 +79,7 @@ export function PdfView({ path }: PdfViewProps) {
 	}
 	if (state.kind === 'error') {
 		if (isPreviewTooLarge(state.message)) {
-			return <PreviewTooLargePlate path={path} message={state.message} />;
+			return <CannotPreviewPlate path={path} message={state.message} />;
 		}
 		return (
 			<div className="flex h-full items-start justify-center p-6 text-xs text-destructive">

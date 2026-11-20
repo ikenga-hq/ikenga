@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import { FileText, Loader2 } from 'lucide-react';
 import { isRemoteWebSession } from '@/lib/transport';
+import { CannotPreviewPlate } from './chrome/cannot-preview-plate';
 import { basename } from './lib/path';
 import { mimeFromExt, resolveMime } from './lib/mime';
 import { recordViewerOpen, type ViewerRecentSource } from './lib/recents';
@@ -45,6 +46,22 @@ interface ViewerRouterProps {
 
 type Renderer = React.ComponentType<{ path: string }>;
 
+/** Image formats WebKit/Chromium webviews can't draw — straight to the plate. */
+const UNSUPPORTED_IMAGE_EXT = /\.(heic|heif|tiff?)$/i;
+
+export function isUnsupportedImage(path: string): boolean {
+	return UNSUPPORTED_IMAGE_EXT.test(path);
+}
+
+export function UnsupportedImageView({ path }: { path: string }) {
+	return (
+		<CannotPreviewPlate
+			path={path}
+			reason="HEIC, HEIF and TIFF images can't be previewed here. Download the file to open it in another app."
+		/>
+	);
+}
+
 /** Exported for `auto-router.test.ts` — mime/extension → renderer is pure
  *  dispatch logic and the highest-risk part of a router change (a
  *  mis-ordered branch silently mis-routes a whole file class). */
@@ -54,6 +71,7 @@ export function pickRenderer(mime: string, path: string): Renderer {
 	if (mime === 'application/pdf' || lower.endsWith('.pdf')) return PdfView;
 	// .svg is image/* but renders best as a regular image; HTML frame would also
 	// work but the image viewer's zoom/pan is friendlier.
+	if (isUnsupportedImage(path)) return UnsupportedImageView;
 	if (mime.startsWith('image/')) return ImageView;
 	if (mime.startsWith('video/')) return VideoView;
 	if (mime.startsWith('audio/')) return AudioView;
