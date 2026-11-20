@@ -29,6 +29,7 @@ import {
 
 import { D05_FOCUS } from './focus';
 import { Kv, PeopleBlock } from './frame';
+import { consumeShareLanding, markShareLanding, openSharedArtifact } from './share-landing';
 
 /** `access_shares_list`'s `ShareView` (§9.1). */
 export interface ShareView {
@@ -75,6 +76,8 @@ export function bannerLine(s: ShareSelection): string {
 export function openShare(v: ShareView | ShareSelection): void {
 	const sel = 'ownerPrincipalId' in v ? selectionOf(v) : v;
 	setShareMode(sel);
+	// An artifact-scope share lands on its file once the app has reloaded.
+	markShareLanding(sel.projectKey, sel.scope);
 	if (typeof window !== 'undefined') window.location.assign('/');
 }
 
@@ -161,6 +164,12 @@ export function SharedWithYou() {
 export function ShareModeBanner() {
 	const [share, setShare] = useState<ShareSelection | null>(() => currentShare());
 	useEffect(() => onShareModeChange(setShare), []);
+	const landKey = share?.scope === 'artifact' ? share.artifactPath : null;
+	const landProject = share?.projectKey;
+	useEffect(() => {
+		if (!landKey || !landProject) return;
+		if (consumeShareLanding(landProject)) void openSharedArtifact(landKey).catch(() => {});
+	}, [landKey, landProject]);
 	if (!share) return null;
 	return (
 		<div

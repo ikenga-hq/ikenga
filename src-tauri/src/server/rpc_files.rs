@@ -77,6 +77,14 @@ fn resolver(state: &AppState) -> impl Fn(&str) -> Result<PathBuf, String> + Sync
     move |p: &str| state.path_guard.resolve(p)
 }
 
+/// [`resolver`] for the read-only arms (`fs_read`, `fs_stat`, `fs_kind`,
+/// `fs_exists`, `fs_mime`): under an artifact-scope share it also admits the
+/// directory that holds the shared file (WP-12). Never used by a write,
+/// rename, list or search.
+fn read_resolver(state: &AppState) -> impl Fn(&str) -> Result<PathBuf, String> + Sync + '_ {
+    move |p: &str| state.path_guard.resolve_read(p)
+}
+
 /// The desktop answers `"missing"` for an allowlist-rejected path, and so
 /// does this — but only once the allowlist exists: without `--data-dir`
 /// every path would read as missing, which is an answer, not the truth.
@@ -85,7 +93,7 @@ pub(super) async fn fs_read(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let path: String = targ(args, &["path"])?;
         state.path_guard.ready()?;
-        shared_fs::read(&resolver(state), &path).await
+        shared_fs::read(&read_resolver(state), &path).await
     }
     .await;
     // Over the preview cap: a typed refusal (`error_data.code`), so the viewers can
@@ -111,7 +119,7 @@ pub(super) async fn fs_stat(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let path: String = targ(args, &["path"])?;
         state.path_guard.ready()?;
-        shared_fs::stat(&resolver(state), &path).await
+        shared_fs::stat(&read_resolver(state), &path).await
     }
     .await;
     respond("fs_stat", r)
@@ -231,7 +239,7 @@ pub(super) async fn fs_kind(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let path: String = targ(args, &["path"])?;
         state.path_guard.ready()?;
-        Ok(shared_fs::kind(&resolver(state), &path).await)
+        Ok(shared_fs::kind(&read_resolver(state), &path).await)
     }
     .await;
     respond("fs_kind", r)
@@ -249,7 +257,7 @@ pub(super) async fn fs_exists(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let path: String = targ(args, &["path"])?;
         state.path_guard.ready()?;
-        Ok(shared_fs::exists(&resolver(state), &path).await)
+        Ok(shared_fs::exists(&read_resolver(state), &path).await)
     }
     .await;
     respond("fs_exists", r)
@@ -259,7 +267,7 @@ pub(super) fn fs_mime(state: &AppState, args: &Value) -> RpcResponse {
     let r = (|| {
         let path: String = targ(args, &["path"])?;
         state.path_guard.ready()?;
-        shared_fs::mime(&resolver(state), &path)
+        shared_fs::mime(&read_resolver(state), &path)
     })();
     respond("fs_mime", r)
 }
@@ -340,11 +348,13 @@ pub(super) async fn viewer_serve(
             "viewer_serve needs filePath (the page being previewed); reload the app".to_string()
         })?;
         state.path_guard.ready()?;
-        let canonical = state.path_guard.resolve_deep(&root_dir)?;
+        // The read variants: under an artifact-scope share the mount may sit in
+        // the folder that holds the shared file (WP-12), never above it.
+        let canonical = state.path_guard.resolve_deep_read(&root_dir)?;
         if !canonical.is_dir() {
             return Err(format!("not a directory: {}", canonical.display()));
         }
-        let file = state.path_guard.resolve_deep(&file_path)?;
+        let file = state.path_guard.resolve_deep_read(&file_path)?;
         if !file.is_file() {
             return Err(format!("not a file: {}", file.display()));
         }
@@ -935,7 +945,7 @@ pub(super) async fn http_fs_download(
     }
     // Every resolve failure answers the same 404: no oracle for what exists
     // outside the allowlist or the share, and no absolute path in the body.
-    let Ok(resolved) = state.path_guard.resolve(&path) else {
+    let Ok(resolved) = state.path_guard.resolve_read(&path) else {
         return download_refusal(StatusCode::NOT_FOUND, "no such file");
     };
     let Ok(file) = tokio::fs::File::open(&resolved).await else {

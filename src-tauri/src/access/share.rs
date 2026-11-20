@@ -702,7 +702,19 @@ async fn prehook_inner(
         "pin_screenshot_write" => return Ok(PreHook::Answered(RpcResponse::success(Value::Null))),
         _ => {}
     }
-    let narrowed = narrowed_state(state, &target, ACTIONS_ARMS.contains(&cmd))?;
+    let mut narrowed = narrowed_state(state, &target, ACTIONS_ARMS.contains(&cmd))?;
+    if share.artifact_path.is_some() {
+        // WP-12: an artifact-scope share may also READ the folder that holds
+        // the shared file (sibling css / images, `viewer_serve`), unless that
+        // folder is a project root or a home directory.
+        let projects = crate::server::viewer::project_roots(state).await;
+        let home = state.home.as_ref().and_then(|h| h.canonicalize().ok());
+        let mut s = (*narrowed).clone();
+        s.path_guard = s
+            .path_guard
+            .with_sibling_reads(&projects, home.as_deref());
+        narrowed = Arc::new(s);
+    }
     Ok(PreHook::Narrowed(narrowed))
 }
 
