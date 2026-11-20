@@ -52,6 +52,7 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("fs_read", req!(shared[Files])),
     ("fs_list", req!(shared[Files])),
     ("fs_kind", req!(shared[Files])),
+    ("fs_stat", req!(shared[Files])),
     ("fs_mime", req!(shared[Files])),
     ("fs_search", req!(shared[Files])),
     ("fs_roots_list", req!(owner[Files])),

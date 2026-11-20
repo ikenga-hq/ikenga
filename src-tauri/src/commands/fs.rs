@@ -39,6 +39,11 @@ pub struct FileEntry {
 #[tauri::command]
 pub async fn fs_read(path: String) -> Result<FileReadResult, String> {
     let resolved = resolve_allowlisted(&path).map_err(|e| e.to_string())?;
+    // Over the preview cap: the typed refusal the viewers turn into a Download plate.
+    let meta = tokio::fs::metadata(&resolved)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    shared_fs::check_preview_size(meta.len())?;
     let bytes = tokio::fs::read(&resolved)
         .await
         .map_err(|e| format!("read failed: {e}"))?;
@@ -47,6 +52,12 @@ pub async fn fs_read(path: String) -> Result<FileReadResult, String> {
         .essence_str()
         .to_string();
     Ok(FileReadResult { bytes, mime })
+}
+
+/// Size, kind, mtime and MIME of an allowlisted path, without reading it.
+#[tauri::command]
+pub async fn fs_stat(path: String) -> Result<shared_fs::FsStat, String> {
+    shared_fs::stat(&allowlisted, &path).await
 }
 
 /// Cheap existence check. Returns true if the path resolves to a regular file

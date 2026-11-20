@@ -130,6 +130,7 @@ export const RPC_REQUIREMENTS: Readonly<Record<string, ArmRequirement>> = {
 	fs_roots_remove: { caps: ['files', 'settings'], class: 'owner' },
 	fs_roots_reset: { caps: ['files', 'settings'], class: 'owner' },
 	fs_search: { caps: ['files'], class: 'shared' },
+	fs_stat: { caps: ['files'], class: 'shared' },
 	fs_trash: { caps: ['files', 'dispatch'], class: 'shared' },
 	fs_write: { caps: ['files', 'dispatch'], class: 'shared' },
 	git_status: { caps: ['files'], class: 'shared' },

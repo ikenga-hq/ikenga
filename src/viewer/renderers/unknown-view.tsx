@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
 import { File, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { fsRead } from '@/lib/tauri-cmd';
+import { fsStat } from '@/lib/tauri-cmd';
 import { basename } from '../lib/path';
+import { formatBytes } from '../lib/preview-cap';
 import { downloadLabel, useDownloadFile } from '../chrome/download-file';
 
 interface UnknownViewProps {
@@ -15,15 +16,19 @@ export function UnknownView({ path, mime }: UnknownViewProps) {
 	const [resolvedMime, setResolvedMime] = useState<string>(mime ?? 'application/octet-stream');
 	const download = useDownloadFile(path);
 
+	// A stat, not a read: learning the size must not pull the whole file over
+	// the wire (a .docx or .pptx can be hundreds of MB).
 	useEffect(() => {
 		let cancelled = false;
-		fsRead(path)
+		fsStat(path)
 			.then((res) => {
 				if (cancelled) return;
-				setSize(res.bytes.length);
+				setSize(res.size);
 				if (!mime) setResolvedMime(res.mime);
 			})
-			.catch(() => {});
+			.catch(() => {
+				// Size and MIME are decoration; the Download button still works.
+			});
 		return () => {
 			cancelled = true;
 		};
@@ -44,11 +49,4 @@ export function UnknownView({ path, mime }: UnknownViewProps) {
 			</Button>
 		</div>
 	);
-}
-
-function formatBytes(n: number): string {
-	if (n < 1024) return `${n} B`;
-	if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-	if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
-	return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }

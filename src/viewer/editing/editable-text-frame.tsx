@@ -23,6 +23,8 @@ import { CodeEditor, type CodeEditorHandle } from '@ikenga/ui-lib';
 import { ErrorState, LoadingState } from '@/components/states';
 import { focusMarkerProps } from '@/lib/keymap/context-keys';
 import { useCommands } from '@/lib/keymap/dispatcher';
+import { PreviewTooLargePlate } from '../chrome/preview-too-large-plate';
+import { isPreviewTooLarge } from '../lib/preview-cap';
 import { ConflictBanner } from './conflict-banner';
 import { EditorToolbar } from './editor-toolbar';
 import { type EditorLanguage, editorLanguageFor } from './language';
@@ -113,6 +115,9 @@ export function TextDocumentFrame({
 		return <LoadingState data-state="loading" fill heading="Loading…" />;
 	}
 	if (doc.load.kind === 'error') {
+		if (isPreviewTooLarge(doc.load.message)) {
+			return <PreviewTooLargePlate path={path} message={doc.load.message} />;
+		}
 		return (
 			<ErrorState
 				data-state="error"

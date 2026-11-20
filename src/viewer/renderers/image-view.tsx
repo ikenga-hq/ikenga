@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { AlertCircle, Loader2, RotateCcw, ZoomIn, ZoomOut } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { fsRead } from '@/lib/tauri-cmd';
+import { PreviewTooLargePlate } from '../chrome/preview-too-large-plate';
+import { isPreviewTooLarge } from '../lib/preview-cap';
 
 interface ImageViewProps {
 	path: string;
@@ -52,6 +54,9 @@ export function ImageView({ path }: ImageViewProps) {
 		);
 	}
 	if (state.kind === 'error') {
+		if (isPreviewTooLarge(state.message)) {
+			return <PreviewTooLargePlate path={path} message={state.message} />;
+		}
 		return (
 			<div className="flex h-full items-start justify-center p-6 text-xs text-destructive">
 				<AlertCircle className="mr-2 mt-0.5 h-4 w-4 shrink-0" />

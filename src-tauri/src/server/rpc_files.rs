@@ -88,7 +88,33 @@ pub(super) async fn fs_read(state: &AppState, args: &Value) -> RpcResponse {
         shared_fs::read(&resolver(state), &path).await
     }
     .await;
-    respond("fs_read", r)
+    // Over the preview cap: a typed refusal (`error_data.code`), so the viewers can
+    // offer Download instead of showing a bare error.
+    match r {
+        Err(e) if shared_fs::preview_too_large_size(&e).is_some() => {
+            let size = shared_fs::preview_too_large_size(&e);
+            RpcResponse::error_with_data(
+                format!("fs_read: {e}"),
+                Some(serde_json::json!({
+                    "code": shared_fs::PREVIEW_TOO_LARGE,
+                    "size": size,
+                    "limit": shared_fs::FS_PREVIEW_MAX_BYTES,
+                })),
+            )
+        }
+        r => respond("fs_read", r),
+    }
+}
+
+/// `fs_stat`: size, kind, mtime and MIME of an allowlisted path, without reading it.
+pub(super) async fn fs_stat(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let path: String = targ(args, &["path"])?;
+        state.path_guard.ready()?;
+        shared_fs::stat(&resolver(state), &path).await
+    }
+    .await;
+    respond("fs_stat", r)
 }
 
 /// `fs_write`. The desktop command is `fs_write(path, bytes)`, so `bytes` (an array of numbers)
@@ -1894,6 +1920,38 @@ mod tests {
         for spawned in [&camel, &snake] {
             ok(r, "pty_kill", json!({ "id": spawned["pty_id"] })).await;
         }
+    }
+
+    // ── fs_read cap / fs_stat ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fs_read_refuses_over_the_cap_with_a_typed_error_and_stat_reports_size() {
+        let d = daemon();
+        let r = &d.router;
+        let big = d.allowed.join("big.bin");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(shared_fs::FS_PREVIEW_MAX_BYTES + 1)
+            .unwrap();
+        std::fs::write(d.allowed.join("a.txt"), b"hello").unwrap();
+
+        let res = rpc(r, "fs_read", json!({ "path": s(&big) })).await;
+        assert_eq!(res["ok"], false, "{res}");
+        assert_eq!(res["error_data"]["code"], "preview_too_large", "{res}");
+        assert_eq!(
+            res["error_data"]["size"],
+            shared_fs::FS_PREVIEW_MAX_BYTES + 1
+        );
+        let small = ok(r, "fs_read", json!({ "path": s(&d.allowed.join("a.txt")) })).await;
+        assert_eq!(small["bytes"].as_array().unwrap().len(), 5);
+
+        let st = ok(r, "fs_stat", json!({ "path": s(&big) })).await;
+        assert_eq!(st["size"], shared_fs::FS_PREVIEW_MAX_BYTES + 1);
+        assert_eq!(st["isDir"], false);
+        // A path outside the allowlist is refused, not answered.
+        std::fs::write(d.outside.join("secret.txt"), b"s").unwrap();
+        let e = err(r, "fs_stat", json!({ "path": s(&d.outside.join("secret.txt")) })).await;
+        assert!(e.starts_with("fs_stat:"), "{e}");
     }
 
     // ── fs_kind / fs_mime ──────────────────────────────────────────────────

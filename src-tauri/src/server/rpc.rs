@@ -848,6 +848,7 @@ pub async fn rpc_handler(
         "fs_trash" => rpc_files::fs_trash(&state, &payload.args).await,
         "fs_list" => rpc_files::fs_list(&state, &payload.args).await,
         "fs_kind" => rpc_files::fs_kind(&state, &payload.args).await,
+        "fs_stat" => rpc_files::fs_stat(&state, &payload.args).await,
         "fs_mime" => rpc_files::fs_mime(&state, &payload.args),
         "fs_search" => rpc_files::fs_search(&state, &payload.args).await,
         "fs_rename" => rpc_files::fs_rename(&state, &payload.args).await,

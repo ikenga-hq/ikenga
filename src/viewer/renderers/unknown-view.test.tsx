@@ -14,8 +14,15 @@ vi.mock('@/lib/transport', () => ({
 vi.mock('@/lib/transport/fs-download', () => ({
 	downloadFile: (path: string) => host.openLocalPath(path, { kind: 'file' }),
 }));
+const rpc = vi.hoisted(() => ({
+	fsStat: vi.fn(async (_p: string) => ({ size: 3, isDir: false, modifiedMs: 0, mime: 'application/zip' })),
+	fsRead: vi.fn(async () => {
+		throw new Error('unknown view must stat, not read');
+	}),
+}));
 vi.mock('@/lib/tauri-cmd', () => ({
-	fsRead: vi.fn(async () => ({ bytes: [1, 2, 3], mime: 'application/zip' })),
+	fsStat: rpc.fsStat,
+	fsRead: rpc.fsRead,
 }));
 
 import { UnknownView } from './unknown-view';
@@ -27,6 +34,15 @@ beforeEach(() => {
 	while (useToastStore.getState().queue.length) dismissToast();
 });
 afterEach(cleanup);
+
+describe('UnknownView — size', () => {
+	it('learns the size from a stat and never reads the file', async () => {
+		render(<UnknownView path="/home/u/big.docx" />);
+		await screen.findByText(/application\/zip · 3 B/);
+		expect(rpc.fsStat).toHaveBeenCalledWith('/home/u/big.docx');
+		expect(rpc.fsRead).not.toHaveBeenCalled();
+	});
+});
 
 describe('UnknownView — open in default app', () => {
 	it('desktop: hands the path to the OS opener', async () => {
