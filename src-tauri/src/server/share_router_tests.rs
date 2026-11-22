@@ -706,3 +706,190 @@ async fn a_share_member_download_is_narrowed_to_the_shared_project() {
     assert_eq!(status, 200);
     assert_eq!(body, b"the Owner's other file");
 }
+
+/// A Guest's request through an artifact-scope share of `artifact`
+/// (project-relative), as the broker relays it into the Owner's child.
+async fn call_artifact(c: &Child, artifact: &str, cmd: &str, args: Value) -> Value {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/rpc")
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/json")
+        .header("x-ikenga-principal", PrincipalId::new_v7().to_string())
+        .header("x-ikenga-caps", "files")
+        .header("x-ikenga-share-project", PROJECT)
+        .header(
+            "x-ikenga-share-principal",
+            PrincipalId::new_v7().to_string(),
+        )
+        .header("x-ikenga-share-device", "-")
+        .header("x-ikenga-share-role", "guest")
+        .header("x-ikenga-share-artifact", artifact);
+    let res = c
+        .router
+        .clone()
+        .oneshot(
+            req.body(Body::from(json!({ "cmd": cmd, "args": args }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// `GET /__viewer/<token>/<rel>`: the status a mounted path answers.
+async fn viewer_get(c: &Child, url: &str, rel: &str) -> u16 {
+    let res = c
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("{url}{rel}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    res.status().as_u16()
+}
+
+/// The quiet refusal a share member gets for anything outside the share.
+fn refused_quietly(v: &Value) -> bool {
+    v["ok"] == false
+        && v["error"]
+            .as_str()
+            .is_some_and(|e| e.ends_with(super::rpc_shell::SHARE_REFUSAL))
+}
+
+/// Live defects D1/D2 (box-files): a Guest shared ONE file that sits in its
+/// project root. A relative path resolves against the project root (the
+/// artifact path is project-relative), the files beside the shared one read
+/// (fs_read and the viewer mount, so markdown / html assets load), and
+/// nothing else does: no sub-folder, no parent, no home, no `/etc`, no
+/// `..` climb, no listing.
+#[tokio::test]
+async fn an_artifact_guest_reads_its_file_relatively_and_the_files_beside_it() {
+    let c = child().await;
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    write(
+        &c.project.join("notes.md"),
+        "# Notes\n\n![chart](./chart.png)\n",
+    );
+    write(&c.project.join("chart.png"), "png bytes");
+    let home_file = c
+        .project
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("home/home-secret.txt");
+    write(&home_file, "home");
+    let guest = |cmd: &'static str, args: Value| {
+        let c = &c;
+        async move { call_artifact(c, "notes.md", cmd, args).await }
+    };
+
+    // D1: the shared file by its project-relative path, and absolutely.
+    for p in [
+        "notes.md",
+        "./notes.md",
+        s(&c.project.join("notes.md")).as_str(),
+    ] {
+        let r = guest("fs_read", json!({ "path": p })).await;
+        assert_eq!(r["ok"], true, "{p}: {r}");
+        assert!(read_text(&r).starts_with("# Notes"), "{p}");
+    }
+    let st = guest("fs_stat", json!({ "path": "notes.md" })).await;
+    assert_eq!(st["ok"], true, "{st}");
+
+    // D2: a file beside it, both spellings.
+    for p in ["chart.png", s(&c.project.join("chart.png")).as_str()] {
+        let r = guest("fs_read", json!({ "path": p })).await;
+        assert_eq!(r["ok"], true, "{p}: {r}");
+        assert_eq!(read_text(&r), "png bytes");
+    }
+
+    // Still refused, every one with the same quiet text.
+    let refusals = [
+        s(&c.project.join("docs/brief.md")), // a sub-folder of the root
+        "docs/brief.md".to_string(),
+        s(&c.outside), // beside the project folder
+        "../not-shared.txt".to_string(),
+        "x/../../not-shared.txt".to_string(),
+        "docs/../../not-shared.txt".to_string(),
+        s(&home_file),
+        "/etc/hostname".to_string(),
+        "~/home-secret.txt".to_string(),
+    ];
+    for p in &refusals {
+        let r = guest("fs_read", json!({ "path": p })).await;
+        assert!(refused_quietly(&r), "{p}: {r}");
+        assert!(!r.to_string().contains(&s(&c.project)), "{p}: {r}");
+    }
+    let list = guest("fs_list", json!({ "dir": s(&c.project) })).await;
+    assert!(refused_quietly(&list), "a listing names no sibling: {list}");
+    let list = guest("fs_list", json!({ "dir": "." })).await;
+    assert!(refused_quietly(&list), "{list}");
+    let write_sib = guest(
+        "fs_write",
+        json!({ "path": "chart.png", "contents": [1, 2, 3] }),
+    )
+    .await;
+    assert_eq!(
+        write_sib["ok"], false,
+        "sibling grant is read-only: {write_sib}"
+    );
+
+    // The viewer mount of the file's folder serves the files beside it and
+    // nothing below them.
+    let mount = guest(
+        "viewer_serve",
+        json!({ "rootDir": s(&c.project), "filePath": s(&c.project.join("notes.md")) }),
+    )
+    .await;
+    assert_eq!(mount["ok"], true, "{mount}");
+    let url = mount["data"]["url"].as_str().unwrap().to_string();
+    assert_eq!(viewer_get(&c, &url, "notes.md").await, 200);
+    assert_eq!(viewer_get(&c, &url, "chart.png").await, 200);
+    assert_eq!(viewer_get(&c, &url, "docs/brief.md").await, 404);
+    assert_eq!(viewer_get(&c, &url, "docs/").await, 404);
+    // A mount above the folder is refused outright.
+    let wide = guest(
+        "viewer_serve",
+        json!({ "rootDir": s(c.project.parent().unwrap()), "filePath": s(&c.project.join("notes.md")) }),
+    )
+    .await;
+    assert!(refused_quietly(&wide), "{wide}");
+}
+
+/// The nested case keeps its folder grant and refuses the folder's parent:
+/// a Guest shared `docs/brief.md` reads `docs/` (and below) but not a file
+/// in the project root, and its relative paths are project-relative too.
+#[tokio::test]
+async fn an_artifact_guest_in_a_sub_folder_reads_that_folder_only() {
+    let c = child().await;
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    write(&c.project.join("docs/img/a.png"), "a");
+    write(&c.project.join("top.md"), "top");
+    let guest = |cmd: &'static str, args: Value| {
+        let c = &c;
+        async move { call_artifact(c, "docs/brief.md", cmd, args).await }
+    };
+    for p in ["docs/brief.md", "docs/img/a.png"] {
+        let r = guest("fs_read", json!({ "path": p })).await;
+        assert_eq!(r["ok"], true, "{p}: {r}");
+    }
+    for p in [
+        "top.md".to_string(),
+        s(&c.project.join("top.md")),
+        "docs/../top.md".to_string(),
+        "brief.md".to_string(), // relative to the project root, not docs/
+    ] {
+        let r = guest("fs_read", json!({ "path": p })).await;
+        assert!(refused_quietly(&r), "{p}: {r}");
+    }
+}
