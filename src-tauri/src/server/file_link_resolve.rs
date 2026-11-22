@@ -122,7 +122,7 @@ fn open_exact(canonical: &Path) -> Result<(std::fs::File, std::fs::Metadata), Re
     }
     // A-01: the handle's own metadata (fstat), checked before the size so a
     // file of another uid reveals nothing, not even that it is too large.
-    if !owned_by_self(&meta) {
+    if !owned_by_self(&meta) || has_other_names(&meta) {
         return Err(Refusal::NotLinkable);
     }
     let named = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
@@ -140,6 +140,15 @@ fn owned_by_self(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: geteuid has no preconditions and cannot fail.
     meta.uid() == unsafe { libc::geteuid() }
+}
+
+/// Whether the open file has more than one name (a hard link). A second name
+/// lets a file that lives in a hidden folder or in the account's own data dir
+/// be reached through a normal folder, past the path rules (A-14, N-06).
+#[cfg(target_os = "linux")]
+fn has_other_names(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.nlink() > 1
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -467,6 +476,21 @@ mod tests {
         let l = run_wide(&s(&f.home.join("r.pdf"))).unwrap();
         assert_eq!(l.canonical, f.home.join("r.pdf"));
         assert!(owned_by_self(&l.file.metadata().unwrap()));
+
+        // N-06 / A-14: a second name for the same file is refused under either
+        // name, at create and at the stored-path read; removing it restores it.
+        let hl = f.home.join("r-hardlink.pdf");
+        std::fs::hard_link(f.home.join("r.pdf"), &hl).unwrap();
+        for p in [s(&hl), s(&f.home.join("r.pdf"))] {
+            assert_eq!(run_wide(&p).unwrap_err(), Refusal::NotLinkable, "{p}");
+            assert_eq!(
+                check(&wide, Some(&f.home), &p, Some(Path::new(&p)), LINK_MAX_BYTES).unwrap_err(),
+                Refusal::NotLinkable,
+                "{p}"
+            );
+        }
+        std::fs::remove_file(&hl).unwrap();
+        assert!(run_wide(&s(&f.home.join("r.pdf"))).is_ok());
     }
 
     #[test]
