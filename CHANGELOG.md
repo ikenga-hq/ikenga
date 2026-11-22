@@ -1,5 +1,16 @@
 # ikenga-desktop
 
+## 0.32.1
+
+### Patch Changes
+
+- 2b9df11: The provisioner now writes `IKENGA_FILE_LINKS=true`. It wrote `1`, which the server rejects at startup, so turning outside links on with `FILE_LINKS="1"` in a profile would have stopped the server from starting.
+- 2b9df11: Checking an outside link without fetching it no longer counts as someone opening it. A HEAD request, which link scanners and chat previews often send, used to raise the open and download counts, write an "opened" entry in the activity log and send you a "Someone opened your link" notification even though no file was sent. It now gets the same answer as before and records nothing.
+- 2b9df11: An outside link can no longer point at a file that has more than one name (a hard link). A hard link placed in a normal folder could expose a file from a hidden folder or from the account's own internal data.
+- 2b9df11: Outside links now answer every unusual request the same way. An OPTIONS request to a link address got an empty "OK" from the server instead of the usual "This link isn't available" page, and the refusal of a passcode sent from another website lacked the headers that keep link pages out of search engines, browser caches and referrer logs. Both now get the same treatment as every other link answer.
+- 2b9df11: An outside link can now only point at a file your own account owns. Before, an account could add a system folder such as `/etc` to its file roots and then share files it did not own, like `/etc/passwd`. The server now checks who owns the file both when the link is made and every time someone opens it, and a file that fails the check gets the same "not available" answer as any other link that can't be opened.
+- 2b9df11: The Share sheet no longer breaks its layout when an invite link is shown. A long link stretched the sheet's contents past its edge, pushing the "What they will be able to see" list and the Done button outside it.
+
 ## 0.32.0
 
 ### Minor Changes
