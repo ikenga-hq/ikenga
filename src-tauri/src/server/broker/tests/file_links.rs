@@ -1443,3 +1443,60 @@ async fn ls24_the_first_open_notifies_exactly_once() {
     assert_eq!(got[0].2["body"], "r.pdf");
     assert!(counters(&h, &link_id).await.2.is_some());
 }
+
+/// A-04: a HEAD on the page, `/view` and `/download` answers the GET's
+/// status and headers but is not an open: no counter, no `first_opened_at`,
+/// no audit row, no notification. The GETs after it still count.
+#[tokio::test]
+async fn a04_head_is_not_an_open() {
+    let calls = Arc::new(RecordingCalls::default());
+    let h = harness_with(true, Some(calls.clone())).await;
+    let (t, link_id) = pdf_link(&h).await;
+    let from = ip(70);
+    let mut heads = Vec::new();
+    for suffix in ["", "/view", "/download"] {
+        // (The body is dropped by hyper on the wire; `oneshot` skips hyper.)
+        let (s, hd, _) = send(
+            &h.app,
+            req("HEAD", &format!("/s/{t}{suffix}"), from)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "HEAD {suffix}");
+        heads.push(hd);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        link_audit_rows(&h).await.is_empty(),
+        "a HEAD writes no audit row"
+    );
+    assert_eq!(counters(&h, &link_id).await, (0, 0, None, None));
+    assert!(
+        calls.calls.lock().unwrap().is_empty(),
+        "a HEAD notifies nobody"
+    );
+    assert_eq!(
+        h.launcher.reads.lock().unwrap().len(),
+        2,
+        "the byte HEADs still asked the child (same answer as a GET)"
+    );
+
+    // The same headers as the GET, and the GETs are opens.
+    for (i, suffix) in ["", "/view", "/download"].iter().enumerate() {
+        let (s, hd, _) = get_from(&h, &format!("/s/{t}{suffix}"), from, None).await;
+        assert_eq!(s, StatusCode::OK, "GET {suffix}");
+        assert_eq!(without_date(&heads[i]), without_date(&hd), "{suffix}");
+    }
+    wait_rows(&h, 3).await;
+    let (opens, downloads, first, _) = counters(&h, &link_id).await;
+    assert_eq!((opens, downloads), (2, 1));
+    assert!(first.is_some());
+    for _ in 0..200 {
+        if !calls.calls.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(calls.calls.lock().unwrap().len(), 1);
+}
