@@ -1,5 +1,13 @@
 # ikenga-desktop
 
+## 0.32.2
+
+### Patch Changes
+
+- d5d4f2a: A shared file that sits in its project's top folder now loads the images and styles beside it, and nothing in the folders below.
+- d5d4f2a: Accepting an invite to one shared file now opens that file, and the Files panel lists it instead of showing an error.
+- d5d4f2a: A teammate given one shared file can now open it by its project-relative path, such as `notes.md`.
+
 ## 0.32.1
 
 ### Patch Changes
