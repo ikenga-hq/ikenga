@@ -298,7 +298,7 @@ export function ShareKolaSheet({
 			<Dialog open={open} onOpenChange={onOpenChange}>
 				<DialogContent
 					data-state="share-kola"
-					className={`${D05_FOCUS} max-w-[760px] bg-[var(--bg-surface)] text-[var(--fg)] sm:max-w-[760px]`}
+					className={`${D05_FOCUS} max-w-[760px] [&>*]:min-w-0 bg-[var(--bg-surface)] text-[var(--fg)] sm:max-w-[760px]`}
 				>
 					<DialogHeader>
 						<DialogTitle className="flex items-center gap-2">
@@ -312,7 +312,7 @@ export function ShareKolaSheet({
 							An invite is single-use and expires. Role and scope are fixed when you create it.
 						</DialogDescription>
 					</DialogHeader>
-					<div className={cn('grid gap-5', !showOutside && 'md:grid-cols-[1fr_260px]')}>
+					<div className={cn('grid gap-5', !showOutside && 'md:grid-cols-[minmax(0,1fr)_260px]')}>
 						<div className="space-y-3">
 							<Row label="How">
 								<div className="inline-flex rounded-[var(--radius-sm)] border border-[var(--border)]">
