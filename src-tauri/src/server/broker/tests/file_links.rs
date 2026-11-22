@@ -1489,7 +1489,16 @@ async fn ls23_a_page_view_and_a_lock_are_audited() {
     let rows = wait_rows(&h, 1).await;
     assert_eq!(rows[0].0, "link.opened");
     assert!(rows[0].5.contains("\"mode\":\"page\""));
-    assert_eq!(counters(&h, &link_id).await.0, 1);
+    // The counter is written after the audit row; wait for it rather than read at once.
+    let mut opens = 0;
+    for _ in 0..200 {
+        opens = counters(&h, &link_id).await.0;
+        if opens == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(opens, 1);
 
     let (pt, plink) = passcode_link(&h, "p.pdf").await;
     // 20 wrong guesses across addresses lock the link (LS-11's recipe).
