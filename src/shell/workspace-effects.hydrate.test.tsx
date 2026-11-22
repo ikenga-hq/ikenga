@@ -11,6 +11,7 @@ import type { PaneTreeSnapshot } from '@/lib/panes/pane-persistence';
 const h = vi.hoisted(() => ({
 	web: true,
 	snapshot: null as PaneTreeSnapshot | null,
+	loadDelayMs: 0,
 }));
 
 vi.mock('@/lib/transport', async (orig) => ({
@@ -20,7 +21,10 @@ vi.mock('@/lib/transport', async (orig) => ({
 }));
 vi.mock('@/lib/panes/pane-persistence', async (orig) => ({
 	...(await orig<typeof import('@/lib/panes/pane-persistence')>()),
-	loadPaneTree: vi.fn(async () => h.snapshot),
+	loadPaneTree: vi.fn(async () => {
+		if (h.loadDelayMs) await new Promise((r) => setTimeout(r, h.loadDelayMs));
+		return h.snapshot;
+	}),
 	persistPaneTree: vi.fn(),
 }));
 vi.mock('@/lib/panes/router-pane-sync', () => ({ useRouterPaneSync: () => {} }));
@@ -40,13 +44,19 @@ vi.mock('@/lib/shell/panel-sizes', () => ({
 	registerPanelSizesSetter: () => () => {},
 }));
 vi.mock('@/terminal/claude-settings', () => ({ loadClaudeSettingsPath: vi.fn(async () => null) }));
+vi.mock('@/lib/tauri-cmd', async (orig) => ({
+	...(await orig<typeof import('@/lib/tauri-cmd')>()),
+	projectGetActive: vi.fn(async () => ({ id: 'p', root_path: '/srv/proj' })),
+}));
 vi.mock('@/terminal/session-store', () => ({
 	useTerminalStore: { getState: () => ({ rehydrated: true }) },
 }));
 
-import { makeLeaf } from '@/lib/panes/pane-reducer';
+import { resetLayoutRestoredForTests } from '@/lib/panes/layout-restored';
+import { findLeaf, makeLeaf } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import type { LeafNode, PaneNode } from '@/lib/panes/types';
+import { openSharedArtifact } from './people/share-landing';
 import { useWorkspaceEffects } from './workspace-effects';
 
 // useWorkspaceEffects reads the query client (remote focus refetch).
@@ -67,6 +77,8 @@ beforeEach(() => {
 		sizes: [50, 50],
 	};
 	h.snapshot = { root, focusedId: routePane.id, closedHistory: [] };
+	h.loadDelayMs = 0;
+	resetLayoutRestoredForTests();
 	// The page's first pane, opened on the URL's route before the layout loads.
 	const first = makeLeaf({ kind: 'route', path: '/ngwa/health' });
 	usePaneStore.getState().hydrate({ root: first, focusedId: first.id, closedHistory: [] });
@@ -89,5 +101,25 @@ describe('useWorkspaceEffects layout restore', () => {
 		renderHook(() => useWorkspaceEffects(() => {}), { wrapper });
 		await waitFor(() => expect(usePaneStore.getState().focusedId).toBe(routePane.id));
 		expect(usePaneStore.getState().focusedView()).toEqual({ kind: 'route', path: '/settings' });
+	});
+
+	// Live defect D3: a Guest accepting an artifact invite reloads into the
+	// share and the landing opens the shared file at boot, while the layout is
+	// still being restored. The restore replaces the whole pane tree, so the
+	// landing must open the file after it, not before.
+	it('the share landing opened at boot survives the layout restore', async () => {
+		h.web = true;
+		h.loadDelayMs = 50; // the saved layout arrives over the network
+		renderHook(() => useWorkspaceEffects(() => {}), { wrapper });
+		const landed = openSharedArtifact('notes.md');
+		await expect(landed).resolves.toBe(true);
+		// Past the restore, whichever finished first.
+		await new Promise((r) => setTimeout(r, 4 * h.loadDelayMs));
+		const s = usePaneStore.getState();
+		const leaf = findLeaf(s.root, s.focusedId);
+		expect(leaf?.tabs[leaf.activeTabIdx]).toMatchObject({
+			kind: 'artifact',
+			path: '/srv/proj/notes.md',
+		});
 	});
 });

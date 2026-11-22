@@ -31,6 +31,10 @@ pub enum MountScope {
     Tree,
     /// Only this canonical file; every other path under the mount is a 404.
     SingleFile(PathBuf),
+    /// Only the files directly in this canonical folder (the mount root):
+    /// no sub-folder and nothing under one. An artifact share of a file in
+    /// its project root reads exactly this (`PathGuard::share_mount_scope`).
+    Folder(PathBuf),
 }
 
 /// The deepest project root (from the host's `projects` table) that contains
@@ -163,6 +167,9 @@ pub fn may_serve(scope: &MountScope, target: &Path) -> bool {
     match scope {
         MountScope::Tree => true,
         MountScope::SingleFile(only) => target == only,
+        MountScope::Folder(dir) => {
+            target == dir || (target.parent() == Some(dir.as_path()) && !target.is_dir())
+        }
     }
 }
 
@@ -351,5 +358,26 @@ mod tests {
             &MountScope::SingleFile(p("/h/u/.ssh/id_rsa")),
             Path::new("/h/u/.ssh/id_rsa")
         ));
+    }
+
+    /// A `Folder` mount serves the folder's own files and nothing in a
+    /// sub-folder (an artifact share of a file in its project root).
+    #[test]
+    fn a_folder_mount_serves_only_the_files_directly_in_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.png"), "a").unwrap();
+        std::fs::write(dir.join("sub/b.png"), "b").unwrap();
+        let scope = MountScope::Folder(dir.clone());
+        assert!(
+            may_serve(&scope, &dir),
+            "the mount root (its index.html is checked next)"
+        );
+        assert!(may_serve(&scope, &dir.join("a.png")));
+        assert!(!may_serve(&scope, &dir.join("sub")));
+        assert!(!may_serve(&scope, &dir.join("sub/b.png")));
+        assert!(!may_serve(&scope, dir.parent().unwrap()));
+        assert!(!may_serve(&scope, &dir.join(".env")));
     }
 }

@@ -702,11 +702,12 @@ async fn prehook_inner(
         "pin_screenshot_write" => return Ok(PreHook::Answered(RpcResponse::success(Value::Null))),
         _ => {}
     }
-    let mut narrowed = narrowed_state(state, &target, ACTIONS_ARMS.contains(&cmd))?;
+    let mut narrowed = narrowed_state(state, &root, &target, ACTIONS_ARMS.contains(&cmd))?;
     if share.artifact_path.is_some() {
         // WP-12: an artifact-scope share may also READ the folder that holds
-        // the shared file (sibling css / images, `viewer_serve`), unless that
-        // folder is a project root or a home directory.
+        // the shared file (sibling css / images, `viewer_serve`): only the
+        // files directly in it when that folder is the project root, nothing
+        // when it is a home directory (`PathGuard::with_sibling_reads`).
         let projects = crate::server::viewer::project_roots(state).await;
         let home = state.home.as_ref().and_then(|h| h.canonicalize().ok());
         let mut s = (*narrowed).clone();
@@ -719,12 +720,15 @@ async fn prehook_inner(
 }
 
 /// The cloned `AppState` a share request runs on: its `path_guard`
-/// narrowed to `target` (`PathGuard::narrowed_to`) and — for the
+/// narrowed to `target` (`PathGuard::narrowed_to`), with a member's
+/// relative paths joined to the shared project root (an artifact path is
+/// project-relative, so `notes.md` names the shared file) and — for the
 /// `actions_*` arms, whose manager captured the router's guard when it was
 /// built — a per-request actions manager on that narrowed guard, with no
 /// personal home (§4.5.4 "Paths the cloned guard does not reach").
 fn narrowed_state(
     state: &Arc<crate::server::AppState>,
+    root: &ShareRoot,
     target: &Path,
     rebuild_actions: bool,
 ) -> Result<Arc<crate::server::AppState>, AccessError> {
@@ -732,6 +736,7 @@ fn narrowed_state(
     s.path_guard = state
         .path_guard
         .narrowed_to(target)
+        .and_then(|g| g.with_share_root(&root.root))
         .map_err(|e| AccessError::new(Code::NotFound, e))?;
     if rebuild_actions {
         s.actions = actions_manager(&s);

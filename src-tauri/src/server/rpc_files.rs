@@ -366,7 +366,8 @@ pub(super) async fn viewer_serve(
             &projects,
             home.as_deref(),
         ) {
-            Ok(scope) => scope,
+            // A share member's mount serves no more than its guard reads.
+            Ok(scope) => state.path_guard.share_mount_scope(&canonical, scope),
             Err(e) => {
                 tracing::warn!(
                     "viewer_serve: refused root {} for {}: {e}",

@@ -20,7 +20,7 @@ import { useShellStore } from '@/lib/shell/shell-store';
 import { useFilesStore } from '@/lib/shell/files-store';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { fsList, fsRootsList, fsSearch, type FileEntry } from '@/lib/tauri-cmd';
-import { isRemoteWebSession } from '@/lib/transport';
+import { currentShare, isRemoteWebSession } from '@/lib/transport';
 import { homeDir } from '@/lib/transport/path-shim';
 import { isDefaultProject } from '@/lib/ngwa/use-store-install';
 import { accessStatus } from '@/lib/access/client';
@@ -65,6 +65,7 @@ import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import { copyText } from '@/lib/clipboard';
 import { downloadLabel, downloadWithFeedback } from '@/viewer/chrome/download-file';
 import { requestShareFile, useCanShareFile } from '@/shell/people/share-file';
+import { sharedArtifactEntry } from '@/shell/people/share-landing';
 
 // Folders we never auto-list by default. The dot-file filter already catches
 // `.git`, `.next`, `.cache`, `.turbo`, etc.; this catches the un-prefixed ones
@@ -844,15 +845,18 @@ function RootSection({ rootPath, isOpen, stickyEdge }: RootSectionProps) {
 		() => (list: FileEntry[]) => sortEntries(list, { showHidden, showIgnored }),
 		[showHidden, showIgnored]
 	);
+	// An artifact-scope share may not list the project: the tree is the one
+	// shared file (fixed for the page's life — entering a share reloads).
+	const sharedFile = useMemo(() => sharedArtifactEntry(rootPath, currentShare()), [rootPath]);
 	const rootQuery = useQuery({
 		queryKey: queryKeys.fs.list(rootPath),
 		queryFn: () => fsList(rootPath),
-		enabled: isOpen,
+		enabled: isOpen && !sharedFile,
 		staleTime: 30_000,
 		select: selectSorted,
 	});
 
-	const searchActive = storedQuery.length > 0;
+	const searchActive = storedQuery.length > 0 && !sharedFile;
 	const searchQuery = useQuery({
 		queryKey: queryKeys.fs.search(rootPath, storedQuery, showHidden, showIgnored),
 		queryFn: () => fsSearch(rootPath, storedQuery, showHidden, showIgnored),
@@ -885,7 +889,10 @@ function RootSection({ rootPath, isOpen, stickyEdge }: RootSectionProps) {
 			? rootQuery.error.message
 			: String(rootQuery.error)
 		: null;
-	const entries = rootQuery.data;
+	const entries = useMemo(
+		() => (sharedFile ? [sharedFile] : rootQuery.data),
+		[sharedFile, rootQuery.data]
+	);
 
 	const visibleEntries = useMemo(() => {
 		if (!entries) return entries;

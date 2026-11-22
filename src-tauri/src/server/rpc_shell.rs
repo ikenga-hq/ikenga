@@ -93,12 +93,42 @@ pub(crate) struct PathGuard {
     /// project's root, or the one artifact for artifact scope. `None` for
     /// every own-workspace guard. Set only by [`PathGuard::narrowed_to`].
     narrow: Option<std::sync::Arc<Narrow>>,
-    /// WP-12: for an artifact-scope share (`Narrow::File`), the canonical
-    /// directory that holds the shared file. READS of anything under it are
-    /// admitted ([`PathGuard::resolve_read`] and friends), so a shared page's
-    /// sibling css / images load. Writes, listings and every other
-    /// resolver stay exact-file. Set only by [`PathGuard::with_sibling_reads`].
-    siblings: Option<PathBuf>,
+    /// WP-12: for an artifact-scope share (`Narrow::File`), what READS in the
+    /// canonical directory that holds the shared file are admitted
+    /// ([`PathGuard::resolve_read`] and friends), so a shared page's sibling
+    /// css / images load. Writes, listings and every other resolver stay
+    /// exact-file. Set only by [`PathGuard::with_sibling_reads`].
+    siblings: Option<Siblings>,
+    /// Where a share member's RELATIVE path is joined: the shared project
+    /// root. For a tree share it is the narrow root itself; an artifact share
+    /// sets it with [`PathGuard::with_share_root`] (artifact paths are
+    /// project-relative). `None` everywhere else.
+    rel_base: Option<PathBuf>,
+}
+
+/// The WP-12 sibling grant of an artifact-scope share (canonical folder).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Siblings {
+    /// The shared file sits below the project root: everything under its
+    /// folder (assets in `img/` and the like).
+    Tree(PathBuf),
+    /// The shared file sits directly in the project root: only the files
+    /// directly in that folder. A tree grant there would be the whole
+    /// project, which an artifact share is not.
+    Flat(PathBuf),
+}
+
+impl Siblings {
+    /// Whether a READ of `canonical` falls inside the grant.
+    fn admits(&self, canonical: &Path) -> bool {
+        match self {
+            Siblings::Tree(d) => canonical.starts_with(d),
+            Siblings::Flat(d) => {
+                canonical == d.as_path()
+                    || (canonical.parent() == Some(d.as_path()) && canonical.is_file())
+            }
+        }
+    }
 }
 
 /// What a share member sees for every refused path, missing or forbidden
@@ -147,6 +177,7 @@ impl PathGuard {
             reserved: Default::default(),
             narrow: None,
             siblings: None,
+            rel_base: None,
         }
     }
 
@@ -158,6 +189,7 @@ impl PathGuard {
             reserved: Default::default(),
             narrow: None,
             siblings: None,
+            rel_base: None,
         }
     }
 
@@ -192,19 +224,46 @@ impl PathGuard {
                 return Err(format!("{} is outside the share", inner.display()));
             }
         }
+        let rel_base = match &narrow {
+            Narrow::Tree(root) => Some(root.clone()),
+            Narrow::File(_) => None,
+        };
         Ok(Self {
             narrow: Some(std::sync::Arc::new(narrow)),
             siblings: None,
+            rel_base,
             ..self.clone()
         })
     }
 
+    /// For a guard narrowed to one file (artifact scope): join a member's
+    /// RELATIVE paths to the shared project `root`, the base the artifact
+    /// path itself is relative to. Only the base moves: what a resolved path
+    /// may reach is still decided by the narrow (and the sibling grant).
+    /// Refused unless `root` holds the file; a tree guard must be narrowed
+    /// to `root` itself and is returned unchanged.
+    pub(crate) fn with_share_root(&self, root: &Path) -> Result<Self, String> {
+        let c = root
+            .canonicalize()
+            .map_err(|e| format!("share root {}: {e}", root.display()))?;
+        match self.narrow.as_deref() {
+            Some(Narrow::File(file)) if file.starts_with(&c) => Ok(Self {
+                rel_base: Some(c),
+                ..self.clone()
+            }),
+            Some(Narrow::Tree(t)) if *t == c => Ok(self.clone()),
+            _ => Err(format!("{} does not hold the share", c.display())),
+        }
+    }
+
     /// WP-12: for a guard narrowed to one file, additionally admit READS
     /// under the directory that holds it — never writes, never anything
-    /// above. Refused (the guard is returned unchanged, exact-file) when that
-    /// directory is a project root, or is too broad to serve a tree from (a
-    /// home directory, an ancestor of it, a top-level directory): the same
-    /// rules `viewer_serve` applies ([`crate::viewer_guard::resolve_mount`]).
+    /// above. When that directory is the file's project root, only the files
+    /// directly in it ([`Siblings::Flat`]: a tree grant there would read the
+    /// whole project). Refused (the guard is returned unchanged, exact-file)
+    /// when the directory is too broad to serve a tree from (a home
+    /// directory, an ancestor of it, a top-level directory): the same rules
+    /// `viewer_serve` applies ([`crate::viewer_guard::resolve_mount`]).
     /// A guard that is not file-narrowed is returned unchanged.
     pub(crate) fn with_sibling_reads(
         &self,
@@ -219,28 +278,53 @@ impl PathGuard {
         let Some(dir) = file.parent() else {
             return g;
         };
-        if crate::viewer_guard::project_root_of(file, project_roots, home)
-            .is_some_and(|r| r == dir)
-        {
-            return g;
-        }
-        if matches!(
+        if !matches!(
             crate::viewer_guard::resolve_mount(dir, file, project_roots, home),
             Ok(crate::viewer_guard::MountScope::Tree)
         ) {
-            g.siblings = Some(dir.to_path_buf());
+            return g;
         }
+        // A file straight in its project root reads the files beside it and
+        // nothing below them: a tree grant there would be the whole project.
+        let in_project_root = crate::viewer_guard::project_root_of(file, project_roots, home)
+            .is_some_and(|r| r == dir);
+        g.siblings = Some(if in_project_root {
+            Siblings::Flat(dir.to_path_buf())
+        } else {
+            Siblings::Tree(dir.to_path_buf())
+        });
         g
     }
 
-    /// Where a RELATIVE path of a share member is joined: the shared root of
-    /// a tree share (never the daemon's cwd, which is the Owner's). `None`
-    /// for every other guard.
-    fn relative_base(&self) -> Option<&Path> {
-        match self.narrow.as_deref() {
-            Some(Narrow::Tree(root)) => Some(root.as_path()),
-            _ => None,
+    /// What a share member's `viewer_serve` mount at `root` may serve,
+    /// given the `scope` the project registry allows there
+    /// ([`crate::viewer_guard::resolve_mount`]). A mount must never serve
+    /// more than this guard reads: a file share whose sibling grant is flat
+    /// gets a [`MountScope::Folder`](crate::viewer_guard::MountScope::Folder)
+    /// of its folder, and one with no grant the file alone. Every other
+    /// guard keeps `scope`.
+    pub(crate) fn share_mount_scope(
+        &self,
+        root: &Path,
+        scope: crate::viewer_guard::MountScope,
+    ) -> crate::viewer_guard::MountScope {
+        use crate::viewer_guard::MountScope;
+        let Some(Narrow::File(file)) = self.narrow.as_deref() else {
+            return scope;
+        };
+        match &self.siblings {
+            Some(Siblings::Tree(_)) => scope,
+            Some(Siblings::Flat(d)) if root == d.as_path() => MountScope::Folder(d.clone()),
+            _ => MountScope::SingleFile(file.clone()),
         }
+    }
+
+    /// Where a RELATIVE path of a share member is joined: the shared project
+    /// root (never the daemon's cwd, which is the Owner's). `None` for an
+    /// own-workspace guard, and for a file-narrowed guard that was given no
+    /// root, which then refuses relative paths.
+    fn relative_base(&self) -> Option<&Path> {
+        self.rel_base.as_deref()
     }
 
     /// The input half of every resolver: `~` / env expansion, then absolute.
@@ -251,6 +335,9 @@ impl PathGuard {
             && (input == "~" || input.starts_with("~/") || input.starts_with("~\\"))
         {
             return Err("home expansion is not available in a share".to_string());
+        }
+        if self.narrow.is_some() && self.rel_base.is_none() && Path::new(input).is_relative() {
+            return Err("a relative path needs the shared project root".to_string());
         }
         crate::path_allow::expand_against(input, self.relative_base()).map_err(|e| e.to_string())
     }
@@ -472,8 +559,8 @@ impl PathGuard {
         }
         if let Some(narrow) = &self.narrow {
             let sibling = access == Access::Read
-                && self.siblings.as_ref().is_some_and(|d| {
-                    canonical.starts_with(d)
+                && self.siblings.as_ref().is_some_and(|s| {
+                    s.admits(canonical)
                         && crate::viewer_guard::may_serve(
                             &crate::viewer_guard::MountScope::Tree,
                             canonical,
@@ -2773,18 +2860,127 @@ mod tests {
         assert!(g.resolve_deep(&s(project.join("docs/new.css"))).is_err());
     }
 
-    /// WP-12: the grant is withheld when the folder is a project root or the
-    /// home directory.
+    /// WP-12: in a project root the grant is the files beside the shared
+    /// one only (never a sub-folder); in the home directory there is none.
     #[test]
-    fn a_file_share_in_a_project_root_or_home_gets_no_sibling_reads() {
+    fn a_file_share_in_a_project_root_or_home_gets_no_sibling_tree() {
         let (_tmp, project, _other, guard) = share_fixture();
         let file = guard.narrowed_to(&project.join("top.md")).unwrap();
         let g = file.with_sibling_reads(&[project.clone()], None);
         assert!(g.resolve_read(&project.join("cousin/c.md").to_string_lossy()).is_err());
+        assert!(g.resolve_read(&project.join("docs/style.css").to_string_lossy()).is_err());
         let g = file.with_sibling_reads(&[], Some(&project));
         assert!(g.resolve_read(&project.join("cousin/c.md").to_string_lossy()).is_err());
         // A tree share never takes the grant.
         let tree = guard.narrowed_to(&project).unwrap().with_sibling_reads(&[], None);
         assert!(tree.siblings.is_none());
+    }
+
+    /// Live defect D1: an artifact-scope (file-narrowed) guard joins a
+    /// member's RELATIVE paths to the shared project root it was given, as a
+    /// tree guard does; with no root it refuses them rather than joining the
+    /// daemon's cwd. Only the base moves: the narrow still decides.
+    #[test]
+    fn a_file_share_resolves_relative_paths_against_the_project_root() {
+        let (_tmp, project, other, guard) = share_fixture();
+        let file = guard.narrowed_to(&project.join("docs/brief.html")).unwrap();
+        assert_eq!(file.resolve("docs/brief.html").unwrap_err(), SHARE_REFUSAL);
+        let g = file.with_share_root(&project).unwrap();
+        for p in [
+            "docs/brief.html",
+            "./docs/brief.html",
+            "docs/img/../brief.html",
+        ] {
+            assert_eq!(
+                g.resolve_read(p).unwrap(),
+                project.join("docs/brief.html"),
+                "{p}"
+            );
+        }
+        for p in [
+            "top.md",
+            "docs/style.css",
+            "x/../../other/secret.md",
+            "../other/secret.md",
+            "brief.html",
+        ] {
+            assert_eq!(g.resolve_read(p).unwrap_err(), SHARE_REFUSAL, "{p}");
+        }
+        // With the sibling grant a relative sibling reads too.
+        let g = g.with_sibling_reads(&[project.clone()], None);
+        assert!(g.resolve_read("docs/style.css").is_ok());
+        assert!(g.resolve_read("top.md").is_err());
+        // The root must hold the file.
+        assert!(file.with_share_root(&other).is_err());
+        let tree = guard.narrowed_to(&project).unwrap();
+        assert!(tree.with_share_root(&project).is_ok());
+        assert!(tree.with_share_root(&project.join("docs")).is_err());
+    }
+
+    /// Live defect D2: a file straight in its project root reads the FILES
+    /// beside it — and nothing below them, nor the project through a symlink
+    /// — and its viewer mount is a `Folder` mount of the same reach.
+    #[test]
+    fn a_file_share_in_a_project_root_reads_only_the_files_beside_it() {
+        let (_tmp, project, other, guard) = share_fixture();
+        std::fs::write(project.join("chart.png"), "png").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            project.join("docs/style.css"),
+            project.join("style-link.css"),
+        )
+        .unwrap();
+        let s = |p: PathBuf| p.to_string_lossy().into_owned();
+        let g = guard
+            .narrowed_to(&project.join("top.md"))
+            .unwrap()
+            .with_share_root(&project)
+            .unwrap()
+            .with_sibling_reads(&[project.clone()], None);
+        assert!(g.resolve_read(&s(project.join("chart.png"))).is_ok());
+        assert!(g.resolve_read("chart.png").is_ok());
+        assert!(
+            g.resolve_deep_read(&s(project.clone())).is_ok(),
+            "the mount root"
+        );
+        for p in [
+            project.join("docs/style.css"),
+            project.join("docs/img/a.png"),
+            project.join("cousin/c.md"),
+            project.join("cousin"),
+            other.join("secret.md"),
+        ] {
+            assert!(g.resolve_read(&s(p.clone())).is_err(), "{}", p.display());
+        }
+        #[cfg(unix)]
+        assert!(
+            g.resolve_read(&s(project.join("style-link.css"))).is_err(),
+            "a link beside the file into a sub-folder reads as that sub-folder"
+        );
+        // Not a read: listings and writes stay exact-file.
+        assert!(g.resolve(&s(project.join("chart.png"))).is_err());
+        assert!(g.resolve_deep(&s(project.clone())).is_err());
+        // The mount it may open serves the same set.
+        use crate::viewer_guard::MountScope;
+        assert_eq!(
+            g.share_mount_scope(&project, MountScope::Tree),
+            MountScope::Folder(project.clone())
+        );
+        // A file share with no grant mounts the file alone; a tree share and
+        // the Owner keep the registry's scope.
+        let bare = guard.narrowed_to(&project.join("top.md")).unwrap();
+        assert_eq!(
+            bare.share_mount_scope(&project, MountScope::Tree),
+            MountScope::SingleFile(project.join("top.md"))
+        );
+        let tree = guard.narrowed_to(&project).unwrap();
+        assert_eq!(
+            tree.share_mount_scope(&project, MountScope::Tree),
+            MountScope::Tree
+        );
+        assert_eq!(
+            guard.share_mount_scope(&project, MountScope::Tree),
+            MountScope::Tree
+        );
     }
 }
