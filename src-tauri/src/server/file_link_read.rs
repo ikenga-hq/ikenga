@@ -203,6 +203,51 @@ pub(crate) mod tests {
         assert_eq!(read_with(g(), h(), bad_max).await.status(), StatusCode::NOT_FOUND);
     }
 
+    /// A-01 at the read: a root-owned, world-readable file is a 404 even when
+    /// the account's allowlist includes `/etc`; the owner check is made on
+    /// the opened handle, so it holds whatever the path does in between.
+    #[tokio::test]
+    async fn refuses_a_file_of_another_uid_even_inside_a_widened_allowlist() {
+        use std::os::unix::fs::MetadataExt;
+        let me = unsafe { libc::geteuid() };
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap().join("home");
+        std::fs::create_dir_all(home.join("data")).unwrap();
+        std::fs::write(home.join("r.pdf"), b"%PDF-1.7 r").unwrap();
+        let roots_file = home.parent().unwrap().join("roots-wide.json");
+        std::fs::write(
+            &roots_file,
+            serde_json::json!({ "roots": [home.to_string_lossy(), "/etc"] }).to_string(),
+        )
+        .unwrap();
+        let roots = Arc::new(crate::fs_roots::FsRoots::load(roots_file).unwrap());
+        let g = || {
+            PathGuard::roots(roots.clone()).reserving(crate::server::reserved::Reserved::new(
+                Some(home.join("data")),
+                vec![],
+            ))
+        };
+        let mut probed = 0;
+        for p in ["/etc/hostname", "/etc/passwd"] {
+            let Ok(meta) = std::fs::metadata(p) else {
+                continue;
+            };
+            if !meta.is_file() || meta.uid() == me {
+                continue;
+            }
+            probed += 1;
+            let res = read_with(g(), Some(home.clone()), q(Path::new(p), LINK_MAX_BYTES)).await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{p}");
+            assert!(body(res).await.is_empty(), "{p}");
+        }
+        if me != 0 {
+            assert!(probed > 0, "no root-owned file in /etc to probe");
+        }
+        let res = read_with(g(), Some(home.clone()), q(&home.join("r.pdf"), 100)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body(res).await, b"%PDF-1.7 r");
+    }
+
     #[test]
     fn the_route_is_internal_class() {
         let r = crate::access::route_requirement(READ_PATH).expect("classified");

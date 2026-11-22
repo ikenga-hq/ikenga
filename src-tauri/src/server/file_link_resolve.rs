@@ -19,7 +19,12 @@
 //! 3. no component directly under the account's home starts with `.`
 //!    (`~/.ssh`, `~/.config`, `~/.claude`, `~/.ikenga` …); deeper
 //!    dot-directories (`<project>/.company/`) are allowed (O-6);
-//! 4. the size is at most `LINK_MAX_BYTES` (and the caller's cap).
+//! 4. the size is at most `LINK_MAX_BYTES` (and the caller's cap);
+//! 5a. the open handle's owner (`fstat`, never a second path lookup, so it
+//!    can't be raced) is this process's own uid. An account can widen its own
+//!    `fs_roots` to `/etc` or `/` (finding A-01), and a world-readable file
+//!    it does not own, such as `/etc/passwd`, must still not be linkable.
+//!    Refused as `NotLinkable`: the same answer as any other refusal.
 //!
 //! Linux-only in practice: outside links exist only on a T1 server. On any
 //! other OS every check refuses (no `server::broker` reference anywhere).
@@ -40,7 +45,8 @@ use crate::access::{AccessError, Code};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refusal {
     /// Outside the allowlist, reserved, missing, not a regular file, not
-    /// UTF-8, or unopenable. One answer for all of them.
+    /// owned by this account's own uid, not UTF-8, or unopenable. One answer
+    /// for all of them.
     NotLinkable,
     Folder,
     /// Under a dot-directory directly in the home (check 3).
@@ -114,12 +120,35 @@ fn open_exact(canonical: &Path) -> Result<(std::fs::File, std::fs::Metadata), Re
     if !meta.is_file() {
         return Err(Refusal::NotLinkable);
     }
+    // A-01: the handle's own metadata (fstat), checked before the size so a
+    // file of another uid reveals nothing, not even that it is too large.
+    if !owned_by_self(&meta) || has_other_names(&meta) {
+        return Err(Refusal::NotLinkable);
+    }
     let named = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
         .map_err(|_| Refusal::NotLinkable)?;
     if named != canonical {
         return Err(Refusal::Moved);
     }
     Ok((file, meta))
+}
+
+/// Whether an open handle's `fstat` owner is this process's effective uid
+/// (the account's own child runs as the account's uid).
+#[cfg(target_os = "linux")]
+fn owned_by_self(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    meta.uid() == unsafe { libc::geteuid() }
+}
+
+/// Whether the open file has more than one name (a hard link). A second name
+/// lets a file that lives in a hidden folder or in the account's own data dir
+/// be reached through a normal folder, past the path rules (A-14, N-06).
+#[cfg(target_os = "linux")]
+fn has_other_names(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.nlink() > 1
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -402,6 +431,66 @@ mod tests {
         let c = std::ffi::CString::new(s(&fifo)).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         assert_eq!(run(&f, &s(&fifo)).unwrap_err(), Refusal::NotLinkable);
+    }
+
+    /// A-01: a world-readable file of another uid (root's `/etc/hostname`,
+    /// `/etc/passwd`) is refused even with `/etc` added to the allowlist,
+    /// exactly as a missing file is; the account's own file still passes.
+    #[test]
+    fn a_file_owned_by_another_uid_is_refused_even_inside_the_allowlist() {
+        let f = fixture();
+        let me = unsafe { libc::geteuid() };
+        let roots_file = f.home.parent().unwrap().join("roots-wide.json");
+        std::fs::write(
+            &roots_file,
+            serde_json::json!({ "roots": [s(&f.home), "/etc"] }).to_string(),
+        )
+        .unwrap();
+        let roots = crate::fs_roots::FsRoots::load(roots_file).unwrap();
+        let wide = PathGuard::roots(Arc::new(roots)).reserving(
+            crate::server::reserved::Reserved::new(Some(f.home.join("data")), vec![]),
+        );
+        let run_wide = |p: &str| check(&wide, Some(&f.home), p, None, LINK_MAX_BYTES);
+        let mut probed = 0;
+        for p in ["/etc/hostname", "/etc/passwd"] {
+            use std::os::unix::fs::MetadataExt;
+            let Ok(meta) = std::fs::metadata(p) else {
+                continue;
+            };
+            if !meta.is_file() || meta.uid() == me {
+                continue;
+            }
+            probed += 1;
+            assert_eq!(run_wide(p).unwrap_err(), Refusal::NotLinkable, "{p}");
+            // The stored-path read (check 5) refuses it the same way.
+            assert_eq!(
+                check(&wide, Some(&f.home), p, Some(Path::new(p)), LINK_MAX_BYTES).unwrap_err(),
+                Refusal::NotLinkable,
+                "{p}"
+            );
+        }
+        if me != 0 {
+            assert!(probed > 0, "no root-owned file in /etc to probe");
+        }
+        // The account's own file, through the same widened guard.
+        let l = run_wide(&s(&f.home.join("r.pdf"))).unwrap();
+        assert_eq!(l.canonical, f.home.join("r.pdf"));
+        assert!(owned_by_self(&l.file.metadata().unwrap()));
+
+        // N-06 / A-14: a second name for the same file is refused under either
+        // name, at create and at the stored-path read; removing it restores it.
+        let hl = f.home.join("r-hardlink.pdf");
+        std::fs::hard_link(f.home.join("r.pdf"), &hl).unwrap();
+        for p in [s(&hl), s(&f.home.join("r.pdf"))] {
+            assert_eq!(run_wide(&p).unwrap_err(), Refusal::NotLinkable, "{p}");
+            assert_eq!(
+                check(&wide, Some(&f.home), &p, Some(Path::new(&p)), LINK_MAX_BYTES).unwrap_err(),
+                Refusal::NotLinkable,
+                "{p}"
+            );
+        }
+        std::fs::remove_file(&hl).unwrap();
+        assert!(run_wide(&s(&f.home.join("r.pdf"))).is_ok());
     }
 
     #[test]

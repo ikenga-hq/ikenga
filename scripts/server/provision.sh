@@ -787,7 +787,7 @@ write_env() {
   if [[ "$PERIMETER" == public-https ]]; then set_var IKENGA_TRUSTED_PROXIES 127.0.0.1; else unset_var IKENGA_TRUSTED_PROXIES; fi
   # Outside file links (box-files WP-15): off unless the profile turns them on,
   # and only on the public perimeter (validate_profile refuses anything else).
-  if [[ "$FILE_LINKS" == 1 && "$PERIMETER" == public-https ]]; then set_var IKENGA_FILE_LINKS 1; else unset_var IKENGA_FILE_LINKS; fi
+  if [[ "$FILE_LINKS" == 1 && "$PERIMETER" == public-https ]]; then set_var IKENGA_FILE_LINKS true; else unset_var IKENGA_FILE_LINKS; fi
 
   # Optional secrets (agent API keys etc.) from a file the operator controls:
   # copied by name, never read into argv or the log.
