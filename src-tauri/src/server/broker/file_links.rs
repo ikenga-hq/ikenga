@@ -10,6 +10,12 @@
 //! | `GET, HEAD /s/:token/download` | attachment bytes, every kind |
 //! | anything else under `/s` | the uniform "not available" page (§6.1) |
 //!
+//! "Anything else" includes `OPTIONS`: [`front`] sits outside the CORS
+//! layer and the `Origin` gate and sends every method but `GET`, `HEAD`
+//! and `POST` straight to the handler, so no preflight 200 is ever answered
+//! here (LS-15, A-03). It also puts the `/s` headers on every `/s` answer,
+//! the `Origin` gate's 403 included.
+//!
 //! Unauthenticated and served by the root broker for people with **no
 //! account**. The routes are always registered (otherwise `/s/…` would fall
 //! to the SPA and answer 200 with the app's index.html); the
@@ -57,6 +63,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
@@ -721,8 +728,46 @@ async fn record_wrong_passcode(pool: &SqlitePool, link_id: &str, now: i64) -> bo
 
 // ─── routes ─────────────────────────────────────────────────────────────────
 
+/// Whether `path` is one of the link routes' paths.
+fn is_link_path(path: &str) -> bool {
+    path == "/s" || path.starts_with("/s/")
+}
+
+/// The outermost middleware of [`super::router`], for `/s` paths only (any
+/// other request passes untouched). LS-15 / A-03:
+///
+/// * a method other than `GET`, `HEAD` and `POST` (`OPTIONS`, `PUT`,
+///   `DELETE` …) goes straight to [`handle`], past the CORS layer (which
+///   would answer a preflight `OPTIONS` 200) and the `Origin` gate: the
+///   answer is the uniform 404, counted as a miss like any other;
+/// * every `/s` answer, whoever made it (the `Origin` gate's 403 for a
+///   cross-origin `POST` too), leaves with `Referrer-Policy`,
+///   `X-Robots-Tag`, `X-Content-Type-Options` and, unless the answer set its
+///   own, `Cache-Control: no-store`.
+pub async fn front(
+    State(state): State<Arc<BrokerState>>,
+    conn: Option<ConnectInfo<SocketAddr>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !is_link_path(req.uri().path()) {
+        return next.run(req).await;
+    }
+    let mut res = if matches!(*req.method(), Method::GET | Method::HEAD | Method::POST) {
+        next.run(req).await
+    } else {
+        handle(State(state), conn, req).await
+    };
+    let h = res.headers_mut();
+    common_headers(h);
+    if !h.contains_key(header::CACHE_CONTROL) {
+        h.insert(header::CACHE_CONTROL, hv("no-store"));
+    }
+    res
+}
+
 /// The `/s` routes. Merged by [`super::router`] outside the session layer,
-/// inside the `Origin` gate.
+/// inside the `Origin` gate; [`front`] wraps the whole router.
 pub fn routes(state: Arc<BrokerState>) -> Router {
     Router::new()
         .route("/s", any(handle))

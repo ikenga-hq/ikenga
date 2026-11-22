@@ -893,6 +893,108 @@ async fn ls13_a_cross_origin_passcode_post_is_refused() {
     assert_eq!(failures, 0);
 }
 
+/// LS-15 / A-03: the Origin gate's 403 for a cross-origin passcode POST
+/// carries the same no-referrer, no-index, nosniff and no-store headers as
+/// every other /s answer.
+#[tokio::test]
+async fn a03_the_cross_origin_refusal_carries_the_link_headers() {
+    let h = harness(true).await;
+    let (t, _) = passcode_link(&h, "r.pdf").await;
+    for (i, origin) in ["https://evil.example", "null"].iter().enumerate() {
+        let (s, hd, _) = send(
+            &h.app,
+            req("POST", &format!("/s/{t}"), ip(1 + i as u32))
+                .header("origin", *origin)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("passcode=wrong-guess"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{origin}");
+        assert_common_headers(&hd, origin);
+        assert_eq!(hd["cache-control"], "no-store", "{origin}");
+    }
+    assert_eq!(h.state.file_links.verifications.load(Ordering::SeqCst), 0);
+}
+
+/// LS-15 / A-03: OPTIONS (a CORS preflight included) and any other method
+/// but GET, HEAD and POST answer the uniform 404 page with the /s headers on
+/// every /s path, never the CORS layer's 200, whatever the Origin; and the
+/// app's own routes still get their CORS preflight.
+#[tokio::test]
+async fn a03_options_and_other_methods_are_the_uniform_404() {
+    let h = harness(true).await;
+    let (t, _) = pdf_link(&h).await;
+    let (_, h404, b404) = get_from(
+        &h,
+        &format!("/s/{}", links::mint_token().token),
+        ip(1),
+        None,
+    )
+    .await;
+    let paths = [
+        format!("/s/{t}"),
+        format!("/s/{t}/view"),
+        format!("/s/{t}/download"),
+        "/s".to_string(),
+        "/s/".to_string(),
+        "/s/x/y".to_string(),
+    ];
+    let same = format!("https://{HOST}");
+    let mut n = 10u32;
+    for path in &paths {
+        for (method, origin, preflight) in [
+            ("OPTIONS", None, false),
+            ("OPTIONS", Some("https://evil.example"), true),
+            ("OPTIONS", Some(same.as_str()), true),
+            ("TRACE", None, false),
+            ("PATCH", Some("https://evil.example"), false),
+            ("DELETE", Some("null"), false),
+        ] {
+            n += 1;
+            let mut b = req(method, path, ip(n));
+            if let Some(o) = origin {
+                b = b.header("origin", o);
+            }
+            if preflight {
+                b = b
+                    .header("access-control-request-method", "POST")
+                    .header("access-control-request-headers", "content-type");
+            }
+            let (s, hd, body) = send(&h.app, b.body(Body::empty()).unwrap()).await;
+            let what = format!("{method} {path} {origin:?}");
+            assert_eq!(s, StatusCode::NOT_FOUND, "{what}");
+            assert_eq!(body, b404, "{what}");
+            assert_page_headers(&hd, &what);
+            assert_common_headers(&hd, &what);
+            for k in [
+                "access-control-allow-origin",
+                "access-control-allow-methods",
+                "access-control-allow-headers",
+            ] {
+                assert!(hd.get(k).is_none(), "{what}: {k}");
+            }
+            let mut got = without_date(&hd);
+            got.retain(|(k, _)| k != "vary");
+            let mut want = without_date(&h404);
+            want.retain(|(k, _)| k != "vary");
+            assert_eq!(got, want, "{what}");
+        }
+    }
+    // Outside /s the CORS layer is untouched.
+    let (s, hd, _) = send(
+        &h.app,
+        req("OPTIONS", "/api/rpc", ip(9_000))
+            .header("origin", "https://evil.example")
+            .header("access-control-request-method", "POST")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "the app's preflight still answers");
+    assert!(hd.get("x-robots-tag").is_none());
+}
+
 /// LS-13: `Origin: null` (what an attacker's sandboxed or no-referrer page
 /// can send) is refused too, and spends nothing.
 #[tokio::test]

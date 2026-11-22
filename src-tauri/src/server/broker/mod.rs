@@ -324,7 +324,11 @@ pub fn router(
     // path must never fall to the SPA) and outside the session layer, so a
     // signed-in visitor's session is never read, refreshed or rotated by one
     // (06-file-links O-8, the conservative choice); inside the `Origin` gate
-    // (a cross-origin passcode POST is refused, LS-13).
+    // (a cross-origin passcode POST is refused, LS-13). `file_links::front`
+    // wraps everything, CORS included, for `/s` paths only: any method but
+    // GET, HEAD and POST gets the uniform 404 rather than a CORS preflight
+    // 200, and every `/s` answer (the gate's 403 too) carries the `/s`
+    // headers (LS-15, A-03).
     Router::new()
         .merge(file_links::routes(state.clone()))
         .merge(app)
@@ -333,6 +337,7 @@ pub fn router(
             auth_mod::origin_gate,
         ))
         .layer(cors)
+        .layer(middleware::from_fn_with_state(state, file_links::front))
 }
 
 /// What `t1_boot` hands the broker once its §8 probe has passed and the
