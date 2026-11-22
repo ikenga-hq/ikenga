@@ -12,6 +12,7 @@ import { initOsFileDrop } from '@/lib/dnd/os-file-drop';
 import { useIykeBridge } from '@/lib/iyke/bridge';
 import { useIykeControlListener } from '@/lib/iyke/control-listener';
 import { useIykeShellSync } from '@/lib/iyke/use-iyke-shell-sync';
+import { markLayoutRestored } from '@/lib/panes/layout-restored';
 import { loadPaneTree, persistPaneTree, type PaneTreeSnapshot } from '@/lib/panes/pane-persistence';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { useRouterPaneSync } from '@/lib/panes/router-pane-sync';
@@ -212,6 +213,9 @@ export function useWorkspaceEffects(
 			const snapshot = await raceTimeout(loadPaneTree(), 2000, 'loadPaneTree');
 			if (cancelled) return;
 			if (snapshot) hydrateRestoredLayout(snapshot);
+			// Tabs opened at boot (the share landing) wait for this: the
+			// hydrate above replaced the whole tree.
+			markLayoutRestored();
 			unsubPersist = usePaneStore.subscribe((state) => {
 				persistPaneTree({
 					root: state.root,
