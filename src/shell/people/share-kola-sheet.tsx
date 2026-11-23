@@ -332,7 +332,7 @@ export function ShareKolaSheet({
 													: 'text-[var(--fg-muted)]'
 											)}
 										>
-											{m === 'email' ? 'Email' : 'Link'}
+											{m === 'email' ? 'Email invite' : 'Invite link'}
 										</button>
 									))}
 									{offerLinks && absolutePath && (
@@ -348,7 +348,7 @@ export function ShareKolaSheet({
 													: 'text-[var(--fg-muted)]'
 											)}
 										>
-											Get a link
+											Outside link
 										</button>
 									)}
 								</div>

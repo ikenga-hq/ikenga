@@ -1,6 +1,11 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import { FileText, Loader2 } from 'lucide-react';
-import { currentShare, isRemoteWebSession, type ShareSelection } from '@/lib/transport';
+import {
+	currentShare,
+	isReadOnlyShare,
+	isRemoteWebSession,
+	type ShareSelection,
+} from '@/lib/transport';
 import { CannotPreviewPlate } from './chrome/cannot-preview-plate';
 import { basename } from './lib/path';
 import { mimeFromExt, resolveMime } from './lib/mime';
@@ -175,6 +180,8 @@ export function ViewerRouter({
 	}
 
 	const Renderer = pickRenderer(mime, path);
+	// A read-only share member gets the plain rendered view: no Edit, no toolbar.
+	const canEdit = Boolean(editable) && !isReadOnlyShare();
 
 	// Suspense fence for the lazy-loaded heavyweights (code/pdf/xlsx).
 	// Eager renderers wrap through it cleanly — Suspense is a no-op when
@@ -185,13 +192,13 @@ export function ViewerRouter({
 			{Renderer === HtmlFrame ? (
 				<HtmlFrame path={path} paneId={paneId} />
 			) : Renderer === MarkdownView ? (
-				<MarkdownView path={path} editable={editable} paneId={paneId} line={line} col={col} />
+				<MarkdownView path={path} editable={canEdit} paneId={paneId} line={line} col={col} />
 			) : Renderer === CodeView ? (
-				<CodeView path={path} editable={editable} paneId={paneId} line={line} col={col} />
+				<CodeView path={path} editable={canEdit} paneId={paneId} line={line} col={col} />
 			) : Renderer === JsonView ? (
-				<JsonView path={path} editable={editable} paneId={paneId} line={line} col={col} />
+				<JsonView path={path} editable={canEdit} paneId={paneId} line={line} col={col} />
 			) : Renderer === CsvView ? (
-				<CsvView path={path} editable={editable} paneId={paneId} line={line} col={col} />
+				<CsvView path={path} editable={canEdit} paneId={paneId} line={line} col={col} />
 			) : (
 				<Renderer path={path} />
 			)}

@@ -800,7 +800,7 @@ for (const mode of ['dark', 'light'] as const) {
 			// D-9: "Create invite", not "Send invite".
 			await expect(sheet.getByRole('button', { name: 'Create invite' })).toBeEnabled();
 			await expect(sheet).not.toContainText('Send invite');
-			await expectFocusRing(page, sheet.getByRole('button', { name: 'Link' }));
+			await expectFocusRing(page, sheet.getByRole('button', { name: 'Invite link', exact: true }));
 			await expectFocusRing(page, sheet.getByRole('button', { name: 'Create invite' }), {
 				clear: true,
 			});

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
 	__resetShareModeForTests,
+	isReadOnlyShare,
 	setShareMode,
 	shareQueryParam,
 	WebRemoteTransport,
@@ -26,6 +27,32 @@ beforeEach(() => {
 afterEach(() => {
 	vi.unstubAllGlobals();
 	setShareMode(null);
+});
+
+describe('isReadOnlyShare', () => {
+	const share = (role: 'operator' | 'reviewer' | 'guest') =>
+		setShareMode({
+			projectKey: KEY,
+			projectId: 'royalti-co',
+			projectName: 'Royalti',
+			ownerUsername: 'ada',
+			role,
+			scope: 'artifact',
+			artifactPath: 'notes.md',
+		});
+
+	it('is false in your own workspace and in an Operator share', () => {
+		expect(isReadOnlyShare()).toBe(false);
+		share('operator');
+		expect(isReadOnlyShare()).toBe(false);
+	});
+
+	it('is true for a Reviewer or Guest share, which cannot write files', () => {
+		share('guest');
+		expect(isReadOnlyShare()).toBe(true);
+		share('reviewer');
+		expect(isReadOnlyShare()).toBe(true);
+	});
 });
 
 describe('share mode', () => {

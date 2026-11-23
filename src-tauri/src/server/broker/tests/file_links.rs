@@ -720,6 +720,40 @@ async fn ls10_a_hostile_childs_headers_and_lengths_are_not_trusted() {
     assert_eq!(status_of(&h, &format!("/s/{t}/view"), ip(3)).await, StatusCode::NOT_FOUND);
 }
 
+/// A markdown file is shown as a document: HTML the renderer wrote under a
+/// no-script CSP, with the file's own HTML escaped, while /download stays the
+/// file's bytes.
+#[tokio::test]
+async fn md01_markdown_is_rendered_safely_on_view_and_raw_on_download() {
+    let h = harness(true).await;
+    let p = h.home.join("DESIGN.md");
+    std::fs::write(&p, b"x").unwrap();
+    let (t, _) = add_link(
+        &h,
+        h.owner,
+        Spec::of(&p, "DESIGN.md", "text", "text/plain; charset=utf-8"),
+    )
+    .await;
+    let src = b"---\nname: Devotee\n---\n\n# Hello\n\n<script>alert(1)</script>\n\n[a](javascript:alert(1)) ![t](https://t.example/p.png)\n";
+    h.launcher.set_mode(Mode::Hostile {
+        body: Arc::new(src.to_vec()),
+    });
+    let (s, hd, b) = get_from(&h, &format!("/s/{t}/view"), ip(1), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(hd["content-type"], "text/html; charset=utf-8");
+    let csp = hd["content-security-policy"].to_str().unwrap();
+    assert!(csp.contains("default-src 'none'") && csp.contains("sandbox") && !csp.contains("script-src"), "{csp}");
+    assert_eq!(hd["x-content-type-options"], "nosniff");
+    assert!(hd.get("set-cookie").is_none());
+    let html = String::from_utf8(b.to_vec()).unwrap();
+    assert!(html.contains("<h1>Hello</h1>") && html.contains("name: Devotee"), "{html}");
+    assert!(html.contains("&lt;script&gt;") && !html.contains("<script"), "{html}");
+    assert!(!html.contains("<a ") && !html.contains("<img") && !html.contains("t.example"), "{html}");
+    let (_, hd, b) = get_from(&h, &format!("/s/{t}/download"), ip(2), None).await;
+    assert!(hd["content-disposition"].to_str().unwrap().starts_with("attachment;"));
+    assert_eq!(b, src.to_vec());
+}
+
 /// LS-25: a file grown past the image preview limit → /view 404, /download 200.
 #[tokio::test]
 async fn ls25_a_file_grown_past_its_preview_limit_is_download_only() {

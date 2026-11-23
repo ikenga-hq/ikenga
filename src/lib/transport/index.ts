@@ -173,6 +173,14 @@ export function currentShare(): ShareSelection | null {
 	return shareSelection;
 }
 
+/** True when this tab is a share whose role cannot write files. Only an
+ *  Operator share holds the cap for `fs_write` (Files + Dispatch), so for a
+ *  Reviewer or Guest the viewer offers no Edit at all. */
+export function isReadOnlyShare(): boolean {
+	const s = currentShare();
+	return s !== null && s.role !== 'operator';
+}
+
 /** Switch this tab into (or, with `null`, out of) share mode. */
 export function setShareMode(selection: ShareSelection | null): void {
 	shareSelection = selection && isShareSelection(selection) ? selection : null;
