@@ -216,6 +216,7 @@ agent-client-protocol = { version = "0.11", features = ["unstable"] }
 # before splitting on newlines so the parser can spot real content lines.
 strip-ansi-escapes = "0.2"
 vt100 = "0.15"
+pulldown-cmark = { version = "0.13.6", default-features = false }
 
 # macOS-only: NSProcessInfo.beginActivity App-Nap inhibitor. Held while a
 # browser MCP tool call is in flight to keep eval round-trips fast even when

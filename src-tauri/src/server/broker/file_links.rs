@@ -76,6 +76,7 @@ use sqlx::{Row, SqlitePool};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::children::ChildEndpoint;
+use super::md_preview;
 use super::proxy::PRINCIPAL_HEADER;
 use super::BrokerState;
 use crate::access::audit::{self, AuditVia, Event};
@@ -118,6 +119,10 @@ pub const STREAMS_TOTAL: usize = 32;
 pub const COLD_LAUNCHES: usize = 2;
 /// Passcode verifications in flight (§2.2): its own gate, not the login's.
 pub const PASSCODE_VERIFICATIONS: usize = 1;
+/// Markdown renders running at once, box-wide. A render cannot be cancelled
+/// once started, so this (not the per-request stream permits, which a
+/// dropped connection returns) is what bounds them.
+pub const MD_RENDERS: usize = 2;
 /// The largest passcode form body read.
 const MAX_FORM_BYTES: usize = 4 * 1024;
 /// In-memory maps are swept past this many keys (the invite throttle's rule).
@@ -242,6 +247,7 @@ pub struct LinkGate {
     streams: Arc<Semaphore>,
     cold: Arc<Semaphore>,
     passcode_gate: Arc<Semaphore>,
+    renders: Arc<Semaphore>,
     /// How the broker reaches an owner's child for the first-open
     /// notification (§8.3). `None`: the installed broker host's.
     calls: Option<Arc<dyn OwnerCalls>>,
@@ -285,6 +291,7 @@ impl LinkGate {
             streams: Arc::new(Semaphore::new(STREAMS_TOTAL)),
             cold: Arc::new(Semaphore::new(COLD_LAUNCHES)),
             passcode_gate: Arc::new(Semaphore::new(PASSCODE_VERIFICATIONS)),
+            renders: Arc::new(Semaphore::new(MD_RENDERS)),
             calls: None,
             verifications: AtomicUsize::new(0),
         }
@@ -1122,6 +1129,31 @@ async fn bytes(
         (link_permit, box_permit),
     ));
     let name = links::clean_name(&row.name);
+    // Markdown is shown as a document, not as its source (06 §5.1 amended).
+    // A larger file falls through to the plain-text view below.
+    if inline && md_preview::is_markdown(&name) && len <= md_preview::MAX_RENDER_INPUT as u64 {
+        // The render slot goes into the blocking task, so it is held until the
+        // render ends even if the visitor has gone.
+        let Ok(render_slot) = gate.renders.clone().try_acquire_owned() else {
+            return Outcome::Done(busy());
+        };
+        let mut raw: Vec<u8> = Vec::with_capacity(len as usize);
+        let mut stream = std::pin::pin!(body.into_data_stream());
+        while let Some(Ok(chunk)) = stream.next().await {
+            raw.extend_from_slice(&chunk);
+        }
+        // A read that broke part-way is not shown as a short document.
+        if raw.len() as u64 != len {
+            return Outcome::NotAvailable;
+        }
+        let html = tokio::task::spawn_blocking(move || {
+            let _slot = render_slot;
+            md_preview::render(&String::from_utf8_lossy(&raw))
+        })
+        .await
+        .unwrap_or_default();
+        return Outcome::Done(markdown_response(&name, html));
+    }
     Outcome::Done(bytes_response(content_type, &name, inline, len, body))
 }
 
@@ -1338,7 +1370,8 @@ fn file_page(gate: &LinkGate, token: &str, row: &LinkRow) -> Response {
         Some(PreviewKind::Image) => {
             format!("<div class=\"preview\"><img src=\"/s/{t}/view\" alt=\"{name}\"></div>")
         }
-        // Markdown included: shown as text, never rendered (§5.1).
+        // Text types: shown as text in a sandboxed frame. Markdown is rendered
+        // by [md_preview] on /view, never as the file's own HTML (§5.1).
         Some(PreviewKind::Text) => format!(
             "<div class=\"preview\"><iframe sandbox src=\"/s/{t}/view\" \
              title=\"{name}\"></iframe></div>"
@@ -1372,6 +1405,26 @@ fn bytes_response(
         header::CONTENT_SECURITY_POLICY,
         hv("default-src 'none'; frame-ancestors 'self'; sandbox"),
     );
+    h.insert("cross-origin-resource-policy", hv("same-origin"));
+    h.insert(header::CACHE_CONTROL, hv("private, no-store"));
+    common_headers(h);
+    res
+}
+
+/// The rendered markdown document for `/view`: HTML, but only the HTML
+/// [md_preview] writes, under its own no-script CSP and the sandbox directive.
+fn markdown_response(name: &str, html: String) -> Response {
+    let len = html.len() as u64;
+    let mut res = html.into_response();
+    let h = res.headers_mut();
+    h.insert(header::CONTENT_TYPE, hv("text/html; charset=utf-8"));
+    let disposition = HeaderValue::from_str(&download::content_disposition(name, true))
+        .unwrap_or_else(|_| hv("attachment; filename=\"download\""));
+    h.insert(header::CONTENT_DISPOSITION, disposition);
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    if let Ok(v) = HeaderValue::from_str(md_preview::csp()) {
+        h.insert(header::CONTENT_SECURITY_POLICY, v);
+    }
     h.insert("cross-origin-resource-policy", hv("same-origin"));
     h.insert(header::CACHE_CONTROL, hv("private, no-store"));
     common_headers(h);

@@ -28,6 +28,7 @@ pub mod children;
 pub mod file_links;
 pub mod fs_roots_admin;
 pub mod health_probe;
+pub mod md_preview;
 pub mod proxy;
 pub mod vault;
 pub mod ws_registry;
