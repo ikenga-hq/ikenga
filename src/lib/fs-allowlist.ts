@@ -35,6 +35,22 @@ export function isAbsoluteServerPath(p: string): boolean {
 	return p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p);
 }
 
+/** A folder path the user may type into their list. Always an absolute path;
+ *  the desktop app also takes `~` / `~/…`, which Rust (`fs_roots`) expands
+ *  against this machine's home. A server would expand `~` against its own
+ *  process, not the caller's home, so a browser session gets absolute only. */
+export function isAddableFolderPath(p: string, desktop: boolean): boolean {
+	if (isAbsoluteServerPath(p)) return true;
+	return desktop && (p === '~' || p.startsWith('~/') || p.startsWith('~\\'));
+}
+
+/** An example folder for the add field and its error, in this machine's form
+ *  on the desktop app (a browser session can't know its server's OS). */
+export function folderPathExample(desktop: boolean, windows: boolean): string {
+	if (desktop && windows) return 'C:\\Users\\you\\projects';
+	return '/home/you/projects';
+}
+
 /** Whether an RPC error is a permission refusal (vs. a bad path). */
 export function isPermissionError(message: string): boolean {
 	return /^(forbidden|requires_t1)\b/.test(message) || message.includes('missing=');

@@ -16,12 +16,12 @@ use std::sync::{Arc, OnceLock, RwLock};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Defaults seeded into the JSON file on first run.
+/// What a set loaded without a seed starts from: nothing.
 ///
-/// Empty by design: a fresh install has no FS allowlist until the user
-/// adds a root via the onboarding wizard's "Project & file roots" step or
-/// Settings → Storage → File roots. The empty-state UI in
-/// `routes/onboarding/roots-body.tsx` already explains the consequence.
+/// Every real caller passes a seed instead ([`FsRoots::load_seeded`]): the
+/// desktop and a T1 principal child seed the user's home folder, and only T0
+/// (a server shared by whoever holds its token) keeps no seed. Users widen or
+/// narrow the list in Settings → Storage → Folders you can open.
 pub const DEFAULT_ROOTS: &[&str] = &[];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +59,8 @@ pub struct FsRoots {
     /// What [`FsRoots::reset`] restores: the seed this set was loaded with,
     /// or [`DEFAULT_ROOTS`] when it had none.
     defaults: Vec<String>,
+    /// See [`FsRoots::seeded_on_load`].
+    seeded_on_load: bool,
     state: RwLock<State>,
 }
 
@@ -96,9 +98,10 @@ fn entries_of<S: AsRef<str>>(inputs: &[S]) -> Vec<Entry> {
 }
 
 impl FsRoots {
-    /// Load from disk, seeding defaults if the file is missing. The desktop's
-    /// loader; the daemon always goes through [`FsRoots::load_seeded`].
-    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+    /// Load from disk with no seed ([`DEFAULT_ROOTS`]). Both the desktop and
+    /// the daemon go through [`FsRoots::load_seeded`] now; this stays for
+    /// tests and any caller that wants an unseeded set.
+    #[allow(dead_code)]
     pub fn load(file: PathBuf) -> Result<Self> {
         Self::load_seeded(file, Vec::new())
     }
@@ -125,7 +128,8 @@ impl FsRoots {
         } else {
             seed
         };
-        let (inputs, initialized) = if !initialized && inputs.is_empty() && !defaults.is_empty() {
+        let seeded_on_load = !initialized && inputs.is_empty() && !defaults.is_empty();
+        let (inputs, initialized) = if seeded_on_load {
             tracing::info!("[fs_roots] seeding {} with {defaults:?}", file.display());
             (defaults.clone(), true)
         } else {
@@ -135,6 +139,7 @@ impl FsRoots {
         let roots = Self {
             file,
             defaults,
+            seeded_on_load,
             state: RwLock::new(State {
                 entries: entries_of(&inputs),
                 initialized,
@@ -200,6 +205,27 @@ impl FsRoots {
                 resolved,
             });
         })
+    }
+
+    /// Whether this load applied the seed: the list had never been set up,
+    /// so this boot is its first. The desktop uses it to add project folders
+    /// that sit outside the seed exactly once, never on a later boot, where
+    /// it would undo a removal the user made.
+    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+    pub fn seeded_on_load(&self) -> bool {
+        self.seeded_on_load
+    }
+
+    /// Whether the folder `input` names (expanded like [`FsRoots::add`]
+    /// expands it) is already inside an active root, the root itself
+    /// included. Blank input is never covered.
+    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+    pub fn covers(&self, input: &str) -> Result<bool> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(false);
+        }
+        Ok(self.is_allowed(&resolve_input(trimmed)?))
     }
 
     /// Remove a root by its user-input string (the same string the UI shows).
@@ -419,6 +445,55 @@ mod tests {
         assert!(roots.add(&extra.to_string_lossy()).is_err());
         assert!(roots.list_inputs().is_empty());
         assert!(!roots.is_allowed(&extra.canonicalize().unwrap()));
+    }
+
+    /// The desktop's first boot on an install that never set its list up
+    /// (`{"roots": []}`, no flag): the home seed applies and the load says
+    /// so; the next boot, and a set that was already configured, do not.
+    #[test]
+    fn seeded_on_load_is_true_only_on_the_seeding_boot() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let seed = vec![home.to_string_lossy().to_string()];
+        let file = dir.path().join("fs_roots.json");
+        std::fs::write(&file, r#"{"roots": []}"#).unwrap();
+
+        let first = FsRoots::load_seeded(file.clone(), seed.clone()).unwrap();
+        assert!(first.seeded_on_load());
+        assert_eq!(first.list_inputs(), seed);
+        drop(first);
+        let second = FsRoots::load_seeded(file, seed.clone()).unwrap();
+        assert!(!second.seeded_on_load());
+
+        let configured = dir.path().join("configured.json");
+        std::fs::write(&configured, r#"{"roots": ["/work"]}"#).unwrap();
+        assert!(!FsRoots::load_seeded(configured, seed)
+            .unwrap()
+            .seeded_on_load());
+        let unseeded = FsRoots::load(dir.path().join("t0.json")).unwrap();
+        assert!(!unseeded.seeded_on_load());
+    }
+
+    /// `covers` answers "is this folder already allowed?" for the bridge's
+    /// add (no prompt needed) and the project backfill (nothing to add).
+    #[test]
+    fn covers_a_root_and_what_is_under_it_only() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        let sub = root.join("sub");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let roots = FsRoots::load(dir.path().join("fs_roots.json")).unwrap();
+        roots.add(&root.to_string_lossy()).unwrap();
+
+        assert!(roots.covers(&root.to_string_lossy()).unwrap());
+        assert!(roots
+            .covers(&format!(" {} ", sub.to_string_lossy()))
+            .unwrap());
+        assert!(!roots.covers(&other.to_string_lossy()).unwrap());
+        assert!(!roots.covers("  ").unwrap(), "blank is never covered");
     }
 
     #[test]

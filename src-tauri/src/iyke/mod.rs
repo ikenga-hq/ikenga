@@ -18,6 +18,7 @@ pub mod browser_rpc;
 pub mod browser_sessions;
 pub mod claude;
 pub mod comments;
+pub mod fs_roots_routes;
 pub mod handlers;
 pub mod hook_settings;
 pub mod hooks;

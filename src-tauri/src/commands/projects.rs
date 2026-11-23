@@ -26,6 +26,64 @@ impl ListChangedSink for AppHandle {
     }
 }
 
+// ─── Project folders → the fs allowlist (desktop only) ───────────────────
+//
+// On the desktop, a folder the user made a project of is a folder they mean
+// to open. Before WP-05 the FE's `fileRoots` store wrote every picked root to
+// `fs_roots`; WP-05 moved roots onto projects and nothing wrote the allowlist
+// any more, so a desktop install's list stayed `{"roots": []}` and every
+// project folder was refused ("path outside allowlist").
+//
+// The desktop list starts with the user's home folder (`lib.rs`), so most
+// project folders are already covered and nothing is added for them; these
+// hooks only matter for folders elsewhere (another drive, `/srv/...`).
+//
+// Desktop only, on purpose: the daemon's `project_create` arm checks a new
+// root *against* the allowlist (`rpc_shell::check_stored_root`), because over
+// the network the allowlist is the boundary. The iyke bridge's project routes
+// don't grant either: an agent asks through `POST /iyke/fs-roots/add`, which
+// the user answers in the shell.
+
+/// Allow `root` unless it is blank or already covered. Best-effort: a failure
+/// is logged and never fails the project command that made the project.
+fn allow_project_root(root: Option<&str>) {
+    let Some(root) = root.map(str::trim).filter(|r| !r.is_empty()) else {
+        return;
+    };
+    let Some(roots) = crate::fs_roots::current() else {
+        return;
+    };
+    if roots.covers(root).unwrap_or(false) {
+        return;
+    }
+    if let Err(e) = roots.add(root) {
+        log::warn!("[fs_roots] could not allow project folder {root}: {e:#}");
+    }
+}
+
+/// Boot backfill for installs that hit the WP-05 gap. Runs only on the boot
+/// that first seeded the list (with home): every live project folder the seed
+/// doesn't cover is added. Never on a later boot, so a folder the user
+/// removed stays removed.
+pub async fn allow_project_folders_once(pool: &SqlitePool) {
+    let Some(roots) = crate::fs_roots::current() else {
+        return;
+    };
+    if !roots.seeded_on_load() {
+        return;
+    }
+    let folders: Vec<String> = match list_projects(pool, false).await {
+        Ok(projects) => projects.into_iter().filter_map(|p| p.root_path).collect(),
+        Err(e) => {
+            log::warn!("[fs_roots] project backfill: list projects failed: {e}");
+            return;
+        }
+    };
+    for folder in &folders {
+        allow_project_root(Some(folder));
+    }
+}
+
 // ─── One-time migration: claudeProjectRoots → projects ────────────────────
 //
 // Pre-Phase-0-of-projects-first-class, the /claude config browser tracked a
@@ -213,7 +271,7 @@ pub async fn project_create(
     description: Option<String>,
 ) -> Result<Project, String> {
     let pool = db.ensure_pool().await?;
-    create_project_announcing(
+    let project = create_project_announcing(
         &pool,
         CreateArgs {
             id,
@@ -225,7 +283,9 @@ pub async fn project_create(
         },
         &app,
     )
-    .await
+    .await?;
+    allow_project_root(project.root_path.as_deref());
+    Ok(project)
 }
 
 #[tauri::command]
@@ -236,7 +296,12 @@ pub async fn project_update(
     patch: ProjectPatch,
 ) -> Result<Project, String> {
     let pool = db.ensure_pool().await?;
-    update_project_announcing(&pool, &id, patch, &app).await
+    let sets_root = matches!(patch.root_path, Some(Some(_)));
+    let project = update_project_announcing(&pool, &id, patch, &app).await?;
+    if sets_root {
+        allow_project_root(project.root_path.as_deref());
+    }
+    Ok(project)
 }
 
 #[tauri::command]

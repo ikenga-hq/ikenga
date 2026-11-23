@@ -17,8 +17,9 @@ import type {
 	SettingsWriteOptions,
 } from '@/lib/settings/types';
 import { scopedPersistName } from '@/lib/window/window-context';
-import { currentShare, isRemoteWebSession } from '@/lib/transport';
+import { currentShare, isRemoteWebSession, isTauri } from '@/lib/transport';
 import {
+	fsRootsAdd,
 	type Project,
 	projectGetActive,
 	projectList,
@@ -1176,6 +1177,24 @@ function mergeShellState(persisted: unknown, current: ShellState): ShellState {
 	return next;
 }
 
+/**
+ * Desktop app only: a folder the user adds to a project is a folder they mean
+ * to open, so it goes on the fs allowlist (Rust `fs_roots`) too. Before WP-05
+ * the `fileRoots` store did this; afterwards extra roots only reached
+ * settings, and the explorer was refused every one of them. Additive and
+ * best-effort: removing a root here leaves the allowlist alone (Settings →
+ * Storage → Folders you can open edits that). A browser session never widens
+ * its server's list this way — there the allowlist is the boundary.
+ */
+function allowNewFoldersOnDesktop(added: readonly string[]): void {
+	if (!isTauri()) return;
+	for (const folder of added) {
+		fsRootsAdd(folder).catch((err) => {
+			console.warn('[shell-store] could not allow project folder', folder, err);
+		});
+	}
+}
+
 export const useShellStore = create<ShellState>()(
 	persist(
 		(set, get) => ({
@@ -1207,6 +1226,7 @@ export const useShellStore = create<ShellState>()(
 						s.activeProject
 					),
 				});
+				allowNewFoldersOnDesktop(nextRoots.filter((r) => !previousRoots.includes(r)));
 				enqueueSettingsWrite(
 					'projects.extraRoots',
 					() =>
