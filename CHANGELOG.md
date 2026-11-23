@@ -1,5 +1,12 @@
 # ikenga-desktop
 
+## 0.32.3
+
+### Patch Changes
+
+- 3ff079f: An outside link to a markdown file now shows it as a readable document (headings, lists, tables, code, front matter) instead of its source. The file's own HTML is shown as text, links show their address as plain text, and only images stored inside the file are shown.
+- 3ff079f: A teammate with a read-only share now sees files as plain rendered views, with no Edit button. The Share sheet's three tabs are now "Email invite", "Invite link" and "Outside link", so two of them no longer read "Link".
+
 ## 0.32.2
 
 ### Patch Changes
