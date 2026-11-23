@@ -25,6 +25,12 @@ use std::sync::OnceLock;
 /// Past this much output the document stops with a note. A 5 MiB file of
 /// nested quotes or list markers would otherwise grow several-fold.
 const MAX_OUT: usize = 8 * 1024 * 1024;
+/// A markdown file larger than this is shown as plain text, not rendered:
+/// the parser builds the whole tree first (about 27x the input in memory
+/// for hostile text) and the output cap above cannot reach that.
+pub const MAX_RENDER_INPUT: usize = 1024 * 1024;
+/// An image's alt text is kept to this many bytes.
+const MAX_ALT: usize = 1000;
 /// A shown address is cut here.
 const MAX_URL_SHOWN: usize = 300;
 
@@ -151,8 +157,12 @@ pub fn render(markdown: &str) -> String {
                     }
                 }
                 Event::Text(t) | Event::Code(t) | Event::Html(t) | Event::InlineHtml(t) => {
-                    if alt.len() < 1000 {
-                        alt.push_str(&t);
+                    if alt.len() < MAX_ALT {
+                        let mut end = (MAX_ALT - alt.len()).min(t.len());
+                        while !t.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        alt.push_str(&t[..end]);
                     }
                 }
                 Event::SoftBreak | Event::HardBreak => alt.push(' '),
@@ -376,6 +386,16 @@ mod tests {
         // Alt text cannot leave its attribute.
         let h = body("![a\" onerror=\"alert(1)](data:image/gif;base64,R0lGOD==)");
         assert!(h.contains("alt=\"a&quot; onerror=&quot;alert(1)\""), "{h}");
+    }
+
+    #[test]
+    fn alt_text_is_cut_at_its_cap_on_a_char_boundary() {
+        let h = render(&format!(
+            "![{}](https://x.example/a.png)",
+            "é".repeat(5_000)
+        ));
+        assert!(h.len() < 20_000, "{}", h.len());
+        assert!(h.contains("[image: "));
     }
 
     #[test]

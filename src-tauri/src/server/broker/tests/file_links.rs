@@ -33,6 +33,7 @@ use crate::server::broker::children::{tests::FakeProcess, ChildLauncher, Launche
 use crate::server::broker::file_links::{
     LinkConfig, LinkGate, PasscodeVerifier, COOKIE_NAME, PASS_LINK_MAX,
 };
+use crate::server::broker::md_preview;
 use crate::server::broker::{router, BrokerExtensions, BrokerState};
 use crate::server::file_link_read::{read_with, ReadQuery, READ_PATH};
 use crate::server::operator::password::LoginVerifier;
@@ -752,6 +753,24 @@ async fn md01_markdown_is_rendered_safely_on_view_and_raw_on_download() {
     let (_, hd, b) = get_from(&h, &format!("/s/{t}/download"), ip(2), None).await;
     assert!(hd["content-disposition"].to_str().unwrap().starts_with("attachment;"));
     assert_eq!(b, src.to_vec());
+}
+
+/// A markdown file past the render limit is shown as plain text, not parsed.
+#[tokio::test]
+async fn md02_a_large_markdown_file_is_plain_text_not_rendered() {
+    let h = harness(true).await;
+    let p = h.home.join("big.md");
+    std::fs::write(&p, b"x").unwrap();
+    let (t, _) = add_link(&h, h.owner, Spec::of(&p, "big.md", "text", "text/plain; charset=utf-8")).await;
+    let src = "# not a heading\n".repeat(md_preview::MAX_RENDER_INPUT / 16 + 1).into_bytes();
+    assert!(src.len() > md_preview::MAX_RENDER_INPUT);
+    h.launcher.set_mode(Mode::Hostile {
+        body: Arc::new(src.clone()),
+    });
+    let (s, hd, b) = get_from(&h, &format!("/s/{t}/view"), ip(1), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(hd["content-type"].to_str().unwrap().starts_with("text/plain"));
+    assert_eq!(b, src);
 }
 
 /// LS-25: a file grown past the image preview limit → /view 404, /download 200.

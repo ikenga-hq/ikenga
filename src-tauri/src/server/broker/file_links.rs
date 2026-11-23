@@ -119,6 +119,10 @@ pub const STREAMS_TOTAL: usize = 32;
 pub const COLD_LAUNCHES: usize = 2;
 /// Passcode verifications in flight (§2.2): its own gate, not the login's.
 pub const PASSCODE_VERIFICATIONS: usize = 1;
+/// Markdown renders running at once, box-wide. A render cannot be cancelled
+/// once started, so this (not the per-request stream permits, which a
+/// dropped connection returns) is what bounds them.
+pub const MD_RENDERS: usize = 2;
 /// The largest passcode form body read.
 const MAX_FORM_BYTES: usize = 4 * 1024;
 /// In-memory maps are swept past this many keys (the invite throttle's rule).
@@ -243,6 +247,7 @@ pub struct LinkGate {
     streams: Arc<Semaphore>,
     cold: Arc<Semaphore>,
     passcode_gate: Arc<Semaphore>,
+    renders: Arc<Semaphore>,
     /// How the broker reaches an owner's child for the first-open
     /// notification (§8.3). `None`: the installed broker host's.
     calls: Option<Arc<dyn OwnerCalls>>,
@@ -286,6 +291,7 @@ impl LinkGate {
             streams: Arc::new(Semaphore::new(STREAMS_TOTAL)),
             cold: Arc::new(Semaphore::new(COLD_LAUNCHES)),
             passcode_gate: Arc::new(Semaphore::new(PASSCODE_VERIFICATIONS)),
+            renders: Arc::new(Semaphore::new(MD_RENDERS)),
             calls: None,
             verifications: AtomicUsize::new(0),
         }
@@ -1124,7 +1130,13 @@ async fn bytes(
     ));
     let name = links::clean_name(&row.name);
     // Markdown is shown as a document, not as its source (06 §5.1 amended).
-    if inline && md_preview::is_markdown(&name) {
+    // A larger file falls through to the plain-text view below.
+    if inline && md_preview::is_markdown(&name) && len <= md_preview::MAX_RENDER_INPUT as u64 {
+        // The render slot goes into the blocking task, so it is held until the
+        // render ends even if the visitor has gone.
+        let Ok(render_slot) = gate.renders.clone().try_acquire_owned() else {
+            return Outcome::Done(busy());
+        };
         let mut raw: Vec<u8> = Vec::with_capacity(len as usize);
         let mut stream = std::pin::pin!(body.into_data_stream());
         while let Some(Ok(chunk)) = stream.next().await {
@@ -1134,9 +1146,12 @@ async fn bytes(
         if raw.len() as u64 != len {
             return Outcome::NotAvailable;
         }
-        let html = tokio::task::spawn_blocking(move || md_preview::render(&String::from_utf8_lossy(&raw)))
-            .await
-            .unwrap_or_default();
+        let html = tokio::task::spawn_blocking(move || {
+            let _slot = render_slot;
+            md_preview::render(&String::from_utf8_lossy(&raw))
+        })
+        .await
+        .unwrap_or_default();
         return Outcome::Done(markdown_response(&name, html));
     }
     Outcome::Done(bytes_response(content_type, &name, inline, len, body))
